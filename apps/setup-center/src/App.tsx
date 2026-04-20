@@ -97,6 +97,7 @@ import { useVersionCheck } from "./hooks/useVersionCheck";
 import { useEnvManager } from "./hooks/useEnvManager";
 import { AdvancedView } from "./views/AdvancedView";
 import { OnboardingCoreAgentPanel } from "./views/OnboardingCoreAgentPanel";
+import { OnboardingWhaleSkillsPanel } from "./views/OnboardingWhaleSkillsPanel";
 
 const THEME_I18N_KEYS: Record<Theme, string> = {
   system: "topbar.themeSystem",
@@ -4955,26 +4956,18 @@ export function App() {
                       {t("onboarding.coreAgent.skillsDisabledHint")}
                     </div>
                   ) : (
-                    <Suspense
-                      fallback={(
-                        <div className="flex justify-center py-10">
-                          <Loader2 className="size-8 animate-spin text-muted-foreground" />
-                        </div>
-                      )}
-                    >
-                      <SkillManager
-                        venvDir={venvDir}
-                        currentWorkspaceId={currentWorkspaceId}
-                        envDraft={envDraft}
-                        onEnvChange={setEnvDraft}
-                        onSaveEnvKeys={async (keys) => {
-                          await saveEnvKeys(keys);
-                        }}
-                        apiBaseUrl={apiBaseUrl}
-                        serviceRunning={!!serviceStatus?.running}
-                        dataMode={dataMode}
-                      />
-                    </Suspense>
+                    <OnboardingWhaleSkillsPanel
+                      venvDir={venvDir}
+                      currentWorkspaceId={currentWorkspaceId}
+                      envDraft={envDraft}
+                      onEnvChange={setEnvDraft}
+                      onSaveEnvKeys={async (keys) => {
+                        await saveEnvKeys(keys);
+                      }}
+                      apiBaseUrl={apiBaseUrl}
+                      serviceRunning={!!serviceStatus?.running}
+                      dataMode={dataMode}
+                    />
                   )
                 }
               />

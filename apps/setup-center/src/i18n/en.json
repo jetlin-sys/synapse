@@ -1705,7 +1705,7 @@
       "personaSlugInvalid": "Invalid name: cannot be empty or contain \\ / : * ? \" < > | or control characters. Letters, digits, and CJK are allowed.",
       "noPersonaFiles": "No extra persona files yet. Click New to add one.",
       "skillsTitle": "Skills (SKILL) configuration",
-      "skillsHint": "Same as Capabilities → Skills: enable/disable skills and adjust skill-related environment variables.",
+      "skillsHint": "Here you only choose skills for the default (Xiaojing) profile; the global pool stays under Capabilities → Skills.",
       "skillsDisabledHint": "The skills module is turned off above. Enable it to configure skills.",
       "personaBindingHint": "Role ID maps 1:1 to identity/personas/<id>.md; the active choice is stored in PERSONA_NAME. Next writes it to the workspace .env.",
       "customPersonasLabel": "Custom personas",
@@ -1725,7 +1725,7 @@
       "taskBehaviorTitle": "Habits",
       "taskBehaviorDesc": "Proactive messaging, quiet hours, and stickers",
       "taskSkillsTitle": "Skills",
-      "taskSkillsDesc": "Enable and configure external tools and APIs",
+      "taskSkillsDesc": "Pick external skills for the default profile; install and enable the global pool under Capabilities → Skills.",
       "dialogPersonaTitle": "Identity",
       "dialogCoreTitle": "Core parameters",
       "dialogMemoryTitle": "Memory",
@@ -1741,7 +1741,13 @@
       "sectionStickers": "Stickers",
       "skillsMasterTitle": "Skills module",
       "skillsMasterDesc": "Controls whether the agent can use extended tools and skills",
-      "personaEditorPlaceholder": "Enter persona in Markdown…"
+      "personaEditorPlaceholder": "Enter persona in Markdown…",
+      "whaleSkillsNeedService": "Start the backend service before configuring Xiaojing core skills.",
+      "whaleSkillsBanner": "This only updates external skills on the default agent profile (data/agents/profiles/default.json), not data/skills.json. Install and enable the global pool under Capabilities → Skills. If a skill is disabled globally, Xiaojing may not load it even if checked here.",
+      "whaleSkillsSaved": "Saved to default profile",
+      "whaleNoExternalSkills": "No external skills installed yet",
+      "whaleNoExternalSkillsHint": "Install skills under Capabilities → Skills after setup, or skip for now.",
+      "whaleSaveSkills": "Save to default profile"
     },
     "claudeCode": {
       "title": "Developer CLI setup",

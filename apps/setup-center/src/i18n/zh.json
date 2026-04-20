@@ -1706,7 +1706,7 @@
       "personaSlugInvalid": "名称无效：不能为空，且不能含 \\ / : * ? \" < > | 或控制字符；中文、字母、数字均可",
       "noPersonaFiles": "暂无额外人格文件，可点击「新建」添加。",
       "skillsTitle": "技能（SKILL）配置",
-      "skillsHint": "与「能力 → 技能配置」相同：可启用/关闭各技能并调整技能相关环境变量。",
+      "skillsHint": "此处只配置小鲸人设勾选的外部技能；全局技能池仍在「能力 → 技能」。",
       "skillsDisabledHint": "技能模块已通过右侧开关关闭。开启后可配置技能列表。",
       "personaBindingHint": "角色 ID 与 identity/personas 下同名 md 文件一一对应；当前选择保存在环境变量 PERSONA_NAME。点击「下一步」会写入工作区 .env。",
       "customPersonasLabel": "自定义角色",
@@ -1726,7 +1726,7 @@
       "taskBehaviorTitle": "行为习惯",
       "taskBehaviorDesc": "配置主动发起交流的频率、静默时段与表情包支持",
       "taskSkillsTitle": "核心技能",
-      "taskSkillsDesc": "按需启用并配置智能体所需要的各种外置能力（API、工具等）",
+      "taskSkillsDesc": "为小鲸（default）勾选外部技能并保存至人设文件；安装与全局启用请在「能力 → 技能」完成。",
       "dialogPersonaTitle": "身份设定",
       "dialogCoreTitle": "核心参数",
       "dialogMemoryTitle": "记忆机制",
@@ -1742,7 +1742,13 @@
       "sectionStickers": "表情包支持",
       "skillsMasterTitle": "技能模块总开关",
       "skillsMasterDesc": "控制智能体是否可以使用拓展工具和能力",
-      "personaEditorPlaceholder": "请输入 Markdown 格式的人格设定…"
+      "personaEditorPlaceholder": "请输入 Markdown 格式的人格设定…",
+      "whaleSkillsNeedService": "请先启动后端服务后再配置小鲸核心技能。",
+      "whaleSkillsBanner": "此处仅写入小鲸（default）人设中的外部技能列表（data/agents/profiles/default.json），不会修改 data/skills.json。全局外部技能池请在主界面「能力 → 技能」安装并启用；若某技能在全局未启用，小鲸即使勾选也可能无法加载。",
+      "whaleSkillsSaved": "已保存到小鲸人设",
+      "whaleNoExternalSkills": "当前暂无已安装的外部技能",
+      "whaleNoExternalSkillsHint": "可先在「能力 → 技能」安装外部技能，或暂时跳过，稍后再配置。",
+      "whaleSaveSkills": "保存到小鲸人设"
     },
     "claudeCode": {
       "title": "研发工具安装检测",
