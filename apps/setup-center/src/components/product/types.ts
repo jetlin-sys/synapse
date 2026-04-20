@@ -72,6 +72,10 @@ export interface Product {
   ownerInfo?: string;
   repositories: Repository[];
   latestTickets?: Ticket[];
+  /** 需求单数量（get_prod_info / get_prod_process_info 与 order_process 同级的 demand_order_count） */
+  demandOrderCount?: number;
+  /** 研发单数量（task_order_count） */
+  taskOrderCount?: number;
   analysisStatus: {
     code: "success" | "processing" | "pending" | "error";
     ticket: "success" | "processing" | "pending" | "error";
@@ -299,6 +303,31 @@ function documentAggregatedCompletedTime(
   );
 }
 
+/** 与 order_process 同级的数量字段；兼容服务端误将 key 写成带尾部空格 */
+function orderCountsFromProcessWire(data: ProdProcessDataPayload | ProdInfoWireItem): {
+  demandOrderCount?: number;
+  taskOrderCount?: number;
+} {
+  const rec = data as Record<string, unknown>;
+  const read = (keys: readonly string[]): number | undefined => {
+    for (const k of keys) {
+      const raw = rec[k];
+      if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+      if (typeof raw === "string" && raw.trim() !== "") {
+        const n = Number(raw);
+        if (Number.isFinite(n)) return n;
+      }
+    }
+    return undefined;
+  };
+  const d = read(["demand_order_count", "demand_order_count "] as const);
+  const t = read(["task_order_count", "task_order_count "] as const);
+  const out: { demandOrderCount?: number; taskOrderCount?: number } = {};
+  if (d !== undefined) out.demandOrderCount = d;
+  if (t !== undefined) out.taskOrderCount = t;
+  return out;
+}
+
 function ticketCompletedTime(data: {
   order_process?: string;
   order_process_time?: string | null;
@@ -316,7 +345,7 @@ export type AnalysisProcessFields = {
 
 /** get_prod_process_info / get_prod_info 中的过程字段 → 卡片/详情用状态与时间 */
 export function buildAnalysisFieldsFromProcessPayload(
-  data: ProdProcessDataPayload | Pick<ProdInfoWireItem, "repo_process" | "order_process" | "order_process_time" | "doc_process">,
+  data: ProdProcessDataPayload | Pick<ProdInfoWireItem, "repo_process" | "order_process" | "order_process_time" | "doc_process" | "demand_order_count" | "task_order_count">,
 ): AnalysisProcessFields {
   const repoWorst = data.repo_process?.length
     ? pickWorstUnifiedState(
@@ -349,7 +378,7 @@ export function buildAnalysisFieldsFromProcessPayload(
 
 /** 仅聚合为旧版四维 success/processing/pending/error（兼容调用方） */
 export function analysisStatusFromProcessPayload(
-  data: ProdProcessDataPayload | Pick<ProdInfoWireItem, "repo_process" | "order_process" | "order_process_time" | "doc_process">,
+  data: ProdProcessDataPayload | Pick<ProdInfoWireItem, "repo_process" | "order_process" | "order_process_time" | "doc_process" | "demand_order_count" | "task_order_count">,
 ): Product["analysisStatus"] {
   return buildAnalysisFieldsFromProcessPayload(data).analysisStatus;
 }
@@ -357,12 +386,15 @@ export function analysisStatusFromProcessPayload(
 /** 将过程数据合并进已有 Product（刷新 / 更新仓库回调） */
 export function applyProcessPayloadToProduct(p: Product, payload: ProdProcessDataPayload): Product {
   const fields = buildAnalysisFieldsFromProcessPayload(payload);
+  const counts = orderCountsFromProcessWire(payload);
   return {
     ...p,
     analysisStatus: fields.analysisStatus,
     analysisUnified: fields.analysisUnified,
     analysisTimes: fields.analysisTimes,
     repositories: mergeRepositoriesWithProcess(p.repositories, payload.repo_process),
+    demandOrderCount: counts.demandOrderCount ?? p.demandOrderCount,
+    taskOrderCount: counts.taskOrderCount ?? p.taskOrderCount,
   };
 }
 
@@ -420,6 +452,7 @@ export function prodInfoWireToProduct(item: ProdInfoWireItem): Product {
   const repos = Array.isArray(item.repo_info) ? item.repo_info.filter((r): r is RdRepoInfo => r != null) : [];
   const baseRepos = repos.map(repoWireToRepository);
   const fields = buildAnalysisFieldsFromProcessPayload(item);
+  const counts = orderCountsFromProcessWire(item);
   return {
     id: stableProductIdFromWire(item),
     name: item.prod ?? "",
@@ -435,6 +468,7 @@ export function prodInfoWireToProduct(item: ProdInfoWireItem): Product {
     analysisStatus: fields.analysisStatus,
     analysisUnified: fields.analysisUnified,
     analysisTimes: fields.analysisTimes,
+    ...counts,
     knowledge: {
       architecture: false,
       solution: false,

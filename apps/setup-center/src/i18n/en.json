@@ -467,6 +467,7 @@
     "configComplete": "Config complete",
     "configIncomplete": "Config incomplete",
     "system": "System",
+    "systemRequiredToggle": "System skills are required and always on",
     "external": "External",
     "enabled": "Enabled",
     "disabled": "Disabled",

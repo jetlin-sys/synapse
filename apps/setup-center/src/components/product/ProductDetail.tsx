@@ -207,6 +207,15 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
   const allKnowledgeNotCreated = knowledgeKeys.every((k) => !product.knowledge[k]);
   const showAutoGenerateCta = codeU !== "new" && ticketU !== "new" && allKnowledgeNotCreated;
 
+  const ticketReqMetric =
+    product.demandOrderCount !== undefined
+      ? product.demandOrderCount
+      : product.latestTickets?.filter((tick) => tick.title.includes("需求")).length ?? 0;
+  const ticketDevMetric =
+    product.taskOrderCount !== undefined
+      ? product.taskOrderCount
+      : product.latestTickets?.filter((tick) => !tick.title.includes("需求")).length ?? 0;
+
   const getMockDocsForCategory = (categoryKey: string, productName: string) => {
     return [
       {
@@ -620,7 +629,7 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                       {t("workbench.products.detail.reqTickets")}
                     </div>
                     <div className="text-base text-foreground font-semibold">
-                      {product.latestTickets?.filter((tick) => tick.title.includes("需求")).length || 0}
+                      {ticketReqMetric}
                     </div>
                   </div>
                   <div className="bg-background/50 p-2 rounded text-center border border-border/40">
@@ -628,7 +637,7 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                       {t("workbench.products.detail.devTickets")}
                     </div>
                     <div className="text-base text-foreground font-semibold">
-                      {product.latestTickets?.filter((tick) => !tick.title.includes("需求")).length || 0}
+                      {ticketDevMetric}
                     </div>
                   </div>
                 </div>

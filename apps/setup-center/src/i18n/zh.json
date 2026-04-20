@@ -467,6 +467,7 @@
     "configComplete": "已配置",
     "configIncomplete": "配置不完整",
     "system": "系统技能",
+    "systemRequiredToggle": "系统技能为必选，始终启用",
     "external": "外部技能",
     "enabled": "启用",
     "disabled": "已禁用",

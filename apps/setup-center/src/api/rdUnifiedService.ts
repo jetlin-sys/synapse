@@ -106,6 +106,10 @@ export type ProdInfoWireItem = {
   order_process?: string;
   /** 工单分析完成时间（order_process 为 D 时可选） */
   order_process_time?: string | null;
+  /** 需求单数量（与 order_process 同级；部分环境字段名可能误带尾部空格，解析见 types 层） */
+  demand_order_count?: number;
+  /** 研发单数量 */
+  task_order_count?: number;
   /** 各文档类型处理状态；聚合规则与 repo_process 相同 */
   doc_process?: DocProcessWireItem[];
 };
@@ -128,6 +132,8 @@ export type ProdProcessDataPayload = {
   repo_process?: RepoProcessWireItem[];
   order_process?: string;
   order_process_time?: string | null;
+  demand_order_count?: number;
+  task_order_count?: number;
   doc_process?: DocProcessWireItem[];
 };
 

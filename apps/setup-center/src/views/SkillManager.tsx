@@ -23,6 +23,7 @@ import {
   AlertDialogHeader, AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { ModalOverlay } from "../components/ModalOverlay";
+import { cn } from "@/lib/utils";
 
 // ─── i18n 辅助：按当前语言优先显示中文名/描述 ───
 
@@ -274,9 +275,16 @@ function SkillCard({
                 {uninstalling ? <Loader2 className="animate-spin" size={14} /> : <IconTrash size={14} />}
               </Button>
             )}
-            <Label className="flex items-center gap-1.5 cursor-pointer text-xs font-normal ml-2 mr-2">
+            <Label
+              className={cn(
+                "flex items-center gap-1.5 text-xs font-normal ml-2 mr-2",
+                skill.system ? "cursor-not-allowed opacity-80" : "cursor-pointer",
+              )}
+              title={skill.system ? t("skills.systemRequiredToggle") : undefined}
+            >
               <Checkbox
                 checked={skill.enabled !== false}
+                disabled={skill.system}
                 onCheckedChange={() => onToggleEnabled()}
               />
               {t("skills.enabled")}
@@ -780,6 +788,7 @@ export function SkillManager({
 
   // ── 切换启用/禁用（仅更新本地 draft，不自动保存） ──
   const handleToggleEnabled = useCallback((skill: SkillInfo) => {
+    if (skill.system) return;
     const cur = enabledDraft[skill.skillId] ?? (skill.enabled !== false);
     setEnabledDraft((prev) => ({ ...prev, [skill.skillId]: !cur }));
     setEnabledDirty(true);
