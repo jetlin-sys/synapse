@@ -498,7 +498,7 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
           {listLoading ? (
             <Card className="shadow-sm border-border/80">
               <CardContent className="flex flex-col items-center justify-center gap-3 py-16 text-muted-foreground">
-                <Loader2 className="size-10 animate-spin text-primary/80" />
+                <Loader2 className="size-10 app-loading-spin text-primary/80" aria-hidden />
                 <p className="text-sm">{t("workbench.products.loadingList")}</p>
               </CardContent>
             </Card>

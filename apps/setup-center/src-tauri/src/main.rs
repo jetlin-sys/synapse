@@ -383,6 +383,47 @@ fn probe_devservice_ports(ip: String) -> Result<Vec<DevServiceProbeRow>, String>
     Ok(out)
 }
 
+/// 单端口 TCP 探测（工单图谱等按需检测，避免 `probe_devservice_ports` 多端口顺序阻塞）。
+#[tauri::command]
+fn probe_devservice_one_port(ip: String, port: u16) -> Result<DevServiceProbeRow, String> {
+    let host = ip.trim();
+    if host.is_empty() {
+        return Err("IP is required".into());
+    }
+    let timeout = Duration::from_secs(3);
+    let addr_str = format!("{host}:{port}");
+    let row = match addr_str.to_socket_addrs() {
+        Ok(mut iter) => {
+            if let Some(addr) = iter.next() {
+                match TcpStream::connect_timeout(&addr, timeout) {
+                    Ok(_) => DevServiceProbeRow {
+                        port,
+                        ok: true,
+                        error: None,
+                    },
+                    Err(e) => DevServiceProbeRow {
+                        port,
+                        ok: false,
+                        error: Some(e.to_string()),
+                    },
+                }
+            } else {
+                DevServiceProbeRow {
+                    port,
+                    ok: false,
+                    error: Some("no addresses resolved".into()),
+                }
+            }
+        }
+        Err(e) => DevServiceProbeRow {
+            port,
+            ok: false,
+            error: Some(e.to_string()),
+        },
+    };
+    Ok(row)
+}
+
 // ── 前端日志持久化 ──
 
 const FRONTEND_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
@@ -3146,6 +3187,7 @@ fn main() {
             read_devservice_ip,
             write_devservice_ip,
             probe_devservice_ports,
+            probe_devservice_one_port,
             append_frontend_log,
             save_log_export,
             register_cli,

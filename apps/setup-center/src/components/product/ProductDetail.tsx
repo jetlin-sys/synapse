@@ -19,6 +19,7 @@ import {
   ChevronRight,
   Zap,
   Sparkles,
+  Loader2,
 } from "lucide-react";
 import { Product, type UnifiedWireAnalysisState } from "./types";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -28,12 +29,15 @@ import { toast } from "sonner";
 import { IS_TAURI } from "@/platform";
 import {
   buildCodeGraphEmbedUrl,
+  buildTicketKnowledgeGraphEmbedUrl,
   codeGraphProjectNameFromRepoUrl,
   getDevserviceHost,
   getProdProcessInfo,
   gitNexusAnalysis,
   gitNexusInitialize,
   orderInitialize,
+  probeUnifiedServicePortReachable,
+  TICKET_KNOWLEDGE_GRAPH_PORT,
 } from "@/api/rdUnifiedService";
 import type { ProdProcessDataPayload } from "@/api/rdUnifiedService";
 import "./product-workbench.css";
@@ -90,6 +94,9 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
   const [gitnexusBusyIdx, setGitnexusBusyIdx] = useState<number | null>(null);
   const [orderTicketBusy, setOrderTicketBusy] = useState(false);
   const [devserviceHost, setDevserviceHost] = useState<string | null>(null);
+  /** null = 探测中；iframe 仅在 true 时挂载，避免不可达时 WebView 内嵌浏览器错误白屏 */
+  const [ticketGraphReachable, setTicketGraphReachable] = useState<boolean | null>(null);
+  const [ticketGraphProbeNonce, setTicketGraphProbeNonce] = useState(0);
 
   const productRef = useRef(product);
   productRef.current = product;
@@ -151,6 +158,30 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
     if (!proj) return null;
     return buildCodeGraphEmbedUrl(devserviceHost, proj);
   }, [product, activeRepoIdx, devserviceHost]);
+
+  const ticketGraphIframeSrc = useMemo(() => {
+    if (!product || !IS_TAURI || !devserviceHost) return null;
+    const prodKey = product.name.trim();
+    if (!prodKey) return null;
+    return buildTicketKnowledgeGraphEmbedUrl(devserviceHost, prodKey);
+  }, [product, devserviceHost]);
+
+  useEffect(() => {
+    if (!open || !IS_TAURI || activeTab !== "ticket-graph") return;
+    if (!ticketGraphIframeSrc || !devserviceHost) {
+      setTicketGraphReachable(null);
+      return;
+    }
+    let cancelled = false;
+    setTicketGraphReachable(null);
+    void (async () => {
+      const ok = await probeUnifiedServicePortReachable(devserviceHost, TICKET_KNOWLEDGE_GRAPH_PORT);
+      if (!cancelled) setTicketGraphReachable(ok);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, activeTab, ticketGraphIframeSrc, devserviceHost, ticketGraphProbeNonce]);
 
   const knowledgeItems = useMemo(
     () => [
@@ -643,22 +674,65 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
             )}
 
             {activeTab === "ticket-graph" && (
-              <div className="p-6 h-full flex flex-col gap-4">
-                <div className="flex-1 rounded-xl border border-border bg-muted/5 relative overflow-hidden flex items-center justify-center min-h-[400px]">
-                  <div className="absolute inset-0 bg-[radial-gradient(theme(colors.emerald.500)_1px,transparent_1px)] [background-size:30px_30px] opacity-10"></div>
-                  <div className="relative z-10 flex flex-col items-center text-center max-w-md">
-                    <ClipboardList size={48} className="text-emerald-500 opacity-50 mb-4" strokeWidth={1} />
-                    <h4 className="text-lg font-semibold text-foreground mb-2">
-                      {t("workbench.products.detail.ticketGraphTitle")}
-                    </h4>
-                    <p className="text-sm text-muted-foreground">
-                      {t("workbench.products.detail.ticketGraphHint")}
-                    </p>
-                    <div className="mt-6 flex items-center justify-center gap-3 flex-wrap">
-                      <Badge variant="outline" className="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20">需求流转: 128</Badge>
-                      <Badge variant="outline" className="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20">缺陷修复: 45</Badge>
-                    </div>
-                  </div>
+              <div className="p-6 h-full flex min-h-0 flex-col gap-4">
+                <div className="flex min-h-[720px] flex-1 flex-col rounded-xl border border-border bg-muted/5 relative overflow-hidden">
+                  {ticketGraphIframeSrc && ticketGraphReachable === true ? (
+                    <iframe
+                      key={ticketGraphIframeSrc}
+                      title={t("workbench.products.detail.ticketKnowledgeGraphIframeTitle")}
+                      src={ticketGraphIframeSrc}
+                      className="h-full min-h-[720px] w-full flex-1 border-0 bg-background"
+                      referrerPolicy="no-referrer-when-downgrade"
+                    />
+                  ) : (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(theme(colors.emerald.500)_1px,transparent_1px)] [background-size:30px_30px] opacity-10" />
+                      <div className="relative z-10 flex min-h-[720px] w-full flex-col items-center justify-center px-6 text-center">
+                        <div className="flex max-w-md flex-col items-center gap-2">
+                          {!ticketGraphIframeSrc ? (
+                            <>
+                              <ClipboardList size={48} className="text-emerald-500 opacity-50 mb-2" strokeWidth={1} />
+                              <h4 className="text-lg font-semibold text-foreground">
+                                {t("workbench.products.detail.ticketGraphTitle")}
+                              </h4>
+                              <p className="text-sm text-muted-foreground">
+                                {t("workbench.products.detail.ticketGraphHint")}
+                              </p>
+                            </>
+                          ) : ticketGraphReachable === null ? (
+                            <>
+                              <Loader2
+                                size={40}
+                                className="text-emerald-500/80 mb-2 app-loading-spin"
+                                strokeWidth={1.5}
+                                aria-hidden
+                              />
+                              <p className="text-sm text-muted-foreground">
+                                {t("workbench.products.detail.ticketGraphProbing")}
+                              </p>
+                            </>
+                          ) : (
+                            <>
+                              <ClipboardList size={48} className="text-emerald-500 opacity-50 mb-2" strokeWidth={1} />
+                              <p className="text-base font-medium text-foreground">
+                                {t("workbench.products.detail.ticketGraphServiceUnreachable")}
+                              </p>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="mt-4"
+                                onClick={() => setTicketGraphProbeNonce((n) => n + 1)}
+                              >
+                                <RefreshCw size={14} className="mr-1.5" />
+                                {t("workbench.products.detail.ticketGraphRetryProbe")}
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             )}

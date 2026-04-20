@@ -349,15 +349,16 @@ async def _get_product_list(body: GetProductListRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
+            return error_response(502, f"研发云获取产品列表失败：{msg}")
+
         if not isinstance(raw.get("data"), list):
             return error_response(502, f"研发云返回数据data非列表：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云返回非 JSON：{resp.text}")
-
-    # 检查返回码
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
-        return error_response(502, f"研发云获取产品列表失败：{msg}")
 
     # 提取数据
     simplified = [
@@ -464,15 +465,15 @@ async def _get_repo_detail(body: GetRepoDetailRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取代码仓库信息失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), list):
             return error_response(502, f"研发云返回数据data非列表：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取代码仓库信息返回非 JSON：{resp.text}")
-
-    # 检查返回码
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取代码仓库信息失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据
     simplified = [
@@ -693,15 +694,15 @@ async def get_product_version_id(body: GetProductVersionIdRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取产品版本ID失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), list):
             return error_response(502, f"研发云返回数据data非列表：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取产品版本ID返回非 JSON：{resp.text}")
-
-    # 检查返回码
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取产品版本ID失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据
     simplified = [
@@ -791,15 +792,15 @@ async def _get_module_name_list(body: GetModuleNameListRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码    
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取模块列表失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), dict):
             return error_response(502, f"研发云返回数据data非字典：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取模块列表返回非 JSON：{resp.text}")
-
-    # 检查返回码    
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取模块列表失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据
     simplified = [
@@ -897,15 +898,15 @@ async def _get_product_branch_list(body: GetProductBranchListRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取产品分支列表失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), dict):
             return error_response(502, f"研发云返回数据data非字典：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取产品分支列表返回非 JSON：{resp.text}")
-    
-    # 检查返回码
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取产品分支列表失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据
     page_data = raw.get("data") or {}
@@ -1108,15 +1109,15 @@ async def _get_patch_version(body: GetPatchVersionRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取补丁计划失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), dict):
             return error_response(502, f"研发云返回数据data非字典：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取补丁计划返回非 JSON：{resp.text}")
-
-    # 检查返回码
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取补丁计划失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据
     items = ((raw.get("data") or {}).get("list") or [])
@@ -1175,15 +1176,15 @@ async def _get_ci_flow_execution_status(body: GetCiFlowExecutionStatusRequest) -
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取CI执行结果失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), dict):
             return error_response(502, f"研发云返回数据data非字典：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取CI执行结果返回非 JSON：{resp.text}")
-
-    # 检查返回码
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取CI执行结果失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据
     flow_data = raw.get("data") or {}
@@ -1257,15 +1258,15 @@ async def _get_ci_flow_report(body: GetCiFlowReportRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取CI报表失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), list):
             return error_response(502, f"研发云返回数据data非列表：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取CI报表返回非 JSON：{resp.text}")
-
-    # 检查返回码
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取CI报表失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据
     return success_response(raw.get("data"))
@@ -1337,15 +1338,15 @@ async def _get_task_build_history(body: GetTaskBuildHistoryRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取任务构建历史失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), dict):
             return error_response(502, f"研发云返回数据data非字典：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取任务构建历史返回非 JSON：{resp.text}")
-
-    # 检查返回码
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取任务构建历史失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据
     simplified = [
@@ -1440,15 +1441,15 @@ async def _get_ci_flow_build_result(body: GetCiFlowBuildResultRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
+        # 检查返回码    
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取构建结果失败"
+            return error_response(502, msg, error=str(raw))
+
         if not isinstance(raw.get("data"), list):
             return error_response(502, f"研发云返回数据data非列表：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云获取构建结果返回非 JSON：{resp.text}")
-
-    # 检查返回码    
-    if raw.get("code") != "9999":
-        msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取构建结果失败"
-        return error_response(502, msg, error=str(raw))
 
     # 提取数据 
     simplified = [
@@ -1496,6 +1497,39 @@ async def get_ci_flow_build_status(body: GetCiFlowBuildStatusRequest) -> dict:
     1) 调 _get_task_build_history 取 featureBuildHisList
     2) 按 ciFlowId 分组，按 ciFlowInstBeginDate 取最新一条
     3) 每条都调用 _get_ci_flow_build_result(ciFlowInstId)
+    4) 返回数据格式：
+    {
+        "taskId": "任务ID",
+        "flowBuildStatusList": [
+            {
+                "ciFlowId": "CI流程ID",
+                "ciFlowInstId": "构建实例ID",
+                "ciFlowInstBeginDate": "构建开始时间",
+                "ciFlowInstEndDate": "构建结束时间",
+                "ciFlowInstRunState": "构建状态",
+                "ciFlowInstRunStateDesc": "构建状态描述",
+                "buildResult": [
+                    {
+                        "nodeName": "节点名称",
+                        "stepId": "步骤ID",
+                        "runResult": "运行结果",
+                        "url": "URL",
+                        "attachments": [
+                            {
+                                "fullPath": "附件全路径",
+                                "path": "附件路径",
+                                "nodeInstanceId": "节点实例ID",
+                                "attachmentDesc": "附件描述",
+                                "fileSize": "附件大小",
+                                "resultType": "附件类型",
+                                "createDate": "创建时间",
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
     """
     try:
         # 1) 先拿到“任务维度”的构建历史（里面包含 featureBuildHisList）
@@ -1635,7 +1669,23 @@ def _build_create_task_payload(body: CreateTaskRequest) -> dict:
 @router.post("/api/dev/iwhalecloud/create_task")
 async def create_task(body: CreateTaskRequest) -> dict:
     """
-    需求单拆单
+    功能：需求单拆单。
+    用法：传入需求单号、负责人、版本、影响点等，创建需求单。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "taskNo": "任务单号",
+        "taskId": "任务ID",
+        "branch": {
+            "productModuleId": 应用模块ID, 
+            "productModuleName": "产品模块名称", 
+            "repoId": 仓库ID, 
+            "repoName": "仓库名称", 
+            "repoUrl": "仓库URL", 
+            "branchName": "特性分支名称", 
+            "baseBranchName": "来源分支名称", 
+        }
+    }
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/user-story/{body.taskNo}/work-item/inner，返回码code为“9999”表示成功
     """
     # 参数校验：统一入口必须具备负责人、版本、影响点等
     if not body.taskNo:
@@ -1760,7 +1810,19 @@ class UpdateTaskPatchRequest(BaseModel):
 
 @router.post("/api/dev/iwhalecloud/update_task_patch")
 async def update_task_patch(body: UpdateTaskPatchRequest) -> dict:
-    """对外路由：修改任务的补丁计划（内部复用 _update_task_patch）。"""
+    """对外路由：修改任务的补丁计划（内部复用 _update_task_patch）。
+    功能：修改任务的补丁计划。
+    用法：传入任务单号和补丁计划名称，修改任务的补丁计划。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "code": "9999",
+        "data": true,
+        "msg": "",
+        "message": "",
+        "finalMessage": ""
+    }
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{body.taskNo}/patch，返回码code为“9999”表示成功
+    """
     return await _update_task_patch(body)
 
 async def _update_task_patch(body: UpdateTaskPatchRequest) -> dict:
@@ -2012,7 +2074,21 @@ class CreateFeatureBranchRequest(BaseModel):
 
 @router.post("/api/dev/iwhalecloud/create_feature_branch")
 async def create_feature_branch(body: CreateFeatureBranchRequest) -> dict:
-    """对外路由：创建特性分支（内部复用 _create_feature_branch"""
+    """对外路由：创建特性分支（内部复用 _create_feature_branch
+    功能：创建特性分支。
+    用法：传入任务单号和特性分支名称，创建特性分支。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+		"productModuleId": 应用模块ID, 
+		"productModuleName": "产品模块名称", 
+		"repoId": 仓库ID, 
+		"repoName": "仓库名称", 
+		"repoUrl": "仓库URL", 
+		"branchName": "特性分支名称", 
+		"baseBranchName": "来源分支名称", 
+	}
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/task-branch/feature/create，返回码code为“9999”表示成功
+    """
     return await _create_feature_branch(body)
 
 async def _create_feature_branch(body: CreateFeatureBranchRequest) -> dict:
@@ -2031,7 +2107,32 @@ async def _create_feature_branch(body: CreateFeatureBranchRequest) -> dict:
     except httpx.RequestError as exc:
         logger.exception("调用研发云创建特性分支接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    return _forward_response(resp)
+
+    # 检查数据格式
+    try:
+        raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云创建特性分支失败"
+            return error_response(502, msg, error=str(raw))
+
+        if not isinstance(raw.get("data"), dict):
+            return error_response(502, f"研发云返回数据data非字典：{resp.text}")
+    except ValueError:
+        return error_response(502, f"研发云创建特性分支返回非 JSON：{resp.text}")
+
+    # 提取数据返回
+    return success_response(
+        {
+            "productModuleId": raw.get("data").get("productModuleId"),
+            "productModuleName": raw.get("data").get("productModuleName"),
+            "repoId": raw.get("data").get("repoId"),
+            "repoName": raw.get("data").get("repoName"),
+            "repoUrl": raw.get("data").get("repoUrl"),
+            "branchName": raw.get("data").get("branchName"),
+            "baseBranchName": raw.get("data").get("baseBranchName"),
+        }
+    )
 
 
 class TransferTaskStageRequest(BaseModel):
@@ -2057,7 +2158,17 @@ async def transfer_task_stage(body: TransferTaskStageRequest) -> dict:
 async def _transfer_task_stage(body: TransferTaskStageRequest) -> dict:
     """
     内部调用：转单（将研发单流转到指定状态并指定处理人）。
-    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{taskNo}/stage。
+    功能：将研发单流转到指定状态并指定处理人。
+    用法：传入任务单号、目标处理人工号、当前操作人工号、目标状态ID、转单备注，将研发单流转到指定状态并指定处理人。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "code": "9999",
+        "data": true,
+        "msg": "",
+        "message": "",
+        "finalMessage": ""
+    }
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{taskNo}/stage，返回码code为“9999”表示成功
     """
     if not body.taskNo:
         return error_response(400, "taskNo 不能为空")
@@ -2085,7 +2196,9 @@ class TransferToCodeReviewRequest(BaseModel):
 
 @router.post("/api/dev/iwhalecloud/transfer_to_code_review")
 async def transfer_to_code_review(body: TransferToCodeReviewRequest) -> dict:
-    """组合接口：先新增测试用例，再将任务单转到代码走查。"""
+    """组合接口：先新增测试用例，再将任务单转到代码走查。
+    返回数据格式：{}
+    """
 
     # 步骤1：先创建/绑定任务自测用例
     testcase_body = AddTaskTestcaseRequest(
@@ -2109,13 +2222,7 @@ async def transfer_to_code_review(body: TransferToCodeReviewRequest) -> dict:
     if isinstance(transfer_resp, dict) and transfer_resp.get("errorcode") not in (None, 0):
         return error_response(502, "转代码走查失败", error=str(transfer_resp))
 
-    return success_response(
-        {
-            "testcase": testcase_resp.get("data") if isinstance(testcase_resp, dict) else testcase_resp,
-            "transfer": transfer_resp.get("data") if isinstance(transfer_resp, dict) else transfer_resp,
-        },
-        "新增测试用例并转代码走查成功",
-    )
+    return success_response({}, "新增测试用例并转代码走查成功",)
 
 
 class TransferDemandStageRequest(BaseModel):
@@ -2136,8 +2243,16 @@ def _build_transfer_demand_stage_payload(body: TransferDemandStageRequest) -> di
 @router.post("/api/dev/iwhalecloud/transfer_demand_stage")
 async def transfer_demand_stage(body: TransferDemandStageRequest) -> dict:
     """
-    转单：将需求单流转到指定状态并指定处理人。
-    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{taskNo}/stage
+    功能：将需求单流转到指定状态并指定处理人。
+    用法：传入需求单号、目标处理人工号、当前操作人工号、目标状态ID、转单备注，将需求单流转到指定状态并指定处理人。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "code": "9999",
+        "data": true,
+        "msg": "",
+        "message": "",
+        "finalMessage": ""
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{taskNo}/stage，返回码code为“9999”表示成功
     """
     if not body.taskNo:
         return error_response(400, "taskNo 不能为空")
@@ -2165,8 +2280,17 @@ def _build_create_comment_payload(body: CreateCommentRequest) -> dict:
 @router.post("/api/dev/iwhalecloud/create_comment")
 async def create_comment(body: CreateCommentRequest):
     """
-    新增评论。
-    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/task-no/{taskNo}/comment
+    功能：新增评论。
+    用法：传入任务单号、评论内容，新增评论。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "code": "9999",
+        "data": true,
+        "msg": "",
+        "message": "",
+        "finalMessage": ""
+    }
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/task-no/{taskNo}/comment，返回码code为“9999”表示成功
     """
     if not body.taskNo:
         return error_response(400, "taskNo 不能为空")
@@ -2230,7 +2354,20 @@ def _filter_task_impact_evaluate_y(data: dict) -> list[dict]:
 
 @router.post("/api/dev/iwhalecloud/get_impact_list_from_demand")
 async def get_impact_list_from_demand(body: GetImpactListFromDemandRequest) -> dict:
-    """对外路由：根据需求单ID获取影响列表（内部复用 _get_impact_list_from_demand）。"""
+    """对外路由：根据需求单ID获取影响列表（内部复用 _get_impact_list_from_demand）。
+    功能：根据需求单ID获取影响列表。
+    用法：传入需求单ID，获取影响列表。
+    接口类型：研发云界面抓取请求（研发平台 --> 需求管理 --> 需求详情）
+    返回数据格式：[
+        {
+            "taskImpactId": 123,
+            "impactName": "影响点名称",
+            "impactDesc": "影响点描述",
+            "createUserId": "创建人工号",
+        }
+    ]
+    转调：GET /portal/zcm-devspace/task/{demandId}/impact?_=timestamp，返回码code为“9999”表示成功
+    """
     return await _get_impact_list_from_demand(body)
 
 async def _get_impact_list_from_demand(body: GetImpactListFromDemandRequest) -> dict:
@@ -2261,19 +2398,20 @@ async def _get_impact_list_from_demand(body: GetImpactListFromDemandRequest) -> 
     if resp.status_code >= 400:
         return error_response(resp.status_code, f"研发云接口调用失败：{resp.text}")
 
+    # 检查数据格式
     try:
         raw = resp.json()
-    except ValueError:
-        return error_response(502, f"研发云返回非 JSON：{resp.text}")
-
-    if isinstance(raw, dict) and "code" in raw:
+        # 检查返回码
         if raw.get("code") != "9999":
             msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
             return error_response(502, f"{msg}", error=str(raw))
 
-    if not isinstance(raw, dict):
-        return error_response(502, "研发云返回格式异常")
+        if not isinstance(raw.get("data"), list):
+            return error_response(502, f"研发云返回数据data非列表：{resp.text}")
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
 
+    # 提取数据
     filtered = _filter_task_impact_evaluate_y(raw)
     return success_response(filtered)
 
@@ -2323,7 +2461,18 @@ def _map_impact_detail_task_impact_id_desc(data: dict) -> list[dict]:
 
 @router.post("/api/dev/iwhalecloud/get_impact_list_from_task")
 async def get_impact_list_from_task(body: GetImpactListFromTaskRequest) -> dict:
-    """对外路由：根据任务ID获取影响列表（内部复用 _get_impact_list_from_task）。"""
+    """对外路由：根据任务ID获取影响列表（内部复用 _get_impact_list_from_task）。
+    功能：根据任务ID获取影响列表。
+    用法：传入任务ID，获取影响列表。
+    接口类型：研发云界面抓取请求（研发平台 --> 事务管理 --> 任务详情）
+    返回数据格式：[
+        {
+            "taskImpactId": 123,
+            "impactDesc": "影响点描述",
+        }
+    ]
+    转调：GET /portal/zcm-devspace/task/{taskId}/impact/detail?_=timestamp，返回码code为“9999”表示成功
+    """
     return await _get_impact_list_from_task(body)
 
 async def _get_impact_list_from_task(body: GetImpactListFromTaskRequest) -> dict:
@@ -2353,19 +2502,20 @@ async def _get_impact_list_from_task(body: GetImpactListFromTaskRequest) -> dict
     if resp.status_code >= 400:
         return error_response(resp.status_code, f"研发云接口调用失败：{resp.text}")
 
+    # 检查数据格式
     try:
         raw = resp.json()
-    except ValueError:
-        return error_response(502, f"研发云返回非 JSON：{resp.text}")
-
-    if isinstance(raw, dict) and "code" in raw:
+        # 检查返回码
         if raw.get("code") != "9999":
             msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
             return error_response(502, f"{msg}", error=str(raw))
 
-    if not isinstance(raw, dict):
-        return error_response(502, "研发云返回格式异常")
+        if not isinstance(raw.get("data"), list):
+            return error_response(502, f"研发云返回数据data非列表：{resp.text}")
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
 
+    # 提取数据
     mapped = _map_impact_detail_task_impact_id_desc(raw)
     return success_response(mapped)
 
@@ -2375,7 +2525,17 @@ class GetTaskListFromDemandRequest(BaseModel):
 
 @router.post("/api/dev/iwhalecloud/get_task_list_from_demand")
 async def get_task_list_from_demand(body: GetTaskListFromDemandRequest) -> dict:
-    """对外路由：根据需求单号获取任务列表，默认不包含弱关联任务（内部复用 _get_task_list_from_demand）。"""
+    """对外路由：根据需求单号获取任务列表，默认不包含弱关联任务（内部复用 _get_task_list_from_demand）。
+    功能：根据需求单号获取任务列表，默认不包含弱关联任务。
+    用法：传入需求单号，获取任务列表。
+    接口类型：研发云提供标准API接口
+    返回数据格式：[
+        {
+            "taskNo": "任务单号"
+        }
+    ]
+    转调：GET /portal/ai-gateway/devspace/rpc/v3/user-story/{demandNo}/work-items，返回码code为“9999”表示成功
+    """
     return await _get_task_list_from_demand(body)
 
 async def _get_task_list_from_demand(body: GetTaskListFromDemandRequest) -> dict:
@@ -2394,13 +2554,34 @@ async def _get_task_list_from_demand(body: GetTaskListFromDemandRequest) -> dict
     except httpx.RequestError as exc:
         logger.exception("调用研发云根据需求单查询任务列表接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    return _forward_response(resp)
+    
+    # 检查数据格式
+    try:
+        raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
+            return error_response(502, f"{msg}", error=str(raw))
+            
+        if not isinstance(raw.get("data"), list):
+            return error_response(502, f"研发云返回数据data非列表：{resp.text}")
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
+    
+    # 提取数据
+    simplified = [
+        {
+            "taskNo": it.get("taskNo")
+        }
+        for it in raw.get("data")
+    ]
+    return success_response(simplified)
 
 
 class GetTaskPatchRequest(BaseModel):
     taskId: int = Field(..., description="任务ID")
 
-def _build_get_task_patch_headers(body: GetTaskPatchRequest, csrf: str, cookies: str) -> dict:
+def _build_get_task_patch_headers(csrf: str, cookies: str) -> dict:
     return {
         "accept": "application/json, text/javascript, */*; q=0.01",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -2422,7 +2603,15 @@ def _build_get_task_patch_headers(body: GetTaskPatchRequest, csrf: str, cookies:
 
 @router.post("/api/dev/iwhalecloud/get_task_patch")
 async def get_task_patch(body: GetTaskPatchRequest) -> dict:
-    """对外路由：根据任务ID获取任务版本信息（内部复用 _get_task_patch）。"""
+    """对外路由：根据任务ID获取任务版本信息（内部复用 _get_task_patch）。
+    功能：根据任务ID获取任务版本信息。
+    用法：传入任务ID，获取任务版本信息。
+    接口类型：研发云界面抓取请求（研发平台 --> 事务管理 --> 任务详情）
+    返回数据格式：{
+        "patchName": "补丁计划名称"
+    }
+    转调：GET /portal/zcm-devspace/task/{taskId}/detail?_=timestamp，返回码code为“9999”表示成功
+    """
     return await _get_task_patch(body)
 
 async def _get_task_patch(body: GetTaskPatchRequest) -> dict:
@@ -2435,7 +2624,7 @@ async def _get_task_patch(body: GetTaskPatchRequest) -> dict:
         return error_response(400, str(e))
 
     url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/zcm-devspace/task/{body.taskId}/detail"
-    headers = _build_get_task_patch_headers(body, csrf, cookies)
+    headers = _build_get_task_patch_headers(csrf, cookies)
     payload = {
         "withAttach": True,
         "withBranchVersion": True,
@@ -2468,15 +2657,29 @@ async def _get_task_patch(body: GetTaskPatchRequest) -> dict:
         logger.exception("调用研发云查询任务版本信息接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
 
-    return _forward_response(resp)
+    # 检查数据格式
+    try:
+        raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
+            return error_response(502, f"{msg}", error=str(raw))
 
+        if not isinstance(raw.get("data"), dict):
+            return error_response(502, f"研发云返回数据data非字典：{resp.text}")
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
+
+    # 提取数据
+    patch_name = (raw.get("data") or {}).get("adPatch").get("patchName")
+    return success_response({"patchName": patch_name})
 
 
 class GetFlowIdByModuleRequest(BaseModel):
     projectId: int = Field(..., description="项目ID")
     productModuleId: int = Field(..., description="应用模块ID")
 
-def _build_get_flow_id_by_module_headers(body: GetFlowIdByModuleRequest, csrf: str, cookies: str) -> dict:
+def _build_get_flow_id_by_module_headers(csrf: str, cookies: str) -> dict:
     return {
         "accept": "application/json, text/javascript, */*; q=0.01",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -2498,7 +2701,16 @@ def _build_get_flow_id_by_module_headers(body: GetFlowIdByModuleRequest, csrf: s
 # 
 @router.post("/api/dev/iwhalecloud/get_flow_id_by_module")
 async def get_flow_id_by_module(body: GetFlowIdByModuleRequest) -> dict:
-    """根据应用模块ID查询 CI 流程ID列表。"""
+    """对外路由：根据应用模块ID查询 CI 流程ID列表（内部复用 _get_flow_id_by_module）。
+    功能：根据应用模块ID查询 CI 流程ID列表。
+    用法：传入项目ID、应用模块ID，获取 CI 流程ID列表。
+    接口类型：研发云界面抓取请求（持续构建 --> 按模块过滤 --> 试飞构建）
+    返回数据格式：[
+        {
+            "flowId": "流程ID"
+        }
+    转调：POST /portal/zcm-cicd/ciFlowController/getCiFlowListByFlowIdOrFlowName，返回码code为“9999”表示成功
+    """
     try:
         csrf, cookies = await _ensure_valid_creds_async()
     except ValueError as e:
@@ -2506,7 +2718,7 @@ async def get_flow_id_by_module(body: GetFlowIdByModuleRequest) -> dict:
 
     url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/zcm-cicd/ciFlowController/getCiFlowListByFlowIdOrFlowName"
     params = {"page": 1, "limit": 20}
-    headers = _build_get_flow_id_by_module_headers(body, csrf, cookies)
+    headers = _build_get_flow_id_by_module_headers(csrf, cookies)
     payload = {
         "async": False,
         "showMask": True,
@@ -2526,7 +2738,28 @@ async def get_flow_id_by_module(body: GetFlowIdByModuleRequest) -> dict:
     except httpx.RequestError as exc:
         logger.exception("调用研发云按模块查询流程ID接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    return _forward_response(resp)
+    
+    # 检查数据格式
+    try:
+        raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
+            return error_response(502, f"{msg}", error=str(raw))
+
+        if not isinstance(raw.get("data").get("content"), list):
+            return error_response(502, f"研发云返回数据data.content非列表：{resp.text}")
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
+    
+    # 提取数据
+    simplified = [
+        {
+            "flowId": it.get("flowId")
+        }
+        for it in raw.get("data").get("content")
+    ]
+    return success_response(simplified)
 
 
 
@@ -2535,7 +2768,26 @@ class GetTaskBranchChangesContentRequest(BaseModel):
 
 @router.post("/api/dev/iwhalecloud/get_task_branch_changes_content")
 async def get_task_branch_changes_content(body: GetTaskBranchChangesContentRequest) -> dict:
-    """根据任务单号查询代码变动明细（默认返回文件内容）。"""
+    f"""根据任务单号查询代码变动明细（默认返回文件内容）。
+    功能：根据任务单号查询代码变动明细（默认返回文件内容）。
+    用法：传入任务单号，查询代码变动明细（默认返回文件内容）。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "branchInfo": {
+            "branchName": "分支名称",
+            "repoUrl": "仓库URL",
+            "productModuleName": "应用模块名称"
+        },
+        "changeFileDetailList": [
+            {
+                "filePath": "文件路径",
+                "operType": "操作类型",
+                "diffContent": "差异内容",
+            }
+        ]
+    }
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/task-branch/{body.taskNo}/changes/content，返回码code为“9999”表示成功
+    """
     if not body.taskNo:
         return error_response(400, "taskNo 不能为空")
 
@@ -2549,8 +2801,30 @@ async def get_task_branch_changes_content(body: GetTaskBranchChangesContentReque
     except httpx.RequestError as exc:
         logger.exception("调用研发云查询任务代码变动明细接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    return _forward_response(resp)
-
+    
+    # 检查数据格式
+    try:
+        raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
+            return error_response(502, f"{msg}", error=str(raw))
+            
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
+    
+    # 提取数据
+    branch_info = raw.get("data").get("branchInfo")
+    change_file_detail_list = [
+        {
+            "filePath": it.get("filePath"),
+            "operType": it.get("operType"),
+            "diffContent": it.get("diffContent"),
+        }
+        for it in raw.get("data").get("changeFileDetailList")
+    ]
+    return success_response({"branchInfo": branch_info, "changeFileDetailList": change_file_detail_list})
+    
 
 class GetDemandListFromProductRequest(BaseModel):
     projectId: int = Field(..., description="项目空间ID")
@@ -2560,7 +2834,7 @@ class GetDemandListFromProductRequest(BaseModel):
     createdDateFrom: str = Field("", description="创建日期开始时间，格式：yyyy-MM-dd")
     createdDateTo: str = Field("", description="创建日期结束时间，格式：yyyy-MM-dd")
 
-def _build_get_demand_list_from_product_headers(body: GetDemandListFromProductRequest, csrf: str, cookies: str) -> dict:
+def _build_get_demand_list_from_product_headers(csrf: str, cookies: str) -> dict:
     return {
         "accept": "application/json, text/javascript, */*; q=0.01",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -2582,9 +2856,38 @@ def _build_get_demand_list_from_product_headers(body: GetDemandListFromProductRe
 
 @router.post("/api/dev/iwhalecloud/get_demand_list_from_product")
 async def get_demand_list_from_product(body: GetDemandListFromProductRequest) -> dict:
-    """
-    根据产品版本ID列表查询需求列表。
-    转调：POST /portal/zcm-devspace/task/page-list?page=1&limit=100
+    """对外路由：根据产品版本ID列表查询需求列表（内部复用 _get_demand_list_from_product）。
+    功能：根据产品版本ID列表查询需求列表。
+    用法：传入项目空间ID、登录用户ID、产品版本ID列表、任务阶段类型列表、创建日期开始时间、创建日期结束时间，查询需求列表。
+    接口类型：研发云界面抓取请求（研发平台 --> 需求管理）
+    返回数据格式：[
+        {
+            "taskNo": "需求单号",
+            "taskId": "需求ID",
+            "taskTitle": "需求名称",
+            "comments": "需求描述",
+            "taskSrc": "需求类型",
+            "taskPriId": "需求优先级",
+            "stageName": "任务阶段名称",
+            "expectWorkMinutes": "设计工时",
+            "sccbWorkMinutes": "预估工时",
+            "createdDate": "创建日期",
+            "finishDate": "完成日期",
+            "designUserDto": {
+                "userName": "设计人员名称",
+                "userCode": "设计人员工号",
+            },
+            "devUserDto": {
+                "userName": "开发人员名称",
+                "userCode": "开发人员工号",
+            },
+            "patchName": "应用模块版本名称",
+            "productVersionId": "产品版本ID",
+            "branchName": "产品分支名称",
+            "branchVersionId": "产品分支版本ID",
+        }
+    ]
+    转调：POST /portal/zcm-devspace/task/page-list，返回码code为“9999”表示成功
     """
     try:
         csrf, cookies = await _ensure_valid_creds_async()
@@ -2597,7 +2900,7 @@ async def get_demand_list_from_product(body: GetDemandListFromProductRequest) ->
 
     url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/zcm-devspace/task/page-list"
     params = {"page": 1, "limit": 100000}
-    headers = _build_get_demand_list_from_product_headers(body, csrf, cookies)
+    headers = _build_get_demand_list_from_product_headers(csrf, cookies)
     payload = {
         "sort": "CREATED_DATE_LATEST",
         "tagIdList": [],
@@ -2644,7 +2947,42 @@ async def get_demand_list_from_product(body: GetDemandListFromProductRequest) ->
     except httpx.RequestError as exc:
         logger.exception("调用研发云按产品版本查询需求列表接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    return _forward_response(resp)
+    
+    # 检查数据格式
+    try:
+        raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
+            return error_response(502, f"{msg}", error=str(raw))
+            
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
+    
+    # 提取数据
+    simplified = [
+        {
+            "taskNo": it.get("taskNo"),
+            "taskId": it.get("taskId"),
+            "taskTitle": it.get("taskTitle"),
+            "comments": it.get("comments"),
+            "taskSrc": it.get("taskSrc"),
+            "taskPriId": it.get("taskPriId"),
+            "stageName": it.get("adTaskFlowStage").get("stageName"),
+            "expectWorkMinutes": it.get("expectWorkMinutes"),
+            "sccbWorkMinutes": it.get("sccbWorkMinutes"),
+            "createdDate": it.get("createdDate"),
+            "finishDate": it.get("finishDate"),
+            "designUserDto": it.get("designUserDto"),
+            "devUserDto": it.get("devUserDto"),
+            "patchName": it.get("adPatch").get("patchName"),
+            "productVersionId": it.get("adPatch").get("productVersionId"),
+            "branchName": it.get("adPatch").get("branchName"),
+            "branchVersionId": it.get("adPatch").get("branchVersionId"),
+        }
+        for it in raw.get("data").get("list")
+    ]
+    return success_response(simplified)
 
 
 
@@ -2678,7 +3016,16 @@ class AddTaskTestcaseRequest(BaseModel):
 
 @router.post("/api/dev/iwhalecloud/add_task_testcase")
 async def add_task_testcase(body: AddTaskTestcaseRequest) -> dict:
-    """对外路由：给任务新增自测用例（内部复用 _add_task_testcase）。"""
+    """对外路由：给任务新增自测用例（内部复用 _add_task_testcase）。
+    功能：给任务新增自测用例。
+    用法：传入项目空间Id、任务单号、测试用例信息，给任务新增自测用例。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "code": "9999",
+        "data": {},
+        "msg": ""
+    }
+    """
     return await _add_task_testcase(body)
 
 async def _add_task_testcase(body: AddTaskTestcaseRequest) -> dict:
@@ -2710,7 +3057,40 @@ class GetOrderDetailRequest(BaseModel):
 
 @router.post("/api/dev/iwhalecloud/get_order_detail")
 async def get_order_detail(body: GetOrderDetailRequest) -> dict:
-    """对外路由：根据工单号获取工单详情（内部复用 _get_order_detail）。"""
+    f"""对外路由：根据工单号获取工单详情（内部复用 _get_order_detail）。
+    功能：根据工单号获取工单详情。
+    用法：传入工单号，获取工单详情。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "taskId": "任务ID",
+        "taskNo": "任务单号",
+        "taskTitle": "任务标题",
+        "comments": "任务描述",
+        "taskPriId": "任务优先级",
+        "regressionCount": "回退次数",
+        "stageName": "任务阶段名称",
+        "expectWorkMinutes": "预计工时",
+        "createdDate": "创建日期",
+        "finishDate": "完成日期",
+        "branchName": "产品分支名称",
+        "projectId": "项目空间ID",
+        "productModuleDto": {
+            "productModuleId": "应用模块ID",
+            "productModuleName": "应用模块名称",
+        },
+        "taskActionDtoList": [
+            {
+                "fieldName": "修改字段名称",
+                "oldValueDesc": "修改之前的旧值描述",
+                "newValue": "修改之后的新值",
+                "newValueDesc": "修改之后的新值描述",
+                "userName": "修改人员名称",
+                "userCode": "修改人员工号"
+            }
+        ]
+    }
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/work-item/{body.orderNo}/detail，返回码code为“9999”表示成功
+    """
     return await _get_order_detail(body)
 
 async def _get_order_detail(body: GetOrderDetailRequest) -> dict:
@@ -2743,7 +3123,55 @@ async def _get_order_detail(body: GetOrderDetailRequest) -> dict:
         logger.exception("调用研发云获取工单详情接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
 
-    return _forward_response(resp)
+    # 检查数据格式
+    try:
+        raw = resp.json()
+        # 检查返回码
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
+            return error_response(502, f"{msg}", error=str(raw))
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
+    
+    # 提取数据
+    taskActionDtoList = [
+        {
+            "fieldName": it.get("adTaskAction").get("fieldName"),
+            "oldValueDesc": it.get("adTaskAction").get("oldValueDesc"),
+            "newValue": it.get("adTaskAction").get("newValue"),
+            "newValueDesc": it.get("adTaskAction").get("newValueDesc"),
+            "userName": it.get("createUserDto").get("userName"),
+            "userCode": it.get("createUserDto").get("userCode"),
+        }
+        for it in raw.get("data").get("taskActionDtoList")
+    ]
+
+    productModuleDto = None
+    # 检查apiProductModule不为None且不为{}
+    if raw.get("data").get("apiProductModule") is not None and raw.get("data").get("apiProductModule") != {}:
+        productModuleDto = {
+            "productModuleId": raw.get("data").get("apiProductModule").get("productModuleId"),
+            "productModuleName": raw.get("data").get("apiProductModule").get("productModuleName"),
+        }
+
+    simplified = {
+        "taskId": raw.get("data").get("apiTask").get("taskId"),
+        "taskNo": raw.get("data").get("apiTask").get("taskNo"),
+        "taskTitle": raw.get("data").get("apiTask").get("taskTitle"),
+        "comments": raw.get("data").get("apiTask").get("comments"),
+        "taskPriId": raw.get("data").get("apiTask").get("taskPriId"),
+        "regressionCount": raw.get("data").get("apiTask").get("regressionCount"),
+        "stageName": raw.get("data").get("apiTaskFlowStage").get("stageName"),
+        "expectWorkMinutes": raw.get("data").get("apiTask").get("expectWorkMinutes"),
+        "createdDate": raw.get("data").get("apiTask").get("createdDate"),
+        "finishDate": raw.get("data").get("apiTask").get("finishDate"),
+        "branchName": raw.get("data").get("apiBranchVersionDto").get("branchName"),
+        "projectId": raw.get("data").get("apiTask").get("projectId"),
+        "productModuleDto": productModuleDto,
+        "taskActionDtoList": taskActionDtoList
+    }
+
+    return _forward_response(simplified)
 
 
 async def _get_task_current_stage(task_no: str) -> dict:

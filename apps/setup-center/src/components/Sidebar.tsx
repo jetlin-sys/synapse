@@ -24,6 +24,8 @@ export type SidebarProps = {
   stepId: StepId;
   onStepChange: (id: StepId) => void;
   disabledViews: string[];
+  /** When false, Multi-Agent nav group (dashboard, org editor, etc.) is hidden. */
+  multiAgentEnabled: boolean;
   storeVisible: boolean;
   desktopVersion: string;
   backendVersion: string | null;
@@ -90,6 +92,7 @@ export function Sidebar({
   configExpanded, onToggleConfig,
   steps, stepId, onStepChange,
   disabledViews,
+  multiAgentEnabled,
   storeVisible,
   desktopVersion, backendVersion, serviceRunning,
   onBugReport, onRefreshStatus, isWeb, mobileOpen,

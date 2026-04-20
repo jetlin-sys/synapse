@@ -212,6 +212,8 @@ export async function getDevserviceHost(): Promise<string | null> {
 export const CODE_GRAPH_VIEWER_PORT = 11001;
 /** 图谱后端服务端口（嵌入页 `server` 查询参数，端口 11011） */
 export const CODE_GRAPH_SERVER_PORT = 11011;
+/** 工单知识图谱展示页（与统一服务同机，端口 12001，`?prod=` 产品标识） */
+export const TICKET_KNOWLEDGE_GRAPH_PORT = 12001;
 
 /**
  * 将 `devservice.ip` 内容规范为 `http://host:port` 中的 host（IPv6 加 `[]`）。
@@ -291,6 +293,43 @@ export function buildCodeGraphEmbedUrl(unifiedServiceHostRaw: string, repo: stri
   const viewer = `http://${host}:${CODE_GRAPH_VIEWER_PORT}/`;
   const q = new URLSearchParams({ server, repo: repoParam });
   return `${viewer}?${q.toString()}`;
+}
+
+/**
+ * 工单知识图谱嵌入 URL：`http://{统一服务 IP}:12001/?prod={产品标识}`
+ */
+export function buildTicketKnowledgeGraphEmbedUrl(
+  unifiedServiceHostRaw: string,
+  prod: string,
+): string | null {
+  const host = unifiedServiceHostAuthority(unifiedServiceHostRaw);
+  const prodParam = prod.trim();
+  if (!host || !prodParam) return null;
+  const base = `http://${host}:${TICKET_KNOWLEDGE_GRAPH_PORT}/`;
+  const q = new URLSearchParams({ prod: prodParam });
+  return `${base}?${q.toString()}`;
+}
+
+/**
+ * TCP 探测产品公共服务某端口是否可达（与引导 `probe_devservice_ports` 一致，避免 iframe 内出现浏览器错误白屏）。
+ */
+export async function probeUnifiedServicePortReachable(
+  unifiedServiceHostRaw: string,
+  port: number,
+): Promise<boolean> {
+  if (!IS_TAURI) return false;
+  const host = unifiedServiceHostAuthority(unifiedServiceHostRaw);
+  if (!host) return false;
+  if (!Number.isFinite(port) || port < 1 || port > 65535) return false;
+  try {
+    const row = await invoke<{ port: number; ok: boolean; error?: string }>("probe_devservice_one_port", {
+      ip: host,
+      port: port as number,
+    });
+    return row?.ok === true;
+  } catch {
+    return false;
+  }
 }
 
 export async function fetchUserinfoForUnifiedService(synapseApiBase: string): Promise<{

@@ -1308,6 +1308,13 @@ button.btnApplyRestart:hover {
   animation: spin 0.8s linear infinite;
 }
 
+/* Lucide Loader2 + Tailwind `animate-spin`: global reduced-motion / perf-mode rules
+   set `animation-duration: 0.01ms` and `iteration-count: 1` on `*`, which makes
+   spinners look frozen. Use `.app-loading-spin` on essential loading indicators. */
+.app-loading-spin {
+  animation: spin 0.85s linear infinite !important;
+}
+
 .loadingDots::after {
   content: '';
   animation: dots 1.4s steps(4, end) infinite;
@@ -4727,6 +4734,10 @@ button.btnApplyRestart:hover {
     animation: none !important;
     display: none !important;
   }
+  .app-loading-spin,
+  .app-loading-spin svg {
+    animation: spin 0.85s linear infinite !important;
+  }
 }
 
 /* ── Global performance mode ──
@@ -4747,6 +4758,10 @@ button.btnApplyRestart:hover {
 }
 [data-perf-mode="low"] .dotProcessing::after {
   animation: none !important;
+}
+[data-perf-mode="low"] .app-loading-spin,
+[data-perf-mode="low"] .app-loading-spin svg {
+  animation: spin 0.85s linear infinite !important;
 }
 [data-perf-mode="low"] .sidebar,
 [data-perf-mode="low"] .chainPanel {

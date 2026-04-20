@@ -5854,6 +5854,7 @@ export function App() {
         <AgentDashboardView
           apiBaseUrl={apiBaseUrl}
           visible={view === "dashboard"}
+          multiAgentEnabled={multiAgentEnabled}
         />
       );
     }
@@ -6097,6 +6098,7 @@ export function App() {
           if (view === "wizard") window.location.hash = _viewToHash("wizard", s);
         }}
         disabledViews={disabledViews}
+        multiAgentEnabled={multiAgentEnabled}
         storeVisible={storeVisible}
         desktopVersion={desktopVersion}
         backendVersion={backendVersion}

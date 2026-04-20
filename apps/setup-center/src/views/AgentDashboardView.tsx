@@ -190,9 +190,12 @@ function getEmojiCanvas(emoji: string, size: number): HTMLCanvasElement {
 export function AgentDashboardView({
   apiBaseUrl = "http://127.0.0.1:18900",
   visible = true,
+  multiAgentEnabled = true,
 }: {
   apiBaseUrl?: string;
   visible?: boolean;
+  /** When false, show placeholder (multi-agent mode off). */
+  multiAgentEnabled?: boolean;
 }) {
   const { t } = useTranslation();
   const canvasRef = useRef<HTMLCanvasElement>(null);
