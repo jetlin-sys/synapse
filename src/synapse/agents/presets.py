@@ -14,25 +14,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 SYSTEM_PRESETS: list[AgentProfile] = [
     # ── 通用基础 ──────────────────────────────────────────────────────
     AgentProfile(
         id="default",
-        name="小秋",
-        description="通用全能助手，拥有所有技能",
+        name="小鲸",
+        description="通用助手；外部技能请在「核心技能」中勾选，仅对这些技能暴露能力目录",
         type=AgentType.SYSTEM,
         skills=[],
-        skills_mode=SkillsMode.ALL,
+        skills_mode=SkillsMode.INCLUSIVE,
         custom_prompt="",
-        icon="🐕",
+        icon="🐋",
         color="#4A90D9",
         category="general",
         fallback_profile_id=None,
         created_by="system",
-        name_i18n={"zh": "小秋", "en": "Akita"},
+        name_i18n={"zh": "小鲸", "en": "Synapse"},
         description_i18n={
-            "zh": "通用全能助手，拥有所有技能",
-            "en": "General-purpose assistant with all skills",
+            "zh": "通用助手；外部技能请在「核心技能」中勾选，仅对这些技能暴露能力目录",
+            "en": "General assistant; enable external skills in Core Skills to expose them in the catalog",
         },
     ),
     # ── 内容创作 ──────────────────────────────────────────────────────
@@ -714,11 +715,16 @@ def deploy_system_presets(store: ProfileStore) -> int:
                     or existing.category != preset.category
                     or sorted(existing.tools) != sorted(preset.tools)
                     or existing.tools_mode != preset.tools_mode
+                    or existing.skills_mode != preset.skills_mode
                 )
                 if needs_upgrade:
                     data = existing.to_dict()
-                    data["skills"] = preset.skills
                     data["skills_mode"] = preset.skills_mode.value
+                    if preset.id == "default" and preset.skills_mode == SkillsMode.INCLUSIVE:
+                        # 预置 default 的 skills 为空；人设勾选以 data/agents/profiles/default.json 为准
+                        data["skills"] = list(existing.skills)
+                    else:
+                        data["skills"] = preset.skills
                     data["category"] = preset.category
                     data["tools"] = preset.tools
                     data["tools_mode"] = preset.tools_mode

@@ -178,7 +178,7 @@
 
 ### 6.6 多智能体
 
-- **Agent Profiles**: 22 个配置文件（default=小秋, content-creator=自媒体达人, video-planner=视频策划...）✅
+- **Agent Profiles**: 22 个配置文件（default=小鲸, content-creator=自媒体达人, video-planner=视频策划...）✅
 - **委派子任务**: `delegate_to_agent` 正确调用码哥 (code-assistant) 进行代码结构分析 ✅
   - 子 Agent 返回了完整的项目结构分析报告（包含目录布局、核心模块分析、改进建议）
   - **耗时**: 约 2 分钟

@@ -134,7 +134,7 @@ class AgentProfile:
     created_by: str = "system"
     created_at: str = ""
 
-    # 国际化：{"zh": "小秋", "en": "Akita"}
+    # 国际化：{"zh": "小鲸", "en": "Synapse"}
     name_i18n: dict[str, str] = field(default_factory=dict)
     description_i18n: dict[str, str] = field(default_factory=dict)
 
