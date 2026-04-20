@@ -201,6 +201,7 @@ export function OnboardingWhaleSkillsPanel(props: {
   }, [skillsWithConfig, installedSearch, i18n.language]);
 
   const handleToggleEnabled = useCallback((skill: SkillInfo) => {
+    if (isWhalecloudDevToolSkill(skill)) return;
     const cur = enabledDraft[skill.skillId] ?? false;
     setEnabledDraft((prev) => ({ ...prev, [skill.skillId]: !cur }));
     setEnabledDirty(true);
@@ -345,6 +346,7 @@ export function OnboardingWhaleSkillsPanel(props: {
             key={skill.skillId}
             skill={skill}
             leadVariant={isWhalecloudDevToolSkill(skill) ? "devTool" : "default"}
+            lockEnabled={isWhalecloudDevToolSkill(skill)}
             expanded={expandedSkill === skill.skillId}
             onToggleExpand={() =>
               setExpandedSkill(expandedSkill === skill.skillId ? null : skill.skillId)

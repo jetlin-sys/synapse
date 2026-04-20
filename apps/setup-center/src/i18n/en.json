@@ -1772,7 +1772,8 @@
       "whaleSkillsSaved": "Saved to default profile",
       "whaleNoExternalSkills": "No external skills installed yet",
       "whaleNoExternalSkillsHint": "Install skills under Capabilities → Skills after setup, or skip for now.",
-      "whaleSaveSkills": "Save to default profile"
+      "whaleSaveSkills": "Save to default profile",
+      "whaleDevToolsLockHint": "R&D tools must stay enabled in this step; the toggle is fixed on."
     },
     "claudeCode": {
       "title": "Developer CLI setup",

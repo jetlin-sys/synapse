@@ -193,6 +193,7 @@ export function SkillCard({
   onSaveConfig,
   saving,
   leadVariant = "default",
+  lockEnabled = false,
 }: {
   skill: SkillInfo;
   expanded: boolean;
@@ -207,6 +208,8 @@ export function SkillCard({
   saving: boolean;
   /** 引导「小鲸技能」与研发工具页：研发流程类技能使用独立图标与标签 */
   leadVariant?: "default" | "devTool";
+  /** 引导页：研发工具须始终启用，禁用开关 */
+  lockEnabled?: boolean;
 }) {
   const hasConfig = skill.config && skill.config.length > 0;
   const configComplete = skill.configComplete ?? true;
@@ -299,13 +302,19 @@ export function SkillCard({
             <Label
               className={cn(
                 "flex items-center gap-1.5 text-xs font-normal ml-2 mr-2",
-                skill.system ? "cursor-not-allowed opacity-80" : "cursor-pointer",
+                skill.system || lockEnabled ? "cursor-not-allowed opacity-80" : "cursor-pointer",
               )}
-              title={skill.system ? t("skills.systemRequiredToggle") : undefined}
+              title={
+                skill.system
+                  ? t("skills.systemRequiredToggle")
+                  : lockEnabled
+                    ? t("onboarding.coreAgent.whaleDevToolsLockHint")
+                    : undefined
+              }
             >
               <Checkbox
-                checked={skill.enabled !== false}
-                disabled={skill.system}
+                checked={lockEnabled ? true : skill.enabled !== false}
+                disabled={skill.system || lockEnabled}
                 onCheckedChange={() => onToggleEnabled()}
               />
               {t("skills.enabled")}

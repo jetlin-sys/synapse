@@ -1773,7 +1773,8 @@
       "whaleSkillsSaved": "已保存到小鲸人设",
       "whaleNoExternalSkills": "当前暂无已安装的外部技能",
       "whaleNoExternalSkillsHint": "可先在「能力 → 技能」安装外部技能，或暂时跳过，稍后再配置。",
-      "whaleSaveSkills": "保存到小鲸人设"
+      "whaleSaveSkills": "保存到小鲸人设",
+      "whaleDevToolsLockHint": "研发工具在引导中须保持启用，无法取消勾选。"
     },
     "claudeCode": {
       "title": "研发工具安装检测",
