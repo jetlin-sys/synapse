@@ -20,6 +20,7 @@ import {
   Zap,
   Sparkles,
   Loader2,
+  AlertCircle,
 } from "lucide-react";
 import { Product, type UnifiedWireAnalysisState } from "./types";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -30,6 +31,7 @@ import { IS_TAURI } from "@/platform";
 import {
   buildCodeGraphEmbedUrl,
   buildTicketKnowledgeGraphEmbedUrl,
+  CODE_GRAPH_VIEWER_PORT,
   codeGraphProjectNameFromRepoUrl,
   getDevserviceHost,
   getProdProcessInfo,
@@ -40,6 +42,7 @@ import {
   TICKET_KNOWLEDGE_GRAPH_PORT,
 } from "@/api/rdUnifiedService";
 import type { ProdProcessDataPayload } from "@/api/rdUnifiedService";
+import { assertOwnerInfoMatchesProduct, toastOwnerInfoGuardError } from "@/utils/ownerInfoGuard";
 import "./product-workbench.css";
 
 /** 详情页轮询 get_prod_process_info（与列表页仅用 get_prod_info 区分） */
@@ -97,9 +100,23 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
   /** null = 探测中；iframe 仅在 true 时挂载，避免不可达时 WebView 内嵌浏览器错误白屏 */
   const [ticketGraphReachable, setTicketGraphReachable] = useState<boolean | null>(null);
   const [ticketGraphProbeNonce, setTicketGraphProbeNonce] = useState(0);
+  const [codeGraphReachable, setCodeGraphReachable] = useState<boolean | null>(null);
+  const [codeGraphProbeNonce, setCodeGraphProbeNonce] = useState(0);
 
   const productRef = useRef(product);
   productRef.current = product;
+
+  const guardOwnerMatch = useCallback(async (): Promise<boolean> => {
+    const p = productRef.current;
+    if (!p || !IS_TAURI) return true;
+    try {
+      await assertOwnerInfoMatchesProduct(synapseApiBase, p);
+      return true;
+    } catch (e) {
+      toastOwnerInfoGuardError(t, e);
+      return false;
+    }
+  }, [synapseApiBase, t]);
 
   const fetchProcessOnce = useCallback(async () => {
     const p = productRef.current;
@@ -167,7 +184,47 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
   }, [product, devserviceHost]);
 
   useEffect(() => {
+    if (!open || !IS_TAURI || activeTab !== "code-graph") return;
+    const p = productRef.current;
+    if (!p) return;
+    const repo = p.repositories[activeRepoIdx];
+    const wireU = repo?.wireAnalysisState ?? "new";
+    if (wireU !== "done") {
+      setCodeGraphReachable(null);
+      return;
+    }
+    if (!codeGraphIframeSrc || !devserviceHost) {
+      setCodeGraphReachable(null);
+      return;
+    }
+    let cancelled = false;
+    setCodeGraphReachable(null);
+    void (async () => {
+      const ok = await probeUnifiedServicePortReachable(devserviceHost, CODE_GRAPH_VIEWER_PORT);
+      if (!cancelled) setCodeGraphReachable(ok);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    open,
+    activeTab,
+    activeRepoIdx,
+    codeGraphIframeSrc,
+    devserviceHost,
+    codeGraphProbeNonce,
+    product?.repositories?.[activeRepoIdx]?.wireAnalysisState,
+    product?.id,
+  ]);
+
+  useEffect(() => {
     if (!open || !IS_TAURI || activeTab !== "ticket-graph") return;
+    const p = productRef.current;
+    const ticketU = p?.analysisUnified?.ticket ?? "new";
+    if (ticketU !== "done") {
+      setTicketGraphReachable(null);
+      return;
+    }
     if (!ticketGraphIframeSrc || !devserviceHost) {
       setTicketGraphReachable(null);
       return;
@@ -181,7 +238,15 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
     return () => {
       cancelled = true;
     };
-  }, [open, activeTab, ticketGraphIframeSrc, devserviceHost, ticketGraphProbeNonce]);
+  }, [
+    open,
+    activeTab,
+    ticketGraphIframeSrc,
+    devserviceHost,
+    ticketGraphProbeNonce,
+    product?.analysisUnified?.ticket,
+    product?.id,
+  ]);
 
   const knowledgeItems = useMemo(
     () => [
@@ -202,10 +267,15 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
 
   const codeU = product.analysisUnified?.code ?? "new";
   const ticketU = product.analysisUnified?.ticket ?? "new";
-  /** 仓库与工单都已脱离「未分析生成」，且五类知识文档均未创建 */
+  const activeRepoForGraph = product.repositories[activeRepoIdx];
+  const activeRepoWireU = activeRepoForGraph?.wireAnalysisState ?? "new";
+  const activeRepoAnalyzing = activeRepoWireU === "init" || activeRepoWireU === "process";
+  /** 主仓库分析完成（done）时，自动生成按钮才可用 */
+  const mainRepo = product.repositories.find((r) => r.isMain);
+  const mainRepoAnalysisDone = (mainRepo?.wireAnalysisState ?? "new") === "done";
   const knowledgeKeys = ["architecture", "solution", "requirements", "manual", "delivery"] as const;
   const allKnowledgeNotCreated = knowledgeKeys.every((k) => !product.knowledge[k]);
-  const showAutoGenerateCta = codeU !== "new" && ticketU !== "new" && allKnowledgeNotCreated;
+  const showAutoGenerateCta = mainRepoAnalysisDone && allKnowledgeNotCreated;
 
   const ticketReqMetric =
     product.demandOrderCount !== undefined
@@ -231,7 +301,8 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
     ];
   };
 
-  const handleOpenDoc = (doc: { id: string; title: string; content: string }, category: string) => {
+  const handleOpenDoc = async (doc: { id: string; title: string; content: string }, category: string) => {
+    if (!(await guardOwnerMatch())) return;
     if (!openDocs.find((d) => d.id === doc.id)) {
       setOpenDocs([...openDocs, { ...doc, category }]);
     }
@@ -348,6 +419,7 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                                   setGitnexusBusyIdx(idx);
                                   void (async () => {
                                     try {
+                                      if (!(await guardOwnerMatch())) return;
                                       const resp = await gitNexusAnalysis(synapseApiBase, {
                                         prod: prodKey,
                                         repo_branch: (repo.branch ?? "").trim(),
@@ -408,6 +480,7 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                                 setGitnexusBusyIdx(idx);
                                 void (async () => {
                                   try {
+                                    if (!(await guardOwnerMatch())) return;
                                     const resp = await gitNexusInitialize(synapseApiBase, {
                                       prod: prodKey,
                                       repo_branch: (repo.branch ?? "").trim(),
@@ -522,7 +595,7 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                             return (
                               <div
                                 key={doc.id}
-                                onClick={() => handleOpenDoc(doc, item.key)}
+                                onClick={() => void handleOpenDoc(doc, item.key)}
                                 className={`px-3 py-1.5 cursor-pointer rounded-md text-xs flex items-center gap-2 transition-colors ${
                                   isDocActive 
                                     ? "bg-primary/10 border border-primary/20 text-primary" 
@@ -584,8 +657,12 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                   <div className="mb-3" onClick={(e) => e.stopPropagation()}>
                     <Button
                       type="button"
-                      disabled={orderTicketBusy || !IS_TAURI}
-                      title={t("workbench.products.detail.autoAnalysisTicketCardHint")}
+                      disabled={orderTicketBusy || !IS_TAURI || !product.knowledge.architecture}
+                      title={
+                        !product.knowledge.architecture
+                          ? t("workbench.products.detail.autoAnalysisTicketArchRequired")
+                          : t("workbench.products.detail.autoAnalysisTicketCardHint")
+                      }
                       className="w-full h-8 gap-1.5 text-xs font-medium bg-gradient-to-r from-primary/10 to-primary/5 hover:from-primary/20 hover:to-primary/10 text-primary border border-primary/20 shadow-sm transition-all rounded-md"
                       onClick={(e) => {
                         e.stopPropagation();
@@ -598,6 +675,7 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                         setOrderTicketBusy(true);
                         void (async () => {
                           try {
+                            if (!(await guardOwnerMatch())) return;
                             const resp = await orderInitialize(synapseApiBase, { prod: prodKey });
                             const msg =
                               typeof resp.message === "string" && resp.message.trim() !== ""
@@ -650,7 +728,98 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
             {activeTab === "code-graph" && (
               <div className="p-6 h-full flex min-h-0 flex-col gap-4">
                 <div className="flex min-h-[400px] flex-1 flex-col rounded-xl border border-border bg-muted/5 relative overflow-hidden">
-                  {codeGraphIframeSrc ? (
+                  {activeRepoWireU !== "done" ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(var(--primary)_1px,transparent_1px)] [background-size:30px_30px] opacity-10 pointer-events-none" />
+                      <div className="relative z-10 flex min-h-[400px] flex-1 flex-col items-center justify-center px-6 text-center">
+                        {activeRepoAnalyzing ? (
+                          <Loader2
+                            size={40}
+                            className="text-primary/80 mb-3 app-loading-spin"
+                            strokeWidth={1.5}
+                            aria-hidden
+                          />
+                        ) : (
+                          <Code2 size={44} className="text-primary/45 mb-3" strokeWidth={1} aria-hidden />
+                        )}
+                        <h4 className="text-lg font-semibold text-foreground mb-2">
+                          {t("workbench.products.detail.graphEmbedWaitingTitle")}
+                        </h4>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          {t("workbench.products.detail.graphEmbedWaitingHintCode")}
+                        </p>
+                        <p className="text-xs text-muted-foreground/90 mt-2">
+                          {detailWireStateLabel(t, activeRepoWireU)}
+                        </p>
+                      </div>
+                    </>
+                  ) : !IS_TAURI || !devserviceHost ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(var(--destructive)_1px,transparent_1px)] [background-size:28px_28px] opacity-[0.07] pointer-events-none" />
+                      <div className="relative z-10 flex min-h-[400px] flex-1 flex-col items-center justify-center px-6 text-center">
+                        <AlertCircle size={44} className="text-destructive/80 mb-3" strokeWidth={1.25} aria-hidden />
+                        <h4 className="text-lg font-semibold text-foreground mb-2">
+                          {t("workbench.products.detail.graphEmbedErrorTitle")}
+                        </h4>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          {!IS_TAURI
+                            ? t("workbench.products.detail.codeGraphEmbedTauriOnly")
+                            : t("workbench.products.createMissingDevservice")}
+                        </p>
+                      </div>
+                    </>
+                  ) : !codeGraphIframeSrc ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(var(--destructive)_1px,transparent_1px)] [background-size:28px_28px] opacity-[0.07] pointer-events-none" />
+                      <div className="relative z-10 flex min-h-[400px] flex-1 flex-col items-center justify-center px-6 text-center">
+                        <AlertCircle size={44} className="text-destructive/80 mb-3" strokeWidth={1.25} aria-hidden />
+                        <h4 className="text-lg font-semibold text-foreground mb-2">
+                          {t("workbench.products.detail.graphEmbedErrorTitle")}
+                        </h4>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          {!activeRepoForGraph?.url?.trim()
+                            ? t("workbench.products.detail.codeGraphNoRepoUrl")
+                            : t("workbench.products.detail.codeGraphEmbedUnavailable")}
+                        </p>
+                      </div>
+                    </>
+                  ) : codeGraphReachable === null ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(var(--primary)_1px,transparent_1px)] [background-size:30px_30px] opacity-10 pointer-events-none" />
+                      <div className="relative z-10 flex min-h-[400px] flex-1 flex-col items-center justify-center px-6 text-center">
+                        <Loader2
+                          size={40}
+                          className="text-primary/80 mb-3 app-loading-spin"
+                          strokeWidth={1.5}
+                          aria-hidden
+                        />
+                        <p className="text-sm text-muted-foreground">{t("workbench.products.detail.codeGraphProbing")}</p>
+                      </div>
+                    </>
+                  ) : codeGraphReachable === false ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(var(--destructive)_1px,transparent_1px)] [background-size:28px_28px] opacity-[0.07] pointer-events-none" />
+                      <div className="relative z-10 flex min-h-[400px] flex-1 flex-col items-center justify-center px-6 text-center">
+                        <AlertCircle size={44} className="text-destructive/80 mb-3" strokeWidth={1.25} aria-hidden />
+                        <h4 className="text-lg font-semibold text-foreground mb-2">
+                          {t("workbench.products.detail.graphEmbedErrorTitle")}
+                        </h4>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          {t("workbench.products.detail.graphEmbedErrorHintProbe")}
+                        </p>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="mt-4"
+                          onClick={() => setCodeGraphProbeNonce((n) => n + 1)}
+                        >
+                          <RefreshCw size={14} className="mr-1.5" />
+                          {t("workbench.products.detail.ticketGraphRetryProbe")}
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
                     <iframe
                       key={codeGraphIframeSrc}
                       title={t("workbench.products.detail.codeGraphTitle")}
@@ -658,25 +827,6 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                       className="h-full min-h-[400px] w-full flex-1 border-0 bg-background"
                       referrerPolicy="no-referrer-when-downgrade"
                     />
-                  ) : (
-                    <>
-                      <div className="absolute inset-0 bg-[radial-gradient(var(--primary)_1px,transparent_1px)] [background-size:30px_30px] opacity-10 pointer-events-none" />
-                      <div className="relative z-10 flex min-h-[400px] flex-1 flex-col items-center justify-center px-6 text-center">
-                        <Code2 size={48} className="text-primary opacity-50 mb-4" strokeWidth={1} />
-                        <h4 className="text-lg font-semibold text-foreground mb-2">
-                          {t("workbench.products.detail.codeGraphTitle")}
-                        </h4>
-                        <p className="text-sm text-muted-foreground max-w-md">
-                          {!IS_TAURI
-                            ? t("workbench.products.detail.codeGraphEmbedTauriOnly")
-                            : !devserviceHost
-                              ? t("workbench.products.createMissingDevservice")
-                              : !product?.repositories[activeRepoIdx]?.url?.trim()
-                                ? t("workbench.products.detail.codeGraphNoRepoUrl")
-                                : t("workbench.products.detail.codeGraphEmbedUnavailable")}
-                        </p>
-                      </div>
-                    </>
                   )}
                 </div>
               </div>
@@ -685,7 +835,94 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
             {activeTab === "ticket-graph" && (
               <div className="p-6 h-full flex min-h-0 flex-col gap-4">
                 <div className="flex min-h-[720px] flex-1 flex-col rounded-xl border border-border bg-muted/5 relative overflow-hidden">
-                  {ticketGraphIframeSrc && ticketGraphReachable === true ? (
+                  {ticketU !== "done" ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(theme(colors.emerald.500)_1px,transparent_1px)] [background-size:30px_30px] opacity-10" />
+                      <div className="relative z-10 flex min-h-[720px] w-full flex-col items-center justify-center px-6 text-center">
+                        {ticketU === "init" || ticketU === "process" ? (
+                          <Loader2
+                            size={40}
+                            className="text-emerald-500/80 mb-3 app-loading-spin"
+                            strokeWidth={1.5}
+                            aria-hidden
+                          />
+                        ) : (
+                          <ClipboardList size={44} className="text-emerald-500/45 mb-3" strokeWidth={1} aria-hidden />
+                        )}
+                        <h4 className="text-lg font-semibold text-foreground mb-2">
+                          {t("workbench.products.detail.graphEmbedWaitingTitle")}
+                        </h4>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          {t("workbench.products.detail.graphEmbedWaitingHintTicket")}
+                        </p>
+                        <p className="text-xs text-muted-foreground/90 mt-2">{detailWireStateLabel(t, ticketU)}</p>
+                      </div>
+                    </>
+                  ) : !IS_TAURI || !devserviceHost ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(var(--destructive)_1px,transparent_1px)] [background-size:28px_28px] opacity-[0.07]" />
+                      <div className="relative z-10 flex min-h-[720px] w-full flex-col items-center justify-center px-6 text-center">
+                        <AlertCircle size={44} className="text-destructive/80 mb-3" strokeWidth={1.25} aria-hidden />
+                        <h4 className="text-lg font-semibold text-foreground mb-2">
+                          {t("workbench.products.detail.graphEmbedErrorTitle")}
+                        </h4>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          {!IS_TAURI
+                            ? t("workbench.products.detail.codeGraphEmbedTauriOnly")
+                            : t("workbench.products.createMissingDevservice")}
+                        </p>
+                      </div>
+                    </>
+                  ) : !ticketGraphIframeSrc ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(var(--destructive)_1px,transparent_1px)] [background-size:28px_28px] opacity-[0.07]" />
+                      <div className="relative z-10 flex min-h-[720px] w-full flex-col items-center justify-center px-6 text-center">
+                        <AlertCircle size={44} className="text-destructive/80 mb-3" strokeWidth={1.25} aria-hidden />
+                        <h4 className="text-lg font-semibold text-foreground mb-2">
+                          {t("workbench.products.detail.graphEmbedErrorTitle")}
+                        </h4>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          {t("workbench.products.detail.graphEmbedErrorHintNoProd")}
+                        </p>
+                      </div>
+                    </>
+                  ) : ticketGraphReachable === null ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(theme(colors.emerald.500)_1px,transparent_1px)] [background-size:30px_30px] opacity-10" />
+                      <div className="relative z-10 flex min-h-[720px] w-full flex-col items-center justify-center px-6 text-center">
+                        <Loader2
+                          size={40}
+                          className="text-emerald-500/80 mb-3 app-loading-spin"
+                          strokeWidth={1.5}
+                          aria-hidden
+                        />
+                        <p className="text-sm text-muted-foreground">{t("workbench.products.detail.ticketGraphProbing")}</p>
+                      </div>
+                    </>
+                  ) : ticketGraphReachable === false ? (
+                    <>
+                      <div className="absolute inset-0 bg-[radial-gradient(var(--destructive)_1px,transparent_1px)] [background-size:28px_28px] opacity-[0.07]" />
+                      <div className="relative z-10 flex min-h-[720px] w-full flex-col items-center justify-center px-6 text-center">
+                        <AlertCircle size={44} className="text-destructive/80 mb-3" strokeWidth={1.25} aria-hidden />
+                        <h4 className="text-lg font-semibold text-foreground mb-2">
+                          {t("workbench.products.detail.graphEmbedErrorTitle")}
+                        </h4>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          {t("workbench.products.detail.graphEmbedErrorHintProbe")}
+                        </p>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="mt-4"
+                          onClick={() => setTicketGraphProbeNonce((n) => n + 1)}
+                        >
+                          <RefreshCw size={14} className="mr-1.5" />
+                          {t("workbench.products.detail.ticketGraphRetryProbe")}
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
                     <iframe
                       key={ticketGraphIframeSrc}
                       title={t("workbench.products.detail.ticketKnowledgeGraphIframeTitle")}
@@ -693,54 +930,6 @@ export function ProductDetail({ product, open, onClose, synapseApiBase, onProces
                       className="h-full min-h-[720px] w-full flex-1 border-0 bg-background"
                       referrerPolicy="no-referrer-when-downgrade"
                     />
-                  ) : (
-                    <>
-                      <div className="absolute inset-0 bg-[radial-gradient(theme(colors.emerald.500)_1px,transparent_1px)] [background-size:30px_30px] opacity-10" />
-                      <div className="relative z-10 flex min-h-[720px] w-full flex-col items-center justify-center px-6 text-center">
-                        <div className="flex max-w-md flex-col items-center gap-2">
-                          {!ticketGraphIframeSrc ? (
-                            <>
-                              <ClipboardList size={48} className="text-emerald-500 opacity-50 mb-2" strokeWidth={1} />
-                              <h4 className="text-lg font-semibold text-foreground">
-                                {t("workbench.products.detail.ticketGraphTitle")}
-                              </h4>
-                              <p className="text-sm text-muted-foreground">
-                                {t("workbench.products.detail.ticketGraphHint")}
-                              </p>
-                            </>
-                          ) : ticketGraphReachable === null ? (
-                            <>
-                              <Loader2
-                                size={40}
-                                className="text-emerald-500/80 mb-2 app-loading-spin"
-                                strokeWidth={1.5}
-                                aria-hidden
-                              />
-                              <p className="text-sm text-muted-foreground">
-                                {t("workbench.products.detail.ticketGraphProbing")}
-                              </p>
-                            </>
-                          ) : (
-                            <>
-                              <ClipboardList size={48} className="text-emerald-500 opacity-50 mb-2" strokeWidth={1} />
-                              <p className="text-base font-medium text-foreground">
-                                {t("workbench.products.detail.ticketGraphServiceUnreachable")}
-                              </p>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                className="mt-4"
-                                onClick={() => setTicketGraphProbeNonce((n) => n + 1)}
-                              >
-                                <RefreshCw size={14} className="mr-1.5" />
-                                {t("workbench.products.detail.ticketGraphRetryProbe")}
-                              </Button>
-                            </>
-                          )}
-                        </div>
-                      </div>
-                    </>
                   )}
                 </div>
               </div>

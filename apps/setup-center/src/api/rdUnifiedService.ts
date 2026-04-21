@@ -15,6 +15,8 @@ export const RD_UNIFIED_PATHS = {
   insertProdInfo: "/dev/iwhalecloud/synapse/create_prod",
   updateProdInfo: "/dev/iwhalecloud/synapse/update_prod_info",
   getProdInfo: "/dev/iwhalecloud/synapse/get_prod_info",
+  /** 单产品/仓库维度查询（与 get_prod_info 中 repo_info 结构一致，含 code_path） */
+  getRepoInfo: "/dev/iwhalecloud/synapse/get_repo_info",
   getProdProcessInfo: "/dev/iwhalecloud/synapse/get_prod_process_info",
   gitNexusInitialize: "/dev/iwhalecloud/synapse/gitnexus_initialize",
   gitNexusAnalysis: "/dev/iwhalecloud/synapse/gitnexus_analysis",
@@ -28,6 +30,8 @@ export type RdRepoInfo = {
   repo_branch: string;
   /** 产品分支：branchVersionId|branchName（与仓库条目绑定） */
   prod_branch?: string;
+  /** 仓库代码路径（create_prod / change_repo_info 提交；get_prod_info / get_repo_info 回读） */
+  code_path?: string;
   repo_func: string;
   repo_token: string;
   repo_master: "Y" | "N";
@@ -560,7 +564,7 @@ export async function orderInitialize(
  *
  * **请求体**：
  * - `prod`：产品名称
- * - `repo_info`：`{ repo_url, repo_branch, prod_branch?, repo_func, repo_token, repo_master: "Y"|"N" }[]`
+ * - `repo_info`：`{ repo_url, repo_branch, prod_branch?, code_path?, repo_func, repo_token, repo_master: "Y"|"N" }[]`
  *
  * 成功后可由调用方再调 {@link getProdProcessInfo} 刷新过程状态。
  */

@@ -9,7 +9,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 
 interface ProductCardProps {
   product: Product;
-  onEdit: (product: Product) => void;
+  onEdit: (product: Product) => void | Promise<void>;
   onDelete: (id: string) => void;
   onView: (product: Product) => void;
   onRefreshProcess?: (product: Product) => void | Promise<void>;
@@ -161,7 +161,7 @@ export function ProductCard({
           disabled={busyRefresh || busyRepo || busyDelete}
           onClick={(e) => {
             e.stopPropagation();
-            onEdit(product);
+            void onEdit(product);
           }}
           title={t("workbench.products.tooltipEdit") || "编辑"}
         >

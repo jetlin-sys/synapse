@@ -35,6 +35,7 @@ import {
   destroyProd,
 } from "@/api/rdUnifiedService";
 import type { ProdProcessDataPayload } from "@/api/rdUnifiedService";
+import { assertOwnerInfoMatchesProduct, toastOwnerInfoGuardError } from "@/utils/ownerInfoGuard";
 import "./product-workbench.css";
 
 /** 产品列表定时刷新间隔（与产品详情页的 process 轮询分离） */
@@ -232,9 +233,15 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
 
   const [repoDialogProduct, setRepoDialogProduct] = useState<Product | null>(null);
 
-  const handleOpenRepoUpdate = (product: Product) => {
+  const handleOpenRepoUpdate = async (product: Product) => {
     if (!IS_TAURI) {
       toast.message(t("workbench.products.tauriOnlyAction"));
+      return;
+    }
+    try {
+      await assertOwnerInfoMatchesProduct(synapseApiBase, product);
+    } catch (e) {
+      toastOwnerInfoGuardError(t, e);
       return;
     }
     setRepoDialogProduct(product);
@@ -284,7 +291,15 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
     setIsModalOpen(true);
   };
 
-  const handleEdit = (product: Product) => {
+  const handleEdit = async (product: Product) => {
+    if (IS_TAURI) {
+      try {
+        await assertOwnerInfoMatchesProduct(synapseApiBase, product);
+      } catch (e) {
+        toastOwnerInfoGuardError(t, e);
+        return;
+      }
+    }
     setEditingProduct(product);
     setIsModalOpen(true);
   };
@@ -341,6 +356,12 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
   const handleFinish = async (values: ProductModalFinishValues) => {
     if (editingProduct) {
       if (IS_TAURI) {
+        try {
+          await assertOwnerInfoMatchesProduct(synapseApiBase, editingProduct);
+        } catch (e) {
+          toastOwnerInfoGuardError(t, e);
+          return;
+        }
         try {
           await updateProdInfo(synapseApiBase, {
             prod: editingProduct.name.trim(),

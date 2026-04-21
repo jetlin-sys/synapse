@@ -21,6 +21,8 @@ export interface Repository {
   /** 产品分支 branchVersionId|branchName，对应 RdRepoInfo.prod_branch */
   prodBranch?: string;
   token: string;
+  /** 仓库代码路径（与研发统一服务 `repo_info.code_path` 对应，手动填写） */
+  codePath?: string;
   isMain: boolean;
   /** 与研发统一服务 repo_process 对齐后的单仓状态 */
   wireAnalysisState?: UnifiedWireAnalysisState;
@@ -210,6 +212,7 @@ function repoWireToRepository(r: RdRepoInfo): Repository {
     branch: r.repo_branch ?? "",
     prodBranch: r.prod_branch?.trim() || undefined,
     token: r.repo_token || "",
+    codePath: (r.code_path ?? "").trim() || undefined,
     isMain: r.repo_master === "Y",
   };
 }
@@ -220,6 +223,7 @@ export function repositoriesToRdRepoInfo(repositories: Repository[]): RdRepoInfo
     repo_url: r.url,
     repo_branch: r.branch,
     prod_branch: (r.prodBranch ?? "").trim(),
+    code_path: (r.codePath ?? "").trim(),
     repo_func: r.purpose,
     repo_token: r.token || "",
     repo_master: r.isMain ? "Y" : "N",
@@ -495,6 +499,7 @@ export const MOCK_PROD_INFO_ITEMS: ProdInfoWireItem[] = [
       {
         repo_url: "https://github.com/rd-agent/search-backend",
         repo_branch: "develop",
+        code_path: "apps/backend",
         repo_func: "后端核心业务",
         repo_token: "",
         repo_master: "Y",
@@ -502,6 +507,7 @@ export const MOCK_PROD_INFO_ITEMS: ProdInfoWireItem[] = [
       {
         repo_url: "https://github.com/rd-agent/search-frontend",
         repo_branch: "develop",
+        code_path: "src",
         repo_func: "前端交互界面",
         repo_token: "",
         repo_master: "N",
@@ -532,6 +538,7 @@ export const MOCK_PROD_INFO_ITEMS: ProdInfoWireItem[] = [
       {
         repo_url: "https://github.com/rd-agent/code-audit-core",
         repo_branch: "master",
+        code_path: "",
         repo_func: "审计引擎",
         repo_token: "",
         repo_master: "Y",

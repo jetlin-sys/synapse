@@ -393,6 +393,7 @@ export function ProductModal({
         url: "",
         purpose: "",
         token: "",
+        codePath: "",
         wireAnalysisState: "new" as const,
       },
     ];
@@ -685,6 +686,10 @@ export function ProductModal({
                           <span className="text-foreground/80">{t("workbench.products.modal.purpose")}: </span>
                           {repo.purpose || "—"}
                         </div>
+                        <div className="break-all">
+                          <span className="text-foreground/80">{t("workbench.products.modal.codePath")}: </span>
+                          {repo.codePath?.trim() || "—"}
+                        </div>
                       </div>
                     </div>
                   ))
@@ -794,6 +799,18 @@ export function ProductModal({
                             />
                             <p className="text-[11px] text-muted-foreground m-0">
                               {t("workbench.products.modal.urlReadonlyHint")}
+                            </p>
+                          </div>
+                          <div className="col-span-12 space-y-2">
+                            <Label className="text-xs">{t("workbench.products.modal.codePath")}</Label>
+                            <Input
+                              className="h-8 text-xs"
+                              value={repo.codePath ?? ""}
+                              onChange={(e) => updateRepo(index, "codePath", e.target.value)}
+                              placeholder={t("workbench.products.modal.codePathPlaceholder")}
+                            />
+                            <p className="text-[11px] text-muted-foreground m-0">
+                              {t("workbench.products.modal.codePathHint")}
                             </p>
                           </div>
                           <div className="col-span-6 space-y-2">

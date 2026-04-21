@@ -34,6 +34,7 @@ import {
   getProdProcessInfo,
 } from "@/api/rdUnifiedService";
 import type { ProdProcessDataPayload, RdProductBranchItem, RdRepoDetailRow } from "@/api/rdUnifiedService";
+import { assertOwnerInfoMatchesProduct, toastOwnerInfoGuardError } from "@/utils/ownerInfoGuard";
 
 function branchRowToOption(row: RdProductBranchItem): SearchableOption {
   const id = row.branchVersionId ?? "";
@@ -201,6 +202,7 @@ export function RepoUpdateDialog({
         branch: "",
         purpose: "",
         token: "",
+        codePath: "",
         isMain: isFirst,
         prodBranch: "",
         clientKey: nextKey("n"),
@@ -223,6 +225,12 @@ export function RepoUpdateDialog({
 
   const handleSave = async () => {
     if (!product || !IS_TAURI) return;
+    try {
+      await assertOwnerInfoMatchesProduct(synapseApiBase, product);
+    } catch (e) {
+      toastOwnerInfoGuardError(t, e);
+      return;
+    }
     const plain = toRepositories(rows);
     if (plain.length > 0) {
       const mains = plain.filter((r) => r.isMain);
@@ -432,6 +440,19 @@ export function RepoUpdateDialog({
                     />
                     <p className="text-[11px] text-muted-foreground m-0">
                       {t("workbench.products.modal.urlReadonlyHint")}
+                    </p>
+                  </div>
+                  <div className="col-span-12 space-y-1.5">
+                    <Label className="text-xs">{t("workbench.products.modal.codePath")}</Label>
+                    <Input
+                      className="h-9 text-xs"
+                      value={repo.codePath ?? ""}
+                      onChange={(e) => updateRow(index, { codePath: e.target.value })}
+                      placeholder={t("workbench.products.modal.codePathPlaceholder")}
+                      disabled={saving}
+                    />
+                    <p className="text-[11px] text-muted-foreground m-0">
+                      {t("workbench.products.modal.codePathHint")}
                     </p>
                   </div>
                   <div className="col-span-12 space-y-1.5">
