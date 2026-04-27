@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { GitBranch, ChevronRight, Plus, Trash2, X } from 'lucide-react';
+import { GitBranch, ChevronRight, Plus, Trash2 } from 'lucide-react';
 import {
   Product,
   Repository,
@@ -76,6 +76,39 @@ function branchRowToOption(row: RdProductBranchItem): SearchableOption {
   return { label: value, value };
 }
 
+/** 单行：左侧功能名，右侧描述；存盘格式 name:desc,name:desc 或旧数据 name,name */
+export type ProductFeatureRow = { title: string; description: string };
+
+const emptyFeatureRow = (): ProductFeatureRow => ({ title: "", description: "" });
+
+export function parseFeaturesFromStored(raw: string): ProductFeatureRow[] {
+  const s = (raw ?? "").trim();
+  if (!s) return [emptyFeatureRow()];
+  const parts = s
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  if (parts.length === 0) return [emptyFeatureRow()];
+  return parts.map((part) => {
+    const i = part.indexOf(":");
+    if (i === -1) return { title: part, description: "" };
+    return { title: part.slice(0, i).trim(), description: part.slice(i + 1).trim() };
+  });
+}
+
+export function serializeFeatureRows(rows: ProductFeatureRow[]): string {
+  return rows
+    .map(({ title, description }) => {
+      const a = title.trim();
+      const b = description.trim();
+      if (!a && !b) return "";
+      if (!b) return a;
+      return `${a}:${b}`;
+    })
+    .filter((x) => x.length > 0)
+    .join(",");
+}
+
 export type ProductModalFinishValues = Partial<Product> & {
   /** 项目空间：projectId|projectName（与 space 一致，供研发统一服务） */
   spaceLabel?: string;
@@ -111,7 +144,7 @@ export function ProductModal({
     productVersion: string;
     appModule: string;
     description: string;
-    features: string[];
+    featureRows: ProductFeatureRow[];
     repositories: Repository[];
   }>({
     name: "",
@@ -120,7 +153,7 @@ export function ProductModal({
     productVersion: "",
     appModule: "",
     description: "",
-    features: [],
+    featureRows: [emptyFeatureRow()],
     repositories: [],
   });
 
@@ -163,7 +196,7 @@ export function ProductModal({
         productVersion: initialValues.version ?? "",
         appModule: initialValues.module ?? "",
         description: initialValues.description || "",
-        features: initialValues.features ? initialValues.features.split(",") : [],
+        featureRows: parseFeaturesFromStored(initialValues.features ?? ""),
         repositories: initialValues.repositories || [],
       });
       setIsEdit(true);
@@ -175,7 +208,7 @@ export function ProductModal({
         productVersion: "",
         appModule: "",
         description: "",
-        features: [],
+        featureRows: [emptyFeatureRow()],
         repositories: [],
       });
       setIsEdit(false);
@@ -447,7 +480,7 @@ export function ProductModal({
       }
     }
 
-    const featuresStr = formState.features.join(",");
+    const featuresStr = serializeFeatureRows(formState.featureRows);
     const spaceLabel = formState.projectSpace || "";
     const iconLabel = DEFAULT_ICONS.find((i) => i.value === formState.icon)?.label || "";
 
@@ -628,14 +661,23 @@ export function ProductModal({
           </div>
 
           <div className="space-y-2">
-            <Label className="flex items-baseline justify-between">
-              {t("workbench.products.modal.features")}
-              <span className="text-[11px] font-normal text-muted-foreground">{t("workbench.products.modal.featuresExtra")}</span>
+            <Label className="flex items-baseline justify-between gap-2">
+              <span>{t("workbench.products.modal.features")}</span>
+              <span className="text-[11px] font-normal text-muted-foreground text-right leading-snug max-w-[min(100%,22rem)]">
+                {t("workbench.products.modal.featuresExtra")}
+              </span>
             </Label>
-            <TagInput
-              value={formState.features}
-              onChange={(v) => setFormState((prev) => ({ ...prev, features: v }))}
-              placeholderEmpty={t("workbench.products.modal.featuresInputPlaceholder")}
+            <ProductFeatureRowsEditor
+              rows={formState.featureRows}
+              onChange={(featureRows) => setFormState((prev) => ({ ...prev, featureRows }))}
+              labels={{
+                nameCol: t("workbench.products.modal.featureNameShort"),
+                descCol: t("workbench.products.modal.featureDescShort"),
+                namePh: t("workbench.products.modal.featureNamePlaceholder"),
+                descPh: t("workbench.products.modal.featureDescPlaceholder"),
+                addRow: t("workbench.products.modal.addFeatureRow"),
+                removeRowAria: t("workbench.products.modal.removeFeatureRowAria"),
+              }}
             />
           </div>
 
@@ -858,62 +900,89 @@ export function ProductModal({
   );
 }
 
-// TagInput component for product features
-interface TagInputProps {
-  value?: string[];
-  onChange?: (value: string[]) => void;
-  placeholderEmpty?: string;
+interface ProductFeatureRowsEditorLabels {
+  nameCol: string;
+  descCol: string;
+  namePh: string;
+  descPh: string;
+  addRow: string;
+  removeRowAria: string;
 }
 
-function TagInput({ value = [], onChange, placeholderEmpty = "" }: TagInputProps) {
-  const [inputVal, setInputVal] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      const trimmed = inputVal.trim();
-      if (trimmed && !value.includes(trimmed)) {
-        onChange?.([...value, trimmed]);
-      }
-      setInputVal("");
-    } else if (e.key === "Backspace" && !inputVal && value.length > 0) {
-      onChange?.(value.slice(0, -1));
-    }
+function ProductFeatureRowsEditor({
+  rows,
+  onChange,
+  labels,
+}: {
+  rows: ProductFeatureRow[];
+  onChange: (rows: ProductFeatureRow[]) => void;
+  labels: ProductFeatureRowsEditorLabels;
+}) {
+  const patchRow = (index: number, patch: Partial<ProductFeatureRow>) => {
+    onChange(rows.map((r, i) => (i === index ? { ...r, ...patch } : r)));
   };
 
-  const handleRemove = (tag: string) => {
-    onChange?.(value.filter((x) => x !== tag));
+  const removeRow = (index: number) => {
+    const next = rows.filter((_, i) => i !== index);
+    onChange(next.length > 0 ? next : [emptyFeatureRow()]);
+  };
+
+  const addRow = () => {
+    onChange([...rows, emptyFeatureRow()]);
   };
 
   return (
-    <div
-      className="flex flex-wrap items-center gap-1.5 p-1.5 min-h-[36px] border border-input bg-background rounded-md text-sm ring-offset-background focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 transition-colors cursor-text"
-      onClick={() => inputRef.current?.focus()}
-    >
-      {value.map((tag) => (
-        <Badge
-          key={tag}
-          variant="secondary"
-          className="flex items-center gap-1 font-normal hover:bg-secondary/80 pr-1 h-6"
-        >
-          {tag}
+    <div className="rounded-xl border border-border/80 bg-muted/5 overflow-hidden shadow-sm">
+      <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.35fr)_auto] gap-2 px-3 py-2 border-b border-border/60 bg-muted/20 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        <span className="pl-1 truncate">{labels.nameCol}</span>
+        <span className="truncate">{labels.descCol}</span>
+        <span className="w-9 shrink-0" aria-hidden />
+      </div>
+      <div className="divide-y divide-border/50">
+        {rows.map((row, index) => (
           <div
-            className="flex items-center justify-center rounded-full hover:bg-muted/50 p-0.5 cursor-pointer"
-            onClick={(e) => { e.stopPropagation(); handleRemove(tag); }}
+            key={index}
+            className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.35fr)_auto] gap-2 px-3 py-2.5 items-center bg-background/40 hover:bg-muted/15 transition-colors"
           >
-            <X size={10} />
+            <Input
+              value={row.title}
+              onChange={(e) => patchRow(index, { title: e.target.value })}
+              placeholder={labels.namePh}
+              className="h-9 text-sm border-border/70 bg-background/80"
+              maxLength={128}
+            />
+            <Input
+              value={row.description}
+              onChange={(e) => patchRow(index, { description: e.target.value })}
+              placeholder={labels.descPh}
+              className="h-9 text-sm border-border/70 bg-background/80"
+              maxLength={256}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-9 w-9 shrink-0 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+              onClick={() => removeRow(index)}
+              aria-label={labels.removeRowAria}
+            >
+              <Trash2 size={15} />
+            </Button>
           </div>
-        </Badge>
-      ))}
-      <input
-        ref={inputRef}
-        value={inputVal}
-        onChange={(e) => setInputVal(e.target.value)}
-        onKeyDown={handleKeyDown}
-        placeholder={value.length === 0 ? placeholderEmpty : ""}
-        className="flex-1 min-w-[120px] bg-transparent outline-none border-none focus:ring-0 placeholder:text-muted-foreground text-sm py-0.5 px-1"
-      />
+        ))}
+      </div>
+      <div className="p-2 border-t border-border/50 bg-muted/10">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="w-full h-9 border-dashed border-border/80 bg-transparent hover:bg-muted/40 text-muted-foreground hover:text-foreground"
+          onClick={addRow}
+        >
+          <Plus size={15} className="mr-2 opacity-80" />
+          {labels.addRow}
+        </Button>
+      </div>
     </div>
   );
 }

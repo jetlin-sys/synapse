@@ -558,7 +558,6 @@ export function ProductDetail({
   /** 主仓库分析完成（done）时，自动生成按钮才可用 */
   const mainRepo = product.repositories.find((r) => r.isMain);
   const mainRepoAnalysisDone = (mainRepo?.wireAnalysisState ?? "new") === "done";
-  const architectureKnowledgeDone = isProductKnowledgeSlotDone(product.knowledge.architecture);
 
   const ticketReqMetric =
     product.demandOrderCount !== undefined
@@ -1169,12 +1168,8 @@ export function ProductDetail({
                   <div className="mb-3" onClick={(e) => e.stopPropagation()}>
                     <Button
                       type="button"
-                      disabled={orderTicketBusy || !IS_TAURI || !architectureKnowledgeDone}
-                      title={
-                        !architectureKnowledgeDone
-                          ? t("workbench.products.detail.autoAnalysisTicketArchRequired")
-                          : t("workbench.products.detail.autoAnalysisTicketCardHint")
-                      }
+                      disabled={orderTicketBusy || !IS_TAURI}
+                      title={t("workbench.products.detail.autoAnalysisTicketCardHint")}
                       className="w-full h-8 gap-1.5 text-xs font-medium bg-gradient-to-r from-primary/10 to-primary/5 hover:from-primary/20 hover:to-primary/10 text-primary border border-primary/20 shadow-sm transition-all rounded-md"
                       onClick={(e) => {
                         e.stopPropagation();
