@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import MDEditor from "@uiw/react-md-editor";
 import { Editor } from "@monaco-editor/react";
 import { Button } from "@/components/ui/button";
@@ -21,14 +21,20 @@ const EXCALIDRAW_PREVIEW_FRAME_STYLE: React.CSSProperties = {
 };
 
 /** Markdown 中 `![...](foo.excalidraw)` 的 foo.excalidraw 原文 JSON（多文件时按文件名查） */
+type OnSaveMeta = { showSaveSuccessToast?: boolean };
+
 interface ProductDocumentEditorProps {
   content: string;
   title: string;
   synapseApiBase: string;
   excalidrawByFileName?: Record<string, string>;
   readonly?: boolean;
-  onSave?: (content: string) => void;
+  onSave?: (content: string, meta?: OnSaveMeta) => void | Promise<void>;
   onSubmit?: () => void;
+  /** 为 false 时禁用「提交到服务端」（例如本地缓存目录无草稿时） */
+  submitEnabled?: boolean;
+  /** 当前文档是否有未保存的编辑（曾进入编辑模式且内容与上次保存不一致） */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 function fixMarkdownTableDelimiters(md: string): string {
@@ -85,12 +91,19 @@ export function ProductDocumentEditor({
   readonly = false,
   onSave,
   onSubmit,
+  submitEnabled = true,
+  onDirtyChange,
 }: ProductDocumentEditorProps) {
   const { t } = useTranslation();
   const [content, setContent] = useState(() => fixMarkdownTableDelimiters(initialContent));
+  const savedContentRef = useRef(fixMarkdownTableDelimiters(initialContent));
+  const [hasOpenedEdit, setHasOpenedEdit] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [isRefining, setIsRefining] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [mode, setMode] = useState<"edit" | "preview">("preview");
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
 
   const isAppThemeDark = (theme: string | null) =>
     theme === "dark" || theme === "daltonized-dark" || theme === "high-contrast";
@@ -108,8 +121,20 @@ export function ProductDocumentEditor({
   }, []);
 
   useEffect(() => {
-    setContent(fixMarkdownTableDelimiters(initialContent));
+    const fixed = fixMarkdownTableDelimiters(initialContent);
+    setContent(fixed);
+    savedContentRef.current = fixed;
+    setHasOpenedEdit(false);
   }, [initialContent]);
+
+  const isDirty =
+    !readonly &&
+    hasOpenedEdit &&
+    fixMarkdownTableDelimiters(content) !== savedContentRef.current;
+
+  useEffect(() => {
+    onDirtyChangeRef.current?.(isDirty);
+  }, [isDirty]);
 
   const handleRefine = async () => {
     if (!prompt.trim() || isRefining) return;
@@ -123,12 +148,32 @@ export function ProductDocumentEditor({
       setContent(res.content);
       setPrompt("");
       toast.success(t("workbench.products.detail.refineSuccess", "文档优化成功"));
-      if (onSave) onSave(res.content);
+      if (onSave) {
+        const out = fixMarkdownTableDelimiters(res.content);
+        await Promise.resolve(onSave(out, { showSaveSuccessToast: false }));
+        savedContentRef.current = out;
+        setHasOpenedEdit(false);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error(t("workbench.products.detail.refineFailed", "文档优化失败") + ": " + msg);
     } finally {
       setIsRefining(false);
+    }
+  };
+
+  const handleSaveClick = async () => {
+    if (!onSave) return;
+    setIsSaving(true);
+    try {
+      const fixed = fixMarkdownTableDelimiters(content);
+      await Promise.resolve(
+        onSave(fixed, { showSaveSuccessToast: true }),
+      );
+      savedContentRef.current = fixed;
+      setHasOpenedEdit(false);
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -236,8 +281,14 @@ export function ProductDocumentEditor({
               variant="outline"
               size="sm"
               className="h-8 text-xs"
-              onClick={() => setMode(m => m === "preview" ? "edit" : "preview")}
-              disabled={isRefining}
+              onClick={() =>
+                setMode((m) => {
+                  const next = m === "preview" ? "edit" : "preview";
+                  if (next === "edit") setHasOpenedEdit(true);
+                  return next;
+                })
+              }
+              disabled={isRefining || isSaving}
             >
               {mode === "preview" ? (
                 <>
@@ -257,10 +308,14 @@ export function ProductDocumentEditor({
               variant="outline"
               size="sm"
               className="h-8 text-xs"
-              onClick={() => onSave(fixMarkdownTableDelimiters(content))}
-              disabled={isRefining || readonly}
+              onClick={() => void handleSaveClick()}
+              disabled={isRefining || isSaving || readonly}
             >
-              <Save size={14} className="mr-1.5" />
+              {isSaving ? (
+                <Loader2 size={14} className="mr-1.5 animate-spin" />
+              ) : (
+                <Save size={14} className="mr-1.5" />
+              )}
               {t("common.save", "保存")}
             </Button>
           )}
@@ -268,9 +323,17 @@ export function ProductDocumentEditor({
             <Button
               variant="default"
               size="sm"
-              className="h-8 text-xs bg-emerald-600 hover:bg-emerald-700 text-white"
+              className="h-8 text-xs bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50"
               onClick={onSubmit}
-              disabled={isRefining || readonly}
+              disabled={isRefining || isSaving || readonly || !submitEnabled}
+              title={
+                !submitEnabled && !readonly
+                  ? t(
+                      "workbench.products.detail.submitToServerNeedLocalDraft",
+                      "请先通过「保存」将文档写入本地缓存后再提交",
+                    )
+                  : undefined
+              }
             >
               <Send size={14} className="mr-1.5" />
               {t("workbench.products.detail.submitToServer", "提交到服务端")}
@@ -278,6 +341,15 @@ export function ProductDocumentEditor({
           )}
         </div>
       </div>
+
+      {isDirty && (
+        <div
+          className="shrink-0 px-4 py-1.5 text-xs border-b border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100"
+          role="status"
+        >
+          {t("workbench.products.detail.docUnsavedHint", "文档已修改，尚未保存")}
+        </div>
+      )}
 
       {/* Editor Area */}
       <div className="flex-1 min-h-0 relative">
@@ -323,6 +395,14 @@ export function ProductDocumentEditor({
             </div>
           </div>
         )}
+        {isSaving && !isRefining && (
+          <div className="absolute inset-0 bg-background/40 backdrop-blur-[1px] flex items-center justify-center z-10">
+            <div className="flex flex-col items-center gap-2 bg-background/95 px-5 py-3 rounded-lg shadow-md border text-sm text-muted-foreground">
+              <Loader2 size={24} className="animate-spin text-primary" />
+              {t("workbench.products.detail.saving", "正在保存...")}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* AI Refine Input */}
@@ -339,12 +419,12 @@ export function ProductDocumentEditor({
               onKeyDown={handleKeyDown}
               placeholder={t("workbench.products.detail.refinePlaceholder", "输入修改需求，AI 自动调整文档...")}
               className="flex-1 bg-transparent border-none outline-none text-sm px-2 text-foreground placeholder:text-muted-foreground"
-              disabled={isRefining}
+              disabled={isRefining || isSaving}
             />
             <Button
               size="sm"
               className="h-8 rounded-full px-4"
-              disabled={!prompt.trim() || isRefining}
+              disabled={!prompt.trim() || isRefining || isSaving}
               onClick={handleRefine}
             >
               {isRefining ? <Loader2 size={14} className="animate-spin" /> : t("common.send", "发送")}

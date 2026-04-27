@@ -21,6 +21,7 @@ import {
   Sparkles,
   Loader2,
   AlertCircle,
+  PanelLeft,
 } from "lucide-react";
 import {
   Product,
@@ -66,6 +67,10 @@ import {
   getProdDoc,
   generateProductKnowledge,
   getProductKnowledgeStatus,
+  productKnowledgeLocalDraftClear,
+  productKnowledgeLocalDraftExists,
+  productKnowledgeLocalDraftRead,
+  productKnowledgeLocalDraftWrite,
   fetchLlmEndpointsCatalog,
   probeUnifiedServicePortReachable,
   TICKET_KNOWLEDGE_GRAPH_PORT,
@@ -82,6 +87,9 @@ import "./product-workbench.css";
  */
 const PRODUCT_DETAIL_POLL_MS = 30_000;
 
+/** 打开详情时主区不默认展示任何视图，左侧也不高亮卡片，直至用户点击 */
+const PRODUCT_DETAIL_MAIN_NONE = "";
+
 type OpenProductDoc = {
   id: string;
   title: string;
@@ -93,6 +101,28 @@ type OpenProductDoc = {
 
 function isExcalidrawOutputDocName(docName: string): boolean {
   return docName.trim().toLowerCase().endsWith(".excalidraw");
+}
+
+/** 与提交到研发统一服务的 doc_content 组装规则一致，供本地 tmp 落盘复用 */
+function buildDocContentPayloadFromCategoryDocs(
+  docs: OpenProductDoc[],
+): { doc_name: string; content: string }[] {
+  const used = new Set<string>();
+  const docContent: { doc_name: string; content: string }[] = [];
+  for (const d of docs) {
+    if (!used.has(d.title)) {
+      used.add(d.title);
+      docContent.push({ doc_name: d.title, content: d.content });
+    }
+    if (d.excalidrawByFileName) {
+      for (const [name, exBody] of Object.entries(d.excalidrawByFileName)) {
+        if (!exBody.trim() || used.has(name)) continue;
+        used.add(name);
+        docContent.push({ doc_name: name, content: exBody });
+      }
+    }
+  }
+  return docContent;
 }
 
 /** 与 Synapse/仓库约定文件名一致，供 Markdown 中 `![](*.excalidraw)` 查表 */
@@ -207,7 +237,7 @@ export function ProductDetail({
   onPatchProductKnowledge,
 }: ProductDetailProps) {
   const { t } = useTranslation();
-  const [activeTab, setActiveTab] = useState<string>("code-graph");
+  const [activeTab, setActiveTab] = useState<string>(PRODUCT_DETAIL_MAIN_NONE);
   const [openDocs, setOpenDocs] = useState<OpenProductDoc[]>([]);
   const [knowledgeCategoryView, setKnowledgeCategoryView] = useState<
     Record<ProductKnowledgeCategory, KnowledgeCategoryViewState>
@@ -231,6 +261,33 @@ export function ProductDetail({
   const [rdSkillCatalog, setRdSkillCatalog] = useState<{ skillId: string; name: string }[]>([]);
   const [rdSkillCatalogLoading, setRdSkillCatalogLoading] = useState(false);
 
+  /** 与后端 `tmp/.../product_knowledge` 下 `_knowledge_docs_root` 是否已有草稿一致，仅此时允许「提交到服务端」 */
+  const [knowledgeLocalDraftExists, setKnowledgeLocalDraftExists] = useState<
+    Record<ProductKnowledgeCategory, boolean>
+  >({
+    architecture: false,
+    solution: false,
+    requirements: false,
+    manual: false,
+    delivery: false,
+  });
+  const [docIdsWithUnsavedEdits, setDocIdsWithUnsavedEdits] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [unsavedNavigationOpen, setUnsavedNavigationOpen] = useState(false);
+  const docUnsavedRef = useRef(docIdsWithUnsavedEdits);
+  docUnsavedRef.current = docIdsWithUnsavedEdits;
+  const pendingUnsavedNavRef = useRef<(() => void) | null>(null);
+
+  const runOrConfirmUnsaved = useCallback((action: () => void) => {
+    if (docUnsavedRef.current.size > 0) {
+      pendingUnsavedNavRef.current = action;
+      setUnsavedNavigationOpen(true);
+      return;
+    }
+    action();
+  }, []);
+
   const productRef = useRef(product);
   productRef.current = product;
 
@@ -241,6 +298,61 @@ export function ProductDetail({
    * 命中后不再请求 status，避免与 get_prod_process_info 同节拍下的重复探测。
    */
   const synapseGenCompletedHydratedRef = useRef<Set<string>>(new Set());
+
+  const refreshKnowledgeLocalDraftFlags = useCallback(async () => {
+    const p = productRef.current;
+    if (!p || !IS_TAURI) {
+      setKnowledgeLocalDraftExists({
+        architecture: false,
+        solution: false,
+        requirements: false,
+        manual: false,
+        delivery: false,
+      });
+      return;
+    }
+    const prodKey = p.name.trim();
+    if (!prodKey) return;
+    const next: Record<ProductKnowledgeCategory, boolean> = {
+      architecture: false,
+      solution: false,
+      requirements: false,
+      manual: false,
+      delivery: false,
+    };
+    await Promise.all(
+      PRODUCT_KNOWLEDGE_KEYS.map(async (k) => {
+        try {
+          const dt = unifiedDocTypeForKnowledgeCategory(k);
+          next[k] = await productKnowledgeLocalDraftExists(synapseApiBase, {
+            prod_name: prodKey,
+            doc_type: dt,
+          });
+        } catch {
+          next[k] = false;
+        }
+      }),
+    );
+    setKnowledgeLocalDraftExists(next);
+  }, [synapseApiBase]);
+
+  useEffect(() => {
+    if (open && product && IS_TAURI) {
+      void refreshKnowledgeLocalDraftFlags();
+    }
+  }, [open, product?.id, product?.name, IS_TAURI, refreshKnowledgeLocalDraftFlags]);
+
+  useEffect(() => {
+    if (!open) {
+      setDocIdsWithUnsavedEdits(new Set());
+      setUnsavedNavigationOpen(false);
+      pendingUnsavedNavRef.current = null;
+    }
+  }, [open]);
+
+  useEffect(() => {
+    setDocIdsWithUnsavedEdits(new Set());
+  }, [product?.id]);
 
   const guardOwnerMatch = useCallback(async (): Promise<boolean> => {
     const p = productRef.current;
@@ -253,6 +365,51 @@ export function ProductDetail({
       return false;
     }
   }, [synapseApiBase, t]);
+
+  const persistCategoryDocsToLocal = useCallback(
+    async (
+      categoryKey: string,
+      mergedCategoryDocs: OpenProductDoc[],
+      options?: { notifySuccess?: boolean },
+    ): Promise<boolean> => {
+      const p = productRef.current;
+      const notifySuccess = options?.notifySuccess === true;
+      if (!p || !IS_TAURI) {
+        if (notifySuccess) {
+          toast.message(t("workbench.products.tauriOnlyAction"));
+        }
+        return false;
+      }
+      const prodKey = p.name.trim();
+      if (!prodKey) return false;
+      if (!(PRODUCT_KNOWLEDGE_KEYS as readonly string[]).includes(categoryKey)) return false;
+      const docType = unifiedDocTypeForKnowledgeCategory(categoryKey as ProductKnowledgeCategory);
+      const doc_content = buildDocContentPayloadFromCategoryDocs(mergedCategoryDocs);
+      if (doc_content.length === 0) return false;
+      try {
+        await productKnowledgeLocalDraftWrite(synapseApiBase, {
+          prod_name: prodKey,
+          doc_type: docType,
+          doc_content,
+        });
+        setKnowledgeLocalDraftExists((prev) => ({
+          ...prev,
+          [categoryKey as ProductKnowledgeCategory]: true,
+        }));
+        if (notifySuccess) {
+          toast.success(t("workbench.products.detail.localDraftSaveSuccess", "文档保存成功"));
+        }
+        return true;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        toast.error(
+          t("workbench.products.detail.localDraftSaveFailed", "本地草稿保存失败") + ": " + msg,
+        );
+        return false;
+      }
+    },
+    [synapseApiBase, t],
+  );
 
   const fetchProcessOnce = useCallback(async () => {
     const p = productRef.current;
@@ -277,7 +434,21 @@ export function ProductDetail({
             for (const cat of doneCats) {
               try {
                 const dt = unifiedDocTypeForKnowledgeCategory(cat);
-                const items = await getProdDoc(synapseApiBase, { prod: prodKey, doc_type: dt });
+                let hasLocal = false;
+                try {
+                  hasLocal = await productKnowledgeLocalDraftExists(synapseApiBase, {
+                    prod_name: prodKey,
+                    doc_type: dt,
+                  });
+                } catch {
+                  hasLocal = false;
+                }
+                const items = hasLocal
+                  ? await productKnowledgeLocalDraftRead(synapseApiBase, {
+                      prod_name: prodKey,
+                      doc_type: dt,
+                    })
+                  : await getProdDoc(synapseApiBase, { prod: prodKey, doc_type: dt });
                 if (items.length === 0) continue;
                 const exAssets: Record<string, string> = {};
                 const textItems: typeof items = [];
@@ -418,7 +589,7 @@ export function ProductDetail({
 
   useEffect(() => {
     if (open && product) {
-      setActiveTab("code-graph");
+      setActiveTab(PRODUCT_DETAIL_MAIN_NONE);
       setOpenDocs([]);
       setKnowledgeCategoryView(initialKnowledgeCategoryViewState());
       hydratedUnifiedDoneForOpenRef.current = null;
@@ -590,10 +761,12 @@ export function ProductDetail({
   };
 
   const handleOpenDoc = async (doc: OpenProductDoc, category: string) => {
+    if (activeTab === doc.id) return;
     if (!(await guardOwnerMatch())) return;
-    if (!openDocs.find((d) => d.id === doc.id)) {
-      setOpenDocs([...openDocs, { ...doc, category }]);
-    }
+    setOpenDocs((prev) => {
+      if (prev.find((d) => d.id === doc.id)) return prev;
+      return [...prev, { ...doc, category }];
+    });
     setActiveTab(doc.id);
   };
 
@@ -767,27 +940,31 @@ export function ProductDetail({
         categoryKey as ProductKnowledgeCategory,
       );
 
-      const used = new Set<string>();
-      const docContent: { doc_name: string; content: string }[] = [];
-      for (const d of categoryDocs) {
-        if (!used.has(d.title)) {
-          used.add(d.title);
-          docContent.push({ doc_name: d.title, content: d.content });
-        }
-        if (d.excalidrawByFileName) {
-          for (const [name, exBody] of Object.entries(d.excalidrawByFileName)) {
-            if (!exBody.trim() || used.has(name)) continue;
-            used.add(name);
-            docContent.push({ doc_name: name, content: exBody });
-          }
-        }
-      }
+      const docContent = buildDocContentPayloadFromCategoryDocs(categoryDocs);
 
       await docsSubmit(synapseApiBase, {
         prod: product.name,
         doc_type: submitDocType,
         doc_content: docContent,
       });
+
+      try {
+        await productKnowledgeLocalDraftClear(synapseApiBase, {
+          prod_name: product.name.trim(),
+          doc_type: submitDocType,
+        });
+        setKnowledgeLocalDraftExists((prev) => ({
+          ...prev,
+          [categoryKey as ProductKnowledgeCategory]: false,
+        }));
+      } catch (clearErr) {
+        const cmsg = clearErr instanceof Error ? clearErr.message : String(clearErr);
+        toast.warning(
+          t("workbench.products.detail.localDraftClearWarning", "文档已提交，但清理本地缓存失败") +
+            ": " +
+            cmsg,
+        );
+      }
 
       toast.success(t("workbench.products.detail.docSubmitSuccess", "文档提交成功"));
       onPatchProductKnowledge?.(product.id, {
@@ -802,7 +979,14 @@ export function ProductDetail({
 
   return (
     <>
-    <Sheet open={open} onOpenChange={(val) => { if (!val) onClose(); }}>
+    <Sheet
+      open={open}
+      onOpenChange={(val) => {
+        if (!val) {
+          runOrConfirmUnsaved(() => onClose());
+        }
+      }}
+    >
       <SheetContent side="right" className="w-[85vw] sm:max-w-[85vw] p-0 flex flex-col gap-0 border-l border-border/80 bg-background">
         <SheetHeader className="px-6 py-4 border-b border-border/80 bg-muted/10 flex flex-row items-center justify-between space-y-0">
           <SheetTitle className="flex items-center gap-3 font-normal">
@@ -843,8 +1027,11 @@ export function ProductDetail({
                     <div
                       key={repo.url || idx}
                       onClick={() => {
-                        setActiveTab("code-graph");
-                        setActiveRepoIdx(idx);
+                        if (isActive) return;
+                        runOrConfirmUnsaved(() => {
+                          setActiveTab("code-graph");
+                          setActiveRepoIdx(idx);
+                        });
                       }}
                       className={`p-3 rounded-md border cursor-pointer transition-all relative group ${bgClass} ${borderClass} hover:border-primary/40`}
                     >
@@ -1029,8 +1216,14 @@ export function ProductDetail({
                     <div key={item.key} className="flex flex-col">
                       <div
                         onClick={() => {
-                          if (done || hasGeneratedDocs) toggleKnowledgeCategoryExpanded(cat);
-                          setActiveTab("knowledge-graph");
+                          if (activeTab === "knowledge-graph") {
+                            if (done || hasGeneratedDocs) toggleKnowledgeCategoryExpanded(cat);
+                            return;
+                          }
+                          runOrConfirmUnsaved(() => {
+                            if (done || hasGeneratedDocs) toggleKnowledgeCategoryExpanded(cat);
+                            setActiveTab("knowledge-graph");
+                          });
                         }}
                         className="flex items-center justify-between w-full cursor-pointer py-2 px-1 hover:bg-muted/50 rounded-md transition-colors"
                       >
@@ -1108,7 +1301,12 @@ export function ProductDetail({
                             return (
                               <div
                                 key={doc.id}
-                                onClick={() => void handleOpenDoc(doc, item.key)}
+                                onClick={() => {
+                                  if (activeTab === doc.id) return;
+                                  runOrConfirmUnsaved(() => {
+                                    void handleOpenDoc(doc, item.key);
+                                  });
+                                }}
                                 className={`px-3 py-1.5 cursor-pointer rounded-md text-xs flex items-center gap-2 transition-colors ${
                                   isDocActive 
                                     ? "bg-primary/10 border border-primary/20 text-primary" 
@@ -1134,7 +1332,10 @@ export function ProductDetail({
                 {t("workbench.products.detail.ticketViewTitle")}
               </h5>
               <div
-                onClick={() => setActiveTab("ticket-graph")}
+                onClick={() => {
+                  if (activeTab === "ticket-graph") return;
+                  runOrConfirmUnsaved(() => setActiveTab("ticket-graph"));
+                }}
                 className={`p-4 rounded-md border cursor-pointer transition-all ${
                   activeTab === "ticket-graph" ? "bg-primary/10 border-primary/30" : "bg-muted/30 border-border/50 hover:border-border"
                 }`}
@@ -1234,6 +1435,22 @@ export function ProductDetail({
 
           {/* Main Content Area */}
           <div className="flex-1 flex flex-col min-w-0 bg-background relative overflow-y-auto custom-scrollbar">
+            {activeTab === PRODUCT_DETAIL_MAIN_NONE && (
+              <div className="flex min-h-[400px] flex-1 flex-col items-center justify-center gap-3 px-8 text-center">
+                <PanelLeft
+                  className="size-12 text-muted-foreground/40"
+                  strokeWidth={1.25}
+                  aria-hidden
+                />
+                <p className="max-w-md text-sm text-muted-foreground">
+                  {t(
+                    "workbench.products.detail.selectSidebarHint",
+                    "请从左侧选择代码仓库、知识分类或工单视图。",
+                  )}
+                </p>
+              </div>
+            )}
+
             {activeTab === "code-graph" && (
               <div className="p-6 h-full flex min-h-0 flex-col gap-4">
                 <div className="flex min-h-[400px] flex-1 flex-col rounded-xl border border-border bg-muted/5 relative overflow-hidden">
@@ -1471,10 +1688,28 @@ export function ProductDetail({
                     synapseApiBase={synapseApiBase}
                     excalidrawByFileName={doc.excalidrawByFileName}
                     readonly={doc.readonly}
-                    onSave={(newContent) => {
-                      setOpenDocs((docs) =>
-                        docs.map((d) => (d.id === doc.id ? { ...d, content: newContent } : d)),
-                      );
+                    submitEnabled={
+                      IS_TAURI && knowledgeLocalDraftExists[doc.category as ProductKnowledgeCategory]
+                    }
+                    onDirtyChange={(dirty) => {
+                      setDocIdsWithUnsavedEdits((prev) => {
+                        const n = new Set(prev);
+                        if (dirty) n.add(doc.id);
+                        else n.delete(doc.id);
+                        return n;
+                      });
+                    }}
+                    onSave={async (newContent, meta) => {
+                      const notifySuccess = meta?.showSaveSuccessToast === true;
+                      let merged: OpenProductDoc[] = [];
+                      setOpenDocs((prev) => {
+                        const next = prev.map((d) =>
+                          d.id === doc.id ? { ...d, content: newContent } : d,
+                        );
+                        merged = next.filter((d) => d.category === doc.category);
+                        return next;
+                      });
+                      await persistCategoryDocsToLocal(doc.category, merged, { notifySuccess });
                     }}
                     onSubmit={() => handleSubmitDocs(doc.category)}
                   />
@@ -1485,6 +1720,53 @@ export function ProductDetail({
         </div>
       </SheetContent>
     </Sheet>
+
+    <Dialog
+      open={unsavedNavigationOpen}
+      onOpenChange={(o) => {
+        setUnsavedNavigationOpen(o);
+        if (!o) pendingUnsavedNavRef.current = null;
+      }}
+    >
+      <DialogContent className="sm:max-w-md" showCloseButton>
+        <DialogHeader>
+          <DialogTitle>
+            {t("workbench.products.detail.leaveDetailUnsavedTitle", "有未保存的文档")}
+          </DialogTitle>
+          <DialogDescription>
+            {t(
+              "workbench.products.detail.leaveDetailUnsavedDesc",
+              "已修改的文档尚未保存。关闭详情或切换到其他视图/卡片将丢失这些未保存的更改。确定要继续吗？",
+            )}
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="gap-2 sm:gap-0">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setUnsavedNavigationOpen(false);
+              pendingUnsavedNavRef.current = null;
+            }}
+          >
+            {t("workbench.products.detail.leaveDetailStay", "继续编辑")}
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            onClick={() => {
+              setUnsavedNavigationOpen(false);
+              const run = pendingUnsavedNavRef.current;
+              pendingUnsavedNavRef.current = null;
+              setDocIdsWithUnsavedEdits(new Set());
+              run?.();
+            }}
+          >
+            {t("workbench.products.detail.leaveDetailUnsavedDiscard", "放弃未保存的更改")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
 
     <Dialog open={genOptsOpen} onOpenChange={setGenOptsOpen}>
       <DialogContent className="sm:max-w-md" showCloseButton>

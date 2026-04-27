@@ -196,6 +196,7 @@
         "mainRepoErrorMany": "Only one primary repository allowed"
       },
       "detail": {
+        "selectSidebarHint": "Select a repository, a knowledge section, or the ticket view on the left.",
         "share": "Share",
         "codeViewTitle": "Code",
         "knowledgeViewTitle": "Knowledge",
@@ -288,12 +289,23 @@
         "noDocsToSubmit": "No documents to submit",
         "docSubmitSuccess": "Document submitted successfully",
         "docSubmitFailed": "Document submission failed",
+        "localDraftSaveSuccess": "Document saved",
+        "localDraftSaveFailed": "Failed to save local draft",
+        "saving": "Saving...",
+        "localDraftClearWarning": "Document submitted, but clearing local cache failed",
         "refineSuccess": "Document refined successfully",
         "refineFailed": "Document refinement failed",
         "refining": "AI is refining the document...",
         "refinePlaceholder": "Enter your revision request, AI will adjust automatically...",
         "excalidrawParseError": "Could not parse Excalidraw file: {{name}}",
         "excalidrawMissing": "Diagram data not loaded: {{name}}",
+        "docUnsavedHint": "You have unsaved changes",
+        "submitToServerNeedLocalDraft": "Save the document locally first, then you can submit to the server",
+        "leaveDetailUnsavedTitle": "Unsaved document changes",
+        "leaveDetailUnsavedDesc": "You have unsaved document edits. Closing the detail or switching to another view or card will discard those changes. Continue anyway?",
+        "leaveDetailStay": "Keep editing",
+        "leaveDetailConfirm": "Leave anyway",
+        "leaveDetailUnsavedDiscard": "Discard unsaved changes",
         "submitToServer": "Submit to server"
       }
     }

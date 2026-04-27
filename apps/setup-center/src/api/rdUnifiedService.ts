@@ -882,6 +882,106 @@ export async function refineProductKnowledge(
   }
   return data.data;
 }
+
+/** Synapse `tmp/docs/<prod_name>/<doc_type>/` 本地编辑层：与 {@link getProdDoc} 正文结构一致 */
+export type ProductKnowledgeLocalDraftQueryBody = {
+  prod_name: string;
+  doc_type: string;
+};
+
+export async function productKnowledgeLocalDraftExists(
+  synapseApiBase: string,
+  body: ProductKnowledgeLocalDraftQueryBody,
+): Promise<boolean> {
+  const base = synapseApiBase.replace(/\/$/, "");
+  const resp = await proxyFetch(`${base}/api/dev/iwhalecloud/product_knowledge/local_draft/exists`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let data: { errorcode?: number; message?: string; data?: { exists?: boolean } };
+  try {
+    data = JSON.parse(resp.body) as typeof data;
+  } catch {
+    throw new Error(resp.status >= 400 ? resp.body || `HTTP ${resp.status}` : "invalid_json");
+  }
+  assertSynapseEnvelope(data);
+  return data.data?.exists === true;
+}
+
+export async function productKnowledgeLocalDraftRead(
+  synapseApiBase: string,
+  body: ProductKnowledgeLocalDraftQueryBody,
+): Promise<{ doc_name: string; content: string }[]> {
+  const base = synapseApiBase.replace(/\/$/, "");
+  const resp = await proxyFetch(`${base}/api/dev/iwhalecloud/product_knowledge/local_draft/read`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let data: {
+    errorcode?: number;
+    message?: string;
+    data?: { doc_content?: unknown };
+  };
+  try {
+    data = JSON.parse(resp.body) as typeof data;
+  } catch {
+    throw new Error(resp.status >= 400 ? resp.body || `HTTP ${resp.status}` : "invalid_json");
+  }
+  assertSynapseEnvelope(data);
+  const raw = data.data?.doc_content;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((row) => ({
+      doc_name: String((row as { doc_name?: unknown }).doc_name ?? "").trim() || "document.md",
+      content: String((row as { content?: unknown }).content ?? ""),
+    }))
+    .filter((row) => row.doc_name.length > 0 || row.content.length > 0);
+}
+
+export async function productKnowledgeLocalDraftWrite(
+  synapseApiBase: string,
+  body: {
+    prod_name: string;
+    doc_type: string;
+    doc_content: { doc_name: string; content: string }[];
+  },
+): Promise<void> {
+  const base = synapseApiBase.replace(/\/$/, "");
+  const resp = await proxyFetch(`${base}/api/dev/iwhalecloud/product_knowledge/local_draft/write`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let data: { errorcode?: number; message?: string };
+  try {
+    data = JSON.parse(resp.body) as typeof data;
+  } catch {
+    throw new Error(resp.status >= 400 ? resp.body || `HTTP ${resp.status}` : "invalid_json");
+  }
+  assertSynapseEnvelope(data);
+}
+
+export async function productKnowledgeLocalDraftClear(
+  synapseApiBase: string,
+  body: ProductKnowledgeLocalDraftQueryBody,
+): Promise<void> {
+  const base = synapseApiBase.replace(/\/$/, "");
+  const resp = await proxyFetch(`${base}/api/dev/iwhalecloud/product_knowledge/local_draft/clear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let data: { errorcode?: number; message?: string };
+  try {
+    data = JSON.parse(resp.body) as typeof data;
+  } catch {
+    throw new Error(resp.status >= 400 ? resp.body || `HTTP ${resp.status}` : "invalid_json");
+  }
+  assertSynapseEnvelope(data);
+}
+
 export async function destroyProd(
   _synapseApiBase: string,
   body: DestroyProdBody,

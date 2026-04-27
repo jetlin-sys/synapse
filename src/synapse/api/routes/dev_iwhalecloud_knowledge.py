@@ -66,7 +66,9 @@ class ProductKnowledgeGenerateRequest(BaseModel):
         min_length=1,
         max_length=128,
     )
-    repo_name: str = Field(..., description="仓库名称（优先使用 repo_url 解析；前端传不到时作为兜底）")
+    repo_name: str = Field(
+        ..., description="仓库名称（优先使用 repo_url 解析；前端传不到时作为兜底）"
+    )
     repo_url: str | None = Field(None, description="仓库 Git URL，用于从路径解析真实仓库名")
     gitnexus_url: str = Field(..., description="GitNexus 服务地址")
     product_desc: str = Field(..., description="产品描述")
@@ -100,12 +102,147 @@ class ProductKnowledgeRefineRequest(BaseModel):
     prompt: str = Field(..., description="修改需求")
 
 
+class ProductKnowledgeLocalDraftQuery(BaseModel):
+    prod_name: str = Field(
+        ...,
+        description="与 docs_initialize 的 prod 一致",
+        min_length=1,
+        max_length=512,
+    )
+    doc_type: str = Field(
+        ...,
+        description="与 docs_initialize 的 doc_type 一致",
+        min_length=1,
+        max_length=256,
+    )
+
+
+class LocalDraftDocRow(BaseModel):
+    doc_name: str = Field(..., min_length=1, max_length=512)
+    content: str = Field(default="")
+
+
+class ProductKnowledgeLocalDraftWriteRequest(BaseModel):
+    prod_name: str = Field(..., min_length=1, max_length=512)
+    doc_type: str = Field(..., min_length=1, max_length=256)
+    doc_content: list[LocalDraftDocRow] = Field(
+        ...,
+        description="与 get_doc / docs_submit 的 doc_content 项结构一致",
+    )
+
+
 _knowledge_tasks: dict[str, dict[str, Any]] = {}
+
+_ATOMIC_WRITE_SUFFIX = ".synapse_part"
 
 
 def _knowledge_docs_root(doc_type: str, prod_name: str) -> Path:
     """大模型产出（FUNCTIONAL_ARCH.md、TECH_ARCH.md、*.excalidraw 等）目录。"""
     return settings.synapse_home / "tmp" / "docs" / prod_name / doc_type
+
+
+def _safe_docs_file_basename(name: str) -> str | None:
+    """拒绝路径穿越与隐藏/临时文件名的落盘文件名。"""
+    s = (name or "").strip()
+    if not s or s in (".", ".."):
+        return None
+    if "/" in s or "\\" in s:
+        return None
+    if ".." in s:
+        return None
+    if s.startswith("."):
+        return None
+    return s
+
+
+def _local_draft_dir_list_doc_files(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    out: list[Path] = []
+    try:
+        for p in sorted(root.iterdir()):
+            if not p.is_file():
+                continue
+            if p.name.startswith("__"):
+                continue
+            if p.name.startswith("."):
+                continue
+            if p.name.endswith(_ATOMIC_WRITE_SUFFIX):
+                continue
+            out.append(p)
+    except OSError as e:
+        logger.warning("list draft dir %s: %s", root, e)
+    return out
+
+
+def local_draft_has_any_file(doc_type: str, prod_name: str) -> bool:
+    root = _knowledge_docs_root(doc_type, prod_name)
+    return len(_local_draft_dir_list_doc_files(root)) > 0
+
+
+def read_local_draft_doc_rows(doc_type: str, prod_name: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    root = _knowledge_docs_root(doc_type, prod_name)
+    for p in _local_draft_dir_list_doc_files(root):
+        safe = _safe_docs_file_basename(p.name)
+        if not safe or safe != p.name:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        rows.append({"doc_name": p.name, "content": text})
+    return rows
+
+
+def write_local_draft_doc_rows_atomic(
+    doc_type: str, prod_name: str, rows: list[tuple[str, str]]
+) -> None:
+    """全量写入该 doc_type 下文档：单文件 .synapse_part + replace；并删除目录内未出现在 payload 中的普通文件。"""
+    root = _knowledge_docs_root(doc_type, prod_name)
+    root.mkdir(parents=True, exist_ok=True)
+    wanted: set[str] = set()
+    normalized: list[tuple[str, str]] = []
+    for raw_name, content in rows:
+        name = _safe_docs_file_basename(raw_name)
+        if not name:
+            raise ValueError(f"invalid_doc_name:{raw_name!r}")
+        wanted.add(name)
+        normalized.append((name, content))
+    for name, content in normalized:
+        dest = root / name
+        part = dest.with_name(dest.name + _ATOMIC_WRITE_SUFFIX)
+        part.write_bytes(content.encode("utf-8"))
+        part.replace(dest)
+    for p in root.iterdir():
+        if not p.is_file():
+            continue
+        if p.name.endswith(_ATOMIC_WRITE_SUFFIX):
+            p.unlink(missing_ok=True)
+            continue
+        if p.name.startswith(".") or p.name.startswith("__"):
+            continue
+        if p.name not in wanted:
+            try:
+                p.unlink()
+            except OSError as e:
+                logger.warning("remove orphan draft %s: %s", p, e)
+
+
+def clear_local_draft_doc_dir(doc_type: str, prod_name: str) -> int:
+    """提交成功后清空 synapse_home/tmp/docs/<prod>/<doc_type>/ 下普通文件（含遗留 .synapse_part）。"""
+    root = _knowledge_docs_root(doc_type, prod_name)
+    if not root.is_dir():
+        return 0
+    n = 0
+    for p in list(root.iterdir()):
+        if p.is_file():
+            try:
+                p.unlink()
+                n += 1
+            except OSError as e:
+                logger.warning("clear draft file %s: %s", p, e)
+    return n
 
 
 def _gitnexus_local_data_path(repo_name: str) -> Path:
@@ -296,7 +433,9 @@ async def _run_knowledge_generation_task(
                 "\n\n---\n## 研发工具技能指引（请严格遵照以下指引执行任务）\n\n"
                 + "\n\n---\n\n".join(skill_bodies)
             )
-        minimal_system_prompt = "你是一个研发工具助手，请按照用户的要求生成系统架构文档。" + skill_section
+        minimal_system_prompt = (
+            "你是一个研发工具助手，请按照用户的要求生成系统架构文档。" + skill_section
+        )
 
         prompt = f"""gitnexus服务部署在[{req.gitnexus_url}]上，请使用工具whalecloud-dev-tool-arch-create生成仓库[{repo_name}]的系统架构和功能架构文档。
 产品描述：[{req.product_desc}]
@@ -312,12 +451,14 @@ GitNexus 本地数据根目录：[{local_data_path}]（materialize/缓存等请�
 
         # 架构文档生成专用工具集：只保留 SKILL 实际需要的执行工具，大幅节省 token
         # SKILL 里用到：run_shell（执行 node 脚本）、文件读写、目录列举
-        _ARCH_GEN_TOOL_NAMES = frozenset({
-            "run_shell",
-            "read_file",
-            "write_file",
-            "list_directory",
-        })
+        _ARCH_GEN_TOOL_NAMES = frozenset(
+            {
+                "run_shell",
+                "read_file",
+                "write_file",
+                "list_directory",
+            }
+        )
         _orig_tools = getattr(agent, "_tools", None)
         _slim_tools = (
             [t for t in _orig_tools if t.get("name") in _ARCH_GEN_TOOL_NAMES]
@@ -345,7 +486,11 @@ GitNexus 本地数据根目录：[{local_data_path}]（materialize/缓存等请�
         finally:
             # 恢复原始状态，避免影响后续复用（ephemeral agent 通常会被销毁，但以防万一）
             agent._org_context = _orig_org_context  # type: ignore[attr-defined]
-            if hasattr(agent, "_context") and agent._context is not None and _orig_system is not None:
+            if (
+                hasattr(agent, "_context")
+                and agent._context is not None
+                and _orig_system is not None
+            ):
                 agent._context.system = _orig_system
             if _orig_tools is not None:
                 agent._tools = _orig_tools  # type: ignore[attr-defined]
@@ -450,10 +595,46 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
             return error_response(404, "任务不存在")
         return success_response(task)
 
+    @router.post("/api/dev/iwhalecloud/product_knowledge/local_draft/exists")
+    def product_knowledge_local_draft_exists(body: ProductKnowledgeLocalDraftQuery) -> Any:
+        exists = local_draft_has_any_file(body.doc_type, body.prod_name)
+        return success_response({"exists": exists})
+
+    @router.post("/api/dev/iwhalecloud/product_knowledge/local_draft/read")
+    def product_knowledge_local_draft_read(body: ProductKnowledgeLocalDraftQuery) -> Any:
+        rows = read_local_draft_doc_rows(body.doc_type, body.prod_name)
+        return success_response({"doc_content": rows})
+
+    @router.post("/api/dev/iwhalecloud/product_knowledge/local_draft/write")
+    def product_knowledge_local_draft_write(body: ProductKnowledgeLocalDraftWriteRequest) -> Any:
+        if not body.doc_content:
+            return error_response(400, "doc_content_empty")
+        pairs: list[tuple[str, str]] = []
+        for r in body.doc_content:
+            dn = r.doc_name.strip()
+            if not dn:
+                return error_response(400, "empty_doc_name")
+            pairs.append((dn, r.content))
+        try:
+            write_local_draft_doc_rows_atomic(body.doc_type, body.prod_name, pairs)
+        except ValueError as e:
+            return error_response(400, str(e))
+        except OSError as e:
+            logger.exception("local draft write failed")
+            return error_response(500, str(e))
+        return success_response({"written": len(pairs)}, "本地草稿已保存")
+
+    @router.post("/api/dev/iwhalecloud/product_knowledge/local_draft/clear")
+    def product_knowledge_local_draft_clear(body: ProductKnowledgeLocalDraftQuery) -> Any:
+        n = clear_local_draft_doc_dir(body.doc_type, body.prod_name)
+        return success_response({"removed": n}, "本地草稿目录已清理")
+
     # TODO: 需要做同步流式的改造
     # TODO: 和初始化一样，TASK_ID要前端生成
     @router.post("/api/dev/iwhalecloud/product_knowledge/refine")
-    async def product_knowledge_refine(request: Request, body: ProductKnowledgeRefineRequest) -> Any:
+    async def product_knowledge_refine(
+        request: Request, body: ProductKnowledgeRefineRequest
+    ) -> Any:
         pool = getattr(request.app.state, "agent_pool", None)
         if not pool:
             return error_response(503, "Agent pool not initialized")
@@ -468,7 +649,9 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
 ```
 
 请直接输出修改后的完整 Markdown 内容，不要包含任何额外的解释或说明。"""
-            base_profile = get_profile_store().get("default") or AgentProfile(id="default", name="小鲸")
+            base_profile = get_profile_store().get("default") or AgentProfile(
+                id="default", name="小鲸"
+            )
             test_profile = replace(
                 base_profile,
                 id=prof_id,

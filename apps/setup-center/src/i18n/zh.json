@@ -196,6 +196,7 @@
         "mainRepoErrorMany": "只能有一个主分支仓库"
       },
         "detail": {
+        "selectSidebarHint": "请从左侧选择代码仓库、知识分类或工单视图。",
         "share": "分享",
         "codeViewTitle": "产品代码视图",
         "knowledgeViewTitle": "产品知识视图",
@@ -289,12 +290,23 @@
         "noDocsToSubmit": "没有可提交的文档",
         "docSubmitSuccess": "文档提交成功",
         "docSubmitFailed": "文档提交失败",
+        "localDraftSaveSuccess": "文档保存成功",
+        "localDraftSaveFailed": "本地草稿保存失败",
+        "saving": "正在保存...",
+        "localDraftClearWarning": "文档已提交，但清理本地缓存失败",
         "refineSuccess": "文档优化成功",
         "refineFailed": "文档优化失败",
         "refining": "AI 正在优化文档...",
         "refinePlaceholder": "输入修改需求，AI 自动调整文档...",
         "excalidrawParseError": "无法解析 Excalidraw 文件：{{name}}",
         "excalidrawMissing": "未加载图形数据：{{name}}",
+        "docUnsavedHint": "文档已修改，尚未保存",
+        "submitToServerNeedLocalDraft": "请先通过「保存」将文档写入本地缓存后再提交",
+        "leaveDetailUnsavedTitle": "有未保存的文档",
+        "leaveDetailUnsavedDesc": "已修改的文档尚未保存。关闭详情或切换到其他视图/卡片将丢失这些未保存的更改。确定要继续吗？",
+        "leaveDetailStay": "继续编辑",
+        "leaveDetailConfirm": "仍要离开",
+        "leaveDetailUnsavedDiscard": "放弃未保存的更改",
         "submitToServer": "提交到服务端"
       }
     }
