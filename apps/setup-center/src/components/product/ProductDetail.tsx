@@ -713,6 +713,8 @@ export function ProductDetail({
 
       await generateProductKnowledge(synapseApiBase, {
         task_id: taskId,
+        prod_name: product.name,
+        doc_type: docTypeParam,
         repo_name: repoNameFromUrl,
         repo_url: mainRepo.url || undefined,
         gitnexus_url: gitnexusUrl,

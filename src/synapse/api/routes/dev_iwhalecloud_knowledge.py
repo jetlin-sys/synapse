@@ -81,6 +81,18 @@ class ProductKnowledgeGenerateRequest(BaseModel):
         description="首选 LLM 端点 name（与 llm_endpoints.json 中一致）；空则走全局路由",
         max_length=200,
     )
+    prod_name: str = Field(
+        ...,
+        description="产品标识，与统一服务 docs_initialize 的 prod 一致；落盘根为 synapse_home/tmp/docs/<prod_name>/<doc_type>/",
+        min_length=1,
+        max_length=512,
+    )
+    doc_type: str = Field(
+        ...,
+        description="文档类型，与统一服务 doc_type 一致；与 prod_name 共同决定落盘目录",
+        min_length=1,
+        max_length=256,
+    )
 
 
 class ProductKnowledgeRefineRequest(BaseModel):
@@ -89,6 +101,16 @@ class ProductKnowledgeRefineRequest(BaseModel):
 
 
 _knowledge_tasks: dict[str, dict[str, Any]] = {}
+
+
+def _knowledge_docs_root(doc_type: str, prod_name: str) -> Path:
+    """大模型产出（FUNCTIONAL_ARCH.md、TECH_ARCH.md、*.excalidraw 等）目录。"""
+    return settings.synapse_home / "tmp" / "docs" / prod_name / doc_type
+
+
+def _gitnexus_local_data_path(repo_name: str) -> Path:
+    """GitNexus 拉取/缓存数据根目录（与架构产出目录分离）。"""
+    return settings.synapse_home / "tmp" / "gitnexus" / repo_name
 
 
 def _task_status_dir() -> Path:
@@ -106,7 +128,7 @@ def _task_status_path(task_id: str) -> Path | None:
 
 
 def _persist_task(task_id: str) -> None:
-    """将当前内存中的任务快照写入磁盘；completed 不写 data 正文，仅保留 repo_name 供从 MD 回读。"""
+    """将当前内存中的任务快照写入磁盘；completed 不写 data 正文，保留 doc_type 等元数据供从 tmp 目录回读 MD。"""
     snap = _knowledge_tasks.get(task_id)
     if not snap:
         return
@@ -116,6 +138,8 @@ def _persist_task(task_id: str) -> None:
     out: dict[str, Any] = {k: v for k, v in snap.items() if k != "data"}
     if snap.get("status") == "completed":
         out["repo_name"] = snap.get("repo_name")
+        out["doc_type"] = snap.get("doc_type")
+        out["prod_name"] = snap.get("prod_name")
     try:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
@@ -135,9 +159,9 @@ def _load_task_from_disk(task_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _read_arch_from_repo_dir(repo_name: str) -> dict[str, Any]:
-    """completed 时从本机临时目录读取架构 MD（权威数据源）。"""
-    output_dir = settings.synapse_home / "tmp" / "gitnexus" / repo_name
+def _read_arch_from_doc_root(doc_type: str, prod_name: str) -> dict[str, Any]:
+    """completed 时从 synapse_home/tmp/docs/<prod_name>/<doc_type>/ 读取架构 MD（与生成任务 cwd 一致）。"""
+    output_dir = _knowledge_docs_root(doc_type, prod_name)
     functional_arch = ""
     tech_arch = ""
     func_path = output_dir / "FUNCTIONAL_ARCH.md"
@@ -176,7 +200,7 @@ def _read_arch_from_repo_dir(repo_name: str) -> dict[str, Any]:
 
 
 def _assemble_task_for_response(task_id: str) -> dict[str, Any] | None:
-    """合并内存/磁盘元数据；completed 始终从 tmp/gitnexus/<repo>/ 读取 MD 作为 data（非 completed 不把 MD 当完成态）。"""
+    """合并内存/磁盘元数据；completed 始终从 tmp/docs/<prod_name>/<doc_type>/ 读取 MD 作为 data（非 completed 不把 MD 当完成态）。"""
     meta = _knowledge_tasks.get(task_id)
     if meta is None:
         meta = _load_task_from_disk(task_id)
@@ -186,32 +210,26 @@ def _assemble_task_for_response(task_id: str) -> dict[str, Any] | None:
         return None
     st = meta.get("status")
     if st == "completed":
-        repo_name = meta.get("repo_name")
-        if isinstance(repo_name, str) and repo_name.strip():
-            data = _read_arch_from_repo_dir(repo_name.strip())
-            mem_data = meta.get("data") if isinstance(meta.get("data"), dict) else {}
-            out_data = {
-                **data,
-                "output": str(mem_data.get("output", "") or data.get("output", "")),
-            }
-            merged = {**{k: v for k, v in meta.items() if k != "data"}, "data": out_data}
-            _knowledge_tasks[task_id] = merged
-            return merged
-        mem_data = meta.get("data")
-        if isinstance(mem_data, dict):
-            return meta
-        empty = {
-            **meta,
-            "data": {
+        raw_dt = meta.get("doc_type")
+        raw_pn = meta.get("prod_name")
+        if isinstance(raw_dt, str) and isinstance(raw_pn, str):
+            data = _read_arch_from_doc_root(raw_dt, raw_pn)
+        else:
+            data = {
                 "functional_arch": "",
                 "tech_arch": "",
                 "sys_arch_layers_excalidraw": "",
                 "tech_stack_excalidraw": "",
                 "output": "",
-            },
+            }
+        mem_data = meta.get("data") if isinstance(meta.get("data"), dict) else {}
+        out_data = {
+            **data,
+            "output": str(mem_data.get("output", "") or data.get("output", "")),
         }
-        _knowledge_tasks[task_id] = empty
-        return empty
+        merged = {**{k: v for k, v in meta.items() if k != "data"}, "data": out_data}
+        _knowledge_tasks[task_id] = merged
+        return merged
     return meta
 
 
@@ -252,10 +270,14 @@ async def _run_knowledge_generation_task(
 
         # repo_url 优先解析真实仓库名，前端未传时 fallback 到 repo_name
         repo_name = _repo_name_from_git_url(req.repo_url) or req.repo_name
+        doc_type = req.doc_type
+        prod_name = req.prod_name
 
-        # 自动推导本地数据路径：~/.synapse/tmp/gitnexus/<repo_name>/
-        local_data_path = settings.synapse_home / "tmp" / "gitnexus" / repo_name
+        # GitNexus 本地数据与架构产出分离：前者 tmp/gitnexus/<repo>，后者 tmp/docs/<prod>/<doc_type>
+        local_data_path = _gitnexus_local_data_path(repo_name)
         local_data_path.mkdir(parents=True, exist_ok=True)
+        output_dir = _knowledge_docs_root(doc_type, prod_name)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         # 将已挂载的技能 body 读出（含真实路径），注入到 system prompt
         skill_bodies: list[str] = []
@@ -280,9 +302,9 @@ async def _run_knowledge_generation_task(
 产品描述：[{req.product_desc}]
 代码路径：[{req.code_path}]
 主要功能：[{req.core_features}]
-本地数据根目录：[{local_data_path}]（gitnexus 拉取的数据将存放于此，请以此路径作为本地数据访问根目录）"""
+GitNexus 本地数据根目录：[{local_data_path}]（materialize/缓存等请使用此路径，作为只读的图谱与源码缓存根）
+架构文档产出目录：[{output_dir}]（FUNCTIONAL_ARCH.md、TECH_ARCH.md、*.excalidraw 等所有交付物必须写入此目录，不要使用 GitNexus 数据目录作为产出路径）"""
 
-        output_dir = local_data_path
         agent.default_cwd = str(output_dir)
         if getattr(agent, "shell_tool", None):
             agent.shell_tool.default_cwd = str(output_dir)  # type: ignore[union-attr]
@@ -354,6 +376,8 @@ async def _run_knowledge_generation_task(
             _knowledge_tasks[task_id] = {
                 "status": "completed",
                 "repo_name": repo_name,
+                "prod_name": prod_name,
+                "doc_type": doc_type,
                 "data": {
                     "functional_arch": functional_arch,
                     "tech_arch": tech_arch,
@@ -405,6 +429,8 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
             "status": "pending",
             "created_at": time.time(),
             "repo_name": repo_resolved,
+            "prod_name": body.prod_name,
+            "doc_type": body.doc_type,
         }
         _persist_task(task_id)
         ep = (body.preferred_endpoint or "").strip() or None

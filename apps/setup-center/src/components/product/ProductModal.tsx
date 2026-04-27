@@ -76,16 +76,19 @@ function branchRowToOption(row: RdProductBranchItem): SearchableOption {
   return { label: value, value };
 }
 
-/** 单行：左侧功能名，右侧描述；存盘格式 name:desc,name:desc 或旧数据 name,name */
+/** 单行：左侧功能名，右侧描述；存盘格式 name:desc|name:desc（仅竖线分隔多项） */
 export type ProductFeatureRow = { title: string; description: string };
 
 const emptyFeatureRow = (): ProductFeatureRow => ({ title: "", description: "" });
+
+/** 功能名、描述中禁止的存盘分隔符 */
+const stripFeatureForbiddenChars = (v: string) => v.replace(/\|/g, "");
 
 export function parseFeaturesFromStored(raw: string): ProductFeatureRow[] {
   const s = (raw ?? "").trim();
   if (!s) return [emptyFeatureRow()];
   const parts = s
-    .split(",")
+    .split("|")
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
   if (parts.length === 0) return [emptyFeatureRow()];
@@ -102,11 +105,28 @@ export function serializeFeatureRows(rows: ProductFeatureRow[]): string {
       const a = title.trim();
       const b = description.trim();
       if (!a && !b) return "";
-      if (!b) return a;
       return `${a}:${b}`;
     })
     .filter((x) => x.length > 0)
-    .join(",");
+    .join("|");
+}
+
+function getFeatureRowsValidationError(
+  rows: ProductFeatureRow[],
+):
+  | "workbench.products.modal.featuresRequired"
+  | "workbench.products.modal.featuresRowPartial"
+  | null {
+  let hasComplete = false;
+  for (const { title, description } of rows) {
+    const a = title.trim();
+    const b = description.trim();
+    if (!a && !b) continue;
+    if (!a || !b) return "workbench.products.modal.featuresRowPartial";
+    hasComplete = true;
+  }
+  if (!hasComplete) return "workbench.products.modal.featuresRequired";
+  return null;
 }
 
 export type ProductModalFinishValues = Partial<Product> & {
@@ -448,6 +468,12 @@ export function ProductModal({
       return;
     }
 
+    const featureErrKey = getFeatureRowsValidationError(formState.featureRows);
+    if (featureErrKey) {
+      toast.error(t(featureErrKey));
+      return;
+    }
+
     if (!isEdit) {
       const mainRepos = formState.repositories.filter((r) => r.isMain);
       if (formState.repositories.length > 0) {
@@ -662,7 +688,9 @@ export function ProductModal({
 
           <div className="space-y-2">
             <Label className="flex items-baseline justify-between gap-2">
-              <span>{t("workbench.products.modal.features")}</span>
+              <span>
+                {t("workbench.products.modal.features")} <span className="text-destructive">*</span>
+              </span>
               <span className="text-[11px] font-normal text-muted-foreground text-right leading-snug max-w-[min(100%,22rem)]">
                 {t("workbench.products.modal.featuresExtra")}
               </span>
@@ -934,8 +962,12 @@ function ProductFeatureRowsEditor({
   return (
     <div className="rounded-xl border border-border/80 bg-muted/5 overflow-hidden shadow-sm">
       <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.35fr)_auto] gap-2 px-3 py-2 border-b border-border/60 bg-muted/20 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-        <span className="pl-1 truncate">{labels.nameCol}</span>
-        <span className="truncate">{labels.descCol}</span>
+        <span className="pl-1 truncate">
+          {labels.nameCol} <span className="text-destructive normal-case">*</span>
+        </span>
+        <span className="truncate">
+          {labels.descCol} <span className="text-destructive normal-case">*</span>
+        </span>
         <span className="w-9 shrink-0" aria-hidden />
       </div>
       <div className="divide-y divide-border/50">
@@ -946,14 +978,16 @@ function ProductFeatureRowsEditor({
           >
             <Input
               value={row.title}
-              onChange={(e) => patchRow(index, { title: e.target.value })}
+              onChange={(e) => patchRow(index, { title: stripFeatureForbiddenChars(e.target.value) })}
               placeholder={labels.namePh}
               className="h-9 text-sm border-border/70 bg-background/80"
               maxLength={128}
             />
             <Input
               value={row.description}
-              onChange={(e) => patchRow(index, { description: e.target.value })}
+              onChange={(e) =>
+                patchRow(index, { description: stripFeatureForbiddenChars(e.target.value) })
+              }
               placeholder={labels.descPh}
               className="h-9 text-sm border-border/70 bg-background/80"
               maxLength={256}

@@ -740,6 +740,10 @@ export async function changeRepoInfo(
 export type ProductKnowledgeGenerateBody = {
   /** 与 docs_initialize 传入的 task_id 一致（前端生成） */
   task_id: string;
+  /** 与 docs_initialize 的 prod 一致；Synapse 落盘 synapse_home/tmp/docs/<prod_name>/<doc_type>/ */
+  prod_name: string;
+  /** 与 docs_initialize 的 doc_type 一致 */
+  doc_type: string;
   repo_name: string;
   repo_url?: string;
   gitnexus_url: string;
