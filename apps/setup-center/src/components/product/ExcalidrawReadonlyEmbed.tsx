@@ -90,7 +90,7 @@ export function ExcalidrawReadonlyEmbed({ sceneJson, className }: ExcalidrawRead
       <Suspense
         fallback={
           <div
-            className="flex h-full min-h-[200px] w-full flex-1 items-center justify-center text-muted-foreground"
+            className="flex h-full min-h-[min(40vh,360px)] w-full flex-1 items-center justify-center text-muted-foreground"
             aria-hidden
           >
             <Loader2 className="h-6 w-6 shrink-0 animate-spin" />

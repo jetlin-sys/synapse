@@ -15,6 +15,11 @@ import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { refineProductKnowledge } from "@/api/rdUnifiedService";
 
+/** 文档预览中 Excalidraw 外框：占视口高度为主，大屏最高约 800px，避免原 400px 过小 */
+const EXCALIDRAW_PREVIEW_FRAME_STYLE: React.CSSProperties = {
+  height: "min(70vh, 600px)",
+};
+
 /** Markdown 中 `![...](foo.excalidraw)` 的 foo.excalidraw 原文 JSON（多文件时按文件名查） */
 interface ProductDocumentEditorProps {
   content: string;
@@ -150,7 +155,7 @@ export function ProductDocumentEditor({
               return (
                 <div
                   className="my-4 w-full min-w-0 overflow-hidden rounded-md border bg-background"
-                  style={{ height: "400px" }}
+                  style={EXCALIDRAW_PREVIEW_FRAME_STYLE}
                 >
                   <ExcalidrawReadonlyEmbed sceneJson={raw} className="h-full" />
                 </div>
@@ -196,7 +201,7 @@ export function ProductDocumentEditor({
               return (
                 <div
                   className="my-4 w-full min-w-0 overflow-hidden rounded-md border"
-                  style={{ height: "400px" }}
+                  style={EXCALIDRAW_PREVIEW_FRAME_STYLE}
                 >
                   <ExcalidrawReadonlyEmbed sceneJson={sceneJson} className="h-full" />
                 </div>
