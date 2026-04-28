@@ -85,6 +85,12 @@ export type DevServiceResponse = {
   total: number;
 };
 
+/** `insertProdInfo` 成功时在服务响应上附带本次请求使用的 owner 密文与展示名（供前端缓存与身份校验一致） */
+export type InsertProdInfoResult = DevServiceResponse & {
+  owner_info: string;
+  owner: string;
+};
+
 export type UpdateProdInfoBody = {
   prod: string;
   function: string;
@@ -419,11 +425,12 @@ export async function postRdUnifiedJson<T>(
 /**
  * 创建产品：调用研发统一服务 insert_prod_info，并自动附带 owner_info / owner。
  * 仅应在 Tauri 下调用（依赖 `read_devservice_ip` 与 `proxyFetch`）。
+ * 成功返回值在通用响应外携带 `owner_info` / `owner`，与请求体一致，便于创建后立即写入本地 Product 缓存。
  */
 export async function insertProdInfo(
   synapseApiBase: string,
   input: Omit<InsertProdInfoBody, "owner_info" | "owner"> & { owner?: string },
-): Promise<DevServiceResponse> {
+): Promise<InsertProdInfoResult> {
   if (!IS_TAURI) {
     throw new Error("rd_unified_tauri_only");
   }
@@ -446,7 +453,7 @@ export async function insertProdInfo(
   if (resp.code !== 0) {
     throw new Error(resp.message || "insert_prod_failed");
   }
-  return resp;
+  return { ...resp, owner_info, owner };
 }
 
 /**

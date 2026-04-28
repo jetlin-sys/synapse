@@ -1,6 +1,7 @@
 ---
 name: whalecloud-dev-tool-arch-create
 description: "通用产品架构/技术架构文档生成技能（源码优先 + GitNexus 索引辅助）。按仓库语言与构建体系自动匹配分析流程；C++ 仓库启用附录中的专项阅读策略。Examples: 写架构说明、梳理分层与执行流、结合图谱写技术架构、产出 FUNCTIONAL_ARCH + TECH_ARCH 双文档。"
+label: 产品架构文档生成工具
 ---
 
 # 产品架构文档生成（源码优先 · GitNexus 辅助）

@@ -1,6 +1,7 @@
 ---
 name: whalecloud-dev-tool-arch-modify
 description: "产品知识文档修改技能（源码优先 + 历史文档参考 + GitNexus 辅助）。以用户需求为驱动，以实际代码为依据，以历史文档为参照，精准修改产品架构文档（FUNCTIONAL_ARCH.md / TECH_ARCH.md / *.excalidraw）。Examples: 修改文档章节、补充功能说明、更新架构图、修正错误描述。"
+label: 产品架构文档修改工具
 ---
 
 # 产品知识文档修改（源码优先 · 历史文档参考 · 用户需求驱动）

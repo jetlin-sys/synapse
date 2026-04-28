@@ -1,6 +1,7 @@
 ---
 name: whalecloud-dev-tool-rule-create
 description: "基于 FUNCTIONAL_ARCH + TECH_ARCH，结合 GitNexus 源码缓存核验，生成经代码证据支撑的单一 AGENT.md（四维结构控熵 + 研发约束规则合一）；GITNEXUS_URL/REPO_NAME/GNX_CACHE_DIR 必选。OUT_DIR 默认 docs/；主产出 AGENT.md，元数据（WRITE_META≠false）固定为 agent-doc-meta.json。"
+label: 产品手册文档生成工具
 ---
 
 # 仓库结构控熵 + 研发约束规则生成（双架构输入 · GitNexus 必选 · 可重复）

@@ -29,6 +29,16 @@ import {
   DropdownMenuTrigger,
   DropdownMenuCheckboxItem,
 } from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { toast } from "sonner";
 import { IS_TAURI } from "@/platform";
 import {
@@ -197,6 +207,7 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
     productId: string;
     kind: "refresh" | "repo" | "delete";
   } | null>(null);
+  const [deletingProduct, setDeletingProduct] = useState<Product | null>(null);
 
   const filteredProducts = products;
 
@@ -323,7 +334,19 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
     setIsModalOpen(true);
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDeleteRequest = async (product: Product) => {
+    if (IS_TAURI) {
+      try {
+        await assertOwnerInfoMatchesProduct(synapseApiBase, product);
+      } catch (e) {
+        toastOwnerInfoGuardError(t, e);
+        return;
+      }
+    }
+    setDeletingProduct(product);
+  };
+
+  const executeDelete = async (id: string) => {
     const product = products.find((p) => p.id === id);
     if (!product) return;
     const detailWasThisProduct = selectedProduct?.id === id;
@@ -354,7 +377,7 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
       setProducts((prev) => prev.filter((p) => p.id !== id));
       clearDetailIfNeeded();
       const okMsg = typeof resp.message === "string" && resp.message.trim() !== "" ? resp.message.trim() : "";
-      toast.success(okMsg || t("workbench.products.deleted"));
+      toast.success(okMsg || t("workbench.products.deleted") || "已删除");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg === "missing_devservice_ip") {
@@ -419,9 +442,10 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
       return;
     }
 
+    let insertOwner: { owner: string; ownerInfo: string } | undefined;
     if (IS_TAURI) {
       try {
-        await insertProdInfo(synapseApiBase, {
+        const created = await insertProdInfo(synapseApiBase, {
           prod: values.name || "",
           version: (values.version || "").trim(),
           module: (values.module || "").trim(),
@@ -431,6 +455,7 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
           prod_desc: (values.description || "").trim(),
           repo_info: repositoriesToRdRepoInfo(values.repositories || []),
         });
+        insertOwner = { owner: created.owner, ownerInfo: created.owner_info };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         if (msg === "missing_devservice_ip") {
@@ -446,6 +471,7 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
 
     const newProduct: Product = {
       ...values,
+      ...(insertOwner ? { owner: insertOwner.owner, ownerInfo: insertOwner.ownerInfo } : {}),
       id: Math.random().toString(36).slice(2, 11),
       icon: values.icon || DEFAULT_ICONS[Math.floor(Math.random() * DEFAULT_ICONS.length)].value,
       repositories: values.repositories || [],
@@ -542,11 +568,11 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
           ) : filteredProducts.length > 0 ? (
             <div className="grid gap-5 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-3">
               {filteredProducts.map((product) => (
-                <ProductCard
+                  <ProductCard
                   key={product.id}
                   product={product}
                   onEdit={handleEdit}
-                  onDelete={handleDelete}
+                  onDelete={handleDeleteRequest}
                   onView={handleView}
                   onRefreshProcess={handleRefreshProcess}
                   onChangeRepos={handleOpenRepoUpdate}
@@ -601,6 +627,34 @@ export function ProductManager({ synapseApiBase = "http://127.0.0.1:18900" }: { 
           onProcessPayload={mergeProcessIntoProduct}
           onPatchProductKnowledge={patchProductKnowledge}
         />
+
+        <AlertDialog open={deletingProduct != null} onOpenChange={(open) => { if (!open) setDeletingProduct(null); }}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t("workbench.products.deleteConfirmTitle")}</AlertDialogTitle>
+              <AlertDialogDescription asChild>
+                <div>
+                  <p>{t("workbench.products.deleteConfirmDesc")}</p>
+                  {deletingProduct && <span className="block mt-2 font-medium text-foreground">{deletingProduct.name}</span>}
+                </div>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t("workbench.products.cancel")}</AlertDialogCancel>
+              <AlertDialogAction
+                variant="destructive"
+                onClick={() => {
+                  if (deletingProduct) {
+                    void executeDelete(deletingProduct.id);
+                  }
+                  setDeletingProduct(null);
+                }}
+              >
+                {t("workbench.products.confirm")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     </div>
   );

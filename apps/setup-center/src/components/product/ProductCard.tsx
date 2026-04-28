@@ -10,7 +10,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 interface ProductCardProps {
   product: Product;
   onEdit: (product: Product) => void | Promise<void>;
-  onDelete: (id: string) => void;
+  onDelete: (product: Product) => void;
   onView: (product: Product) => void;
   onRefreshProcess?: (product: Product) => void | Promise<void>;
   onChangeRepos?: (product: Product) => void | Promise<void>;
@@ -201,7 +201,7 @@ export function ProductCard({
           disabled={busyRefresh || busyRepo || busyDelete}
           onClick={(e) => {
             e.stopPropagation();
-            onDelete(product.id);
+            onDelete(product);
           }}
           title={t("workbench.products.tooltipDelete") || "删除"}
         >
@@ -222,25 +222,29 @@ export function ProductCard({
               >
                 {product.name}
               </h3>
-              {product.module ? (
-                <Badge
-                  variant="secondary"
-                  className="max-w-[5.5rem] shrink-0 truncate font-normal text-[10px] px-1.5 py-0 sm:max-w-[7rem] bg-purple-500/10 text-purple-700 dark:text-purple-400"
-                  title={displayIdPipeName(product.module)}
-                >
-                  {displayIdPipeName(product.module)}
-                </Badge>
-              ) : null}
-              {product.version ? (
-                <Badge
-                  variant="outline"
-                  className="max-w-[6rem] shrink-0 truncate whitespace-nowrap border-teal-500/35 bg-teal-500/10 font-normal text-[10px] text-teal-800 dark:text-teal-300 sm:max-w-[8rem]"
-                  title={displayIdPipeName(product.version)}
-                >
-                  {displayIdPipeName(product.version)}
-                </Badge>
-              ) : null}
             </div>
+            {(product.module || product.version) ? (
+              <div className="flex min-w-0 items-center gap-2">
+                {product.module ? (
+                  <Badge
+                    variant="secondary"
+                    className="max-w-[5.5rem] shrink-0 truncate font-normal text-[10px] px-1.5 py-0 sm:max-w-[7rem] bg-purple-500/10 text-purple-700 dark:text-purple-400"
+                    title={displayIdPipeName(product.module)}
+                  >
+                    {displayIdPipeName(product.module)}
+                  </Badge>
+                ) : null}
+                {product.version ? (
+                  <Badge
+                    variant="outline"
+                    className="max-w-[6rem] shrink-0 truncate whitespace-nowrap border-teal-500/35 bg-teal-500/10 font-normal text-[10px] text-teal-800 dark:text-teal-300 sm:max-w-[8rem]"
+                    title={displayIdPipeName(product.version)}
+                  >
+                    {displayIdPipeName(product.version)}
+                  </Badge>
+                ) : null}
+              </div>
+            ) : null}
             {product.description?.trim() ? (
               <Tooltip delayDuration={400}>
                 <TooltipTrigger asChild>
@@ -274,14 +278,14 @@ export function ProductCard({
             dimensionLabel={t("workbench.products.analysisCode")}
           />
           <AnalysisStatusBadge
-            dimensionKey="ticket"
-            unified={product.analysisUnified?.ticket}
-            dimensionLabel={t("workbench.products.analysisTicket")}
-          />
-          <AnalysisStatusBadge
             dimensionKey="document"
             unified={product.analysisUnified?.document}
             dimensionLabel={t("workbench.products.analysisDocument")}
+          />
+          <AnalysisStatusBadge
+            dimensionKey="ticket"
+            unified={product.analysisUnified?.ticket}
+            dimensionLabel={t("workbench.products.analysisTicket")}
           />
         </div>
 
