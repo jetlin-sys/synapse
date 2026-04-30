@@ -765,9 +765,9 @@ export const OrderManagement: React.FC<{
 
             <div className="mt-2 flex w-full items-center justify-between gap-1.5">
               {[
+                { id: 'prepare', label: '预备中', count: prepareCount, color: 'text-blue-400' },
                 { id: 'pending', label: '未进行', count: pendingCount, color: 'text-muted-foreground' },
-                { id: 'processing', label: '处理中', count: processingCount, color: 'text-primary' },
-                { id: 'prepare', label: '预备中', count: prepareCount, color: 'text-blue-400' }
+                { id: 'processing', label: '处理中', count: processingCount, color: 'text-primary' }
               ].map(filter => (
                 <button
                   key={filter.id}
