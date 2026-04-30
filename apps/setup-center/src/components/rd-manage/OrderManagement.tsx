@@ -1,5 +1,5 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { ConfigProvider, theme, Badge, Avatar, Button, Drawer, Modal, Tag, Progress, Tabs } from 'antd';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import { ConfigProvider, theme, Badge, Avatar, Button, Drawer, Modal, Tag, Progress, Tabs, Popover } from 'antd';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   GitBranch,
@@ -27,7 +27,9 @@ import {
   Flame,
   TrendingUp,
   Loader2,
-  AlertCircle
+  AlertCircle,
+  Search,
+  Banknote
 } from 'lucide-react';
 import { fetchRdManageDemands, fetchRdManageDemandNodes, DemandNodeInfo, DemandInfo } from '../../api/rdManageService';
 import { ViewId } from '../../types';
@@ -56,7 +58,7 @@ export interface Ticket {
   title: string;
   currentStage: number;
   currentNode: string;
-  status: 'processing' | 'human_intervention' | 'pending' | 'completed' | 'error';
+  status: 'processing' | 'human_intervention' | 'pending' | 'completed' | 'error' | 'prepare';
   owner: string;
   urgency: 'low' | 'medium' | 'high';
   tokens: number;
@@ -133,16 +135,67 @@ const SOP_STAGES: SOPStage[] = [
 // Flatten nodes for easy index calculation
 const ALL_NODES = SOP_STAGES.flatMap(s => s.nodes.map(n => ({ ...n, stageId: s.id })));
 
+/** 流水线最后一阶段（代码走查）：不参与折叠合并 */
+const LAST_PIPELINE_STAGE_ID = SOP_STAGES[SOP_STAGES.length - 1]?.id ?? 5;
+/** 工单已全部完成时，焦点落在最后一个 SOP 节点（研发组长评审） */
+const LAST_PIPELINE_NODE_ID = ALL_NODES[ALL_NODES.length - 1]?.id ?? 'leader_review';
+
+function focusNodeIdForTicket(ticket: Ticket): string {
+  if (ticket.status === 'completed') return LAST_PIPELINE_NODE_ID;
+  return ticket.currentNode;
+}
+
+/** 当前节点圆点中心相对 canvas 的 X（与进度条 `left-16` 同一坐标系，单位 px） */
+function getNodeCenterXInCanvas(nodeEl: HTMLElement, canvasEl: HTMLElement): number {
+  let x = 0;
+  let el: HTMLElement | null = nodeEl;
+  while (el && el !== canvasEl) {
+    x += el.offsetLeft;
+    el = el.offsetParent as HTMLElement | null;
+  }
+  if (el === canvasEl) {
+    return x + nodeEl.offsetWidth / 2;
+  }
+  // offsetParent 链未落到 canvas（部分布局下会断链）：用视口几何 + 横向缩放还原到布局宽度坐标
+  const nr = nodeEl.getBoundingClientRect();
+  const cr = canvasEl.getBoundingClientRect();
+  const scaleX = cr.width > 1 ? canvasEl.scrollWidth / cr.width : 1;
+  return (nr.left + nr.width / 2 - cr.left) * scaleX;
+}
+
+/** 主轨道起点与 `left-16` / `px-16` 一致 */
+const BUS_LINE_START_PX = 64;
+
+/** Ant Design 与当前 data-theme 同步（避免浅色主题下仍强制暗色算法） */
+function useAntThemeDark() {
+  const [dark, setDark] = useState(() => {
+    if (typeof document === 'undefined') return false;
+    const t = document.documentElement.getAttribute('data-theme') || 'light';
+    return t === 'dark' || t === 'daltonized-dark' || t === 'high-contrast';
+  });
+  useEffect(() => {
+    const read = () => {
+      const t = document.documentElement.getAttribute('data-theme') || 'light';
+      setDark(t === 'dark' || t === 'daltonized-dark' || t === 'high-contrast');
+    };
+    read();
+    const m = new MutationObserver(read);
+    m.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    return () => m.disconnect();
+  }, []);
+  return dark;
+}
+
 type NodeState = 'completed' | 'processing' | 'error' | 'human_intervention' | 'pending';
 
 // --- Subcomponents for Outputs ---
 
 const TerminalOutput = ({ lines }: { lines: string[] }) => (
-  <div className="bg-[#050505] border border-slate-800 rounded-lg p-3 font-mono text-xs overflow-y-auto max-h-64 custom-scrollbar">
+  <div className="max-h-64 overflow-y-auto rounded-lg border border-border bg-[color-mix(in_srgb,var(--background)_88%,#0a0a12)] p-3 font-mono text-xs custom-scrollbar dark:bg-[color-mix(in_srgb,var(--background)_40%,#020617)]">
     {lines.map((line, i) => (
       <div key={i} className="mb-1">
-        <span className="text-emerald-500 mr-2">$</span>
-        <span className={line.includes('Error') ? 'text-red-400' : line.includes('Warning') ? 'text-amber-400' : 'text-slate-300'}>
+        <span className="mr-2 text-emerald-600 dark:text-emerald-400">$</span>
+        <span className={line.includes('Error') ? 'text-red-500 dark:text-red-400' : line.includes('Warning') ? 'text-amber-600 dark:text-amber-400' : 'text-foreground/85'}>
           {line}
         </span>
       </div>
@@ -151,7 +204,7 @@ const TerminalOutput = ({ lines }: { lines: string[] }) => (
 );
 
 const JsonOutput = ({ data }: { data: any }) => (
-  <div className="bg-[#050505] border border-slate-800 rounded-lg p-4 font-mono text-xs overflow-auto max-h-64 custom-scrollbar text-blue-300">
+  <div className="max-h-64 overflow-auto rounded-lg border border-border bg-[color-mix(in_srgb,var(--background)_88%,#0a0a12)] p-4 font-mono text-xs text-blue-600 custom-scrollbar dark:bg-[color-mix(in_srgb,var(--background)_40%,#020617)] dark:text-blue-300">
     <pre>{JSON.stringify(data, null, 2)}</pre>
   </div>
 );
@@ -168,10 +221,19 @@ export const OrderManagement: React.FC<{
   const [selectedNode, setSelectedNode] = useState<SOPNode | null>(null);
   const [ticketModalOpen, setTicketModalOpen] = useState(false);
   const [selectedTicketForModal, setSelectedTicketForModal] = useState<Ticket | null>(null);
-  const [ticketFilter, setTicketFilter] = useState<'all' | 'pending' | 'processing' | 'completed'>('all');
+  const [ticketFilter, setTicketFilter] = useState<'prepare' | 'pending' | 'processing' | 'all'>('all');
+  const [searchQuery, setSearchQuery] = useState('');
   const [ticketNodes, setTicketNodes] = useState<DemandNodeInfo[]>([]);
 
+  const [collapsedStages, setCollapsedStages] = useState<Record<number, boolean>>({});
+  const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
+  const isDragging = useRef(false);
+  const lastMousePos = useRef({ x: 0, y: 0 });
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const [activeLineWidth, setActiveLineWidth] = useState<number>(0);
+
   const containerRef = useRef<HTMLDivElement>(null);
+  const antDark = useAntThemeDark();
 
   // Load Data from Backend
   useEffect(() => {
@@ -179,7 +241,7 @@ export const OrderManagement: React.FC<{
       try {
         const data = await fetchRdManageDemands(synapseApiBase);
         const allTickets: Ticket[] = [];
-        const mapDemands = (demands: DemandInfo[] = []) => {
+        const mapDemands = (demands: DemandInfo[] = []): Ticket[] => {
           return demands.map(d => ({
             id: d.需求单号 || `TICKET-${Math.random().toString(36).substring(7)}`,
             title: d.需求单名称 || '未知需求',
@@ -187,22 +249,27 @@ export const OrderManagement: React.FC<{
             createdAt: d.需求开始时间 || new Date().toISOString(),
             runTime: d.需求结束时间 || "0h",
             tokens: d.需求工作量 || 0,
-            status: (d.需求状态 || 'pending') as any,
+            status: (d.需求状态 || 'pending') as Ticket['status'],
             owner: d.设计人员 || '未知',
             branch: d.需求关联应用模块 || 'master',
-            urgency: d.需求优先级 === '高' ? 'high' : d.需求优先级 === '中' ? 'medium' : 'low',
+            urgency: (d.需求优先级 === '高' ? 'high' : d.需求优先级 === '中' ? 'medium' : 'low') as Ticket['urgency'],
             currentNode: d.当前sop节点 || 'pending',
             currentStage: 0 // Will compute below
           }));
         };
-        allTickets.push(...mapDemands(data.预备工单));
+        allTickets.push(...mapDemands(data.预备工单).map(t => ({...t, status: t.status === 'pending' ? 'prepare' : t.status} as Ticket)));
         allTickets.push(...mapDemands(data.可处理工单));
         allTickets.push(...mapDemands(data.在途工单));
         allTickets.push(...mapDemands(data.近三月完成工单));
         
         allTickets.forEach(t => {
-          const stage = SOP_STAGES.find(s => s.nodes.some(n => n.id === t.currentNode));
-          t.currentStage = stage ? stage.id : 0;
+          if (t.status === 'completed') {
+            t.currentNode = LAST_PIPELINE_NODE_ID;
+            t.currentStage = LAST_PIPELINE_STAGE_ID;
+          } else {
+            const stage = SOP_STAGES.find(s => s.nodes.some(n => n.id === t.currentNode));
+            t.currentStage = stage ? stage.id : 0;
+          }
         });
         
         setTickets(allTickets);
@@ -224,16 +291,20 @@ export const OrderManagement: React.FC<{
 
   const filteredTickets = useMemo(() => {
     return tickets.filter(t => {
-      if (ticketFilter === 'all') return true;
+      const q = searchQuery.trim().toLowerCase();
+      if (q && !(t.id.toLowerCase().includes(q) || t.title.toLowerCase().includes(q) || t.description.toLowerCase().includes(q))) {
+        return false;
+      }
       if (ticketFilter === 'pending') return t.status === 'pending';
       if (ticketFilter === 'processing') return t.status === 'processing' || t.status === 'human_intervention' || t.status === 'error';
-      if (ticketFilter === 'completed') return t.status === 'completed';
+      if (ticketFilter === 'prepare') return t.status === 'prepare';
       return true;
     });
-  }, [tickets, ticketFilter]);
+  }, [tickets, ticketFilter, searchQuery]);
 
   const pendingCount = useMemo(() => tickets.filter(t => t.status === 'pending').length, [tickets]);
   const processingCount = useMemo(() => tickets.filter(t => t.status === 'processing' || t.status === 'human_intervention' || t.status === 'error').length, [tickets]);
+  const prepareCount = useMemo(() => tickets.filter(t => t.status === 'prepare').length, [tickets]);
   const completedCount = useMemo(() => tickets.filter(t => t.status === 'completed').length, [tickets]);
 
   const activeTicket = useMemo(() => tickets.find(t => t.id === activeTicketId) || tickets[0] || null, [activeTicketId, tickets]);
@@ -250,6 +321,9 @@ export const OrderManagement: React.FC<{
     }
 
     // Fallback Mock Logic
+    if (ticket.status === 'completed') return 'completed';
+    if (ticket.status === 'pending' || ticket.status === 'prepare') return 'pending';
+
     const targetIndex = ALL_NODES.findIndex(n => n.id === nodeId);
     const currentIndex = ALL_NODES.findIndex(n => n.id === ticket.currentNode);
 
@@ -283,26 +357,153 @@ export const OrderManagement: React.FC<{
     return () => clearInterval(interval);
   }, []);
 
-  // Handle auto-scroll to current node when ticket changes
+  // Handle auto-scroll to current / 已完成时最后一个 SOP 节点
   useEffect(() => {
-    if (!containerRef.current || !activeTicket) return;
+    if (!activeTicket || !canvasRef.current || !containerRef.current) return;
     const timeoutId = setTimeout(() => {
-      const activeNodeElement = document.getElementById(`node-${activeTicket.currentNode}`);
-      const container = containerRef.current;
-      if (activeNodeElement && container) {
+      const focusId = focusNodeIdForTicket(activeTicket);
+      const activeNodeElement = document.getElementById(`node-${focusId}`);
+      if (activeNodeElement) {
         const nodeRect = activeNodeElement.getBoundingClientRect();
-        const containerRect = container.getBoundingClientRect();
-        const nodeCenter = nodeRect.left + (nodeRect.width / 2);
-        const containerCenter = containerRect.left + (containerRect.width / 2);
-        const scrollDelta = nodeCenter - containerCenter;
-        container.scrollTo({
-          left: container.scrollLeft + scrollDelta,
-          behavior: 'smooth'
-        });
+        const canvasRect = canvasRef.current!.getBoundingClientRect();
+        const containerRect = containerRef.current!.getBoundingClientRect();
+        
+        // Calculate node center relative to canvas (unscaled)
+        const nodeCenterX = (nodeRect.left - canvasRect.left + nodeRect.width / 2) / transform.scale;
+        
+        const targetX = containerRect.width / 2 - nodeCenterX * transform.scale;
+        
+        setTransform(prev => ({
+          ...prev,
+          x: targetX,
+          y: 0 // keep Y at 0 for horizontal pipeline
+        }));
       }
     }, 150);
     return () => clearTimeout(timeoutId);
-  }, [activeTicketId, activeTicket?.currentNode]);
+  }, [activeTicketId, activeTicket?.currentNode, activeTicket?.status]);
+
+  // Auto-collapse completed stages（最后一阶段「代码走查」不折叠，避免与进度/节点展示错位）
+  useEffect(() => {
+    if (!activeTicket) return;
+    const newCollapsed: Record<number, boolean> = {};
+    SOP_STAGES.forEach(stage => {
+      if (stage.id === LAST_PIPELINE_STAGE_ID) return;
+      const isStageCompleted = stage.nodes.every(n => getNodeStateGlobal(activeTicket, n.id) === 'completed');
+      if (isStageCompleted) {
+        newCollapsed[stage.id] = true;
+      }
+    });
+    setCollapsedStages(newCollapsed);
+  }, [activeTicketId, ticketNodes]);
+
+  // Calculate Active Line Width based on DOM elements
+  const measureActiveLineWidth = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!activeTicket || !canvas) return;
+
+    if (activeTicket.status === 'completed') {
+      const nodeEl = document.getElementById(`node-${LAST_PIPELINE_NODE_ID}`);
+      if (nodeEl) {
+        const centerX = getNodeCenterXInCanvas(nodeEl, canvas);
+        const maxW = Math.max(0, canvas.scrollWidth - BUS_LINE_START_PX * 2);
+        setActiveLineWidth(Math.min(Math.max(0, centerX - BUS_LINE_START_PX), maxW));
+      } else {
+        setActiveLineWidth(Math.max(0, canvas.scrollWidth - BUS_LINE_START_PX * 2));
+      }
+      return;
+    }
+    if (activeTicket.status === 'pending' || activeTicket.status === 'prepare') {
+      setActiveLineWidth(0);
+      return;
+    }
+
+    const nodeEl = document.getElementById(`node-${activeTicket.currentNode}`);
+    if (!nodeEl) return;
+
+    const centerX = getNodeCenterXInCanvas(nodeEl, canvas);
+    const maxW = Math.max(0, canvas.scrollWidth - BUS_LINE_START_PX * 2);
+    setActiveLineWidth(Math.min(Math.max(0, centerX - BUS_LINE_START_PX), maxW));
+  }, [activeTicket]);
+
+  useEffect(() => {
+    let raf = 0;
+    const run = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        requestAnimationFrame(measureActiveLineWidth);
+      });
+    };
+    run();
+    const t = window.setTimeout(run, 80);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(t);
+    };
+  }, [activeTicket, collapsedStages, ticketNodes, measureActiveLineWidth]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ro = new ResizeObserver(() => measureActiveLineWidth());
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, [measureActiveLineWidth]);
+
+  // Canvas Pan & Zoom
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (e.ctrlKey || e.metaKey) {
+        const zoomSensitivity = 0.002;
+        const delta = -e.deltaY * zoomSensitivity;
+        setTransform(prev => {
+          const newScale = Math.min(Math.max(0.2, prev.scale * (1 + delta)), 3);
+          const rect = container.getBoundingClientRect();
+          const mouseX = e.clientX - rect.left;
+          const mouseY = e.clientY - rect.top;
+          const canvasX = (mouseX - prev.x) / prev.scale;
+          const canvasY = (mouseY - prev.y) / prev.scale;
+          return { x: mouseX - canvasX * newScale, y: 0, scale: newScale };
+        });
+      } else {
+        setTransform(prev => ({
+          ...prev,
+          x: prev.x - e.deltaX - e.deltaY,
+          y: 0
+        }));
+      }
+    };
+    
+    container.addEventListener('wheel', handleWheel, { passive: false });
+    return () => container.removeEventListener('wheel', handleWheel);
+  }, []);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (e.button === 0 || e.button === 1 || e.button === 2) {
+      if ((e.target as HTMLElement).closest('.node-card') || (e.target as HTMLElement).closest('.stage-collapse-btn')) return;
+      isDragging.current = true;
+      lastMousePos.current = { x: e.clientX, y: e.clientY };
+    }
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging.current) return;
+    const dx = e.clientX - lastMousePos.current.x;
+    setTransform(prev => ({
+      ...prev,
+      x: prev.x + dx,
+      y: 0
+    }));
+    lastMousePos.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handleMouseUp = () => {
+    isDragging.current = false;
+  };
 
   const handleNodeClick = (node: SOPNode) => {
     setSelectedNode(node);
@@ -536,43 +737,54 @@ export const OrderManagement: React.FC<{
   };
 
   if (!activeTicket) {
-    return <div className="flex h-full items-center justify-center text-slate-400">Loading demands...</div>;
+    return <div className="flex h-full min-h-0 flex-1 items-center justify-center text-muted-foreground">Loading demands...</div>;
   }
 
   return (
-    <ConfigProvider theme={{ algorithm: theme.darkAlgorithm }}>
-      <div className="flex h-full w-full bg-[#050505] text-slate-200 overflow-hidden font-sans">
+    <ConfigProvider theme={{ algorithm: antDark ? theme.darkAlgorithm : theme.defaultAlgorithm }}>
+      <div className="flex h-full min-h-0 w-full min-w-0 flex-1 overflow-hidden bg-background font-sans text-foreground">
         
-        {/* Left Panel: Ticket List */}
-        <div className="w-80 flex-shrink-0 border-r border-slate-800/60 bg-[#0a0a0e] flex flex-col z-20">
-          <div className="p-4 border-b border-slate-800/60 backdrop-blur-md flex flex-col gap-3">
-            <h2 className="text-base font-semibold text-slate-100 flex items-center gap-2">
-              <FileText className="w-4 h-4 text-blue-400" />
-              已分配工作
+        {/* Left Panel: 与会话列表同宽 */}
+        <div className="z-20 flex w-[340px] min-w-[340px] shrink-0 flex-col border-r border-border bg-[color:var(--panel)]">
+          <div className="convSidebarHeader">
+            <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground">
+              <FileText className="h-4 w-4 text-primary" />
+              智能任务看板
             </h2>
-            <div className="flex items-center justify-between p-1 bg-slate-900/50 border border-slate-800 rounded-lg mt-1">
+            
+            <div className="mt-2 flex items-center rounded-lg border border-border bg-background px-2.5 py-1.5 focus-within:ring-1 focus-within:ring-primary/50">
+              <Search className="h-3.5 w-3.5 opacity-70 text-muted-foreground" />
+              <input 
+                type="text" 
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                placeholder="搜索工单ID、名称或描述..." 
+                className="ml-2 flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground/60 focus:outline-none"
+              />
+            </div>
+
+            <div className="mt-2 flex w-full items-center justify-between gap-1.5">
               {[
-                { id: 'all', label: '全部', count: tickets.length, color: 'text-slate-200' },
-                { id: 'pending', label: '未进行', count: pendingCount, color: 'text-slate-400' },
-                { id: 'processing', label: '处理中', count: processingCount, color: 'text-blue-400' },
-                { id: 'completed', label: '近3月份完成', count: completedCount, color: 'text-green-400' }
+                { id: 'pending', label: '未进行', count: pendingCount, color: 'text-muted-foreground' },
+                { id: 'processing', label: '处理中', count: processingCount, color: 'text-primary' },
+                { id: 'prepare', label: '预备中', count: prepareCount, color: 'text-blue-400' }
               ].map(filter => (
                 <button
                   key={filter.id}
-                  onClick={() => setTicketFilter(filter.id as any)}
-                  className={`flex-1 flex items-center justify-center gap-1 py-1.5 rounded-md transition-all duration-200 ${
+                  onClick={() => setTicketFilter(prev => prev === filter.id ? 'all' : filter.id as any)}
+                  className={`group relative flex flex-1 items-center justify-center gap-1 rounded-full px-2 py-1 transition-all duration-200 ${
                     ticketFilter === filter.id 
-                      ? 'bg-slate-800 shadow-sm ring-1 ring-slate-700' 
-                      : 'hover:bg-slate-800/50'
+                      ? 'bg-muted/50 shadow-sm ring-1 ring-border/50' 
+                      : 'hover:bg-muted/30'
                   }`}
                 >
-                  <span className={`text-xs font-medium whitespace-nowrap ${ticketFilter === filter.id ? filter.color : 'text-slate-500'}`}>
+                  <span className={`whitespace-nowrap text-xs font-medium transition-colors ${ticketFilter === filter.id ? filter.color : 'text-muted-foreground group-hover:text-foreground/80'}`}>
                     {filter.label}
                   </span>
-                  <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full ${
+                  <span className={`rounded-full px-1.5 py-0.5 font-mono text-[10px] transition-colors ${
                     ticketFilter === filter.id 
-                      ? 'bg-black/40 text-slate-300' 
-                      : 'bg-transparent text-slate-600'
+                      ? 'bg-background text-foreground shadow-sm' 
+                      : 'bg-muted/40 text-muted-foreground/70'
                   }`}>
                     {filter.count}
                   </span>
@@ -580,15 +792,17 @@ export const OrderManagement: React.FC<{
               ))}
             </div>
           </div>
-          <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-3">
+          <div className="convSidebarList flex flex-1 flex-col gap-1 overflow-y-auto">
             {filteredTickets.map(ticket => {
               const currentNodeObj = ALL_NODES.find(n => n.id === ticket.currentNode);
               const progressPercent = Math.round((ticket.currentStage / (SOP_STAGES.length - 1)) * 100);
+              const isDone = ticket.status === 'completed';
               
               const statusBorderColor = 
-                ticket.status === 'human_intervention' ? 'bg-red-500' :
-                ticket.status === 'processing' ? 'bg-blue-500' :
-                'bg-slate-600';
+                ticket.status === 'human_intervention' ? 'bg-destructive' :
+                ticket.status === 'processing' ? 'bg-primary' :
+                ticket.status === 'completed' ? 'bg-green-600 dark:bg-green-500' :
+                'bg-muted-foreground/40';
 
               return (
                 <motion.div
@@ -596,77 +810,80 @@ export const OrderManagement: React.FC<{
                   whileHover={{ scale: 1.01 }}
                   whileTap={{ scale: 0.99 }}
                   onClick={() => setActiveTicketId(ticket.id)}
-                  className={`relative p-4 rounded-xl cursor-pointer transition-all duration-300 overflow-hidden group ${
+                  className={`group relative mb-1 cursor-pointer overflow-hidden rounded-[10px] px-2.5 py-3 transition-[background,box-shadow] duration-150 ${
                     activeTicketId === ticket.id 
-                      ? 'bg-white/[0.08] shadow-[0_8px_24px_rgba(0,0,0,0.4)] ring-1 ring-white/10' 
-                      : 'bg-white/[0.02] hover:bg-white/[0.04]'
+                      ? 'bg-[rgba(37,99,235,0.09)] ring-1 ring-border' 
+                      : 'hover:bg-[rgba(37,99,235,0.05)]'
                   }`}
                 >
                   {/* Left Status Line */}
-                  <div className={`absolute left-0 top-0 bottom-0 w-1 ${statusBorderColor}`} />
+                  <div className={`absolute bottom-0 left-0 top-0 w-1 ${statusBorderColor}`} />
 
-                  {/* Actions & Details Button */}
-                  <div className="absolute top-3 right-3 flex items-center gap-2">
-                    {ticket.status === 'human_intervention' && (
+                  {/* Global Hover Mask for Immediate Action */}
+                  {ticket.status === 'human_intervention' && (
+                    <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/40 opacity-0 backdrop-blur-[2px] transition-opacity duration-300 group-hover:opacity-100">
                       <Button 
                         type="primary" 
                         size="small" 
-                        className={`${activeTicketId === ticket.id ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity duration-300 bg-red-600 hover:bg-red-500 text-[10px] h-6 px-2 border-none shadow-[0_0_10px_rgba(239,68,68,0.4)] z-20`}
+                        className="h-8 rounded-full border-none bg-destructive px-5 font-medium text-destructive-foreground shadow-lg hover:bg-destructive/90"
                         onClick={(e) => {
                            e.stopPropagation();
-                           handleShowTicketDetails(e, ticket);
+                           setActiveTicketId(ticket.id);
                         }}
                       >
                         立即处理
                       </Button>
-                    )}
+                    </div>
+                  )}
+
+                  {/* Details Button */}
+                  <div className="absolute right-2 top-2 z-20 flex items-center gap-2">
                     <Button 
                       type="text" 
                       size="small" 
-                      icon={<Info className="w-3.5 h-3.5" />} 
-                      className="text-slate-500 hover:text-blue-400 flex items-center justify-center p-0 w-6 h-6 z-10"
+                      icon={<Info className="h-3.5 w-3.5" />} 
+                      className="z-10 flex h-6 w-6 items-center justify-center p-0 text-muted-foreground hover:text-primary"
                       onClick={(e) => handleShowTicketDetails(e, ticket)}
                     />
                   </div>
 
-                  {/* Top: Ticket ID & Urgency */}
-                  <div className="flex items-center gap-2 mb-2 pl-2">
-                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-white/[0.06] text-slate-400">
-                      {ticket.id}
+                  {/* Top: Created At (previously Ticket ID) */}
+                  <div className="mb-2 flex items-center pl-2 pr-10">
+                    <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground/80">
+                      <Clock className="h-3 w-3 opacity-70" />
+                      {ticket.createdAt.replace('T', ' ').substring(0, 16)}
                     </span>
-                    {ticket.urgency === 'high' && (
-                      <Flame className="w-3.5 h-3.5 text-red-500 animate-pulse" />
-                    )}
                   </div>
                   
-                  {/* Middle: Title */}
-                  <h3 className={`font-medium mb-4 line-clamp-2 text-sm pr-8 pl-2 ${activeTicketId === ticket.id ? 'text-blue-50' : 'text-slate-300'}`}>
+                  {/* Middle: Title (with urgency flame) */}
+                  <h3 className={`mb-3 line-clamp-2 pl-2 pr-10 text-sm font-medium flex items-start gap-1.5 ${activeTicketId === ticket.id ? 'text-primary' : 'text-foreground'}`}>
+                    {ticket.urgency === 'high' && (
+                      <Flame className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-pulse text-destructive" />
+                    )}
                     {ticket.title}
                   </h3>
 
                   {/* Bottom: Node Info & Meta */}
-                  <div className="flex items-center justify-between text-xs text-slate-400 pl-2">
-                    <div className="flex items-center gap-1.5">
-                      {currentNodeObj?.type.includes('human') ? (
-                        <User className="w-3.5 h-3.5 text-amber-400" />
+                  <div className="flex items-center justify-between pl-2 pr-2 text-xs text-muted-foreground">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      {isDone ? (
+                        <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-green-600 dark:text-green-400" />
+                      ) : currentNodeObj?.type.includes('human') ? (
+                        <User className="h-3.5 w-3.5 shrink-0 text-amber-500" />
                       ) : currentNodeObj?.type.includes('system') ? (
-                        <TerminalSquare className="w-3.5 h-3.5 text-slate-400" />
+                        <TerminalSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                       ) : (
-                        <Bot className="w-3.5 h-3.5 text-blue-400" />
+                        <Bot className="h-3.5 w-3.5 shrink-0 text-primary" />
                       )}
-                      <span className="text-slate-300">
-                        {currentNodeObj?.name || '未知节点'}
+                      <span className={`truncate ${isDone ? 'text-green-700 dark:text-green-400' : 'text-foreground/90'}`}>
+                        {isDone ? '研发完成' : (currentNodeObj?.name || '未知节点')}
                       </span>
                     </div>
                     
-                    <div className="flex items-center gap-2.5 font-mono text-[10px]">
-                      <span className="flex items-center gap-1">
-                        <Clock className="w-3 h-3 text-slate-400" />
-                        <span className="text-slate-300">{ticket.runTime}</span>
-                      </span>
-                      <span className="flex items-center gap-1 relative">
-                        <Coins className={`w-3 h-3 ${ticket.status === 'processing' ? 'text-amber-500' : 'text-amber-500/70'}`} />
-                        <span className={ticket.status === 'processing' ? 'text-amber-400' : 'text-amber-500/70'}>
+                    <div className="flex shrink-0 items-center gap-2 font-mono text-[10px]">
+                      <span className="relative flex items-center gap-1">
+                        <Coins className={`h-3 w-3 ${ticket.status === 'processing' ? 'text-amber-500' : 'text-amber-500/70'}`} />
+                        <span className={ticket.status === 'processing' ? 'text-amber-500' : 'text-amber-600/70 dark:text-amber-400/70'}>
                           {ticket.tokens >= 1000 ? (ticket.tokens/1000).toFixed(1) + 'k' : ticket.tokens}
                         </span>
                         {ticket.status === 'processing' && (
@@ -674,9 +891,9 @@ export const OrderManagement: React.FC<{
                             initial={{ y: 5, opacity: 0 }}
                             animate={{ y: -10, opacity: [0, 1, 0] }}
                             transition={{ repeat: Infinity, duration: 1.5 }}
-                            className="absolute -right-3 -top-1 text-green-400"
+                            className="absolute -right-3 -top-1 text-green-500"
                           >
-                            <TrendingUp className="w-2.5 h-2.5" />
+                            <TrendingUp className="h-2.5 w-2.5" />
                           </motion.div>
                         )}
                       </span>
@@ -684,10 +901,10 @@ export const OrderManagement: React.FC<{
                   </div>
 
                   {/* Background Progress Bar */}
-                  <div className="absolute bottom-0 left-0 right-0 h-[2px] bg-white/[0.02]">
+                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-border/40">
                     <motion.div 
-                      className="h-full bg-gradient-to-r from-blue-600 via-indigo-400 to-blue-600 bg-[length:200%_100%]" 
-                      style={{ width: `${progressPercent}%` }} 
+                      className={`h-full ${ticket.status === 'completed' ? 'bg-green-500' : 'bg-gradient-to-r from-primary via-primary/70 to-primary bg-[length:200%_100%]'}`}
+                      style={{ width: ticket.status === 'completed' ? '100%' : ticket.status === 'pending' || ticket.status === 'prepare' ? '0%' : `${progressPercent}%` }} 
                       animate={ticket.status === 'processing' ? { backgroundPosition: ['100% 0', '-100% 0'] } : {}}
                       transition={{ repeat: Infinity, duration: 2, ease: 'linear' }}
                     />
@@ -698,81 +915,117 @@ export const OrderManagement: React.FC<{
           </div>
         </div>
 
-        {/* Right Panel: Pipeline Dashboard */}
-        <div className="flex-1 flex flex-col bg-[#050505] relative overflow-hidden">
+        {/* Right: 流水线（背景与主内容区一致，仅轨道区略提亮） */}
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background">
           
-          {/* Header */}
-          <div className="h-20 border-b border-slate-800/60 px-8 flex items-center justify-between backdrop-blur-md bg-slate-950/50 z-20">
-            <div>
-              <div className="flex items-center gap-3 mb-1.5">
-                <h1 className="text-lg font-bold text-slate-100 tracking-wide">{activeTicket.title}</h1>
-                <span className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-[10px] font-mono text-indigo-300">
+          <div className="chatTopBar z-20 min-h-[4.25rem] flex-wrap gap-y-2">
+            <div className="min-w-0 flex-1">
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                <h1 className="max-w-[min(100%,52rem)] truncate text-base font-semibold tracking-tight text-foreground md:text-lg">
+                  {activeTicket.title}
+                </h1>
+                <span className="shrink-0 rounded border border-border bg-muted/40 px-2 py-0.5 font-mono text-[10px] text-primary">
                   {activeTicket.id}
                 </span>
               </div>
-              <div className="flex items-center gap-5 text-xs text-slate-400">
-                <span className="flex items-center gap-1.5"><Clock className="w-3.5 h-3.5" /> 持续运行: <span className="text-slate-200 font-mono">{activeTicket.runTime}</span></span>
-                <span className="flex items-center gap-1.5"><Coins className="w-3.5 h-3.5 text-amber-500/80" /> 消耗 Token: <span className="text-slate-200 font-mono">{activeTicket.tokens.toLocaleString()}</span></span>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span className="flex items-center gap-1.5"><Clock className="h-3.5 w-3.5 shrink-0" /> 持续运行: <span className="font-mono text-foreground/90">{activeTicket.runTime}</span></span>
+                <span className="flex items-center gap-1.5"><Coins className="h-3.5 w-3.5 shrink-0 text-amber-500/80" /> 消耗 Token: <span className="font-mono text-foreground/90">{activeTicket.tokens.toLocaleString()}</span></span>
               </div>
             </div>
             
-            <div className="flex items-center gap-3">
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
               {activeTicket.status === 'human_intervention' && (
                 <motion.div
                   initial={{ opacity: 0, scale: 0.9 }}
                   animate={{ opacity: 1, scale: 1 }}
-                  className="px-4 py-1.5 bg-red-950/40 border border-red-500/50 rounded-lg flex items-center gap-2 text-red-400 text-xs font-medium shadow-[0_0_15px_rgba(239,68,68,0.15)]"
+                  className="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive shadow-sm"
                 >
-                  <ShieldAlert className="w-4 h-4" />
+                  <ShieldAlert className="h-4 w-4 shrink-0" />
                   需人工干预
                 </motion.div>
               )}
             </div>
           </div>
 
-          {/* Neural Pipeline Board (Horizontal Data Bus Layout) */}
           <div 
             ref={containerRef}
-            className="flex-1 overflow-x-auto overflow-y-hidden relative custom-scrollbar bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-slate-900/20 via-[#050505] to-[#050505]"
+            className="relative min-h-0 flex-1 overflow-hidden bg-muted/10 cursor-grab active:cursor-grabbing"
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseUp}
           >
             
-            <div className="flex items-center h-full min-w-max px-16 relative">
+            <div 
+              ref={canvasRef}
+              className="absolute flex h-full min-h-0 min-w-max items-center px-16 origin-left"
+              style={{ transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})` }}
+            >
               {/* Background Central Data Bus Line */}
-              <div className="absolute top-1/2 left-0 right-0 h-1.5 bg-slate-800 -translate-y-1/2 z-0 rounded-full mx-8 shadow-inner" />
+              <div className="absolute left-0 right-0 top-1/2 z-0 mx-16 h-1.5 -translate-y-1/2 rounded-full bg-border shadow-inner" />
               
               {/* Active Central Data Bus Line */}
               <motion.div 
-                className="absolute top-1/2 left-8 h-1.5 bg-blue-500 -translate-y-1/2 z-0 rounded-full shadow-[0_0_15px_rgba(59,130,246,0.8)]"
+                className="absolute left-16 top-1/2 z-0 h-1.5 -translate-y-1/2 rounded-full bg-primary shadow-[0_0_15px_color-mix(in_srgb,var(--primary)_55%,transparent)]"
                 initial={{ width: 0 }}
-                animate={{ width: `${Math.max(0, (ALL_NODES.findIndex(n => n.id === activeTicket.currentNode) / Math.max(1, ALL_NODES.length - 1)) * 100)}%` }}
+                animate={{ width: activeLineWidth }}
                 transition={{ duration: 0.8, ease: "easeOut" }}
-                style={{ maxWidth: 'calc(100% - 4rem)' }}
               />
 
               {SOP_STAGES.map((stage, sIdx) => {
                 const isStagePast = activeTicket.currentStage > stage.id;
                 const isStageActive = activeTicket.currentStage === stage.id;
                 const isStageFuture = activeTicket.currentStage < stage.id;
+                const isCollapsed = collapsedStages[stage.id];
+
+                if (isCollapsed) {
+                  return (
+                    <div key={stage.id} className="relative z-10 flex h-full min-h-0 border-l border-dashed border-border/60 px-6 items-center justify-center">
+                      <motion.div 
+                        whileHover={{ scale: 1.05 }}
+                        onClick={() => setCollapsedStages(prev => ({ ...prev, [stage.id]: false }))}
+                        className="stage-collapse-btn flex flex-col items-center gap-3 bg-green-500/10 border border-green-500/30 rounded-full py-6 px-2 cursor-pointer hover:bg-green-500/20 transition-colors shadow-sm"
+                      >
+                        <CheckCircle2 className="w-5 h-5 text-green-500" />
+                        <div className="text-xs text-green-600 dark:text-green-400 font-medium tracking-widest" style={{ writingMode: 'vertical-rl' }}>{stage.name}</div>
+                        <div className="text-[10px] text-green-500/70 font-mono">{stage.nodes.length}</div>
+                      </motion.div>
+                    </div>
+                  );
+                }
 
                 return (
-                  <div key={stage.id} className="flex relative z-10 px-6 h-full border-l border-slate-800/50 border-dashed">
+                  <div key={stage.id} className="relative z-10 flex h-full min-h-0 border-l border-dashed border-border/60 px-6">
                     
-                    {/* Stage Label on the Line */}
-                    <div className="absolute top-1/2 left-0 -translate-y-1/2 -translate-x-1/2 flex flex-col items-center">
-                       <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold border-4 border-[#050505] z-10 ${
-                         isStagePast ? 'bg-green-500 text-black shadow-[0_0_10px_rgba(34,197,94,0.5)]' :
-                         isStageActive ? 'bg-blue-500 text-white shadow-[0_0_15px_rgba(59,130,246,0.6)]' :
-                         'bg-slate-700 text-slate-400'
+                    {/* Stage Label on the Line — 最后一阶段不折叠 */}
+                    <div 
+                      className={`stage-collapse-btn absolute left-0 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center transition-transform ${
+                        stage.id === LAST_PIPELINE_STAGE_ID
+                          ? 'cursor-default'
+                          : 'cursor-pointer hover:scale-110'
+                      }`}
+                      onClick={
+                        stage.id === LAST_PIPELINE_STAGE_ID
+                          ? undefined
+                          : () => setCollapsedStages(prev => ({ ...prev, [stage.id]: true }))
+                      }
+                      title={stage.id === LAST_PIPELINE_STAGE_ID ? undefined : '点击折叠该阶段'}
+                    >
+                       <div className={`z-10 flex h-8 w-8 items-center justify-center rounded-full border-[3px] bg-background text-xs font-bold ${
+                         isStagePast || activeTicket.status === 'completed' ? 'border-green-500 text-green-500 shadow-[0_0_10px_color-mix(in_srgb,var(--success)_30%,transparent)]' :
+                         isStageActive && activeTicket.status !== 'pending' && activeTicket.status !== 'prepare' ? 'border-primary text-primary shadow-[0_0_14px_color-mix(in_srgb,var(--primary)_30%,transparent)]' :
+                         'border-muted text-muted-foreground'
                        }`}>
-                         {isStagePast ? <CheckCircle2 className="w-5 h-5" /> : stage.id}
+                         {isStagePast || activeTicket.status === 'completed' ? <CheckCircle2 className="h-5 w-5" /> : stage.id}
                        </div>
-                       <div className={`absolute top-10 whitespace-nowrap text-xs font-medium tracking-widest ${isStageActive ? 'text-blue-400' : isStagePast ? 'text-slate-400' : 'text-slate-600'}`}>
+                       <div className={`absolute top-10 whitespace-nowrap text-xs font-medium tracking-widest ${isStageActive && activeTicket.status !== 'pending' && activeTicket.status !== 'prepare' ? 'text-primary' : isStagePast || activeTicket.status === 'completed' ? 'text-muted-foreground' : 'text-muted-foreground/50'}`}>
                          {stage.name}
                        </div>
                     </div>
 
                     {/* Nodes Array */}
-                    <div className="flex ml-16 h-full items-center">
+                    <div className="ml-16 flex h-full min-h-0 items-center">
                       {stage.nodes.map((node, nIdx) => {
                         const globalIndex = ALL_NODES.findIndex(n => n.id === node.id);
                         const isTop = globalIndex % 2 === 0;
@@ -792,96 +1045,244 @@ export const OrderManagement: React.FC<{
                         const modelStr = apiNode?.model || (isHuman ? '人工处理' : ['Claude-3.5', 'GPT-4o', 'Gemini-1.5'][nodeHash % 3]);
                         const tokenStr = apiNode?.token_cost ? `${(apiNode.token_cost/1000).toFixed(1)}k` : (isHuman ? '--' : `${((nodeHash % 50 + 10) / 10).toFixed(1)}k`);
                         
-                        let cardClass = "bg-slate-900/50 border-slate-800 text-slate-400 h-[120px]";
-                        let iconClass = "text-slate-500";
-                        let dotClass = "bg-slate-700 border-[#050505]";
-                        let lineClass = "bg-slate-800";
-                        let hoverClass = "hover:border-slate-600 hover:bg-slate-800/80";
+                        let cardClass = "min-h-[7.5rem] border-border bg-card/60 text-muted-foreground";
+                        let iconClass = "text-muted-foreground";
+                        let dotClass = "bg-border border-background";
+                        let lineClass = "bg-border";
+                        let hoverClass = "hover:border-primary/35 hover:bg-muted/30";
 
                         if (state === 'completed') {
-                          cardClass = "bg-slate-900/80 border-green-500/30 text-slate-300 h-[140px]";
+                          cardClass = "min-h-[8.5rem] border-green-500/35 bg-card/90 text-foreground";
                           iconClass = "text-green-500";
-                          dotClass = "bg-green-500 border-[#050505]";
+                          dotClass = "bg-green-500 border-background";
                           lineClass = "bg-green-500/50";
-                          hoverClass = "hover:border-green-500/60 hover:bg-slate-800";
+                          hoverClass = "hover:border-green-500/50 hover:bg-muted/25";
                         } else if (state === 'processing') {
-                          cardClass = "bg-blue-900/20 border-blue-400/50 text-blue-100 shadow-[0_0_20px_rgba(59,130,246,0.15)] h-[120px]";
-                          iconClass = "text-blue-400";
-                          dotClass = "bg-blue-400 border-[#050505] shadow-[0_0_10px_rgba(59,130,246,0.8)]";
-                          lineClass = "bg-blue-400/80";
-                          hoverClass = "hover:border-blue-400 hover:bg-blue-900/30";
+                          cardClass = "min-h-[7.5rem] border-primary/45 bg-primary/10 text-foreground shadow-[0_0_18px_color-mix(in_srgb,var(--primary)_12%,transparent)]";
+                          iconClass = "text-primary";
+                          dotClass = "bg-primary border-background shadow-[0_0_10px_color-mix(in_srgb,var(--primary)_55%,transparent)]";
+                          lineClass = "bg-primary/75";
+                          hoverClass = "hover:border-primary hover:bg-primary/15";
                         } else if (state === 'error') {
-                          cardClass = "bg-red-950/40 border-red-500/60 text-red-100 shadow-[0_0_20px_rgba(239,68,68,0.2)] h-[120px]";
-                          iconClass = "text-red-500";
-                          dotClass = "bg-red-500 border-[#050505] shadow-[0_0_10px_rgba(239,68,68,0.8)] animate-pulse";
-                          lineClass = "bg-red-500/80";
-                          hoverClass = "hover:border-red-400 hover:bg-red-900/50";
+                          cardClass = "min-h-[7.5rem] border-destructive/55 bg-destructive/10 text-destructive-foreground shadow-[0_0_16px_color-mix(in_srgb,var(--destructive)_14%,transparent)]";
+                          iconClass = "text-destructive";
+                          dotClass = "bg-destructive border-background shadow-[0_0_10px_color-mix(in_srgb,var(--destructive)_45%,transparent)] animate-pulse";
+                          lineClass = "bg-destructive/75";
+                          hoverClass = "hover:border-destructive hover:bg-destructive/15";
                         } else if (state === 'human_intervention') {
-                          cardClass = "bg-amber-950/40 border-amber-500/60 text-amber-100 shadow-[0_0_20px_rgba(245,158,11,0.2)] h-[120px]";
-                          iconClass = "text-amber-500";
-                          dotClass = "bg-amber-500 border-[#050505] shadow-[0_0_10px_rgba(245,158,11,0.8)] animate-pulse";
-                          lineClass = "bg-amber-500/80";
-                          hoverClass = "hover:border-amber-400 hover:bg-amber-900/50";
+                          cardClass = "min-h-[7.5rem] border-amber-500/55 bg-amber-500/10 text-amber-950 shadow-[0_0_16px_rgba(245,158,11,0.12)] dark:text-amber-50";
+                          iconClass = "text-amber-600 dark:text-amber-400";
+                          dotClass = "bg-amber-500 border-background shadow-[0_0_10px_rgba(245,158,11,0.45)] animate-pulse";
+                          lineClass = "bg-amber-500/75";
+                          hoverClass = "hover:border-amber-500 hover:bg-amber-500/15";
                         }
 
+                        const renderPopoverContent = () => {
+                          // Calculate duration in minutes (mock based on nodeHash or apiNode)
+                          const durationMinutes = apiNode?.time_cost 
+                            ? Math.ceil(parseInt(apiNode.time_cost) / 60) || 5 
+                            : (isHuman ? (nodeHash % 60) + 30 : (nodeHash % 15) + 2);
+                          
+                          // Determine number of points (max 10, min 1 per minute)
+                          const numPoints = Math.min(10, durationMinutes);
+                          const interval = durationMinutes / numPoints;
+                          
+                          // Generate monotonically increasing token data
+                          const totalTokensMock = apiNode?.token_cost || ((nodeHash % 50 + 10) * 1000);
+                          const tokenData = Array.from({ length: numPoints }).map((_, i) => {
+                            const timeMark = Math.round((i + 1) * interval);
+                            // Use a curve that grows faster at the end to make it look realistic
+                            const progress = (i + 1) / numPoints;
+                            const tokensAtPoint = Math.round(totalTokensMock * Math.pow(progress, 1.5));
+                            return { 
+                              time: `${timeMark}m`, 
+                              tokens: tokensAtPoint 
+                            };
+                          });
+                          
+                          const maxTokens = Math.max(...tokenData.map(d => d.tokens), 1);
+                          const totalTokens = tokenData[tokenData.length - 1]?.tokens || 0;
+                          
+                          // Mock pricing
+                          const pricingMap: Record<string, number> = {
+                            'Claude-3.5': 0.003, // $0.003 per 1k tokens
+                            'GPT-4o': 0.005,
+                            'Gemini-1.5': 0.0015
+                          };
+                          const pricePer1k = pricingMap[modelStr] || 0.002;
+                          const totalCost = (totalTokens / 1000) * pricePer1k;
+
+                          // SVG Line Chart coordinates
+                          const chartWidth = 280;
+                          const chartHeight = 60;
+                          const points = tokenData.map((d, i) => {
+                            const x = (i / (Math.max(1, tokenData.length - 1))) * chartWidth;
+                            const y = chartHeight - (d.tokens / maxTokens) * chartHeight;
+                            return `${x},${y}`;
+                          }).join(' ');
+
+                          return (
+                            <div className="w-80 p-2">
+                              <div className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1.5">
+                                <TerminalSquare className="w-3.5 h-3.5" /> 节点微览
+                              </div>
+                              <div className="bg-black/40 rounded p-3 text-[10px] font-mono text-green-400 h-36 overflow-y-auto custom-scrollbar relative">
+                                <div>&gt; [INFO] Initializing node environment...</div>
+                                <div>&gt; [INFO] Loading dependencies for {node.name}...</div>
+                                <div>&gt; [INFO] Executing {node.name}...</div>
+                                {state === 'completed' && (
+                                  <>
+                                    <div>&gt; [INFO] Processing data chunks...</div>
+                                    <div>&gt; [INFO] Validating output format...</div>
+                                    <div>&gt; [SUCCESS] Output generated successfully.</div>
+                                    <div className="text-blue-400 mt-1">&gt; [METRICS] Time: {timeStr}, Tokens: {tokenStr}</div>
+                                  </>
+                                )}
+                                {state === 'processing' && (
+                                  <>
+                                    <div>&gt; [RUNNING] Analyzing data structure...</div>
+                                    <div>&gt; [RUNNING] Generating abstract syntax tree...</div>
+                                    <div className="animate-pulse text-amber-400 mt-1">&gt; [RUNNING] Awaiting model response...</div>
+                                  </>
+                                )}
+                                {state === 'error' && (
+                                  <>
+                                    <div>&gt; [RUNNING] Analyzing data...</div>
+                                    <div className="text-red-400 mt-1">&gt; [ERROR] Execution failed at line 42.</div>
+                                    <div className="text-red-400">&gt; [ERROR] Timeout waiting for model response.</div>
+                                  </>
+                                )}
+                                {state === 'human_intervention' && (
+                                  <>
+                                    <div>&gt; [RUNNING] Analyzing data...</div>
+                                    <div className="text-amber-400 mt-1">&gt; [WARN] Ambiguous requirements detected.</div>
+                                    <div className="text-amber-400">&gt; [WARN] Waiting for human clarification.</div>
+                                  </>
+                                )}
+                              </div>
+                              {!isHuman && (
+                                <div className="mt-4">
+                                  <div className="flex items-center justify-between text-[10px] mb-2">
+                                    <span className="text-muted-foreground flex items-center gap-1">
+                                      <TrendingUp className="w-3 h-3"/> Token 消耗总量趋势
+                                    </span>
+                                    <div className="flex items-center gap-3">
+                                      <span className="text-amber-500 flex items-center gap-1" title="当前总消耗">
+                                        <Coins className="w-3 h-3"/>
+                                        {totalTokens >= 1000 ? (totalTokens/1000).toFixed(1) + 'k' : totalTokens}
+                                      </span>
+                                      <span className="text-emerald-500 flex items-center gap-1" title={`模型定价: $${pricePer1k}/1k tk`}>
+                                        <Banknote className="w-3 h-3"/>
+                                        {totalCost.toFixed(4)} 元
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="relative w-full h-[60px] mt-2 text-primary">
+                                    <svg width="100%" height="100%" viewBox={`0 0 ${chartWidth} ${chartHeight}`} preserveAspectRatio="none">
+                                      <defs>
+                                        <linearGradient id="lineGradient" x1="0" y1="0" x2="0" y2="1">
+                                          <stop offset="0%" stopColor="currentColor" stopOpacity="0.3" />
+                                          <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
+                                        </linearGradient>
+                                      </defs>
+                                      <polygon 
+                                        points={`0,${chartHeight} ${points} ${chartWidth},${chartHeight}`} 
+                                        fill="url(#lineGradient)" 
+                                      />
+                                      <polyline 
+                                        points={points} 
+                                        fill="none" 
+                                        stroke="currentColor" 
+                                        strokeWidth="2" 
+                                        strokeLinecap="round" 
+                                        strokeLinejoin="round" 
+                                      />
+                                      {tokenData.map((d, i) => {
+                                        const x = (i / (Math.max(1, tokenData.length - 1))) * chartWidth;
+                                        const y = chartHeight - (d.tokens / maxTokens) * chartHeight;
+                                        return (
+                                          <circle key={i} cx={x} cy={y} r="3" fill="#0f172a" stroke="currentColor" strokeWidth="1.5" />
+                                        );
+                                      })}
+                                    </svg>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        };
+
                         return (
-                          <div id={`node-${node.id}`} key={node.id} className={`relative flex flex-col justify-center items-center w-56 h-[500px] ${marginClass}`}>
+                          <div id={`node-${node.id}`} key={node.id} className={`relative flex h-full min-h-0 w-56 flex-col items-center justify-center self-stretch ${marginClass}`}>
                             {/* Stem connecting card to central bus */}
                             <div className={`absolute left-1/2 w-0.5 -translate-x-1/2 ${lineClass} z-0 ${
-                              isTop ? 'bottom-1/2 h-[40px]' : 'top-1/2 h-[40px]'
+                              isTop ? 'bottom-[calc(50%+3px)] h-[37px]' : 'top-[calc(50%+3px)] h-[37px]'
                             }`} />
 
                             {/* Node Point on Data Bus */}
                             <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full border-[3px] z-10 ${dotClass}`} />
 
                             {/* Node Card */}
-                            <motion.div
-                              whileHover={{ scale: 1.05, y: isTop ? -5 : 5 }}
-                              onClick={() => handleNodeClick(node)}
-                              className={`absolute left-0 w-full p-4 rounded-xl border backdrop-blur-md cursor-pointer transition-all duration-300 z-20 flex flex-col ${cardClass} ${hoverClass} ${isTop ? 'bottom-[calc(50%+40px)]' : 'top-[calc(50%+40px)]'}`}
+                            <Popover 
+                              content={renderPopoverContent()} 
+                              placement={isTop ? "top" : "bottom"} 
+                              mouseEnterDelay={0.6}
+                              overlayInnerStyle={{ 
+                                background: 'rgba(15, 23, 42, 0.75)', 
+                                backdropFilter: 'blur(16px)', 
+                                border: '1px solid rgba(255,255,255,0.1)',
+                                boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                                borderRadius: '12px'
+                              }}
                             >
-                              <div className="flex items-start justify-between mb-2">
-                                <div className="p-1.5 rounded-lg bg-black/30">
-                                  {state === 'completed' ? <CheckCircle2 className={`w-4 h-4 ${iconClass}`} /> :
-                                   state === 'processing' ? <Loader2 className={`w-4 h-4 ${iconClass} animate-spin`} /> :
-                                   state === 'error' ? <AlertCircle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
-                                   state === 'human_intervention' ? <AlertTriangle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
-                                   <CircleDashed className={`w-4 h-4 ${iconClass}`} />}
-                                </div>
-                                <div className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-black/40 border border-white/5">
-                                  {isHuman ? (
-                                    <span className="flex items-center gap-1 text-amber-400"><User className="w-3 h-3" /> 人工</span>
-                                  ) : node.type.includes('ai') || apiNode?.role === 'AI' ? (
-                                    <span className="flex items-center gap-1 text-blue-400"><Bot className="w-3 h-3" /> AI</span>
-                                  ) : (
-                                    <span className="flex items-center gap-1 text-slate-400"><TerminalSquare className="w-3 h-3" /> 系统</span>
-                                  )}
-                                </div>
-                              </div>
-                              <h4 className="font-medium text-sm mb-1">{node.name}</h4>
-                              <p className="text-[10px] leading-relaxed opacity-70 line-clamp-2 flex-1">{node.desc}</p>
-                              
-                              {state === 'completed' && (
-                                <div className="mt-2 pt-2 border-t border-slate-700/50 flex items-center justify-between text-[10px] text-slate-400 font-mono gap-2 w-full">
-                                  {!isHuman && (
-                                    <div className="flex items-center gap-1 opacity-80" title="执行模型">
-                                      <Cpu className="w-3 h-3 text-blue-400/70" />
-                                      <span>{modelStr}</span>
-                                    </div>
-                                  )}
-                                  <div className="flex items-center gap-1 opacity-80 ml-auto" title="节点耗时">
-                                    <Clock className="w-3 h-3 text-slate-400/70" />
-                                    <span>{timeStr}</span>
+                              <motion.div
+                                whileHover={{ scale: 1.05, y: isTop ? -5 : 5 }}
+                                onClick={() => handleNodeClick(node)}
+                                className={`node-card absolute left-0 z-20 flex w-full cursor-pointer flex-col rounded-xl border p-4 backdrop-blur-sm transition-all duration-300 ${cardClass} ${hoverClass} ${isTop ? 'bottom-[calc(50%+40px)]' : 'top-[calc(50%+40px)]'}`}
+                              >
+                                <div className="mb-2 flex items-start justify-between">
+                                  <div className="rounded-lg bg-muted/40 p-1.5">
+                                    {state === 'completed' ? <CheckCircle2 className={`w-4 h-4 ${iconClass}`} /> :
+                                     state === 'processing' ? <Loader2 className={`w-4 h-4 ${iconClass} animate-spin`} /> :
+                                     state === 'error' ? <AlertCircle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
+                                     state === 'human_intervention' ? <AlertTriangle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
+                                     <CircleDashed className={`w-4 h-4 ${iconClass}`} />}
                                   </div>
-                                  {!isHuman && (
-                                    <div className="flex items-center gap-1 opacity-80" title="Token消耗">
-                                      <Coins className="w-3 h-3 text-amber-500/70" />
-                                      <span>{tokenStr}</span>
-                                    </div>
-                                  )}
+                                  <div className="rounded-full border border-border bg-muted/50 px-2 py-0.5 font-mono text-[10px]">
+                                    {isHuman ? (
+                                      <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400"><User className="h-3 w-3" /> 人工</span>
+                                    ) : node.type.includes('ai') || apiNode?.role === 'AI' ? (
+                                      <span className="flex items-center gap-1 text-primary"><Bot className="h-3 w-3" /> AI</span>
+                                    ) : (
+                                      <span className="flex items-center gap-1 text-muted-foreground"><TerminalSquare className="h-3 w-3" /> 系统</span>
+                                    )}
+                                  </div>
                                 </div>
-                              )}
-                            </motion.div>
+                                <h4 className="mb-1 text-sm font-medium">{node.name}</h4>
+                                <p className="line-clamp-2 flex-1 text-[10px] leading-relaxed opacity-80">{node.desc}</p>
+                                
+                                {state === 'completed' && (
+                                  <div className="mt-2 flex w-full items-center justify-between gap-2 border-t border-border/60 pt-2 font-mono text-[10px] text-muted-foreground">
+                                    {!isHuman && (
+                                      <div className="flex items-center gap-1 opacity-80" title="执行模型">
+                                        <Cpu className="h-3 w-3 text-primary/70" />
+                                        <span>{modelStr}</span>
+                                      </div>
+                                    )}
+                                    <div className="ml-auto flex items-center gap-1 opacity-80" title="节点耗时">
+                                      <Clock className="h-3 w-3 text-muted-foreground" />
+                                      <span>{timeStr}</span>
+                                    </div>
+                                    {!isHuman && (
+                                      <div className="flex items-center gap-1 opacity-80" title="Token消耗">
+                                        <Coins className="h-3 w-3 text-amber-500/80" />
+                                        <span>{tokenStr}</span>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </motion.div>
+                            </Popover>
                           </div>
                         );
                       })}
@@ -897,13 +1298,13 @@ export const OrderManagement: React.FC<{
       {/* Node Details Drawer */}
       <Drawer
         title={
-          <div className="flex items-center gap-3 text-slate-200">
+          <div className="flex items-center gap-3 text-foreground">
             {selectedNode?.type.includes('ai') ? (
-               <div className="p-1.5 bg-blue-500/20 rounded-lg"><Bot className="text-blue-400 w-5 h-5" /></div>
+               <div className="rounded-lg bg-primary/15 p-1.5"><Bot className="h-5 w-5 text-primary" /></div>
             ) : (
-               <div className="p-1.5 bg-amber-500/20 rounded-lg"><User className="text-amber-500 w-5 h-5" /></div>
+               <div className="rounded-lg bg-amber-500/15 p-1.5"><User className="h-5 w-5 text-amber-600 dark:text-amber-400" /></div>
             )}
-            <span className="font-semibold text-base">{selectedNode?.name}</span>
+            <span className="text-base font-semibold">{selectedNode?.name}</span>
           </div>
         }
         placement="right"
@@ -911,23 +1312,23 @@ export const OrderManagement: React.FC<{
         open={drawerOpen}
         width={500}
         styles={{
-          header: { background: '#0a0a0f', borderBottom: '1px solid #1e293b', padding: '16px 24px' },
-          body: { background: '#050505', padding: '24px' },
-          mask: { backdropFilter: 'blur(3px)', background: 'rgba(0,0,0,0.6)' }
+          header: { background: 'var(--panel2)', borderBottom: '1px solid var(--line)', padding: '16px 24px' },
+          body: { background: 'var(--bg-app)', padding: '24px' },
+          mask: { backdropFilter: 'blur(3px)', background: 'rgba(0,0,0,0.45)' }
         }}
-        closeIcon={<span className="text-slate-500 hover:text-white transition-colors">✕</span>}
+        closeIcon={<span className="text-muted-foreground transition-colors hover:text-foreground">✕</span>}
       >
         {selectedNode && (
-          <div className="h-full flex flex-col">
-            <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-4 mb-6 shadow-inner">
-              <h4 className="text-xs font-semibold text-slate-500 mb-2 uppercase tracking-wider">节点说明</h4>
-              <p className="text-slate-300 leading-relaxed text-sm">
+          <div className="flex h-full flex-col">
+            <div className="mb-6 rounded-xl border border-border bg-muted/30 p-4 shadow-inner">
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">节点说明</h4>
+              <p className="text-sm leading-relaxed text-foreground/90">
                 {selectedNode.desc}
               </p>
             </div>
 
-            <div className="flex-1">
-              <h4 className="text-xs font-semibold text-slate-500 mb-4 uppercase tracking-wider">执行产物 / 交互区</h4>
+            <div className="min-h-0 flex-1">
+              <h4 className="mb-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">执行产物 / 交互区</h4>
               {renderNodeOutput(selectedNode, activeTicket)}
             </div>
           </div>
@@ -937,8 +1338,8 @@ export const OrderManagement: React.FC<{
       {/* Ticket Details Modal */}
       <Modal
         title={
-          <div className="flex items-center gap-2 text-lg border-b border-slate-800 pb-4 mb-2">
-            <FileText className="w-5 h-5 text-blue-400" />
+          <div className="mb-2 flex items-center gap-2 border-b border-border pb-4 text-lg text-foreground">
+            <FileText className="h-5 w-5 text-primary" />
             工单详情
           </div>
         }
@@ -947,57 +1348,58 @@ export const OrderManagement: React.FC<{
         footer={null}
         width={600}
         styles={{
-          content: { background: '#0a0a0f', border: '1px solid #1e293b', color: '#f1f5f9', padding: '24px' },
+          root: { background: 'var(--panel2)', border: '1px solid var(--line)', color: 'var(--text)' },
+          body: { paddingTop: 8 },
           header: { background: 'transparent' },
           mask: { backdropFilter: 'blur(4px)' }
         }}
-        closeIcon={<span className="text-slate-500 hover:text-white">✕</span>}
+        closeIcon={<span className="text-muted-foreground hover:text-foreground">✕</span>}
       >
         {selectedTicketForModal && (
           <div className="space-y-6 pt-2">
             <div>
-              <h2 className="text-xl font-bold text-slate-100 mb-2">{selectedTicketForModal.title}</h2>
-              <div className="flex items-center gap-2 text-sm text-slate-400 font-mono bg-slate-900 px-3 py-1.5 rounded-lg w-max border border-slate-800">
-                <GitBranch className="w-4 h-4 text-indigo-400" />
+              <h2 className="mb-2 text-xl font-bold text-foreground">{selectedTicketForModal.title}</h2>
+              <div className="flex w-max items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-1.5 font-mono text-sm text-muted-foreground">
+                <GitBranch className="h-4 w-4 text-primary" />
                 {selectedTicketForModal.branch}
               </div>
             </div>
 
             <div className="grid grid-cols-2 gap-4">
-              <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800">
-                <div className="text-xs text-slate-500 mb-1">当前阶段</div>
-                <div className="font-medium text-blue-400">{SOP_STAGES[selectedTicketForModal.currentStage]?.name || '未知'}</div>
+              <div className="rounded-xl border border-border bg-muted/25 p-4">
+                <div className="mb-1 text-xs text-muted-foreground">当前阶段</div>
+                <div className="font-medium text-primary">{SOP_STAGES[selectedTicketForModal.currentStage]?.name || '未知'}</div>
               </div>
-              <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800">
-                <div className="text-xs text-slate-500 mb-1">状态</div>
+              <div className="rounded-xl border border-border bg-muted/25 p-4">
+                <div className="mb-1 text-xs text-muted-foreground">状态</div>
                 <div className="font-medium">
-                  {selectedTicketForModal.status === 'human_intervention' ? <span className="text-red-400">需人工干预</span> :
-                   selectedTicketForModal.status === 'processing' ? <span className="text-blue-400">处理中</span> : 
-                   selectedTicketForModal.status === 'error' ? <span className="text-red-400">异常</span> : 
-                   selectedTicketForModal.status === 'completed' ? <span className="text-green-400">已完成</span> : 
-                   <span className="text-slate-400">待处理</span>}
+                  {selectedTicketForModal.status === 'human_intervention' ? <span className="text-destructive">需人工干预</span> :
+                   selectedTicketForModal.status === 'processing' ? <span className="text-primary">处理中</span> : 
+                   selectedTicketForModal.status === 'error' ? <span className="text-destructive">异常</span> : 
+                   selectedTicketForModal.status === 'completed' ? <span className="text-green-600 dark:text-green-400">已完成</span> : 
+                   <span className="text-muted-foreground">待处理</span>}
                 </div>
               </div>
-              <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800">
-                <div className="text-xs text-slate-500 mb-1 flex items-center gap-1.5"><Clock className="w-3.5 h-3.5"/> 运行时长</div>
-                <div className="font-medium text-slate-200">{selectedTicketForModal.runTime}</div>
+              <div className="rounded-xl border border-border bg-muted/25 p-4">
+                <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground"><Clock className="h-3.5 w-3.5"/> 运行时长</div>
+                <div className="font-medium text-foreground">{selectedTicketForModal.runTime}</div>
               </div>
-              <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800">
-                <div className="text-xs text-slate-500 mb-1 flex items-center gap-1.5"><Coins className="w-3.5 h-3.5"/> 消耗 Token</div>
-                <div className="font-medium text-slate-200">{selectedTicketForModal.tokens.toLocaleString()}</div>
+              <div className="rounded-xl border border-border bg-muted/25 p-4">
+                <div className="mb-1 flex items-center gap-1.5 text-xs text-muted-foreground"><Coins className="h-3.5 w-3.5"/> 消耗 Token</div>
+                <div className="font-medium text-foreground">{selectedTicketForModal.tokens.toLocaleString()}</div>
               </div>
             </div>
 
             <div>
-              <div className="text-xs font-semibold text-slate-500 mb-2 uppercase">需求描述</div>
-              <div className="bg-[#050505] p-4 rounded-xl border border-slate-800 text-sm text-slate-300 leading-relaxed min-h-[100px]">
+              <div className="mb-2 text-xs font-semibold uppercase text-muted-foreground">需求描述</div>
+              <div className="min-h-[100px] rounded-xl border border-border bg-background p-4 text-sm leading-relaxed text-foreground/90">
                 {selectedTicketForModal.description}
               </div>
             </div>
 
-            <div className="flex items-center justify-between text-xs text-slate-500 border-t border-slate-800 pt-4">
+            <div className="flex items-center justify-between border-t border-border pt-4 text-xs text-muted-foreground">
               <div>创建时间: {selectedTicketForModal.createdAt}</div>
-              <div className="flex items-center gap-1.5">负责人: <Avatar size={16} className="bg-slate-700 text-[10px]">{selectedTicketForModal.owner.charAt(0)}</Avatar> {selectedTicketForModal.owner}</div>
+              <div className="flex items-center gap-1.5">负责人: <Avatar size={16} className="bg-muted text-[10px] text-foreground">{selectedTicketForModal.owner.charAt(0)}</Avatar> {selectedTicketForModal.owner}</div>
             </div>
           </div>
         )}
