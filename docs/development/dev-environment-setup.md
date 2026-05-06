@@ -38,6 +38,10 @@ source .venv/bin/activate
 ### 3. 以可编辑模式安装项目依赖
 
 ```bash
+cd docs-site
+npm install
+cd ..
+python scripts/build_docs.py
 pip install -e .
 ```
 
