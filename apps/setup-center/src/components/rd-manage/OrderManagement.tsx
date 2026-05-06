@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
-import { ConfigProvider, theme, Badge, Avatar, Button, Drawer, Modal, Tag, Progress, Tabs, Popover } from 'antd';
+import { ConfigProvider, theme, Badge, Avatar, Button, Drawer, Modal, Tag, Progress, Tabs, Popover, Tooltip } from 'antd';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   GitBranch,
@@ -31,7 +31,7 @@ import {
   Search,
   Banknote
 } from 'lucide-react';
-import { fetchRdManageDemands, fetchRdManageDemandNodes, DemandNodeInfo, DemandInfo } from '../../api/rdManageService';
+import { fetchRdManageDemands, type DemandListItem } from '../../api/rdManageService';
 import { ViewId } from '../../types';
 
 // --- Types & Data ---
@@ -52,6 +52,17 @@ interface SOPStage {
   nodes: SOPNode[];
 }
 
+export interface WorkItem {
+  id: string;
+  title: string;
+  createdAt: string;
+  tokens: number;
+  branch: string;
+  description: string;
+  /** 该研发单对应的流水线当前节点 id（由接口 task sop_node 解析） */
+  currentNode: string;
+}
+
 export interface Ticket {
   id: string;
   branch: string;
@@ -65,6 +76,7 @@ export interface Ticket {
   runTime: string;
   description: string;
   createdAt: string;
+  workItems: WorkItem[];
 }
 
 const SOP_STAGES: SOPStage[] = [
@@ -209,6 +221,88 @@ const JsonOutput = ({ data }: { data: any }) => (
   </div>
 );
 
+/** 将接口 sop_node 文案或 id 解析为流水线节点 id；空串无法解析时返回 null */
+function resolveSopRawToNodeId(sopRaw: string): string | null {
+  const sop = (sopRaw || "").trim();
+  if (!sop) return null;
+  return ALL_NODES.find((n) => n.name === sop || n.id === sop)?.id ?? null;
+}
+
+function stageIdForNodeId(nodeId: string): number {
+  const stage = SOP_STAGES.find((s) => s.nodes.some((n) => n.id === nodeId));
+  return stage ? stage.id : 0;
+}
+
+/** 接口可能省略 local_process_state，用需求状态兜底「待处理」 */
+function effectiveLocalProcessState(d: DemandListItem): string {
+  const s = (d.local_process_state || "").trim();
+  if (s) return s;
+  if ((d.demand_status || "").trim() === "待处理") return "待处理";
+  return "";
+}
+
+function mapDemandListItemToTicket(d: DemandListItem): Ticket {
+  const local = effectiveLocalProcessState(d);
+  let status: Ticket["status"] = "pending";
+  if (local === "预备中") status = "prepare";
+  else if (local === "待处理") status = "pending";
+  else if (local === "处理中") status = "processing";
+  else if (local === "全人工") status = "human_intervention";
+  else if (local === "已完成" || d.demand_status === "已完成" || d.demand_status === "completed")
+    status = "completed";
+  else if (["需求开发", "开发中", "测试中"].some((x) => (d.demand_status || "").includes(x)))
+    status = "processing";
+  else status = "pending";
+
+  let demandNodeId = "pending";
+  if (status === "completed") {
+    demandNodeId = LAST_PIPELINE_NODE_ID;
+  } else if (local === "待处理") {
+    demandNodeId = "pending";
+  } else if (local === "预备中" || local === "全人工") {
+    demandNodeId = "pending";
+  } else if (status === "processing") {
+    const sop = (d.sop_node || "").trim();
+    demandNodeId = resolveSopRawToNodeId(sop) ?? "pending";
+  }
+
+  const runTime =
+    (d.demand_deal_time || "").trim() ||
+    (d.demand_finish_time || "").trim() ||
+    "0h";
+
+  const items = d.owned_work_items || [];
+  const workItems: WorkItem[] = items.map((w) => {
+    const taskResolved = resolveSopRawToNodeId((w.sop_node || "").trim());
+    const currentNode = taskResolved ?? demandNodeId;
+    return {
+      id: w.task_no,
+      title: w.task_title,
+      createdAt: w.created_date || new Date().toISOString(),
+      tokens: w.sccb_work_hours != null ? Math.round(Number(w.sccb_work_hours) * 60) : 0,
+      branch: w.product_module_name || "master",
+      description: w.task_desc || "",
+      currentNode,
+    };
+  });
+
+  return {
+    id: d.demand_no || `TICKET-${Math.random().toString(36).slice(2, 9)}`,
+    title: d.demand_title || "未知需求",
+    description: d.demand_desc || "",
+    createdAt: d.demand_create_time || new Date().toISOString(),
+    runTime,
+    tokens: d.demand_sccb_work_minutes || 0,
+    status,
+    owner: d.demand_designer || "未知",
+    branch: d.product_version_code || "master",
+    urgency: "medium",
+    currentNode: demandNodeId,
+    currentStage: 0,
+    workItems,
+  };
+}
+
 // --- Main Components ---
 
 export const OrderManagement: React.FC<{
@@ -217,13 +311,13 @@ export const OrderManagement: React.FC<{
 }> = ({ synapseApiBase = "http://127.0.0.1:18900", onViewChange }) => {
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [activeTicketId, setActiveTicketId] = useState<string>('');
+  const [activeWorkItemId, setActiveWorkItemId] = useState<string>('');
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selectedNode, setSelectedNode] = useState<SOPNode | null>(null);
   const [ticketModalOpen, setTicketModalOpen] = useState(false);
   const [selectedTicketForModal, setSelectedTicketForModal] = useState<Ticket | null>(null);
-  const [ticketFilter, setTicketFilter] = useState<'prepare' | 'pending' | 'processing' | 'all'>('all');
+  const [ticketFilter, setTicketFilter] = useState<'prepare' | 'pending' | 'processing' | 'human_intervention' | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [ticketNodes, setTicketNodes] = useState<DemandNodeInfo[]>([]);
 
   const [collapsedStages, setCollapsedStages] = useState<Record<number, boolean>>({});
   const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
@@ -235,45 +329,33 @@ export const OrderManagement: React.FC<{
   const containerRef = useRef<HTMLDivElement>(null);
   const antDark = useAntThemeDark();
 
-  // Load Data from Backend
+  // Load Data（接口 `data: { list, updated_at }`；失败时由 rdManageService 回退前端 Mock）
   useEffect(() => {
     async function loadData() {
       try {
         const data = await fetchRdManageDemands(synapseApiBase);
-        const allTickets: Ticket[] = [];
-        const mapDemands = (demands: DemandInfo[] = []): Ticket[] => {
-          return demands.map(d => ({
-            id: d.需求单号 || `TICKET-${Math.random().toString(36).substring(7)}`,
-            title: d.需求单名称 || '未知需求',
-            description: d.需求描述 || '',
-            createdAt: d.需求开始时间 || new Date().toISOString(),
-            runTime: d.需求结束时间 || "0h",
-            tokens: d.需求工作量 || 0,
-            status: (d.需求状态 || 'pending') as Ticket['status'],
-            owner: d.设计人员 || '未知',
-            branch: d.需求关联应用模块 || 'master',
-            urgency: (d.需求优先级 === '高' ? 'high' : d.需求优先级 === '中' ? 'medium' : 'low') as Ticket['urgency'],
-            currentNode: d.当前sop节点 || 'pending',
-            currentStage: 0 // Will compute below
-          }));
-        };
-        allTickets.push(...mapDemands(data.预备工单).map(t => ({...t, status: t.status === 'pending' ? 'prepare' : t.status} as Ticket)));
-        allTickets.push(...mapDemands(data.可处理工单));
-        allTickets.push(...mapDemands(data.在途工单));
-        allTickets.push(...mapDemands(data.近三月完成工单));
-        
-        allTickets.forEach(t => {
-          if (t.status === 'completed') {
+        const allTickets = (data.list || []).map(mapDemandListItemToTicket);
+
+        allTickets.forEach((t) => {
+          if (t.status === "completed") {
             t.currentNode = LAST_PIPELINE_NODE_ID;
             t.currentStage = LAST_PIPELINE_STAGE_ID;
           } else {
-            const stage = SOP_STAGES.find(s => s.nodes.some(n => n.id === t.currentNode));
+            const stage = SOP_STAGES.find((s) => s.nodes.some((n) => n.id === t.currentNode));
             t.currentStage = stage ? stage.id : 0;
           }
         });
-        
+
         setTickets(allTickets);
-        if (allTickets.length > 0) setActiveTicketId(allTickets[0].id);
+        if (allTickets.length > 0) {
+          const first = allTickets[0];
+          setActiveTicketId(first.id);
+          if (first.status === "processing" && first.workItems && first.workItems.length > 0) {
+            setActiveWorkItemId(first.workItems[0].id);
+          } else {
+            setActiveWorkItemId("");
+          }
+        }
       } catch (e) {
         console.error("Failed to load demands:", e);
       }
@@ -281,44 +363,59 @@ export const OrderManagement: React.FC<{
     loadData();
   }, [synapseApiBase]);
 
-  // Load node data when active ticket changes
-  useEffect(() => {
-    if (!activeTicketId) return;
-    fetchRdManageDemandNodes(synapseApiBase, activeTicketId).then(res => {
-      setTicketNodes(res.nodes || []);
-    }).catch(console.error);
-  }, [activeTicketId, synapseApiBase]);
-
   const filteredTickets = useMemo(() => {
     return tickets.filter(t => {
       const q = searchQuery.trim().toLowerCase();
-      if (q && !(t.id.toLowerCase().includes(q) || t.title.toLowerCase().includes(q) || t.description.toLowerCase().includes(q))) {
+      if (q && !(
+        t.id.toLowerCase().includes(q) || 
+        t.title.toLowerCase().includes(q) || 
+        t.description.toLowerCase().includes(q) ||
+        t.workItems?.some(w => w.id.toLowerCase().includes(q) || w.title.toLowerCase().includes(q) || w.description.toLowerCase().includes(q))
+      )) {
         return false;
       }
       if (ticketFilter === 'pending') return t.status === 'pending';
-      if (ticketFilter === 'processing') return t.status === 'processing' || t.status === 'human_intervention' || t.status === 'error';
+      if (ticketFilter === 'processing') return t.status === 'processing' || t.status === 'error';
+      if (ticketFilter === 'human_intervention') return t.status === 'human_intervention';
       if (ticketFilter === 'prepare') return t.status === 'prepare';
       return true;
     });
   }, [tickets, ticketFilter, searchQuery]);
 
   const pendingCount = useMemo(() => tickets.filter(t => t.status === 'pending').length, [tickets]);
-  const processingCount = useMemo(() => tickets.filter(t => t.status === 'processing' || t.status === 'human_intervention' || t.status === 'error').length, [tickets]);
+  const processingCount = useMemo(() => tickets.filter(t => t.status === 'processing' || t.status === 'error').length, [tickets]);
+  const humanInterventionCount = useMemo(() => tickets.filter(t => t.status === 'human_intervention').length, [tickets]);
   const prepareCount = useMemo(() => tickets.filter(t => t.status === 'prepare').length, [tickets]);
   const completedCount = useMemo(() => tickets.filter(t => t.status === 'completed').length, [tickets]);
 
   const activeTicket = useMemo(() => tickets.find(t => t.id === activeTicketId) || tickets[0] || null, [activeTicketId, tickets]);
+  const activeWorkItem = useMemo(() => activeTicket?.workItems?.find(w => w.id === activeWorkItemId) || null, [activeTicket, activeWorkItemId]);
+
+  const displayTicket = useMemo(() => {
+    if (!activeTicket) return null;
+    if (activeWorkItem) {
+      const merge: Partial<Ticket> = {
+        id: activeWorkItem.id,
+        title: activeWorkItem.title,
+        createdAt: activeWorkItem.createdAt,
+        tokens: activeWorkItem.tokens,
+        branch: activeWorkItem.branch,
+        description: activeWorkItem.description,
+      };
+      if (activeTicket.status === "processing") {
+        merge.currentNode = activeWorkItem.currentNode;
+        merge.currentStage = stageIdForNodeId(activeWorkItem.currentNode);
+      }
+      return { ...activeTicket, ...merge };
+    }
+    return activeTicket;
+  }, [activeTicket, activeWorkItem]);
 
   const getNodeStateGlobal = (ticket: Ticket | null, nodeId: string): NodeState => {
     if (!ticket) return 'pending';
     
-    // API logic check
     const targetNode = ALL_NODES.find(n => n.id === nodeId);
     if (!targetNode) return 'pending';
-    const apiNode = ticketNodes.find(n => n.node_name === targetNode.name);
-    if (apiNode && apiNode.node_status) {
-      return apiNode.node_status as NodeState;
-    }
 
     // Fallback Mock Logic
     if (ticket.status === 'completed') return 'completed';
@@ -348,7 +445,11 @@ export const OrderManagement: React.FC<{
         if (t.status === 'processing') {
           return {
             ...t,
-            tokens: t.tokens + Math.floor(Math.random() * 80) + 20
+            tokens: t.tokens + Math.floor(Math.random() * 80) + 20,
+            workItems: t.workItems?.map(w => ({
+              ...w,
+              tokens: w.tokens + Math.floor(Math.random() * 40) + 10
+            }))
           };
         }
         return t;
@@ -359,9 +460,9 @@ export const OrderManagement: React.FC<{
 
   // Handle auto-scroll to current / 已完成时最后一个 SOP 节点
   useEffect(() => {
-    if (!activeTicket || !canvasRef.current || !containerRef.current) return;
+    if (!displayTicket || !canvasRef.current || !containerRef.current) return;
     const timeoutId = setTimeout(() => {
-      const focusId = focusNodeIdForTicket(activeTicket);
+      const focusId = focusNodeIdForTicket(displayTicket);
       const activeNodeElement = document.getElementById(`node-${focusId}`);
       if (activeNodeElement) {
         const nodeRect = activeNodeElement.getBoundingClientRect();
@@ -381,28 +482,28 @@ export const OrderManagement: React.FC<{
       }
     }, 150);
     return () => clearTimeout(timeoutId);
-  }, [activeTicketId, activeTicket?.currentNode, activeTicket?.status]);
+  }, [displayTicket?.id, displayTicket?.currentNode, displayTicket?.status]);
 
   // Auto-collapse completed stages（最后一阶段「代码走查」不折叠，避免与进度/节点展示错位）
   useEffect(() => {
-    if (!activeTicket) return;
+    if (!displayTicket) return;
     const newCollapsed: Record<number, boolean> = {};
     SOP_STAGES.forEach(stage => {
       if (stage.id === LAST_PIPELINE_STAGE_ID) return;
-      const isStageCompleted = stage.nodes.every(n => getNodeStateGlobal(activeTicket, n.id) === 'completed');
+      const isStageCompleted = stage.nodes.every(n => getNodeStateGlobal(displayTicket, n.id) === 'completed');
       if (isStageCompleted) {
         newCollapsed[stage.id] = true;
       }
     });
     setCollapsedStages(newCollapsed);
-  }, [activeTicketId, ticketNodes]);
+  }, [displayTicket?.id, displayTicket?.currentNode]);
 
   // Calculate Active Line Width based on DOM elements
   const measureActiveLineWidth = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!activeTicket || !canvas) return;
+    if (!displayTicket || !canvas) return;
 
-    if (activeTicket.status === 'completed') {
+    if (displayTicket.status === 'completed') {
       const nodeEl = document.getElementById(`node-${LAST_PIPELINE_NODE_ID}`);
       if (nodeEl) {
         const centerX = getNodeCenterXInCanvas(nodeEl, canvas);
@@ -413,18 +514,18 @@ export const OrderManagement: React.FC<{
       }
       return;
     }
-    if (activeTicket.status === 'pending' || activeTicket.status === 'prepare') {
+    if (displayTicket.status === 'pending' || displayTicket.status === 'prepare') {
       setActiveLineWidth(0);
       return;
     }
 
-    const nodeEl = document.getElementById(`node-${activeTicket.currentNode}`);
+    const nodeEl = document.getElementById(`node-${displayTicket.currentNode}`);
     if (!nodeEl) return;
 
     const centerX = getNodeCenterXInCanvas(nodeEl, canvas);
     const maxW = Math.max(0, canvas.scrollWidth - BUS_LINE_START_PX * 2);
     setActiveLineWidth(Math.min(Math.max(0, centerX - BUS_LINE_START_PX), maxW));
-  }, [activeTicket]);
+  }, [displayTicket]);
 
   useEffect(() => {
     let raf = 0;
@@ -440,7 +541,7 @@ export const OrderManagement: React.FC<{
       cancelAnimationFrame(raf);
       window.clearTimeout(t);
     };
-  }, [activeTicket, collapsedStages, ticketNodes, measureActiveLineWidth]);
+  }, [displayTicket, collapsedStages, measureActiveLineWidth]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -534,23 +635,6 @@ export const OrderManagement: React.FC<{
           <p>节点未开始执行，暂无输出产物</p>
         </div>
       );
-    }
-
-    const apiNode = ticketNodes.find(n => n.node_name === node.name);
-
-    if (apiNode && apiNode.output_artifacts) {
-        // Render from API if present
-        return (
-            <div className="space-y-3">
-                <h4 className="text-sm font-medium text-slate-400 flex items-center gap-2"><Network className="w-4 h-4" /> 节点数据</h4>
-                <JsonOutput data={apiNode.output_artifacts} />
-                {state === 'human_intervention' && (
-                    <Button type="primary" block size="large" className="mt-4 bg-amber-600 hover:bg-amber-500 border-none" onClick={handleJumpToMeeting}>
-                        跳转研发会议室 (预置 TODO)
-                    </Button>
-                )}
-            </div>
-        )
     }
 
     switch (node.id) {
@@ -736,7 +820,7 @@ export const OrderManagement: React.FC<{
     }
   };
 
-  if (!activeTicket) {
+  if (!displayTicket) {
     return <div className="flex h-full min-h-0 flex-1 items-center justify-center text-muted-foreground">Loading demands...</div>;
   }
 
@@ -748,8 +832,17 @@ export const OrderManagement: React.FC<{
         <div className="z-20 flex w-[340px] min-w-[340px] shrink-0 flex-col border-r border-border bg-[color:var(--panel)]">
           <div className="convSidebarHeader">
             <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground">
-              <FileText className="h-4 w-4 text-primary" />
+              <FileText className="h-4 w-4 shrink-0 text-primary" />
               智能任务看板
+              <Tooltip
+                title="研发云工单请先进入需求设计环节，才能使用智能研发助手进行处理！"
+                placement="topLeft"
+                overlayStyle={{ maxWidth: 280 }}
+              >
+                <span className="inline-flex shrink-0 cursor-help text-muted-foreground transition-colors hover:text-foreground">
+                  <Info className="h-3.5 w-3.5" aria-hidden />
+                </span>
+              </Tooltip>
             </h2>
             
             <div className="mt-2 flex items-center rounded-lg border border-border bg-background px-2.5 py-1.5 focus-within:ring-1 focus-within:ring-primary/50">
@@ -763,16 +856,17 @@ export const OrderManagement: React.FC<{
               />
             </div>
 
-            <div className="mt-2 flex w-full items-center justify-between gap-1.5">
-              {[
-                { id: 'prepare', label: '预备中', count: prepareCount, color: 'text-blue-400' },
-                { id: 'pending', label: '未进行', count: pendingCount, color: 'text-muted-foreground' },
-                { id: 'processing', label: '处理中', count: processingCount, color: 'text-primary' }
-              ].map(filter => (
+            <div className="mt-2 flex w-full min-w-0 flex-nowrap items-center justify-between gap-1">
+              {([
+                { id: 'prepare' as const, label: '预备中', count: prepareCount, color: 'text-blue-400' },
+                { id: 'pending' as const, label: '待处理', count: pendingCount, color: 'text-muted-foreground' },
+                { id: 'processing' as const, label: '处理中', count: processingCount, color: 'text-primary' },
+                { id: 'human_intervention' as const, label: '全人工', count: humanInterventionCount, color: 'text-destructive' }
+              ]).map(filter => (
                 <button
                   key={filter.id}
-                  onClick={() => setTicketFilter(prev => prev === filter.id ? 'all' : filter.id as any)}
-                  className={`group relative flex flex-1 items-center justify-center gap-1 rounded-full px-2 py-1 transition-all duration-200 ${
+                  onClick={() => setTicketFilter(prev => (prev === filter.id ? 'all' : filter.id))}
+                  className={`group relative flex min-w-0 flex-1 shrink items-center justify-center gap-0.5 rounded-full px-1.5 py-1 transition-all duration-200 ${
                     ticketFilter === filter.id 
                       ? 'bg-muted/50 shadow-sm ring-1 ring-border/50' 
                       : 'hover:bg-muted/30'
@@ -792,125 +886,165 @@ export const OrderManagement: React.FC<{
               ))}
             </div>
           </div>
-          <div className="convSidebarList flex flex-1 flex-col gap-1 overflow-y-auto">
+          <div className="convSidebarList flex flex-1 flex-col gap-1 overflow-y-auto p-1">
             {filteredTickets.map(ticket => {
-              const currentNodeObj = ALL_NODES.find(n => n.id === ticket.currentNode);
-              const progressPercent = Math.round((ticket.currentStage / (SOP_STAGES.length - 1)) * 100);
-              const isDone = ticket.status === 'completed';
-              
-              const statusBorderColor = 
-                ticket.status === 'human_intervention' ? 'bg-destructive' :
-                ticket.status === 'processing' ? 'bg-primary' :
-                ticket.status === 'completed' ? 'bg-green-600 dark:bg-green-500' :
-                'bg-muted-foreground/40';
+              const renderCard = (item: Ticket | WorkItem, isWorkItem: boolean) => {
+                const isDone = ticket.status === 'completed';
+                const nodeIdForRow = isWorkItem ? (item as WorkItem).currentNode : ticket.currentNode;
+                const currentNodeObj = ALL_NODES.find(n => n.id === nodeIdForRow);
+                const rowStageId = isWorkItem
+                  ? stageIdForNodeId((item as WorkItem).currentNode)
+                  : ticket.currentStage;
+                const progressPercent = Math.round((rowStageId / (SOP_STAGES.length - 1)) * 100);
+                
+                const statusBorderColor = 
+                  ticket.status === 'human_intervention' ? 'bg-destructive' :
+                  ticket.status === 'processing' ? 'bg-primary' :
+                  ticket.status === 'completed' ? 'bg-green-600 dark:bg-green-500' :
+                  'bg-muted-foreground/40';
 
-              return (
-                <motion.div
-                  key={ticket.id}
-                  whileHover={{ scale: 1.01 }}
-                  whileTap={{ scale: 0.99 }}
-                  onClick={() => setActiveTicketId(ticket.id)}
-                  className={`group relative mb-1 cursor-pointer overflow-hidden rounded-[10px] px-2.5 py-3 transition-[background,box-shadow] duration-150 ${
-                    activeTicketId === ticket.id 
-                      ? 'bg-[rgba(37,99,235,0.09)] ring-1 ring-border' 
-                      : 'hover:bg-[rgba(37,99,235,0.05)]'
-                  }`}
-                >
-                  {/* Left Status Line */}
-                  <div className={`absolute bottom-0 left-0 top-0 w-1 ${statusBorderColor}`} />
+                const isActive = isWorkItem ? activeWorkItemId === item.id : activeTicketId === item.id && !activeWorkItemId;
 
-                  {/* Global Hover Mask for Immediate Action */}
-                  {ticket.status === 'human_intervention' && (
-                    <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/40 opacity-0 backdrop-blur-[2px] transition-opacity duration-300 group-hover:opacity-100">
-                      <Button 
-                        type="primary" 
-                        size="small" 
-                        className="h-8 rounded-full border-none bg-destructive px-5 font-medium text-destructive-foreground shadow-lg hover:bg-destructive/90"
-                        onClick={(e) => {
-                           e.stopPropagation();
-                           setActiveTicketId(ticket.id);
-                        }}
-                      >
-                        立即处理
-                      </Button>
-                    </div>
-                  )}
+                return (
+                  <motion.div
+                    key={item.id}
+                    whileHover={{ scale: 1.01 }}
+                    whileTap={{ scale: 0.99 }}
+                    onClick={() => {
+                      setActiveTicketId(ticket.id);
+                      setActiveWorkItemId(isWorkItem ? item.id : '');
+                    }}
+                    className={`group relative mb-1 cursor-pointer overflow-hidden rounded-[10px] px-2.5 py-3 transition-[background,box-shadow] duration-150 ${
+                      isActive 
+                        ? 'bg-[rgba(37,99,235,0.09)] ring-1 ring-border' 
+                        : 'hover:bg-[rgba(37,99,235,0.05)]'
+                    }`}
+                  >
+                    {/* Left Status Line */}
+                    <div className={`absolute bottom-0 left-0 top-0 w-1 ${statusBorderColor}`} />
 
-                  {/* Details Button */}
-                  <div className="absolute right-2 top-2 z-20 flex items-center gap-2">
-                    <Button 
-                      type="text" 
-                      size="small" 
-                      icon={<Info className="h-3.5 w-3.5" />} 
-                      className="z-10 flex h-6 w-6 items-center justify-center p-0 text-muted-foreground hover:text-primary"
-                      onClick={(e) => handleShowTicketDetails(e, ticket)}
-                    />
-                  </div>
-
-                  {/* Top: Created At (previously Ticket ID) */}
-                  <div className="mb-2 flex items-center pl-2 pr-10">
-                    <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground/80">
-                      <Clock className="h-3 w-3 opacity-70" />
-                      {ticket.createdAt.replace('T', ' ').substring(0, 16)}
-                    </span>
-                  </div>
-                  
-                  {/* Middle: Title (with urgency flame) */}
-                  <h3 className={`mb-3 line-clamp-2 pl-2 pr-10 text-sm font-medium flex items-start gap-1.5 ${activeTicketId === ticket.id ? 'text-primary' : 'text-foreground'}`}>
-                    {ticket.urgency === 'high' && (
-                      <Flame className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-pulse text-destructive" />
+                    {/* Global Hover Mask for Immediate Action */}
+                    {ticket.status === 'human_intervention' && (
+                      <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/40 opacity-0 backdrop-blur-[2px] transition-opacity duration-300 group-hover:opacity-100">
+                        <Button 
+                          type="primary" 
+                          size="small" 
+                          className="h-8 rounded-full border-none bg-destructive px-5 font-medium text-destructive-foreground shadow-lg hover:bg-destructive/90"
+                          onClick={(e) => {
+                             e.stopPropagation();
+                             setActiveTicketId(ticket.id);
+                             setActiveWorkItemId(isWorkItem ? item.id : '');
+                          }}
+                        >
+                          立即处理
+                        </Button>
+                      </div>
                     )}
-                    {ticket.title}
-                  </h3>
 
-                  {/* Bottom: Node Info & Meta */}
-                  <div className="flex items-center justify-between pl-2 pr-2 text-xs text-muted-foreground">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      {isDone ? (
-                        <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-green-600 dark:text-green-400" />
-                      ) : currentNodeObj?.type.includes('human') ? (
-                        <User className="h-3.5 w-3.5 shrink-0 text-amber-500" />
-                      ) : currentNodeObj?.type.includes('system') ? (
-                        <TerminalSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                      ) : (
-                        <Bot className="h-3.5 w-3.5 shrink-0 text-primary" />
-                      )}
-                      <span className={`truncate ${isDone ? 'text-green-700 dark:text-green-400' : 'text-foreground/90'}`}>
-                        {isDone ? '研发完成' : (currentNodeObj?.name || '未知节点')}
+                    {/* Details Button */}
+                    <div className="absolute right-2 top-2 z-20 flex items-center gap-2">
+                      <Button 
+                        type="text" 
+                        size="small" 
+                        icon={<Info className="h-3.5 w-3.5" />} 
+                        className="z-10 flex h-6 w-6 items-center justify-center p-0 text-muted-foreground hover:text-primary"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleShowTicketDetails(e, {
+                            ...ticket,
+                            title: item.title,
+                            description: item.description,
+                            branch: item.branch,
+                            tokens: item.tokens,
+                            createdAt: item.createdAt,
+                            currentNode: isWorkItem ? (item as WorkItem).currentNode : ticket.currentNode,
+                            currentStage: isWorkItem
+                              ? stageIdForNodeId((item as WorkItem).currentNode)
+                              : ticket.currentStage,
+                          });
+                        }}
+                      />
+                    </div>
+
+                    {/* Top: Created At */}
+                    <div className="mb-2 flex items-center pl-2 pr-10">
+                      <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground/80">
+                        <Clock className="h-3 w-3 opacity-70" />
+                        {item.createdAt.replace('T', ' ').substring(0, 16)}
                       </span>
                     </div>
                     
-                    <div className="flex shrink-0 items-center gap-2 font-mono text-[10px]">
-                      <span className="relative flex items-center gap-1">
-                        <Coins className={`h-3 w-3 ${ticket.status === 'processing' ? 'text-amber-500' : 'text-amber-500/70'}`} />
-                        <span className={ticket.status === 'processing' ? 'text-amber-500' : 'text-amber-600/70 dark:text-amber-400/70'}>
-                          {ticket.tokens >= 1000 ? (ticket.tokens/1000).toFixed(1) + 'k' : ticket.tokens}
-                        </span>
-                        {ticket.status === 'processing' && (
-                          <motion.div
-                            initial={{ y: 5, opacity: 0 }}
-                            animate={{ y: -10, opacity: [0, 1, 0] }}
-                            transition={{ repeat: Infinity, duration: 1.5 }}
-                            className="absolute -right-3 -top-1 text-green-500"
-                          >
-                            <TrendingUp className="h-2.5 w-2.5" />
-                          </motion.div>
-                        )}
-                      </span>
-                    </div>
-                  </div>
+                    {/* Middle: Title */}
+                    <h3 className={`mb-3 line-clamp-2 pl-2 pr-10 text-sm font-medium flex items-start gap-1.5 ${isActive ? 'text-primary' : 'text-foreground'}`}>
+                      {!isWorkItem && ticket.urgency === 'high' && (
+                        <Flame className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-pulse text-destructive" />
+                      )}
+                      {isWorkItem && <GitBranch className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary/70" />}
+                      {item.title}
+                    </h3>
 
-                  {/* Background Progress Bar */}
-                  <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-border/40">
-                    <motion.div 
-                      className={`h-full ${ticket.status === 'completed' ? 'bg-green-500' : 'bg-gradient-to-r from-primary via-primary/70 to-primary bg-[length:200%_100%]'}`}
-                      style={{ width: ticket.status === 'completed' ? '100%' : ticket.status === 'pending' || ticket.status === 'prepare' ? '0%' : `${progressPercent}%` }} 
-                      animate={ticket.status === 'processing' ? { backgroundPosition: ['100% 0', '-100% 0'] } : {}}
-                      transition={{ repeat: Infinity, duration: 2, ease: 'linear' }}
-                    />
+                    {/* Bottom: Node Info & Meta */}
+                    <div className="flex items-center justify-between pl-2 pr-2 text-xs text-muted-foreground">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        {isDone ? (
+                          <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-green-600 dark:text-green-400" />
+                        ) : currentNodeObj?.type.includes('human') ? (
+                          <User className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+                        ) : currentNodeObj?.type.includes('system') ? (
+                          <TerminalSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        ) : (
+                          <Bot className="h-3.5 w-3.5 shrink-0 text-primary" />
+                        )}
+                        <span className={`truncate ${isDone ? 'text-green-700 dark:text-green-400' : 'text-foreground/90'}`}>
+                          {isDone ? '研发完成' : (currentNodeObj?.name || '未知节点')}
+                        </span>
+                      </div>
+                      
+                      <div className="flex shrink-0 items-center gap-2 font-mono text-[10px]">
+                        <span className="relative flex items-center gap-1">
+                          <Coins className={`h-3 w-3 ${ticket.status === 'processing' ? 'text-amber-500' : 'text-amber-500/70'}`} />
+                          <span className={ticket.status === 'processing' ? 'text-amber-500' : 'text-amber-600/70 dark:text-amber-400/70'}>
+                            {item.tokens >= 1000 ? (item.tokens/1000).toFixed(1) + 'k' : item.tokens}
+                          </span>
+                          {ticket.status === 'processing' && (
+                            <motion.div
+                              initial={{ y: 5, opacity: 0 }}
+                              animate={{ y: -10, opacity: [0, 1, 0] }}
+                              transition={{ repeat: Infinity, duration: 1.5 }}
+                              className="absolute -right-3 -top-1 text-green-500"
+                            >
+                              <TrendingUp className="h-2.5 w-2.5" />
+                            </motion.div>
+                          )}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Background Progress Bar */}
+                    <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-border/40">
+                      <motion.div 
+                        className={`h-full ${ticket.status === 'completed' ? 'bg-green-500' : 'bg-gradient-to-r from-primary via-primary/70 to-primary bg-[length:200%_100%]'}`}
+                        style={{ width: ticket.status === 'completed' ? '100%' : ticket.status === 'pending' || ticket.status === 'prepare' ? '0%' : `${progressPercent}%` }} 
+                        animate={ticket.status === 'processing' ? { backgroundPosition: ['100% 0', '-100% 0'] } : {}}
+                        transition={{ repeat: Infinity, duration: 2, ease: 'linear' }}
+                      />
+                    </div>
+                  </motion.div>
+                );
+              };
+
+              if (ticket.status === 'processing' && ticket.workItems && ticket.workItems.length > 0) {
+                return (
+                  <div key={ticket.id} className="relative mb-2 mt-3 rounded-[10px] border border-dashed border-primary/40 p-1.5 pt-3">
+                    <div className="absolute -top-2.5 left-2 bg-[color:var(--panel)] px-1 text-[10px] font-medium text-primary">
+                      {ticket.title}
+                    </div>
+                    {ticket.workItems.map(workItem => renderCard(workItem, true))}
                   </div>
-                </motion.div>
-              );
+                );
+              }
+
+              return renderCard(ticket, false);
             })}
           </div>
         </div>
@@ -922,20 +1056,20 @@ export const OrderManagement: React.FC<{
             <div className="min-w-0 flex-1">
               <div className="mb-1 flex flex-wrap items-center gap-2">
                 <h1 className="max-w-[min(100%,52rem)] truncate text-base font-semibold tracking-tight text-foreground md:text-lg">
-                  {activeTicket.title}
+                  {displayTicket.title}
                 </h1>
                 <span className="shrink-0 rounded border border-border bg-muted/40 px-2 py-0.5 font-mono text-[10px] text-primary">
-                  {activeTicket.id}
+                  {displayTicket.id}
                 </span>
               </div>
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span className="flex items-center gap-1.5"><Clock className="h-3.5 w-3.5 shrink-0" /> 持续运行: <span className="font-mono text-foreground/90">{activeTicket.runTime}</span></span>
-                <span className="flex items-center gap-1.5"><Coins className="h-3.5 w-3.5 shrink-0 text-amber-500/80" /> 消耗 Token: <span className="font-mono text-foreground/90">{activeTicket.tokens.toLocaleString()}</span></span>
+                <span className="flex items-center gap-1.5"><Clock className="h-3.5 w-3.5 shrink-0" /> 持续运行: <span className="font-mono text-foreground/90">{displayTicket.runTime}</span></span>
+                <span className="flex items-center gap-1.5"><Coins className="h-3.5 w-3.5 shrink-0 text-amber-500/80" /> 消耗 Token: <span className="font-mono text-foreground/90">{displayTicket.tokens.toLocaleString()}</span></span>
               </div>
             </div>
             
             <div className="flex shrink-0 flex-wrap items-center gap-2">
-              {activeTicket.status === 'human_intervention' && (
+              {displayTicket.status === 'human_intervention' && (
                 <motion.div
                   initial={{ opacity: 0, scale: 0.9 }}
                   animate={{ opacity: 1, scale: 1 }}
@@ -957,6 +1091,17 @@ export const OrderManagement: React.FC<{
             onMouseLeave={handleMouseUp}
           >
             
+            {displayTicket.status === 'human_intervention' ? (
+              <div className="flex h-full items-center justify-center p-8">
+                <div className="max-w-md rounded-xl border border-destructive/20 bg-destructive/5 p-6 text-center shadow-sm">
+                  <User className="mx-auto mb-4 h-12 w-12 text-destructive/80" />
+                  <h3 className="mb-2 text-lg font-medium text-foreground">全人工处理中</h3>
+                  <p className="text-sm leading-relaxed text-muted-foreground">
+                    该工单由人工负责处理，小鲸暂时无法帮忙，请同学们把需要我帮忙处理的工单推进到需求设计环节，再启用全自动处理流程。
+                  </p>
+                </div>
+              </div>
+            ) : (
             <div 
               ref={canvasRef}
               className="absolute flex h-full min-h-0 min-w-max items-center px-16 origin-left"
@@ -974,18 +1119,19 @@ export const OrderManagement: React.FC<{
               />
 
               {SOP_STAGES.map((stage, sIdx) => {
-                const isStagePast = activeTicket.currentStage > stage.id;
-                const isStageActive = activeTicket.currentStage === stage.id;
-                const isStageFuture = activeTicket.currentStage < stage.id;
+                const isStagePast = displayTicket.currentStage > stage.id;
+                const isStageActive = displayTicket.currentStage === stage.id;
+                const isStageFuture = displayTicket.currentStage < stage.id;
                 const isCollapsed = collapsedStages[stage.id];
 
                 if (isCollapsed) {
                   return (
-                    <div key={stage.id} className="relative z-10 flex h-full min-h-0 border-l border-dashed border-border/60 px-6 items-center justify-center">
+                    <div key={stage.id} className="relative z-20 flex h-full min-h-0 border-l border-dashed border-border/60 px-6">
+                      {/* 折叠合并标签抬到「画布顶 ↔ 中央进度线」的中段，避免与蓝色进度条重叠 */}
                       <motion.div 
                         whileHover={{ scale: 1.05 }}
                         onClick={() => setCollapsedStages(prev => ({ ...prev, [stage.id]: false }))}
-                        className="stage-collapse-btn flex flex-col items-center gap-3 bg-green-500/10 border border-green-500/30 rounded-full py-6 px-2 cursor-pointer hover:bg-green-500/20 transition-colors shadow-sm"
+                        className="stage-collapse-btn absolute left-1/2 top-[25%] z-20 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-3 rounded-full border border-green-500/30 bg-green-500/10 px-2 py-6 shadow-sm transition-colors hover:bg-green-500/20 cursor-pointer"
                       >
                         <CheckCircle2 className="w-5 h-5 text-green-500" />
                         <div className="text-xs text-green-600 dark:text-green-400 font-medium tracking-widest" style={{ writingMode: 'vertical-rl' }}>{stage.name}</div>
@@ -1013,13 +1159,13 @@ export const OrderManagement: React.FC<{
                       title={stage.id === LAST_PIPELINE_STAGE_ID ? undefined : '点击折叠该阶段'}
                     >
                        <div className={`z-10 flex h-8 w-8 items-center justify-center rounded-full border-[3px] bg-background text-xs font-bold ${
-                         isStagePast || activeTicket.status === 'completed' ? 'border-green-500 text-green-500 shadow-[0_0_10px_color-mix(in_srgb,var(--success)_30%,transparent)]' :
-                         isStageActive && activeTicket.status !== 'pending' && activeTicket.status !== 'prepare' ? 'border-primary text-primary shadow-[0_0_14px_color-mix(in_srgb,var(--primary)_30%,transparent)]' :
+                         isStagePast || displayTicket.status === 'completed' ? 'border-green-500 text-green-500 shadow-[0_0_10px_color-mix(in_srgb,var(--success)_30%,transparent)]' :
+                         isStageActive && displayTicket.status !== 'pending' && displayTicket.status !== 'prepare' ? 'border-primary text-primary shadow-[0_0_14px_color-mix(in_srgb,var(--primary)_30%,transparent)]' :
                          'border-muted text-muted-foreground'
                        }`}>
-                         {isStagePast || activeTicket.status === 'completed' ? <CheckCircle2 className="h-5 w-5" /> : stage.id}
+                         {isStagePast || displayTicket.status === 'completed' ? <CheckCircle2 className="h-5 w-5" /> : stage.id}
                        </div>
-                       <div className={`absolute top-10 whitespace-nowrap text-xs font-medium tracking-widest ${isStageActive && activeTicket.status !== 'pending' && activeTicket.status !== 'prepare' ? 'text-primary' : isStagePast || activeTicket.status === 'completed' ? 'text-muted-foreground' : 'text-muted-foreground/50'}`}>
+                       <div className={`absolute top-10 whitespace-nowrap text-xs font-medium tracking-widest ${isStageActive && displayTicket.status !== 'pending' && displayTicket.status !== 'prepare' ? 'text-primary' : isStagePast || displayTicket.status === 'completed' ? 'text-muted-foreground' : 'text-muted-foreground/50'}`}>
                          {stage.name}
                        </div>
                     </div>
@@ -1029,21 +1175,20 @@ export const OrderManagement: React.FC<{
                       {stage.nodes.map((node, nIdx) => {
                         const globalIndex = ALL_NODES.findIndex(n => n.id === node.id);
                         const isTop = globalIndex % 2 === 0;
-                        const state = getNodeStateGlobal(activeTicket, node.id);
-                        const apiNode = ticketNodes.find(n => n.node_name === node.name);
+                        const state = getNodeStateGlobal(displayTicket, node.id);
                         
-                        const isHuman = node.type.includes('human') || node.type === 'ai_exception' || apiNode?.role === 'Human';
+                        const isHuman = node.type.includes('human') || node.type === 'ai_exception';
                         const nextNode = stage.nodes[nIdx + 1];
                         const isNextHuman = nextNode && (nextNode.type.includes('human') || nextNode.type === 'ai_exception');
                         
                         // Group AI nodes highly compressed (-mr-12 for horizontal overlapping), separate human intervention/wait nodes heavily (mr-32)
                         const marginClass = nIdx === stage.nodes.length - 1 ? 'mr-16' : (isHuman || isNextHuman ? 'mr-32' : '-mr-12');
                         
-                        // Generate processing stats based on node type or apiNode
+                        // Generate processing stats based on node type
                         const nodeHash = node.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-                        const timeStr = apiNode?.time_cost || (isHuman ? `${(nodeHash % 4) + 1}h ${nodeHash % 60}m` : `${((nodeHash % 50) / 10 + 0.5).toFixed(1)}s`);
-                        const modelStr = apiNode?.model || (isHuman ? '人工处理' : ['Claude-3.5', 'GPT-4o', 'Gemini-1.5'][nodeHash % 3]);
-                        const tokenStr = apiNode?.token_cost ? `${(apiNode.token_cost/1000).toFixed(1)}k` : (isHuman ? '--' : `${((nodeHash % 50 + 10) / 10).toFixed(1)}k`);
+                        const timeStr = isHuman ? `${(nodeHash % 4) + 1}h ${nodeHash % 60}m` : `${((nodeHash % 50) / 10 + 0.5).toFixed(1)}s`;
+                        const modelStr = isHuman ? '人工处理' : ['Claude-3.5', 'GPT-4o', 'Gemini-1.5'][nodeHash % 3];
+                        const tokenStr = isHuman ? '--' : `${((nodeHash % 50 + 10) / 10).toFixed(1)}k`;
                         
                         let cardClass = "min-h-[7.5rem] border-border bg-card/60 text-muted-foreground";
                         let iconClass = "text-muted-foreground";
@@ -1078,17 +1223,15 @@ export const OrderManagement: React.FC<{
                         }
 
                         const renderPopoverContent = () => {
-                          // Calculate duration in minutes (mock based on nodeHash or apiNode)
-                          const durationMinutes = apiNode?.time_cost 
-                            ? Math.ceil(parseInt(apiNode.time_cost) / 60) || 5 
-                            : (isHuman ? (nodeHash % 60) + 30 : (nodeHash % 15) + 2);
+                          // Calculate duration in minutes (mock based on nodeHash)
+                          const durationMinutes = isHuman ? (nodeHash % 60) + 30 : (nodeHash % 15) + 2;
                           
                           // Determine number of points (max 10, min 1 per minute)
                           const numPoints = Math.min(10, durationMinutes);
                           const interval = durationMinutes / numPoints;
                           
                           // Generate monotonically increasing token data
-                          const totalTokensMock = apiNode?.token_cost || ((nodeHash % 50 + 10) * 1000);
+                          const totalTokensMock = (nodeHash % 50 + 10) * 1000;
                           const tokenData = Array.from({ length: numPoints }).map((_, i) => {
                             const timeMark = Math.round((i + 1) * interval);
                             // Use a curve that grows faster at the end to make it look realistic
@@ -1251,7 +1394,7 @@ export const OrderManagement: React.FC<{
                                   <div className="rounded-full border border-border bg-muted/50 px-2 py-0.5 font-mono text-[10px]">
                                     {isHuman ? (
                                       <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400"><User className="h-3 w-3" /> 人工</span>
-                                    ) : node.type.includes('ai') || apiNode?.role === 'AI' ? (
+                                    ) : node.type.includes('ai') ? (
                                       <span className="flex items-center gap-1 text-primary"><Bot className="h-3 w-3" /> AI</span>
                                     ) : (
                                       <span className="flex items-center gap-1 text-muted-foreground"><TerminalSquare className="h-3 w-3" /> 系统</span>
@@ -1291,6 +1434,7 @@ export const OrderManagement: React.FC<{
                 );
               })}
             </div>
+            )}
           </div>
         </div>
       </div>
@@ -1329,7 +1473,7 @@ export const OrderManagement: React.FC<{
 
             <div className="min-h-0 flex-1">
               <h4 className="mb-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">执行产物 / 交互区</h4>
-              {renderNodeOutput(selectedNode, activeTicket)}
+              {renderNodeOutput(selectedNode, displayTicket)}
             </div>
           </div>
         )}

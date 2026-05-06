@@ -31,6 +31,10 @@ const ProductManagerView = lazy(() =>
   import("./views/workbench/ProductManagerView").then((m) => ({ default: m.ProductManagerView })),
 );
 
+const MeetingRoomView = lazy(() =>
+  import("./views/rd-manage/MeetingRoomView").then((m) => ({ default: m.MeetingRoomView })),
+);
+
 const OrderManagementView = lazy(() =>
   import("./views/rd-manage/OrderManagementView").then((m) => ({ default: m.OrderManagementView })),
 );
@@ -5922,7 +5926,7 @@ export function App() {
       return <OrderManagementView synapseApiBase={httpApiBase()} onViewChange={setView} />;
     }
     if (view === "workbench_meeting") {
-      return <WorkbenchPlaceholderView titleKey="sidebar.workbenchMeeting" />;
+      return <MeetingRoomView synapseApiBase={httpApiBase()} />;
     }
     if (view === "workbench_sandbox") {
       return <WorkbenchPlaceholderView titleKey="sidebar.workbenchSandbox" />;

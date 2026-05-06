@@ -8,7 +8,7 @@ import socket
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import Any, Literal, Tuple
 
 import httpx
 from fastapi import APIRouter, Body, Request
@@ -124,6 +124,184 @@ def _devservice_ip_path() -> Path:
 def _devservice_ip_path_legacy() -> Path:
     """旧版路径：project_root/data/devservice.ip（仅读取回退）。"""
     return settings.project_root / "data" / "devservice.ip"
+
+
+def _owner_order_file_name() -> Path:
+    return settings.synapse_home / "work" / "userwork.json"
+
+
+def _owner_order_file_lock_path() -> Path:
+    return Path(str(_owner_order_file_name()) + ".lock")
+
+
+def _atomic_write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    """原子写入 JSON：先写同目录临时文件再 replace。"""
+    dst_path = path.with_name(path.name)
+    content = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    dst_path.write_text(content, encoding="utf-8")
+
+
+def _snapshot_norm_id(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _merge_owned_work_items(
+    old_items: list[Any] | None, new_items: list[Any] | None
+) -> list[dict[str, Any]]:
+    """研发单：新有老无则插入，老有新无则保留，新老均有则整条以新为准（全字段更新）。"""
+    old_items = [x for x in (old_items or []) if isinstance(x, dict)]
+    new_items = [x for x in (new_items or []) if isinstance(x, dict)]
+
+    old_by_task: dict[str, dict[str, Any]] = {}
+    for t in old_items:
+        tn = _snapshot_norm_id(t.get("task_no"))
+        if tn:
+            old_by_task[tn] = t
+
+    new_by_task: dict[str, dict[str, Any]] = {}
+    for t in new_items:
+        tn = _snapshot_norm_id(t.get("task_no"))
+        if tn:
+            new_by_task[tn] = t
+
+    out: list[dict[str, Any]] = []
+    seen_old_order: set[str] = set()
+    for t in old_items:
+        tn = _snapshot_norm_id(t.get("task_no"))
+        if not tn or tn in seen_old_order:
+            continue
+        seen_old_order.add(tn)
+        if tn in new_by_task:
+            out.append(dict(new_by_task[tn]))
+        else:
+            out.append(dict(old_by_task[tn]))
+
+    seen_new_append: set[str] = set()
+    for t in new_items:
+        tn = _snapshot_norm_id(t.get("task_no"))
+        if not tn or tn in old_by_task or tn in seen_new_append:
+            continue
+        out.append(dict(t))
+        seen_new_append.add(tn)
+
+    return out
+
+
+def _apply_local_process_state_on_new_demand_insert(row: dict[str, Any]) -> dict[str, Any]:
+    """新有老无插入需求单时：指定阶段将 ``local_process_state`` 设为全人工。"""
+    out = dict(row)
+    st = _snapshot_norm_id(out.get("demand_status"))
+    if st in ("待处理", "需求评审", "To Creator"):
+        out["local_process_state"] = "预备中"
+        out["sop_node"] = ""
+    elif st == "需求设计":
+        out["local_process_state"] = "待处理"
+        out["sop_node"] = "等待调度"
+    elif st in ("需求开发", "需求测试"):
+        out["local_process_state"] = "全人工"
+        out["sop_node"] = ""
+    return out
+
+
+def _merge_demand_record(old_d: dict[str, Any], new_d: dict[str, Any]) -> dict[str, Any]:
+    """需求单新老均有：以新数据为准更新，但保留老的 ``sop_node``、``local_process_state``。"""
+    merged: dict[str, Any] = dict(new_d)
+    merged["sop_node"] = old_d.get("sop_node")
+    merged["local_process_state"] = old_d.get("local_process_state")
+    merged["owned_work_items"] = _merge_owned_work_items(
+        old_d.get("owned_work_items"), new_d.get("owned_work_items")
+    )
+    return merged
+
+
+def _merge_owner_order_lists(
+    old_list: list[Any] | None, new_list: list[Any] | None
+) -> list[dict[str, Any]]:
+    """需求单：新有老无则插入（特定阶段插入时 ``local_process_state``→全人工），老有新无则保留，新老均有则合并（见 ``_merge_demand_record``）。"""
+    old_list = [x for x in (old_list or []) if isinstance(x, dict)]
+    new_list = [x for x in (new_list or []) if isinstance(x, dict)]
+
+    new_by_dn: dict[str, dict[str, Any]] = {}
+    for d in new_list:
+        dn = _snapshot_norm_id(d.get("demand_no"))
+        if dn:
+            new_by_dn[dn] = d
+
+    old_dns_set = {_snapshot_norm_id(d.get("demand_no")) for d in old_list if _snapshot_norm_id(d.get("demand_no"))}
+
+    out: list[dict[str, Any]] = []
+    for d in old_list:
+        dn = _snapshot_norm_id(d.get("demand_no"))
+        if not dn:
+            continue
+        if dn in new_by_dn:
+            out.append(_merge_demand_record(d, new_by_dn[dn]))
+        else:
+            out.append(dict(d))
+
+    for d in new_list:
+        dn = _snapshot_norm_id(d.get("demand_no"))
+        if not dn or dn in old_dns_set:
+            continue
+        out.append(_apply_local_process_state_on_new_demand_insert(dict(d)))
+
+    return out
+
+
+def persist_owner_order_snapshot_to_file(*, out_list: list[dict[str, Any]]) -> None:
+    """将本次拉取的需求列表与已有 ``userwork.json`` 合并后落盘；写文件时使用 FileLock 与原子替换。
+
+    合并规则：需求单与研发单均为「新有老无插入、老有新无保留、新老均有更新」；需求单更新时保留
+    ``sop_node``、``local_process_state``；新有老无且 ``demand_status`` 为需求设计/需求开发/需求测试时
+    ``local_process_state`` 置为全人工。研发单更新为全量替换单条。文件 JSON：``list``、``updated_at``。
+    """
+    from filelock import FileLock
+
+    path = _owner_order_file_name()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(_owner_order_file_lock_path()), timeout=30)
+    with lock:
+        existing_list: list[Any] = []
+        if path.is_file():
+            try:
+                raw = path.read_text(encoding="utf-8")
+                prev = json.loads(raw)
+                if isinstance(prev, dict):
+                    lst = prev.get("list")
+                    if isinstance(lst, list):
+                        existing_list = lst
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("读取已有 userwork.json 失败，将仅写入本次数据: %s", exc)
+                existing_list = []
+
+        merged_list = _merge_owner_order_lists(existing_list, out_list)
+        payload = {
+            "list": merged_list,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _atomic_write_json_file(path, payload)
+
+
+def load_owner_order_snapshot_from_file() -> dict[str, Any] | None:
+    """读取已落地的 ``userwork.json``；不存在或非法 JSON 时返回 ``None``。读时同样加锁。"""
+    from filelock import FileLock
+
+    path = _owner_order_file_name()
+    if not path.is_file():
+        return None
+    lock = FileLock(str(_owner_order_file_lock_path()), timeout=30)
+    with lock:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, dict) else None
 
 
 DEVSERVICE_PROBE_PORTS: tuple[int, ...] = (10001, 11001, 11011, 12001, 12011, 13001, 13011)
@@ -2578,6 +2756,232 @@ async def _get_task_list_from_demand(body: GetTaskListFromDemandRequest) -> dict
     return success_response(simplified)
 
 
+# 门户 POST /portal/zcm-devspace/task/{taskId}/detail 请求体（与 task.data 内层结构一致）
+_PORTAL_ZCM_TASK_DETAIL_BODY: dict[str, bool] = {
+    "withAttach": True,
+    "withBranchVersion": True,
+    "withOwnerUser": True,
+    "withParticipant": False,
+    "withProductModule": True,
+    "withProject": True,
+    "withRelatedResourceCount": False,
+    "withSprint": True,
+    "withTag": False,
+    "withTaskFlow": True,
+    "withTaskFlowStage": True,
+    "withTaskType": True,
+    "withContractProject": True,
+    "withZmpProject": True,
+    "withPatch": True,
+    "withProjectGroup": True,
+    "withProjectSetting": True,
+    "withTaskSrc": True,
+    "withTaskExtendEdo": False,
+    "withParent": True,
+}
+
+_GET_DEMAND_BY_USER_WORK_HTTP_TIMEOUT = 60.0
+
+
+def _bearer_headers_for_gateway(user_blob: dict | None) -> dict | None:
+    """ai-gateway 用 Authorization；优先 owner_info 解密 JSON 的 token，否则 userinfo.encryption。"""
+    auth: str | None = None
+    if user_blob:
+        t = str(user_blob.get("token") or "").strip()
+        if t:
+            auth = t if t.lower().startswith("bearer ") else f"Bearer {t}"
+    if not auth:
+        try:
+            auth = _load_dev_iwhalecloud_authorization()
+        except (FileNotFoundError, ValueError, OSError) as e:
+            logger.warning(
+                "get_demand_by_user 研发单：无可用 Bearer（owner_info 中无 token 且无法加载 userinfo）：%s",
+                e,
+            )
+            return None
+    return {
+        "Authorization": auth,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+
+def _gateway_work_item_detail_payload() -> dict:
+    """与 _get_order_detail 一致，便于读取 apiTask.ownerUserId / taskId。"""
+    return {
+        "withTaskFlowStage": "true",
+        "withOwnerUser": "true",
+        "withProductModule": "true",
+        "withAction": "true",
+        "withParent": "true",
+        "withTaskDoc": "true",
+        "withDevCase": "true",
+        "withTestCase": "true",
+        "withTaskType": "true",
+        "withProductVersion": "true",
+        "withBranchVersion": "true",
+        "withAttach": "true",
+        "withEdo": "true",
+        "withTaskImpact": "true",
+        "withConfig": "true",
+        "withAllTaskType": "true",
+    }
+
+
+def _int_or_none(v) -> int | None:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+def _task_id_from_work_items_entry(item: dict) -> int | None:
+    if not isinstance(item, dict):
+        return None
+    tid = _int_or_none(item.get("taskId"))
+    if tid is not None:
+        return tid
+    ad = item.get("adTask")
+    if isinstance(ad, dict):
+        return _int_or_none(ad.get("taskId"))
+    return None
+
+async def _get_work_items_raw_list(
+    client: httpx.AsyncClient, demand_no: str, bearer_headers: dict
+) -> list[dict]:
+    url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/ai-gateway/devspace/rpc/v3/user-story/{demand_no}/work-items"
+    params = {"withWeakRela": "false"}
+    try:
+        resp = await client.get(url, headers=bearer_headers, params=params)
+        _log_httpx_response("_get_work_items_raw_list", resp)
+        raw = resp.json()
+    except (httpx.RequestError, ValueError) as exc:
+        logger.warning("work-items 请求失败 demand_no=%s: %s", demand_no, exc)
+        return []
+    if raw.get("code") != "9999":
+        logger.warning(
+            "work-items 非成功码 demand_no=%s code=%s",
+            demand_no,
+            raw.get("code"),
+        )
+        return []
+    data = raw.get("data")
+    if not isinstance(data, list):
+        return []
+    return [x for x in data if isinstance(x, dict)]
+
+
+async def _gateway_api_task_owner_and_id(
+    client: httpx.AsyncClient, task_no: str, bearer_auth: str
+) -> tuple[int | None, int | None]:
+    """POST work-item/{taskNo}/detail → (ownerUserId, taskId)。"""
+    url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/ai-gateway/devspace/rpc/v3/work-item/{task_no}/detail"
+    headers = {"Authorization": bearer_auth, "Content-Type": "application/json"}
+    try:
+        resp = await client.post(url, headers=headers, json=_gateway_work_item_detail_payload())
+        raw = resp.json()
+    except (httpx.RequestError, ValueError) as exc:
+        logger.warning("gateway work-item detail 失败 task_no=%s: %s", task_no, exc)
+        return None, None
+    if raw.get("code") != "9999":
+        return None, None
+    block = raw.get("data")
+    api = (block.get("apiTask") if isinstance(block, dict) else None) or {}
+    if not isinstance(api, dict):
+        return None, None
+    return _int_or_none(api.get("ownerUserId")), _int_or_none(api.get("taskId"))
+
+
+async def _portal_task_detail_data(
+    client: httpx.AsyncClient, task_id: int, csrf: str, cookies: str
+) -> dict | None:
+    url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/zcm-devspace/task/{task_id}/detail"
+    hdr = _build_get_task_patch_headers(csrf, cookies)
+    try:
+        resp = await client.post(url, headers=hdr, json=_PORTAL_ZCM_TASK_DETAIL_BODY)
+        _log_httpx_response("_portal_task_detail_data", resp)
+        raw = resp.json()
+    except (httpx.RequestError, ValueError) as exc:
+        logger.warning("门户 task detail 失败 task_id=%s: %s", task_id, exc)
+        return None
+    if raw.get("code") != "9999":
+        logger.warning("门户 task detail 非成功 task_id=%s code=%s", task_id, raw.get("code"))
+        return None
+    data = raw.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def _portal_task_detail_to_owned_work_item(detail: dict) -> dict | None:
+    """门户 task detail 的 data → owned_work_items 单条（snake_case，与 ss/SQL 行字段风格一致）。"""
+    if not isinstance(detail, dict):
+        return None
+    ad = detail.get("adTask")
+    if not isinstance(ad, dict):
+        return None
+    task_no = ad.get("taskNo")
+    if task_no is None or not str(task_no).strip():
+        return None
+
+    minutes_raw = ad.get("sccbWorkMinutes")
+    sccb_work_hours: float | None = None
+    if minutes_raw is not None and str(minutes_raw).strip() != "":
+        try:
+            sccb_work_hours = int(minutes_raw) / 60.0
+        except (TypeError, ValueError):
+            try:
+                sccb_work_hours = float(minutes_raw) / 60.0
+            except (TypeError, ValueError):
+                sccb_work_hours = None
+
+    flow = detail.get("adTaskFlowStage")
+    stage_name = _safe_str(flow.get("stageName")) if isinstance(flow, dict) else ""
+
+    pmd = detail.get("productModuleDto")
+    if isinstance(pmd, dict):
+        product_module_id = _int_or_none(pmd.get("productModuleId"))
+        product_module_name = _safe_str(pmd.get("productModuleName"))
+        repo_url = _safe_str(pmd.get("repoUrl"))
+    else:
+        product_module_id = None
+        product_module_name = ""
+        repo_url = ""
+
+    return {
+        "task_no": str(task_no).strip(),
+        "task_title": _safe_str(ad.get("taskTitle")),
+        "task_desc": _safe_str(ad.get("comments")),
+        "created_date": _safe_str(ad.get("createdDate")),
+        "sccb_work_hours": sccb_work_hours,
+        "stage_name": stage_name,
+        "product_module_id": product_module_id,
+        "product_module_name": product_module_name,
+        "repo_url": repo_url,
+    }
+
+
+async def _owned_work_items_for_demand(
+    *,
+    client: httpx.AsyncClient,
+    demand_no: str,
+    bearer_headers: dict,
+    csrf: str,
+    cookies: str,
+) -> list[dict]:
+    out: list[dict] = []
+    items = await _get_work_items_raw_list(client, demand_no, bearer_headers)
+    for item in items:
+        task_id = _task_id_from_work_items_entry(item)
+        if task_id is None:
+            continue
+        detail = await _portal_task_detail_data(client, task_id, csrf, cookies)
+        if not detail:
+            continue
+        mapped = _portal_task_detail_to_owned_work_item(detail)
+        if mapped is not None:
+            out.append(mapped)
+    return out
+
+
 class GetTaskPatchRequest(BaseModel):
     taskId: int = Field(..., description="任务ID")
 
@@ -2625,28 +3029,7 @@ async def _get_task_patch(body: GetTaskPatchRequest) -> dict:
 
     url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/zcm-devspace/task/{body.taskId}/detail"
     headers = _build_get_task_patch_headers(csrf, cookies)
-    payload = {
-        "withAttach": True,
-        "withBranchVersion": True,
-        "withOwnerUser": True,
-        "withParticipant": False,
-        "withProductModule": True,
-        "withProject": True,
-        "withRelatedResourceCount": False,
-        "withSprint": True,
-        "withTag": False,
-        "withTaskFlow": True,
-        "withTaskFlowStage": True,
-        "withTaskType": True,
-        "withContractProject": True,
-        "withZmpProject": True,
-        "withPatch": True,
-        "withProjectGroup": True,
-        "withProjectSetting": True,
-        "withTaskSrc": True,
-        "withTaskExtendEdo": False,
-        "withParent": True,
-    }
+    payload = dict(_PORTAL_ZCM_TASK_DETAIL_BODY)
 
     logger.debug("get_task_patch url:%s payload:%s", url, payload)
     try:
@@ -2984,6 +3367,314 @@ async def get_demand_list_from_product(body: GetDemandListFromProductRequest) ->
     ]
     return success_response(simplified)
 
+
+def _safe_str(v) -> str:
+    if v is None or v == "null":
+        return ""
+    return str(v)
+
+
+def _safe_int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+_CREATED_DATE_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _elapsed_since_created_date_str(created_date: str | None) -> str:
+    """从 createdDate 到当前时间的间隔，格式「x天y小时」。无法解析或为空时返回「0天0小时」。"""
+    if created_date is None or not str(created_date).strip():
+        return "0天0小时"
+    raw = str(created_date).strip()
+    try:
+        dt = datetime.strptime(raw, _CREATED_DATE_FMT)
+    except (TypeError, ValueError) as e:
+        logger.warning("解析 createdDate 失败: %r — %s", created_date, e)
+        return "0天0小时"
+    total_seconds = int((datetime.now() - dt).total_seconds())
+    if total_seconds < 0:
+        total_seconds = 0
+    days, remainder = divmod(total_seconds, 86400)
+    hours = remainder // 3600
+    return f"{days}天{hours}小时"
+
+
+def _task_field_dto_list_to_demand_impact_str(task_field_dto_list) -> str:
+    """仅 row['taskFieldDtoList'] → graphiti demand_impact 字符串语义（单一路径，无字段回退）。"""
+    if task_field_dto_list is None:
+        return ""
+    if isinstance(task_field_dto_list, (list, dict)):
+        return json.dumps(task_field_dto_list, ensure_ascii=False)
+    return _safe_str(task_field_dto_list)
+
+
+def _page_list_row_to_demand_attrs(row: dict) -> dict:
+    """page-list 包装行 → graphiti_pipeline Demand attributes，每字段单一路径。"""
+    try:
+        ad = row.get("adTask")
+        flow = row.get("adTaskFlowStage")
+        stage_name = flow.get("stageName")
+        du = row.get("designUserDto")
+        if du is None:
+            display_name = ""
+        else:
+            display_name = du.get("displayName")
+
+        pvd = row.get("productVersionDto")
+        if isinstance(pvd, dict):
+            _pvid = pvd.get("productVersionId")
+            try:
+                product_version_id = int(_pvid) if _pvid is not None else None
+            except (TypeError, ValueError):
+                product_version_id = None
+            product_version_code = _safe_str(pvd.get("productVersionCode"))
+        else:
+            product_version_id = None
+            product_version_code = ""
+
+        impact = _task_field_dto_list_to_demand_impact_str(row.get("taskFieldDtoList"))
+        data = {
+            "demand_no": ad.get("taskNo"),
+            "demand_title": _safe_str(ad.get("taskTitle")),
+            "demand_desc": _safe_str(ad.get("comments")),
+            "demand_create_time": _safe_str(ad.get("createdDate")),
+            "demand_deal_time": _elapsed_since_created_date_str(ad.get("createdDate")),
+            "demand_finish_time": _safe_str(ad.get("finishDate")),
+            "demand_sccb_work_minutes": _safe_int(ad.get("sccbWorkMinutes")),
+            "demand_status": _safe_str(stage_name),
+            "demand_impact": _safe_str(impact),
+            "demand_designer": _safe_str(display_name),
+            "product_version_id": product_version_id,
+            "product_version_code": product_version_code,
+            "sop_node":'',
+            "local_process_state":''
+        }
+
+        return data
+    except Exception as e:
+        logger.exception(f"转换 {row} graphiti_pipeline Demand attributes 失败: %s", e)
+        return {}
+
+def _get_demand_by_user_portal_cookies_sync(username: str, password: str) -> tuple[str, str]:
+    """仅 get_demand_by_user：Playwright 登录取门户 x-csrf-token 与 Cookie；不读不写 iwhalecloud_session。
+
+    逻辑与 _fetch_token_and_cookies_sync 内 Playwright 段一致，独立实现，避免改动原函数。
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        page.set_default_timeout(DEV_IWHALECLOUD_LOGIN_PLAYWRIGHT_TIMEOUT_MS)
+        page.set_default_navigation_timeout(DEV_IWHALECLOUD_LOGIN_PLAYWRIGHT_TIMEOUT_MS)
+        try:
+            csrf_token = {"value": None}
+
+            def on_request(req):
+                if csrf_token["value"]:
+                    return
+                h = req.headers
+                t = h.get("x-csrf-token") or h.get("X-CSRF-Token")
+                if t:
+                    csrf_token["value"] = t
+
+            page.on("request", on_request)
+            page.goto(DEV_IWHALECLOUD_BASE_URL, wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle", timeout=60000)
+            page.fill("#edt_username", username)
+            page.fill("#edt_pwd", password)
+            page.click(".loginBtn")
+            page.wait_for_load_state("networkidle", timeout=60000)
+            try:
+                page.locator('li:has-text("研发平台")').locator("button.ui-tabs-close.close").click()
+            except PlaywrightTimeoutError:
+                pass
+            token = csrf_token["value"]
+            if not token:
+                raise ValueError("未获取到 x-csrf-token")
+            all_cookies = context.cookies()
+            cookies = _cookies_to_header(all_cookies)
+            logger.debug("get_demand_by_user 门户会话 token=[%s] cookies=[%s]", token, cookies)
+            return token, cookies
+        finally:
+            context.close()
+            browser.close()
+
+
+class GetDemandByUserRequest(BaseModel):
+    owner_info: str = Field(..., description="CryptHelper 密文；解密后为 employee_id、password、token、userId 等 JSON")
+
+
+@router.post("/api/dev/iwhalecloud/get_demand_by_user")
+async def get_demand_by_user(body: GetDemandByUserRequest) -> dict:
+    """按负责人用户查询需求（全项目 currentProjectId=null）；入参 owner_info 密文解密后取工号/密码/用户ID。
+
+    转调 POST /portal/zcm-devspace/task/page-list。HTTP 响应**仅** ``total``，不返回需求列表；拉全量后的
+    列表（含与 graphiti_pipeline 一致的 Demand 字段、``product_version_id``/``product_version_code``、
+    以及 **owned_work_items**）会落盘到 ``synapse_home/work/userwork.json``，请用
+    ``GET /api/dev/iwhalecloud/owner_order_snapshot`` 读取。
+
+    每条需求在落盘数据中含 **owned_work_items**：该需求下研发单摘要列表（串行拉门户详情后映射），每项为扁平
+    snake_case 字段：``task_no``、``task_title``、``task_desc``（门户 adTask.comments）、``created_date``、
+    ``sccb_work_hours``（由分钟换算，空为 null）、``stage_name``、``product_module_id``、
+    ``product_module_name``、``repo_url``。
+    各需求单下研发单为**串行**拉取（先需求 A 再需求 B，单需求内 work-items 与详情亦顺序请求）。
+    拉取 work-items 需 ai-gateway **Bearer**：优先 owner_info 解密 JSON 的 ``token``，否则使用
+    ``data/userinfo.encryption`` 中的 Authorization；若皆不可用则 ``owned_work_items`` 为空数组。
+    """
+    raw_cipher = str(body.owner_info).strip()
+    if not raw_cipher:
+        return error_response(400, "owner_info 不能为空")
+
+    crypt_helper = _crypt_helper()
+    plain = crypt_helper.decrypt(raw_cipher, False)
+    if plain is None:
+        return error_response(400, "owner_info 解密失败")
+    try:
+        user_blob = json.loads(plain)
+    except json.JSONDecodeError:
+        return error_response(400, "owner_info 解密后不是合法 JSON")
+
+    if not isinstance(user_blob, dict):
+        return error_response(400, "owner_info 解密后须为 JSON 对象")
+
+    employee_id = str(user_blob.get("employee_id"))
+    password = str(user_blob.get("password"))
+    user_id_raw = user_blob.get("userId")
+    if user_id_raw is None:
+        user_id_raw = user_blob.get("user_id")
+
+    if not employee_id or not password:
+        return error_response(400, "解密后的 employee_id 或 password 不能为空")
+    try:
+        login_user_id = int(user_id_raw)
+    except (TypeError, ValueError):
+        return error_response(400, "解密后的 userId 必须为整数")
+
+    try:
+        async with _iwhalecloud_session_lock:
+            csrf, cookies = await asyncio.to_thread(
+                _get_demand_by_user_portal_cookies_sync, employee_id, password
+            )
+    except ValueError as e:
+        return error_response(502, str(e))
+    except Exception as exc:
+        logger.exception("get_demand_by_user 获取门户会话失败: %s", exc)
+        return error_response(503, f"获取研发云门户会话失败: {exc}")
+
+    url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/zcm-devspace/task/page-list"
+    params = {"page": 1, "limit": 100000}
+    headers = _build_get_demand_list_from_product_headers(csrf, cookies)
+    payload = {
+        "sort": "CREATED_DATE_LATEST",
+        "tagIdList": [],
+        "taskFlowStageTypeList": ["START", "PENDING"],
+        "ownerUserIdList": [login_user_id],
+        "taskFieldQueryDtoList": [],
+        "loginUserId": login_user_id,
+        "taskFlowStageIdList": [],
+        "orderBy": "CREATED_DATE",
+        "orderMode": "DESC",
+        "taskDetailConditionDto": {
+            "withSprint": False,
+            "withPatch": True,
+            "withTaskFlowStage": True,
+            "withTaskType": True,
+            "withOwnerUser": True,
+            "withProductModule": True,
+            "withProductVersion": True,
+            "withRelatedResourceCount": True,
+            "withTag": True,
+            "withProject": True,
+            "withParent": True,
+            "withZmpProject": True,
+            "withProjectSetting": True,
+            "withTaskSrc": True,
+            "withBranchVersion": True,
+            "withTaskPlan": True,
+            "withTaskAnalysis": False,
+            "withTaskField": False,
+            "withTaskExtendEdo": False,
+            "withEdoSprint": False,
+        },
+        "taskTypeCode": "USER_STORY",
+        "currentProjectId": None,
+        "projectIdList": None,
+    }
+    logger.debug("get_demand_by_user url:%s params:%s payload:%s", url, params, payload)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(url, headers=headers, params=params, json=payload)
+            _log_httpx_response("get_demand_by_user", resp)
+    except httpx.RequestError as exc:
+        logger.exception("调用研发云按用户查询需求列表异常: %s", exc)
+        return error_response(503, f"调用研发云接口异常: {exc}")
+
+    try:
+        raw = resp.json()
+        if raw.get("code") != "9999":
+            msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
+            return error_response(502, f"{msg}", error=str(raw))
+    except ValueError:
+        return error_response(502, f"研发云返回非 JSON：{resp.text}")
+
+    data_block = raw.get("data")
+    lst = data_block.get("list") if isinstance(data_block, dict) else None
+    if not isinstance(lst, list):
+        lst = []
+    total = data_block.get("total") if isinstance(data_block, dict) else 0
+    if not isinstance(total, int):
+        try:
+            total = int(total) if total is not None else 0
+        except (TypeError, ValueError):
+            total = 0
+
+    rows = [item for item in lst if isinstance(item, dict)]
+    out_list = [_page_list_row_to_demand_attrs(item) for item in rows]
+
+    bearer_h = _bearer_headers_for_gateway(user_blob)
+    if not bearer_h:
+        for o in out_list:
+            o["owned_work_items"] = []
+    else:
+        async with httpx.AsyncClient(timeout=_GET_DEMAND_BY_USER_WORK_HTTP_TIMEOUT) as wclient:
+            for r, o in zip(rows, out_list):
+                ad = r.get("adTask")
+                dn = ad.get("taskNo") if isinstance(ad, dict) else None
+                if not dn:
+                    o["owned_work_items"] = []
+                    continue
+                try:
+                    o["owned_work_items"] = await _owned_work_items_for_demand(
+                        client=wclient,
+                        demand_no=str(dn),
+                        bearer_headers=bearer_h,
+                        csrf=csrf,
+                        cookies=cookies,
+                    )
+                except Exception as exc:
+                    logger.exception("get_demand_by_user 拉取研发单失败 demand_no=%s: %s", dn, exc)
+                    o["owned_work_items"] = []
+
+    try:
+        await asyncio.to_thread(
+            persist_owner_order_snapshot_to_file, out_list=out_list
+        )
+    except Exception as exc:
+        logger.exception("get_demand_by_user 落地 userwork.json 失败: %s", exc)
+
+    return success_response()
+
+
+@router.get("/api/dev/iwhalecloud/owner_order_snapshot")
+async def get_owner_order_snapshot() -> dict:
+    """读取最近一次 ``get_demand_by_user`` 落地到 ``synapse_home/work/userwork.json`` 的快照（与写接口共用文件锁）。"""
+    data = await asyncio.to_thread(load_owner_order_snapshot_from_file)
+    if data is None:
+        return error_response(404, "尚未生成快照或文件无效（请先调用 get_demand_by_user）")
+    return success_response(data)
 
 
 class ExtCreateTPCaseStep(BaseModel):
@@ -3767,64 +4458,6 @@ async def _ensure_valid_creds_async(force_refresh: bool = False) -> tuple[str, s
 
 class ProductInitializeRequest(BaseModel):
     product_id: int = Field(..., description="产品ID")
-
-@router.get("/api/dev/iwhalecloud/rd-manage/demands")
-def get_rd_manage_demands():
-    """获取工单信息，按照工单类别返回"""
-    mock_demand = {
-        "需求单号": "DEMAND-2026-0413-001",
-        "需求单名称": "智能研发助手核心调度模块",
-        "需求描述": "实现核心调度模块，支持多Agent并发执行任务并处理状态回传。目前在沙箱环境中发现并发锁死异常。",
-        "需求开始时间": "2026-04-13 09:00:00",
-        "需求结束时间": "",
-        "需求工作量": 1200,
-        "需求状态": "processing",
-        "需求影响": "核心调度流程优化",
-        "需求类型": "优化",
-        "需求优先级": "高",
-        "需求关联应用模块": "调度模块",
-        "设计人员": "Admin",
-        "当前sop节点": "exception_check"
-    }
-
-    data = {
-        "预备工单": [{**mock_demand, "需求单号": "DEMAND-2026-0413-003", "需求状态": "pending", "当前sop节点": "pending"}],
-        "可处理工单": [{**mock_demand, "需求单号": "DEMAND-2026-0413-001", "需求状态": "human_intervention", "当前sop节点": "exception_check"}],
-        "在途工单": [{**mock_demand, "需求单号": "DEMAND-2026-0413-002", "需求状态": "processing", "当前sop节点": "solution_review"}],
-        "近三月完成工单": [{**mock_demand, "需求单号": "DEMAND-2026-0411-001", "需求状态": "completed", "当前sop节点": "leader_review", "需求结束时间": "2026-04-12 10:00:00"}]
-    }
-    return success_response(data)
-
-@router.get("/api/dev/iwhalecloud/rd-manage/demands/{demand_no}/nodes")
-def get_rd_manage_demand_nodes(demand_no: str):
-    """获取工单节点信息"""
-    nodes = [
-        {
-            "node_name": "需求澄清",
-            "node_status": "completed",
-            "time_cost": "15m",
-            "token_cost": 15000,
-            "role": "AI",
-            "model": "Claude-3.5",
-            "tools": ["search_history"],
-            "agent": "需求分析助手",
-            "session_info": "session_xxx",
-            "output_artifacts": {"docs": "澄清文档.md"}
-        },
-        {
-            "node_name": "异常检查",
-            "node_status": "human_intervention" if "001" in demand_no else "pending",
-            "time_cost": "0m",
-            "token_cost": 0,
-            "role": "Human",
-            "model": "",
-            "tools": [],
-            "agent": "",
-            "session_info": "",
-            "output_artifacts": {}
-        }
-    ]
-    return success_response({"nodes": nodes})
 
 
 def _register_product_knowledge_routes() -> None:
