@@ -258,8 +258,10 @@ function mapDemandListItemToTicket(d: DemandListItem): Ticket {
   if (status === "completed") {
     demandNodeId = LAST_PIPELINE_NODE_ID;
   } else if (local === "待处理") {
+    // 契约：待处理时需求单一定在「等待调度」，与接口 sop_node 文案无关
     demandNodeId = "pending";
   } else if (local === "预备中" || local === "全人工") {
+    // 契约：预备中/全人工时 sop_node 必为空，不解析接口 sop
     demandNodeId = "pending";
   } else if (status === "processing") {
     const sop = (d.sop_node || "").trim();
@@ -419,7 +421,11 @@ export const OrderManagement: React.FC<{
 
     // Fallback Mock Logic
     if (ticket.status === 'completed') return 'completed';
-    if (ticket.status === 'pending' || ticket.status === 'prepare') return 'pending';
+    if (ticket.status === 'prepare') return 'pending';
+    if (ticket.status === 'pending') {
+      if (nodeId === 'pending') return 'processing';
+      return 'pending';
+    }
 
     const targetIndex = ALL_NODES.findIndex(n => n.id === nodeId);
     const currentIndex = ALL_NODES.findIndex(n => n.id === ticket.currentNode);
@@ -461,6 +467,7 @@ export const OrderManagement: React.FC<{
   // Handle auto-scroll to current / 已完成时最后一个 SOP 节点
   useEffect(() => {
     if (!displayTicket || !canvasRef.current || !containerRef.current) return;
+    if (displayTicket.status === 'prepare' || displayTicket.status === 'human_intervention') return;
     const timeoutId = setTimeout(() => {
       const focusId = focusNodeIdForTicket(displayTicket);
       const activeNodeElement = document.getElementById(`node-${focusId}`);
@@ -514,8 +521,19 @@ export const OrderManagement: React.FC<{
       }
       return;
     }
-    if (displayTicket.status === 'pending' || displayTicket.status === 'prepare') {
+    if (displayTicket.status === 'prepare') {
       setActiveLineWidth(0);
+      return;
+    }
+    if (displayTicket.status === 'pending') {
+      const nodeEl = document.getElementById('node-pending');
+      if (nodeEl) {
+        const centerX = getNodeCenterXInCanvas(nodeEl, canvas);
+        const maxW = Math.max(0, canvas.scrollWidth - BUS_LINE_START_PX * 2);
+        setActiveLineWidth(Math.min(Math.max(0, centerX - BUS_LINE_START_PX), maxW));
+      } else {
+        setActiveLineWidth(0);
+      }
       return;
     }
 
@@ -1091,7 +1109,17 @@ export const OrderManagement: React.FC<{
             onMouseLeave={handleMouseUp}
           >
             
-            {displayTicket.status === 'human_intervention' ? (
+            {displayTicket.status === 'prepare' ? (
+              <div className="flex h-full items-center justify-center p-8">
+                <div className="max-w-md rounded-xl border border-blue-500/25 bg-blue-500/5 p-6 text-center shadow-sm">
+                  <Info className="mx-auto mb-4 h-12 w-12 text-blue-500/90" />
+                  <h3 className="mb-2 text-lg font-medium text-foreground">预备中</h3>
+                  <p className="text-sm leading-relaxed text-muted-foreground">
+                    请先将工单手动处理至需求设计阶段，才能开始智能研发助手自动化处理。
+                  </p>
+                </div>
+              </div>
+            ) : displayTicket.status === 'human_intervention' ? (
               <div className="flex h-full items-center justify-center p-8">
                 <div className="max-w-md rounded-xl border border-destructive/20 bg-destructive/5 p-6 text-center shadow-sm">
                   <User className="mx-auto mb-4 h-12 w-12 text-destructive/80" />
@@ -1160,12 +1188,12 @@ export const OrderManagement: React.FC<{
                     >
                        <div className={`z-10 flex h-8 w-8 items-center justify-center rounded-full border-[3px] bg-background text-xs font-bold ${
                          isStagePast || displayTicket.status === 'completed' ? 'border-green-500 text-green-500 shadow-[0_0_10px_color-mix(in_srgb,var(--success)_30%,transparent)]' :
-                         isStageActive && displayTicket.status !== 'pending' && displayTicket.status !== 'prepare' ? 'border-primary text-primary shadow-[0_0_14px_color-mix(in_srgb,var(--primary)_30%,transparent)]' :
+                         isStageActive && displayTicket.status !== 'prepare' ? 'border-primary text-primary shadow-[0_0_14px_color-mix(in_srgb,var(--primary)_30%,transparent)]' :
                          'border-muted text-muted-foreground'
                        }`}>
                          {isStagePast || displayTicket.status === 'completed' ? <CheckCircle2 className="h-5 w-5" /> : stage.id}
                        </div>
-                       <div className={`absolute top-10 whitespace-nowrap text-xs font-medium tracking-widest ${isStageActive && displayTicket.status !== 'pending' && displayTicket.status !== 'prepare' ? 'text-primary' : isStagePast || displayTicket.status === 'completed' ? 'text-muted-foreground' : 'text-muted-foreground/50'}`}>
+                       <div className={`absolute top-10 whitespace-nowrap text-xs font-medium tracking-widest ${isStageActive && displayTicket.status !== 'prepare' ? 'text-primary' : isStagePast || displayTicket.status === 'completed' ? 'text-muted-foreground' : 'text-muted-foreground/50'}`}>
                          {stage.name}
                        </div>
                     </div>

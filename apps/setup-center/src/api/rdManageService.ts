@@ -30,7 +30,7 @@ export interface DemandListItem {
   demand_designer: string;
   product_version_id: number | null;
   product_version_code: string;
-  /** 当前 SOP 节点名或 id；预备中/全人工时为空串 */
+  /** 当前 SOP 节点名或 id；待处理时必为「等待调度」；预备中/全人工时必为空串 */
   sop_node: string;
   /** 预备中 | 待处理 | 处理中 | 全人工 等 */
   local_process_state: string;
@@ -44,7 +44,7 @@ export interface RdManageDemandsPayload {
 
 /**
  * 前端 Mock：与真实接口 `data` 形状一致。
- * 规则：待处理 → sop_node 必为「等待调度」；预备中 / 全人工 → sop_node 为空串。
+ * 规则：待处理 → sop_node 必为「等待调度」；预备中 / 全人工 → sop_node 必为空串。
  */
 export function getRdManageDemandsMockPayload(): RdManageDemandsPayload {
   return {
@@ -65,8 +65,8 @@ export function getRdManageDemandsMockPayload(): RdManageDemandsPayload {
         demand_designer: "",
         product_version_id: null,
         product_version_code: "",
-        sop_node: "",
-        local_process_state: "",
+        sop_node: "等待调度",
+        local_process_state: "待处理",
         owned_work_items: [],
       },
       {
