@@ -204,6 +204,96 @@ class TestWorkOrderDbMetrics:
         assert flags["NO-HITL"] is False
         assert flags["MISSING"] is False
 
+        # 同一 order 多条轨迹：仅以 id 最大（最新）一行的 HITL 标记为准
+        await db._connection.execute(
+            """
+            INSERT INTO sop_trajectories (
+                order_id, sop_step_id, sop_node_id, sop_node_status,
+                sop_node_start_time, sop_node_end_time, sop_node_use_model,
+                sop_node_use_tokens, sop_node_output_list, sop_node_human_in_the_loop
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "LATEST-WINS-0",
+                "s-old",
+                "n-old",
+                "done",
+                "2026-01-01 09:00:00",
+                "2026-01-01 09:00:10",
+                "gpt",
+                1,
+                "[]",
+                1,
+            ),
+        )
+        await db._connection.execute(
+            """
+            INSERT INTO sop_trajectories (
+                order_id, sop_step_id, sop_node_id, sop_node_status,
+                sop_node_start_time, sop_node_end_time, sop_node_use_model,
+                sop_node_use_tokens, sop_node_output_list, sop_node_human_in_the_loop
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "LATEST-WINS-0",
+                "s-new",
+                "n-new",
+                "done",
+                "2026-01-01 10:00:00",
+                "2026-01-01 10:00:10",
+                "gpt",
+                2,
+                "[]",
+                0,
+            ),
+        )
+        await db._connection.execute(
+            """
+            INSERT INTO sop_trajectories (
+                order_id, sop_step_id, sop_node_id, sop_node_status,
+                sop_node_start_time, sop_node_end_time, sop_node_use_model,
+                sop_node_use_tokens, sop_node_output_list, sop_node_human_in_the_loop
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "LATEST-WINS-1",
+                "s-a",
+                "n-a",
+                "done",
+                "2026-01-01 09:00:00",
+                "2026-01-01 09:00:10",
+                "gpt",
+                1,
+                "[]",
+                0,
+            ),
+        )
+        await db._connection.execute(
+            """
+            INSERT INTO sop_trajectories (
+                order_id, sop_step_id, sop_node_id, sop_node_status,
+                sop_node_start_time, sop_node_end_time, sop_node_use_model,
+                sop_node_use_tokens, sop_node_output_list, sop_node_human_in_the_loop
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "LATEST-WINS-1",
+                "s-b",
+                "n-b",
+                "done",
+                "2026-01-01 10:00:00",
+                "2026-01-01 10:00:10",
+                "gpt",
+                2,
+                "[]",
+                1,
+            ),
+        )
+        await db._connection.commit()
+        flags2 = await db.get_sop_human_in_loop_flags_by_order_ids(["LATEST-WINS-0", "LATEST-WINS-1"])
+        assert flags2["LATEST-WINS-0"] is False
+        assert flags2["LATEST-WINS-1"] is True
+
     @pytest.mark.asyncio
     async def test_token_usage_total_for_scenes(self, db):
         await db._connection.execute(

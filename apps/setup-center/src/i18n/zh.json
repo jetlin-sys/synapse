@@ -2701,6 +2701,14 @@
     "refresh": "刷新",
     "refreshSuccess": "工单列表已更新",
     "refreshFailed": "同步失败：{{message}}",
-    "userinfoMissing": "未找到本地登录凭据，请先完成研发云引导登录"
+    "userinfoMissing": "未找到本地登录凭据，请先完成研发云引导登录",
+    "boardFilterHitl": "人工介入",
+    "boardFilterFullManual": "全人工",
+    "badgeHitl": "需人工介入",
+    "badgeFullManual": "全人工（外部）",
+    "panelHitlTitle": "人工介入",
+    "panelHitlBody": "智能体在当前流水线节点无法继续执行，需要人工介入后继续。",
+    "panelFullManualTitle": "全人工（外部处理）",
+    "panelFullManualBody": "该工单不在本系统智能研发流程内处理，由外部人工跟进；若后续纳入自动化范围，请将工单推进至需求设计等环节。"
   }
 }

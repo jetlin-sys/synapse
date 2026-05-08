@@ -30,7 +30,7 @@ export interface DemandListItem {
   product_version_code: string;
   /** 当前 SOP 节点名或 id；待处理时必为「等待调度」；预备中/全人工时必为空串 */
   sop_node: string;
-  /** 预备中 | 待处理 | 处理中 等（「全人工」不再用于映射人工介入态，见 sop_trajectories） */
+  /** 预备中 | 待处理 | 处理中 | 全人工 等；「全人工」表示不走本系统智能流水线（由 local_process_state 标识）。是否需人工介入由前端根据 /human-in-loop-flags（按最新 sop 轨迹）与处理中子单 task_no 查询得到，非本字段 */
   local_process_state: string;
   owned_work_items: OwnedWorkItem[];
 }
@@ -327,7 +327,7 @@ export async function syncRdManageDemandsFromDevCloud(synapseApiBase: string): P
   return fetchRdManageDemands(synapseApiBase, { allowMockFallback: false });
 }
 
-/** 单次请求仅传一个 order_id；返回该工单是否存在人工介入节点。 */
+/** 单次请求仅传一个 order_id；返回该工单在最新 sop 轨迹行上是否处于人工介入。 */
 export async function fetchHumanInLoopFlag(
   synapseApiBase: string,
   orderId: string,
@@ -351,6 +351,7 @@ export async function fetchHumanInLoopFlag(
 
 /**
  * 批量查询人工介入（对每个 order_id 各调用一次接口，并行）。
+ * 后端仅按 sop_trajectories 中该 order **最新一条**（最大 id）轨迹是否 HITL 判定。
  * 仅应对「处理中」工单收集 ID；order_id 与列表展示维度一致（仅需求单用 demand_no；含研发单时用各 task_no）。
  */
 export async function fetchHumanInLoopFlags(

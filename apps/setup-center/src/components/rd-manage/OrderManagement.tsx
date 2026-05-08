@@ -97,7 +97,15 @@ export interface Ticket {
   title: string;
   currentStage: number;
   currentNode: string;
-  status: 'processing' | 'human_intervention' | 'pending' | 'completed' | 'error' | 'prepare';
+  status:
+    | 'processing'
+    | 'full_manual'
+    | 'pending'
+    | 'completed'
+    | 'error'
+    | 'prepare';
+  /** 需求单维度（无研发子单展示行）：处理中且本地库该 order 最新 sop 轨迹需人工；非工单 status */
+  sopAwaitingHuman: boolean;
   owner: string;
   urgency: 'low' | 'medium' | 'high';
   tokens: number;
@@ -226,7 +234,13 @@ function useAntThemeDark() {
   return dark;
 }
 
-type NodeState = 'completed' | 'processing' | 'error' | 'human_intervention' | 'pending';
+type NodeState =
+  | 'completed'
+  | 'processing'
+  | 'error'
+  | 'awaiting_human'
+  | 'full_manual'
+  | 'pending';
 
 // --- Subcomponents for Outputs ---
 
@@ -285,7 +299,10 @@ function collectOrderIdsForHitlFlags(list: DemandListItem[]): string[] {
   return Array.from(ids);
 }
 
-/** 不含人工介入态（人工介入仅由处理中 + sop_trajectories 叠加得到） */
+/**
+ * 基础态（不含「人工介入」）：人工介入仍仅由「处理中 + sop_trajectories」叠加。
+ * 「全人工」表示走外部人工、不进本系统智能流水线，由 local_process_state 单独标识。
+ */
 function deriveBaseTicketStatus(d: DemandListItem): Ticket["status"] {
   const local = effectiveLocalProcessState(d);
   const isCompleted =
@@ -296,6 +313,7 @@ function deriveBaseTicketStatus(d: DemandListItem): Ticket["status"] {
   if (local === "预备中") return "prepare";
   if (local === "待处理") return "pending";
   if (local === "处理中") return "processing";
+  if (local === "全人工") return "full_manual";
   if (["需求开发", "开发中", "测试中"].some((x) => (d.demand_status || "").includes(x))) {
     return "processing";
   }
@@ -316,10 +334,9 @@ function mapDemandListItemToTicket(d: DemandListItem, flags: Record<string, bool
   const owned = d.owned_work_items || [];
   const dn = (d.demand_no || "").trim();
 
-  let status: Ticket["status"] = baseStatus;
-  if (baseStatus === "processing" && owned.length === 0 && dn && flags[dn]) {
-    status = "human_intervention";
-  }
+  const status: Ticket["status"] = baseStatus;
+  const sopAwaitingHuman =
+    baseStatus === "processing" && owned.length === 0 && Boolean(dn && flags[dn]);
 
   let demandNodeId = "pending";
   if (status === "completed") {
@@ -330,7 +347,7 @@ function mapDemandListItemToTicket(d: DemandListItem, flags: Record<string, bool
   } else if (local === "预备中") {
     // 契约：预备中时 sop_node 必为空，不解析接口 sop
     demandNodeId = "pending";
-  } else if (status === "human_intervention") {
+  } else if (status === "full_manual") {
     const sop = (d.sop_node || "").trim();
     demandNodeId = resolveSopRawToNodeId(sop) ?? "pending";
   } else if (status === "processing") {
@@ -368,6 +385,7 @@ function mapDemandListItemToTicket(d: DemandListItem, flags: Record<string, bool
     runTime,
     tokens: d.demand_sccb_work_minutes || 0,
     status,
+    sopAwaitingHuman,
     owner: d.demand_designer || "未知",
     branch: d.product_version_code || "master",
     urgency: "medium",
@@ -441,7 +459,9 @@ export const OrderManagement: React.FC<{
   const [dbMetricsErr, setDbMetricsErr] = useState<string | null>(null);
   const [detailProduct, setDetailProduct] = useState<Product | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
-  const [ticketFilter, setTicketFilter] = useState<'prepare' | 'pending' | 'processing' | 'human_intervention' | 'all'>('all');
+  const [ticketFilter, setTicketFilter] = useState<
+    'prepare' | 'pending' | 'processing' | 'full_manual' | 'all'
+  >('all');
   const [searchQuery, setSearchQuery] = useState('');
   /** 看板数据是否已完成首次拉取（用于区分「加载中」与「快照为空」） */
   const [boardDataInitialized, setBoardDataInitialized] = useState(false);
@@ -622,12 +642,7 @@ export const OrderManagement: React.FC<{
       }
       if (ticketFilter === 'pending') return t.status === 'pending';
       if (ticketFilter === 'processing') return t.status === 'processing' || t.status === 'error';
-      if (ticketFilter === 'human_intervention') {
-        return (
-          t.status === 'human_intervention' ||
-          Boolean(t.workItems?.some((w) => w.humanIntervention))
-        );
-      }
+      if (ticketFilter === 'full_manual') return t.status === 'full_manual';
       if (ticketFilter === 'prepare') return t.status === 'prepare';
       return true;
     });
@@ -635,16 +650,8 @@ export const OrderManagement: React.FC<{
 
   const pendingCount = useMemo(() => tickets.filter(t => t.status === 'pending').length, [tickets]);
   const processingCount = useMemo(() => tickets.filter(t => t.status === 'processing' || t.status === 'error').length, [tickets]);
-  const humanInterventionCount = useMemo(
-    () =>
-      tickets.filter(
-        (t) =>
-          t.status === 'human_intervention' || Boolean(t.workItems?.some((w) => w.humanIntervention)),
-      ).length,
-    [tickets],
-  );
   const prepareCount = useMemo(() => tickets.filter(t => t.status === 'prepare').length, [tickets]);
-  const completedCount = useMemo(() => tickets.filter(t => t.status === 'completed').length, [tickets]);
+  const fullManualCount = useMemo(() => tickets.filter((t) => t.status === 'full_manual').length, [tickets]);
 
   const activeTicket = useMemo(() => tickets.find(t => t.id === activeTicketId) || tickets[0] || null, [activeTicketId, tickets]);
   const activeWorkItem = useMemo(() => activeTicket?.workItems?.find(w => w.id === activeWorkItemId) || null, [activeTicket, activeWorkItemId]);
@@ -659,15 +666,16 @@ export const OrderManagement: React.FC<{
         tokens: activeWorkItem.tokens,
         branch: activeWorkItem.branch,
         description: activeWorkItem.description,
+        sopAwaitingHuman: activeWorkItem.humanIntervention,
       };
-      const effectiveStatus = activeWorkItem.humanIntervention
-        ? "human_intervention"
-        : activeTicket.status;
-      if (effectiveStatus === "processing" || effectiveStatus === "human_intervention") {
+      if (
+        activeTicket.status === "processing" ||
+        activeTicket.status === "full_manual"
+      ) {
         merge.currentNode = activeWorkItem.currentNode;
         merge.currentStage = stageIdForNodeId(activeWorkItem.currentNode);
       }
-      return { ...activeTicket, ...merge, status: effectiveStatus };
+      return { ...activeTicket, ...merge };
     }
     return activeTicket;
   }, [activeTicket, activeWorkItem]);
@@ -681,6 +689,7 @@ export const OrderManagement: React.FC<{
     // Fallback Mock Logic
     if (ticket.status === 'completed') return 'completed';
     if (ticket.status === 'prepare') return 'pending';
+    if (ticket.status === 'full_manual') return 'pending';
     if (ticket.status === 'pending') {
       if (nodeId === 'pending') return 'processing';
       return 'pending';
@@ -693,11 +702,13 @@ export const OrderManagement: React.FC<{
     if (targetIndex > currentIndex) return 'pending';
 
     // Target is the current node
-    if (ticket.status === 'processing') return 'processing';
-    if (ticket.status === 'human_intervention') {
-      const node = ALL_NODES[targetIndex];
-      if (node && node.type.includes('human')) return 'human_intervention';
-      return 'error';
+    if (ticket.status === 'processing') {
+      if (ticket.sopAwaitingHuman) {
+        const node = ALL_NODES[targetIndex];
+        if (node && node.type.includes('human')) return 'awaiting_human';
+        return 'error';
+      }
+      return 'processing';
     }
     if (ticket.status === 'error') return 'error';
     return 'pending';
@@ -726,7 +737,11 @@ export const OrderManagement: React.FC<{
   // Handle auto-scroll to current / 已完成时最后一个 SOP 节点
   useEffect(() => {
     if (!displayTicket || !canvasRef.current || !containerRef.current) return;
-    if (displayTicket.status === 'prepare' || displayTicket.status === 'human_intervention') return;
+    if (
+      displayTicket.status === 'prepare' ||
+      displayTicket.status === 'full_manual'
+    )
+      return;
     const timeoutId = setTimeout(() => {
       const focusId = focusNodeIdForTicket(displayTicket);
       const activeNodeElement = document.getElementById(`node-${focusId}`);
@@ -781,6 +796,10 @@ export const OrderManagement: React.FC<{
       return;
     }
     if (displayTicket.status === 'prepare') {
+      setActiveLineWidth(0);
+      return;
+    }
+    if (displayTicket.status === 'full_manual') {
       setActiveLineWidth(0);
       return;
     }
@@ -979,7 +998,7 @@ export const OrderManagement: React.FC<{
           </div>
         );
       case 'exception_check':
-        if (state === 'human_intervention') {
+        if (state === 'awaiting_human') {
           return (
             <div className="space-y-4">
               <div className="bg-red-950/30 border border-red-900/50 rounded-xl p-4 flex items-start gap-3">
@@ -1015,7 +1034,7 @@ export const OrderManagement: React.FC<{
           </div>
         );
       case 'task_exec':
-        if (state === 'human_intervention') {
+        if (state === 'awaiting_human') {
           return (
             <div className="flex flex-col items-center justify-center h-48 bg-blue-950/20 border border-blue-900/50 rounded-xl border-dashed">
               <Play className="w-12 h-12 text-blue-500 mb-4 ml-1" />
@@ -1057,7 +1076,7 @@ export const OrderManagement: React.FC<{
                     <div className="text-xs text-slate-500">代码架构规范审查</div>
                   </div>
                 </div>
-                {state === 'human_intervention' ? <Badge status="warning" text="审核中" /> : <Badge status="success" text="已通过" />}
+                {state === 'awaiting_human' ? <Badge status="warning" text="审核中" /> : <Badge status="success" text="已通过" />}
               </div>
               <div className="flex items-center justify-between bg-slate-900 p-3 rounded-lg border border-slate-800">
                 <div className="flex items-center gap-3">
@@ -1067,7 +1086,7 @@ export const OrderManagement: React.FC<{
                     <div className="text-xs text-slate-500">业务逻辑综合审查</div>
                   </div>
                 </div>
-                {state === 'human_intervention' ? (
+                {state === 'awaiting_human' ? (
                    <Button type="primary" size="small" className="bg-blue-600 text-xs border-none" onClick={handleJumpToMeeting}>
                      去研发会议室审批
                    </Button>
@@ -1120,7 +1139,7 @@ export const OrderManagement: React.FC<{
 
   const showTicketModalPipelineLayers =
     !!selectedTicketForModal &&
-    !['prepare', 'pending', 'human_intervention'].includes(selectedTicketForModal.status);
+    !['prepare', 'pending', 'full_manual'].includes(selectedTicketForModal.status);
   const modalDemandMetrics = dbMetrics?.demand_metrics;
   const modalSummaryMetrics = dbMetrics?.summary;
 
@@ -1169,13 +1188,18 @@ export const OrderManagement: React.FC<{
               />
             </div>
 
-            <div className="mt-2 flex w-full min-w-0 flex-nowrap items-center justify-between gap-1">
+            <div className="mt-2 flex w-full min-w-0 flex-wrap items-center justify-between gap-1">
               {([
                 { id: 'prepare' as const, label: '预备中', count: prepareCount, color: 'text-blue-400' },
                 { id: 'pending' as const, label: '待处理', count: pendingCount, color: 'text-muted-foreground' },
                 { id: 'processing' as const, label: '处理中', count: processingCount, color: 'text-primary' },
-                { id: 'human_intervention' as const, label: '全人工', count: humanInterventionCount, color: 'text-destructive' }
-              ]).map(filter => (
+                {
+                  id: 'full_manual' as const,
+                  label: t('rdManageOrder.boardFilterFullManual'),
+                  count: fullManualCount,
+                  color: 'text-violet-500 dark:text-violet-400',
+                },
+              ]).map((filter) => (
                 <button
                   key={filter.id}
                   onClick={() => setTicketFilter(prev => (prev === filter.id ? 'all' : filter.id))}
@@ -1211,14 +1235,19 @@ export const OrderManagement: React.FC<{
                 const progressPercent = Math.round((rowStageId / (SOP_STAGES.length - 1)) * 100);
 
                 const rowHitl = !isWorkItem
-                  ? ticket.status === 'human_intervention'
+                  ? ticket.sopAwaitingHuman
                   : Boolean((item as WorkItem).humanIntervention);
-                
-                const statusBorderColor = 
-                  rowHitl ? 'bg-destructive' :
-                  ticket.status === 'processing' ? 'bg-primary' :
-                  ticket.status === 'completed' ? 'bg-green-600 dark:bg-green-500' :
-                  'bg-muted-foreground/40';
+                const rowFullManual = !isWorkItem && ticket.status === 'full_manual';
+
+                const statusBorderColor = rowHitl
+                  ? 'bg-destructive'
+                  : rowFullManual
+                    ? 'bg-violet-500 dark:bg-violet-400'
+                    : ticket.status === 'processing'
+                      ? 'bg-primary'
+                      : ticket.status === 'completed'
+                        ? 'bg-green-600 dark:bg-green-500'
+                        : 'bg-muted-foreground/40';
 
                 const isActive = isWorkItem ? activeWorkItemId === item.id : activeTicketId === item.id && !activeWorkItemId;
 
@@ -1235,6 +1264,9 @@ export const OrderManagement: React.FC<{
                     currentStage: isWorkItem
                       ? stageIdForNodeId((item as WorkItem).currentNode)
                       : ticket.currentStage,
+                    sopAwaitingHuman: isWorkItem
+                      ? Boolean((item as WorkItem).humanIntervention)
+                      : ticket.sopAwaitingHuman,
                   });
                 };
 
@@ -1267,17 +1299,17 @@ export const OrderManagement: React.FC<{
                     {/* Left Status Line */}
                     <div className={`absolute bottom-0 left-0 top-0 w-1 ${statusBorderColor}`} />
 
-                    {/* Global Hover Mask for Immediate Action */}
+                    {/* 需人工介入（SOP 最新轨迹）：hover 显示「立即处理」；全人工不走此遮罩 */}
                     {rowHitl && (
                       <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/40 opacity-0 backdrop-blur-[2px] transition-opacity duration-300 group-hover:opacity-100">
-                        <Button 
-                          type="primary" 
-                          size="small" 
+                        <Button
+                          type="primary"
+                          size="small"
                           className="h-8 rounded-full border-none bg-destructive px-5 font-medium text-destructive-foreground shadow-lg hover:bg-destructive/90"
                           onClick={(e) => {
-                             e.stopPropagation();
-                             setActiveTicketId(ticket.id);
-                             setActiveWorkItemId(isWorkItem ? item.id : '');
+                            e.stopPropagation();
+                            setActiveTicketId(ticket.id);
+                            setActiveWorkItemId(isWorkItem ? item.id : '');
                           }}
                         >
                           立即处理
@@ -1285,13 +1317,12 @@ export const OrderManagement: React.FC<{
                       </div>
                     )}
 
-                    {/* 工单信息：人工介入时 hover 遮罩 z-30 会盖住默认层，在遮罩之上再渲染一份到右上角 */}
-                    {!rowHitl && (
-                      <div className="absolute right-2 top-2 z-20 flex items-center gap-2">{ticketInfoButton}</div>
-                    )}
-                    {rowHitl && (
-                      <div className="absolute right-2 top-2 z-40 flex items-center gap-2">{ticketInfoButton}</div>
-                    )}
+                    {/* 需人工介入时遮罩 z-30，信息按钮抬到 z-40 */}
+                    <div
+                      className={`absolute right-2 top-2 flex items-center gap-2 ${rowHitl ? 'z-40' : 'z-20'}`}
+                    >
+                      {ticketInfoButton}
+                    </div>
 
                     {/* Top: Created At */}
                     <div className="mb-2 flex items-center pl-2 pr-10">
@@ -1351,7 +1382,7 @@ export const OrderManagement: React.FC<{
                     <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-border/40">
                       <motion.div 
                         className={`h-full ${ticket.status === 'completed' ? 'bg-green-500' : 'bg-gradient-to-r from-primary via-primary/70 to-primary bg-[length:200%_100%]'}`}
-                        style={{ width: ticket.status === 'completed' ? '100%' : ticket.status === 'pending' || ticket.status === 'prepare' ? '0%' : `${progressPercent}%` }} 
+                        style={{ width: ticket.status === 'completed' ? '100%' : ticket.status === 'pending' || ticket.status === 'prepare' || ticket.status === 'full_manual' ? '0%' : `${progressPercent}%` }} 
                         animate={(ticket.status === 'processing' || rowHitl) ? { backgroundPosition: ['100% 0', '-100% 0'] } : {}}
                         transition={{ repeat: Infinity, duration: 2, ease: 'linear' }}
                       />
@@ -1396,14 +1427,24 @@ export const OrderManagement: React.FC<{
             </div>
             
             <div className="flex shrink-0 flex-wrap items-center gap-2">
-              {displayTicket.status === 'human_intervention' && (
+              {displayTicket.status === 'full_manual' && (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="flex items-center gap-2 rounded-lg border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-700 shadow-sm dark:text-violet-200"
+                >
+                  <User className="h-4 w-4 shrink-0" />
+                  {t('rdManageOrder.badgeFullManual')}
+                </motion.div>
+              )}
+              {displayTicket.sopAwaitingHuman && (
                 <motion.div
                   initial={{ opacity: 0, scale: 0.9 }}
                   animate={{ opacity: 1, scale: 1 }}
                   className="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive shadow-sm"
                 >
                   <ShieldAlert className="h-4 w-4 shrink-0" />
-                  需人工干预
+                  {t('rdManageOrder.badgeHitl')}
                 </motion.div>
               )}
             </div>
@@ -1428,14 +1469,12 @@ export const OrderManagement: React.FC<{
                   </p>
                 </div>
               </div>
-            ) : displayTicket.status === 'human_intervention' ? (
+            ) : displayTicket.status === 'full_manual' ? (
               <div className="flex h-full items-center justify-center p-8">
-                <div className="max-w-md rounded-xl border border-destructive/20 bg-destructive/5 p-6 text-center shadow-sm">
-                  <User className="mx-auto mb-4 h-12 w-12 text-destructive/80" />
-                  <h3 className="mb-2 text-lg font-medium text-foreground">全人工处理中</h3>
-                  <p className="text-sm leading-relaxed text-muted-foreground">
-                    该工单由人工负责处理，小鲸暂时无法帮忙，请同学们把需要我帮忙处理的工单推进到需求设计环节，再启用全自动处理流程。
-                  </p>
+                <div className="max-w-md rounded-xl border border-violet-500/25 bg-violet-500/5 p-6 text-center shadow-sm">
+                  <User className="mx-auto mb-4 h-12 w-12 text-violet-600 dark:text-violet-400" />
+                  <h3 className="mb-2 text-lg font-medium text-foreground">{t('rdManageOrder.panelFullManualTitle')}</h3>
+                  <p className="text-sm leading-relaxed text-muted-foreground">{t('rdManageOrder.panelFullManualBody')}</p>
                 </div>
               </div>
             ) : (
@@ -1551,7 +1590,7 @@ export const OrderManagement: React.FC<{
                           dotClass = "bg-destructive border-background shadow-[0_0_10px_color-mix(in_srgb,var(--destructive)_45%,transparent)] animate-pulse";
                           lineClass = "bg-destructive/75";
                           hoverClass = "hover:border-destructive hover:bg-destructive/15";
-                        } else if (state === 'human_intervention') {
+                        } else if (state === 'awaiting_human') {
                           cardClass = "min-h-[7.5rem] border-amber-500/55 bg-amber-500/10 text-amber-950 shadow-[0_0_16px_rgba(245,158,11,0.12)] dark:text-amber-50";
                           iconClass = "text-amber-600 dark:text-amber-400";
                           dotClass = "bg-amber-500 border-background shadow-[0_0_10px_rgba(245,158,11,0.45)] animate-pulse";
@@ -1632,7 +1671,7 @@ export const OrderManagement: React.FC<{
                                     <div className="text-red-400">&gt; [ERROR] Timeout waiting for model response.</div>
                                   </>
                                 )}
-                                {state === 'human_intervention' && (
+                                {state === 'awaiting_human' && (
                                   <>
                                     <div>&gt; [RUNNING] Analyzing data...</div>
                                     <div className="text-amber-400 mt-1">&gt; [WARN] Ambiguous requirements detected.</div>
@@ -1725,7 +1764,7 @@ export const OrderManagement: React.FC<{
                                     {state === 'completed' ? <CheckCircle2 className={`w-4 h-4 ${iconClass}`} /> :
                                      state === 'processing' ? <Loader2 className={`w-4 h-4 ${iconClass} animate-spin`} /> :
                                      state === 'error' ? <AlertCircle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
-                                     state === 'human_intervention' ? <AlertTriangle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
+                                     state === 'awaiting_human' ? <AlertTriangle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
                                      <CircleDashed className={`w-4 h-4 ${iconClass}`} />}
                                   </div>
                                   <div className="rounded-full border border-border bg-muted/50 px-2 py-0.5 font-mono text-[10px]">

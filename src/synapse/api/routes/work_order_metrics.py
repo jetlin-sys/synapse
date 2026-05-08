@@ -121,7 +121,7 @@ async def work_order_db_metrics(body: WorkOrderDbMetricsBody) -> dict[str, Any]:
 
 @router.post("/human-in-loop-flags")
 async def work_order_human_in_loop_flags(body: WorkOrderHumanInLoopFlagBody) -> dict[str, Any]:
-    """按单个 order_id 查询 sop_trajectories：是否存在 sop_node_human_in_the_loop = 1 的行。"""
+    """按单个 order_id 查询 sop_trajectories：仅看该工单最新一条轨迹是否 sop_node_human_in_the_loop = 1。"""
     db = await _get_db()
     if db is None:
         return error_response(503, "数据库不可用")

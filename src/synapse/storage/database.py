@@ -917,7 +917,7 @@ class Database:
         return result
 
     async def get_sop_human_in_loop_flags_by_order_ids(self, order_ids: list[str]) -> dict[str, bool]:
-        """Per order_id: True iff at least one sop_trajectories row has sop_node_human_in_the_loop = 1."""
+        """Per order_id: True iff the latest sop_trajectories row (max id) has sop_node_human_in_the_loop = 1."""
         if not self._connection or not order_ids:
             return {}
         cleaned = [str(x).strip() for x in order_ids if str(x).strip()]
@@ -925,11 +925,15 @@ class Database:
             return {}
         placeholders = ",".join("?" * len(cleaned))
         sql = f"""
-            SELECT order_id,
-                   MAX(CASE WHEN sop_node_human_in_the_loop = 1 THEN 1 ELSE 0 END) AS has_hitl
-            FROM sop_trajectories
-            WHERE order_id IN ({placeholders})
-            GROUP BY order_id
+            SELECT t.order_id AS order_id,
+                   CASE WHEN COALESCE(t.sop_node_human_in_the_loop, 0) = 1 THEN 1 ELSE 0 END AS has_hitl
+            FROM sop_trajectories t
+            INNER JOIN (
+                SELECT order_id, MAX(id) AS max_id
+                FROM sop_trajectories
+                WHERE order_id IN ({placeholders})
+                GROUP BY order_id
+            ) latest ON t.order_id = latest.order_id AND t.id = latest.max_id
         """
         cursor = await self._connection.execute(sql, cleaned)
         rows = await cursor.fetchall()
