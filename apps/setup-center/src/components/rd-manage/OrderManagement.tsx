@@ -1363,6 +1363,9 @@ export const OrderManagement: React.FC<{
                   ? ticket.sopAwaitingHuman
                   : Boolean((item as WorkItem).humanIntervention);
                 const rowFullManual = !isWorkItem && ticket.status === 'full_manual';
+                /** 预备中 / 全人工不参与本流水线，卡片上不应展示「等待调度」等节点名 */
+                const hidePipelineNodeLabel =
+                  !isWorkItem && (ticket.status === 'prepare' || ticket.status === 'full_manual');
 
                 const statusBorderColor = rowHitl
                   ? 'bg-destructive'
@@ -1479,7 +1482,11 @@ export const OrderManagement: React.FC<{
                           <Bot className="h-3.5 w-3.5 shrink-0 text-primary" />
                         )}
                         <span className={`truncate ${isDone ? 'text-green-700 dark:text-green-400' : 'text-foreground/90'}`}>
-                          {isDone ? '研发完成' : (currentNodeObj?.name || '未知节点')}
+                          {isDone
+                            ? '研发完成'
+                            : hidePipelineNodeLabel
+                              ? '待处理'
+                              : (currentNodeObj?.name || '未知节点')}
                         </span>
                       </div>
                       
