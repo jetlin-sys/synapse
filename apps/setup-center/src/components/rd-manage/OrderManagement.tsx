@@ -1255,7 +1255,16 @@ export const OrderManagement: React.FC<{
       <div className="flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-4 bg-background px-6 text-center text-muted-foreground">
         <FileText className="h-10 w-10 opacity-40" />
         <p className="max-w-md text-sm leading-relaxed">{t("rdManageOrder.emptySnapshot")}</p>
-        <Button type="primary" onClick={() => void refreshWorkOrdersFromDevCloud()} loading={boardRefreshBusy}>
+        <Button
+          type="primary"
+          onClick={() => void refreshWorkOrdersFromDevCloud()}
+          disabled={boardRefreshBusy}
+          icon={
+            boardRefreshBusy ? (
+              <Loader2 className="h-4 w-4 animate-spin app-loading-spin" aria-hidden />
+            ) : undefined
+          }
+        >
           {t("rdManageOrder.refresh")}
         </Button>
       </div>
@@ -1293,9 +1302,14 @@ export const OrderManagement: React.FC<{
                 type="text"
                 size="small"
                 className="shrink-0 !text-muted-foreground hover:!text-foreground"
-                loading={boardRefreshBusy}
                 disabled={boardRefreshBusy}
-                icon={<RefreshCw className="h-4 w-4" />}
+                icon={
+                  boardRefreshBusy ? (
+                    <Loader2 className="h-4 w-4 animate-spin app-loading-spin" aria-hidden />
+                  ) : (
+                    <RefreshCw className="h-4 w-4" aria-hidden />
+                  )
+                }
                 onClick={() => void refreshWorkOrdersFromDevCloud()}
                 aria-label={t("rdManageOrder.refresh")}
                 title={t("rdManageOrder.refresh")}
