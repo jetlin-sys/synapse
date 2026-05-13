@@ -18,6 +18,8 @@ export interface Repository {
   url: string;
   /** 仓库分支：repositoryId|destBranchName，对应 RdRepoInfo.repo_branch */
   branch: string;
+  /** 应用模块 productModuleId|moduleChName，对应 RdRepoInfo.repo_module */
+  repoModule?: string;
   /** 产品分支 branchVersionId|branchName，对应 RdRepoInfo.prod_branch */
   prodBranch?: string;
   token: string;
@@ -126,7 +128,7 @@ export interface Product {
   name: string;
   /** 产品版本：productVersionId|productVersionCode，与研发统一服务 `version` 一致 */
   version: string;
-  /** 应用模块；创建时与研发统一服务一致为 productModuleId|moduleChName */
+  /** 产品标签（研发统一服务 `module` 字段）；仅英文、数字、下划线，≤32 字节 */
   module: string;
   icon: string;
   description: string;
@@ -199,6 +201,49 @@ export function displayIdPipeName(value: string | undefined): string {
   const i = v.indexOf("|");
   if (i > 0) return v.slice(i + 1).trim() || v;
   return v;
+}
+
+/** 产品标签（`module`）最大 UTF-8 字节数 */
+export const PRODUCT_TAG_MAX_BYTES = 32;
+
+/** 输入框侧：仅保留英文、数字、下划线，并截断至字节上限 */
+export function sanitizeProductTagInput(raw: string): string {
+  let s = raw.replace(/[^a-zA-Z0-9_]/g, "");
+  while (new TextEncoder().encode(s).length > PRODUCT_TAG_MAX_BYTES) {
+    s = s.slice(0, -1);
+  }
+  return s;
+}
+
+/** 提交前校验：非空、字符集、字节长度 */
+export function isValidProductTag(s: string): boolean {
+  const t = s.trim();
+  if (!t) return false;
+  if (!/^[a-zA-Z0-9_]+$/.test(t)) return false;
+  return new TextEncoder().encode(t).length <= PRODUCT_TAG_MAX_BYTES;
+}
+
+/**
+ * 工单 `product_module_name` 与 get_prod_info 行匹配：
+ * 兼容旧数据（产品级 `module`）与新数据（仓库级 `repo_module`）。
+ */
+export function prodWireMatchesWorkItemModuleName(
+  row: ProdInfoWireItem,
+  productModuleName: string,
+): boolean {
+  const modName = productModuleName.trim();
+  if (!modName) return false;
+  const m = (row.module ?? "").trim();
+  if (m === modName) return true;
+  if (m.includes("|") && displayIdPipeName(m) === modName) return true;
+  const repos = Array.isArray(row.repo_info) ? row.repo_info : [];
+  for (const repo of repos) {
+    const rm = String(repo?.repo_module ?? "").trim();
+    if (!rm) continue;
+    if (rm === modName) return true;
+    if (displayIdPipeName(rm) === modName) return true;
+  }
+  return false;
 }
 
 /** 多仓库时产品分支下拉：排除其它行已选的 `value`（当前行已选保留可选） */
@@ -276,6 +321,7 @@ function repoWireToRepository(r: RdRepoInfo): Repository {
     purpose: r.repo_func ?? "",
     url: r.repo_url ?? "",
     branch: r.repo_branch ?? "",
+    repoModule: (r.repo_module ?? "").trim() || undefined,
     prodBranch: r.prod_branch?.trim() || undefined,
     token: r.repo_token || "",
     codePath: (r.code_path ?? "").trim() || undefined,
@@ -289,6 +335,7 @@ export function repositoriesToRdRepoInfo(repositories: Repository[]): RdRepoInfo
     repo_url: r.url,
     repo_branch: r.branch,
     prod_branch: (r.prodBranch ?? "").trim(),
+    repo_module: (r.repoModule ?? "").trim(),
     code_path: (r.codePath ?? "").trim(),
     repo_func: r.purpose,
     repo_token: r.token || "",
@@ -654,7 +701,7 @@ export const MOCK_PROD_INFO_ITEMS: ProdInfoWireItem[] = [
   {
     prod: "智能搜索助手",
     version: "v2.4.1",
-    module: "核心检索模块",
+    module: "search_core",
     space: "数据智能部",
     owner: "张三",
     function: "智能检索,语义搜索,多源索引",
@@ -665,6 +712,7 @@ export const MOCK_PROD_INFO_ITEMS: ProdInfoWireItem[] = [
       {
         repo_url: "https://github.com/rd-agent/search-backend",
         repo_branch: "develop",
+        repo_module: "1001|核心检索模块",
         code_path: "apps/backend",
         repo_func: "后端核心业务",
         repo_token: "",
@@ -673,6 +721,7 @@ export const MOCK_PROD_INFO_ITEMS: ProdInfoWireItem[] = [
       {
         repo_url: "https://github.com/rd-agent/search-frontend",
         repo_branch: "develop",
+        repo_module: "1002|前端展示模块",
         code_path: "src",
         repo_func: "前端交互界面",
         repo_token: "",
@@ -693,7 +742,7 @@ export const MOCK_PROD_INFO_ITEMS: ProdInfoWireItem[] = [
   {
     prod: "代码审计工具",
     version: "v1.2.0",
-    module: "安全规则引擎",
+    module: "audit_core",
     space: "基础平台部",
     owner: "李四",
     function: "静态分析,规则引擎,安全扫描",
@@ -704,6 +753,7 @@ export const MOCK_PROD_INFO_ITEMS: ProdInfoWireItem[] = [
       {
         repo_url: "https://github.com/rd-agent/code-audit-core",
         repo_branch: "master",
+        repo_module: "2001|安全规则引擎",
         code_path: "",
         repo_func: "审计引擎",
         repo_token: "",

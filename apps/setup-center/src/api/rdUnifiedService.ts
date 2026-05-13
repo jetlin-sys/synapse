@@ -38,6 +38,8 @@ export type RdRepoInfo = {
   repo_branch: string;
   /** 产品分支：branchVersionId|branchName（与仓库条目绑定） */
   prod_branch?: string;
+  /** 应用模块：productModuleId|moduleChName（create_prod / change_repo_info / get_prod_info） */
+  repo_module?: string;
   /** 仓库代码路径（create_prod / change_repo_info 提交；get_prod_info / get_repo_info 回读） */
   code_path?: string;
   repo_func: string;
@@ -774,7 +776,7 @@ export async function docsSubmit(
  *
  * **请求体**：
  * - `prod`：产品名称
- * - `repo_info`：`{ repo_url, repo_branch, prod_branch?, code_path?, repo_func, repo_token, repo_master: "Y"|"N" }[]`
+ * - `repo_info`：`{ repo_url, repo_branch, prod_branch?, repo_module?, code_path?, repo_func, repo_token, repo_master: "Y"|"N" }[]`
  *
  * 成功后可由调用方再调 {@link getProdProcessInfo} 刷新过程状态。
  */

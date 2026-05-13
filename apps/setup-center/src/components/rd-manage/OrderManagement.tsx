@@ -57,6 +57,7 @@ import {
   applyProcessPayloadToProduct,
   patchProductKnowledgeSlots,
   prodInfoWireToProduct,
+  prodWireMatchesWorkItemModuleName,
   type ProductKnowledgePatch,
 } from '@/components/product/types';
 import { ViewId } from '../../types';
@@ -642,7 +643,7 @@ export const OrderManagement: React.FC<{
         const raw = Array.isArray(resp.data) ? resp.data : [];
         const rows = raw.filter((row): row is ProdInfoWireItem => row != null);
         const hit =
-          (modName && rows.find((r) => (r.module || "").trim() === modName)) ||
+          (modName && rows.find((r) => prodWireMatchesWorkItemModuleName(r, modName))) ||
           (repoUrl
             ? rows.find(
                 (r) =>

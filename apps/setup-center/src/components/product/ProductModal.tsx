@@ -5,11 +5,14 @@ import {
   Product,
   Repository,
   DEFAULT_ICONS,
+  displayIdPipeName,
   filterProdBranchOptionsForRow,
   filterRepoBranchOptionsForRow,
   findRepoUrlForDetailComposite,
+  isValidProductTag,
   isValidRepoBranchComposite,
   repoDetailRowToOption,
+  sanitizeProductTagInput,
 } from "./types";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -175,7 +178,7 @@ export function ProductModal({
     icon: string;
     projectSpace: string;
     productVersion: string;
-    appModule: string;
+    productTag: string;
     description: string;
     featureRows: ProductFeatureRow[];
     repositories: Repository[];
@@ -184,7 +187,7 @@ export function ProductModal({
     icon: DEFAULT_ICONS[0].value,
     projectSpace: "",
     productVersion: "",
-    appModule: "",
+    productTag: "",
     description: "",
     featureRows: [emptyFeatureRow()],
     repositories: [],
@@ -207,8 +210,7 @@ export function ProductModal({
   const isProductInfoFilled = !!(
     formState.name &&
     formState.projectSpace &&
-    formState.productVersion &&
-    formState.appModule
+    formState.productVersion
   );
 
   /** 父组件异步传入项目列表时只更新选项，避免重复重置表单、清空已加载的产品版本 */
@@ -227,7 +229,7 @@ export function ProductModal({
         icon: initialValues.icon || DEFAULT_ICONS[0].value,
         projectSpace: initialValues.space ?? "",
         productVersion: initialValues.version ?? "",
-        appModule: initialValues.module ?? "",
+        productTag: initialValues.module ?? "",
         description: initialValues.description || "",
         featureRows: parseFeaturesFromStored(initialValues.features ?? ""),
         repositories: initialValues.repositories || [],
@@ -239,7 +241,7 @@ export function ProductModal({
         icon: DEFAULT_ICONS[0].value,
         projectSpace: "",
         productVersion: "",
-        appModule: "",
+        productTag: "",
         description: "",
         featureRows: [emptyFeatureRow()],
         repositories: [],
@@ -394,7 +396,7 @@ export function ProductModal({
       ...prev,
       projectSpace: v,
       productVersion: "",
-      appModule: "",
+      productTag: "",
       repositories: [],
     }));
   };
@@ -403,13 +405,8 @@ export function ProductModal({
     setFormState((prev) => ({
       ...prev,
       productVersion: v,
-      appModule: "",
       repositories: [],
     }));
-  };
-
-  const handleModuleChange = (val: string) => {
-    setFormState((prev) => ({ ...prev, appModule: val, repositories: [] }));
   };
 
   const handleRepoProdBranchChange = (index: number, v: string) => {
@@ -455,6 +452,7 @@ export function ProductModal({
       {
         branch: "",
         prodBranch: "",
+        repoModule: "",
         isMain: formState.repositories.length === 0,
         url: "",
         purpose: "",
@@ -480,9 +478,16 @@ export function ProductModal({
       toast.error(t("workbench.products.modal.nameWindowsInvalid"));
       return;
     }
-    if (!isEdit && (!formState.projectSpace || !formState.productVersion || !formState.appModule)) {
-      toast.error(t("workbench.products.modal.spaceVersionModuleRequired"));
+    if (!isEdit && (!formState.projectSpace || !formState.productVersion)) {
+      toast.error(t("workbench.products.modal.spaceVersionRequired"));
       return;
+    }
+    if (!isEdit) {
+      const tag = formState.productTag.trim();
+      if (!isValidProductTag(tag)) {
+        toast.error(t("workbench.products.modal.productTagInvalid"));
+        return;
+      }
     }
 
     const featureErrKey = getFeatureRowsValidationError(formState.featureRows);
@@ -500,6 +505,14 @@ export function ProductModal({
         }
         if (mainRepos.length > 1) {
           toast.error(t("workbench.products.modal.mainRepoErrorMany") || "只能有一个主分支仓库");
+          return;
+        }
+        const badRepoModule = formState.repositories.some((r) => {
+          const rm = r.repoModule?.trim() ?? "";
+          return !rm || parseCompositeLeadingId(rm) == null;
+        });
+        if (badRepoModule) {
+          toast.error(t("workbench.products.modal.repoModuleRequired"));
           return;
         }
         const badPb = formState.repositories.some((r) => {
@@ -534,8 +547,8 @@ export function ProductModal({
         name: formState.name,
         icon: formState.icon,
         version: formState.productVersion,
-        /** productModuleId|moduleChName */
-        module: formState.appModule,
+        /** 产品标签 → 研发统一服务 `module` */
+        module: formState.productTag.trim(),
         description: formState.description,
         features: featuresStr,
         repositories: reposOut,
@@ -551,7 +564,7 @@ export function ProductModal({
     isEdit ||
     !formState.projectSpace ||
     parseProjectIdFromSpaceValue(formState.projectSpace) == null;
-  const moduleSelectDisabled =
+  const repoModuleSelectDisabled =
     isEdit ||
     parseProjectIdFromSpaceValue(formState.projectSpace) == null ||
     parseCompositeLeadingId(formState.productVersion) == null;
@@ -611,7 +624,7 @@ export function ProductModal({
             </div>
           </div>
 
-          {/* Row 2: Space + Version + Module */}
+          {/* Row 2: Space + Version + Product tag */}
           <div className="grid grid-cols-12 gap-5">
             <div className="col-span-12 space-y-2 sm:col-span-4">
               <Label>
@@ -670,32 +683,33 @@ export function ProductModal({
             </div>
             <div className="col-span-12 space-y-2 sm:col-span-4">
               <Label>
-                {t("workbench.products.modal.appModule")} {!isEdit && <span className="text-destructive">*</span>}
+                {t("workbench.products.modal.productTag")}{" "}
+                {!isEdit && <span className="text-destructive">*</span>}
               </Label>
               {isEdit ? (
                 <Input
                   readOnly
                   tabIndex={-1}
-                  value={formState.appModule}
+                  value={formState.productTag}
                   className="bg-muted/50 text-foreground cursor-default"
                 />
               ) : (
-                <SearchableVirtualSelect
-                  value={formState.appModule}
-                  onValueChange={handleModuleChange}
-                  options={appModuleOptions}
-                  placeholder={t("workbench.products.modal.appModulePlaceholder")}
-                  searchPlaceholder={t("workbench.products.modal.searchFilterPlaceholder")}
-                  emptyText={
-                    moduleSelectDisabled
-                      ? t("workbench.products.modal.selectVersionFirst")
-                      : modulesLoading
-                        ? ""
-                        : t("workbench.products.modal.moduleListEmpty")
-                  }
-                  disabled={moduleSelectDisabled}
-                  isLoading={modulesLoading}
-                />
+                <>
+                  <Input
+                    value={formState.productTag}
+                    onChange={(e) =>
+                      setFormState((prev) => ({
+                        ...prev,
+                        productTag: sanitizeProductTagInput(e.target.value),
+                      }))
+                    }
+                    placeholder={t("workbench.products.modal.productTagPlaceholder")}
+                    maxLength={32}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <p className="text-xs text-muted-foreground m-0">{t("workbench.products.modal.productTagHint")}</p>
+                </>
               )}
             </div>
           </div>
@@ -766,6 +780,10 @@ export function ProductModal({
                       </div>
                       <div className="grid gap-1.5 text-xs text-muted-foreground">
                         <div>
+                          <span className="text-foreground/80">{t("workbench.products.modal.appModule")}: </span>
+                          {repo.repoModule?.trim() ? displayIdPipeName(repo.repoModule) : "—"}
+                        </div>
+                        <div>
                           <span className="text-foreground/80">{t("workbench.products.modal.prodBranch")}: </span>
                           {repo.prodBranch?.trim() || "—"}
                         </div>
@@ -832,7 +850,26 @@ export function ProductModal({
 
                       {isExpanded && (
                         <div className="p-4 pt-1 border-t border-border/50 grid grid-cols-12 gap-4 bg-background/50">
-                          <div className="col-span-12 sm:col-span-8 space-y-2">
+                          <div className="col-span-12 sm:col-span-4 space-y-2">
+                            <Label className="text-xs">{t("workbench.products.modal.appModule")} *</Label>
+                            <SearchableVirtualSelect
+                              value={repo.repoModule ?? ""}
+                              onValueChange={(v) => patchRepositoryFields(index, { repoModule: v })}
+                              options={appModuleOptions}
+                              placeholder={t("workbench.products.modal.appModulePlaceholder")}
+                              searchPlaceholder={t("workbench.products.modal.searchFilterPlaceholder")}
+                              emptyText={
+                                repoModuleSelectDisabled
+                                  ? t("workbench.products.modal.selectVersionFirst")
+                                  : modulesLoading
+                                    ? ""
+                                    : t("workbench.products.modal.moduleListEmpty")
+                              }
+                              disabled={repoModuleSelectDisabled}
+                              isLoading={modulesLoading}
+                            />
+                          </div>
+                          <div className="col-span-12 sm:col-span-4 space-y-2">
                             <Label className="text-xs">{t("workbench.products.modal.prodBranch")} *</Label>
                             <SearchableVirtualSelect
                               value={repo.prodBranch ?? ""}
