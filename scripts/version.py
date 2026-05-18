@@ -9,7 +9,7 @@
   - apps/setup-center/package.json (version)
   - apps/setup-center/src-tauri/tauri.conf.json (version)
   - apps/setup-center/src-tauri/Cargo.toml ([package].version)
-  - apps/setup-center/src-tauri/Cargo.lock (synapse-setup-center package entry)
+  - apps/setup-center/src-tauri/Cargo.lock (synapse-desktop package entry)
   - apps/setup-center/android/app/build.gradle (versionName + versionCode)
 - CI/Release 可用 `check` 阻止漏改。
 """
@@ -152,7 +152,7 @@ def _update_cargo_lock(version: str) -> bool:
             continue
         if in_pkg and line.startswith("name = "):
             name = line.split("=", 1)[1].strip().strip('"')
-            is_target_pkg = name == "synapse-setup-center"
+            is_target_pkg = name == "synapse-desktop"
             continue
         if in_pkg and is_target_pkg and line.startswith("version = "):
             old_version = line.split("=", 1)[1].strip().strip('"')
@@ -285,9 +285,9 @@ def check(expected: str | None) -> int:
         mismatches.append("apps/setup-center/src-tauri/Cargo.toml")
 
     cargo_lock = _read_text(ROOT / "apps/setup-center/src-tauri/Cargo.lock")
-    # 找到 synapse-setup-center 这个 package 的 version
+    # 找到 synapse-desktop 这个 package 的 version
     lm = re.search(
-        r'(?ms)^\[\[package\]\]\s*\nname\s*=\s*"synapse-setup-center"\s*\nversion\s*=\s*"([^"]+)"\s*$',
+        r'(?ms)^\[\[package\]\]\s*\nname\s*=\s*"synapse-desktop"\s*\nversion\s*=\s*"([^"]+)"\s*$',
         cargo_lock,
     )
     if not lm or lm.group(1) != v:

@@ -4537,7 +4537,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "synapse-setup-center"
+name = "synapse-desktop"
 version = "1.26.0"
 dependencies = [
  "anyhow",
@@ -4708,6 +4708,7 @@ dependencies = [
  "gtk",
  "heck 0.5.0",
  "http",
+ "image",
  "jni",
  "libc",
  "log",

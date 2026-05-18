@@ -177,7 +177,10 @@ ${StrRep}
 ; (reinst_uninstall phase) and in Section Install (NSIS_HOOK_PREINSTALL).
 ; Ensures file locks are released regardless of old uninstaller's capabilities.
 !macro NSIS_HOOK_PREINSTALL_KILLPROCS
-  nsExec::ExecToLog 'powershell -NoProfile -Command "Get-Process -Name synapse-setup-center,synapse-server -EA SilentlyContinue | Stop-Process -Force"'
+  nsExec::ExecToLog 'powershell -NoProfile -Command "Get-Process -Name synapse-desktop,synapse-setup-center,synapse-server -EA SilentlyContinue | Stop-Process -Force"'
+  Pop $0
+  nsExec::ExecToStack 'cmd /c taskkill /IM synapse-desktop.exe /T /F >nul 2>&1'
+  Pop $0
   Pop $0
   nsExec::ExecToStack 'cmd /c taskkill /IM synapse-setup-center.exe /T /F >nul 2>&1'
   Pop $0
@@ -244,7 +247,10 @@ ${StrRep}
 
 !macro NSIS_HOOK_PREUNINSTALL
   ; 卸载前：强制杀掉残留进程（合并 PowerShell 调用，nsExec 无弹窗）
-  nsExec::ExecToLog 'powershell -NoProfile -Command "Get-Process -Name synapse-setup-center,synapse-server -EA SilentlyContinue | Stop-Process -Force"'
+  nsExec::ExecToLog 'powershell -NoProfile -Command "Get-Process -Name synapse-desktop,synapse-setup-center,synapse-server -EA SilentlyContinue | Stop-Process -Force"'
+  Pop $0
+  nsExec::ExecToStack 'cmd /c taskkill /IM synapse-desktop.exe /T /F >nul 2>&1'
+  Pop $0
   Pop $0
   nsExec::ExecToStack 'cmd /c taskkill /IM synapse-setup-center.exe /T /F >nul 2>&1'
   Pop $0

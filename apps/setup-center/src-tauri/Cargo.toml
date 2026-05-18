@@ -1,5 +1,5 @@
 [package]
-name = "synapse-setup-center"
+name = "synapse-desktop"
 version = "1.26.0"
 description = "Synapse Setup Center"
 authors = ["Synapse"]
@@ -11,7 +11,7 @@ base64 = "0.22.1"
 flate2 = "1.0.35"
 
 [dependencies]
-tauri = { version = "2.10.1", features = [ "tray-icon"] }
+tauri = { version = "2.10.1", features = ["tray-icon", "image-png", "image-ico"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-fs = "2"

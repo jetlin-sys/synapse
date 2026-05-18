@@ -550,8 +550,8 @@ fn bundled_backend_dir() -> PathBuf {
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
 
         let static_names: &[&str] = &[
-            "synapse-setup-center", // Cargo.toml package name (Tauri 2.x default)
-            "synapse-desktop",      // legacy / mainBinaryName override
+            "synapse-desktop",       // Cargo.toml package name (Tauri 2.x default)
+            "synapse-setup-center", // legacy deb 安装路径
             "open-akita-desktop",
         ];
 
@@ -657,14 +657,14 @@ fn bundled_llm_token_guide_video_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         let mut candidates: Vec<PathBuf> = vec![];
-        for app_name in &["synapse-desktop", "synapse-desktop"] {
+        for app_name in &["synapse-desktop", "synapse-setup-center"] {
             candidates.push(PathBuf::from(format!(
                 "/usr/lib/{}/resources/video/llmtoken.mp4",
                 app_name
             )));
         }
         if let Some(usr_dir) = exe_dir.parent() {
-            for app_name in &["synapse-desktop", "synapse-desktop"] {
+            for app_name in &["synapse-desktop", "synapse-setup-center"] {
                 candidates.push(
                     usr_dir
                         .join("lib")
@@ -676,7 +676,7 @@ fn bundled_llm_token_guide_video_path() -> PathBuf {
             }
         }
         if let Some(mount_root) = exe_dir.parent().and_then(|p| p.parent()) {
-            for app_name in &["synapse-desktop", "synapse-desktop"] {
+            for app_name in &["synapse-desktop", "synapse-setup-center"] {
                 candidates.push(
                     mount_root
                         .join("lib")
@@ -4049,8 +4049,46 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let menu = Menu::with_items(app, &[&open_status, &open_web, &show, &hide, &quit])?;
 
+    // default_window_icon 在部分环境（缺 bundle 图标、解析失败）可能为 None；unwrap 会整进程 panic →「一打开就退出」。
+    let tray_icon = if let Some(i) = app.default_window_icon() {
+        i.clone()
+    } else {
+        // 打包后 default_window_icon 偶发为 None 时，依次尝试 resource_dir 与源码 icons/。
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = app.path().resource_dir() {
+            candidates.push(rd.join("icon.png"));
+            candidates.push(rd.join("icon.ico"));
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("icons");
+        candidates.push(dir.join("icon.png"));
+        candidates.push(dir.join("icon.ico"));
+
+        let mut chosen: Option<tauri::image::Image<'static>> = None;
+        let mut last_err = String::new();
+        for p in candidates {
+            match tauri::image::Image::from_path(&p) {
+                Ok(img) => {
+                    chosen = Some(img);
+                    break;
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        match chosen {
+            Some(img) => img,
+            None => {
+                return Err(
+                    format!(
+                        "tray icon: default_window_icon missing; tried resource_dir and src-tauri/icons. Last error: {last_err}"
+                    )
+                    .into(),
+                );
+            }
+        }
+    };
+
     TrayIconBuilder::with_id("main_tray")
-        .icon(app.default_window_icon().unwrap().clone())
+        .icon(tray_icon)
         .tooltip("Synapse")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -5897,7 +5935,7 @@ async fn fetch_pypi_versions(package: String, index_url: Option<String>) -> Resu
 
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .user_agent("synapse-setup-center")
+            .user_agent("synapse-desktop")
             .build()
             .map_err(|e| format!("HTTP client error: {e}"))?;
 
@@ -7298,14 +7336,14 @@ fn bundled_resources_pack_dir(pack_folder: &str) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         let mut candidates: Vec<PathBuf> = vec![];
-        for app_name in &["synapse-desktop", "synapse-desktop"] {
+        for app_name in &["synapse-desktop", "synapse-setup-center"] {
             candidates.push(PathBuf::from(format!(
                 "/usr/lib/{}/resources/{}",
                 app_name, pack_folder
             )));
         }
         if let Some(usr_dir) = exe_dir.parent() {
-            for app_name in &["synapse-desktop", "synapse-desktop"] {
+            for app_name in &["synapse-desktop", "synapse-setup-center"] {
                 candidates.push(
                     usr_dir
                         .join("lib")
@@ -7316,7 +7354,7 @@ fn bundled_resources_pack_dir(pack_folder: &str) -> PathBuf {
             }
         }
         if let Some(mount_root) = exe_dir.parent().and_then(|p| p.parent()) {
-            for app_name in &["synapse-desktop", "synapse-desktop"] {
+            for app_name in &["synapse-desktop", "synapse-setup-center"] {
                 candidates.push(
                     mount_root
                         .join("lib")
