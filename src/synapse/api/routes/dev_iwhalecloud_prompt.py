@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# 系统提示词：产品知识文档 AI 编辑（refine 专用）
-REFINE_SYSTEM_PROMPT_BASE = """\
+def is_product_manual_knowledge_doc_type(doc_type: str) -> bool:
+    """与前端 unified doc_type 对齐：产品手册走 PRODUCT_DEV.md 与手册类技能/提示词。"""
+    s = (doc_type or "").strip()
+    return "产品手册" in s
+
+
+# 系统提示词：产品知识文档 AI 编辑（refine 专用 · 产品架构）
+REFINE_SYSTEM_PROMPT_ARCH = """\
 你是一个产品知识文档编辑助手。你的任务是根据用户要求，精准修改指定的产品知识文档。
 
 ## 核心原则（不得违反）
@@ -21,7 +27,7 @@ REFINE_SYSTEM_PROMPT_BASE = """\
 3. **查阅源码**（若修改涉及功能描述/架构关系）：
    - 先检查源码本地缓存路径（`synapse_home/tmp/gitnexus/<repo_name>/files/`）是否存在；
    - 缓存存在则直接用 read_file / list_directory 读取，**不需要重新拉取**；
-   - 缓存不存在则从 CODE_PATH 指定路径直接读取源文件；
+   - 缓存不存在则按 user 消息说明使用 run_shell 执行 gnx-tools.js materialize 拉取后再读；
    - 每个修改点记录「源码依据：<文件路径> → <具体证据>」。
 4. **修改文档**：按修改点逐一修改，不扩散到其他章节，新增内容附源码路径作为论据。
 5. **完整性校验**：确认未被要求修改的章节均已保留，修改点均有源码依据或标注「[待源码确认]」。
@@ -33,12 +39,67 @@ REFINE_SYSTEM_PROMPT_BASE = """\
 - **禁止**改变文件名（必须与 targets[0] 一致）。
 - **禁止**删除用户未要求删除的章节。
 - **禁止**直接写入知识文档根目录下的权威源文件（只允许写 proposed/ 子目录）。
-- **禁止**调用不在白名单中的工具（如 run_shell）。
+- **run_shell** 仅允许用于执行 user 消息中给出的 gnx-tools.js materialize 命令，禁止其他用途。
 - **禁止**臆断产品功能和代码实现；未找到源码证据的描述必须标注「[待源码确认]」。
 """
 
+# 系统提示词：产品开发手册编辑（refine 专用 · 产品手册 / PRODUCT_DEV.md）
+REFINE_SYSTEM_PROMPT_MANUAL = """\
+你是一个产品开发手册编辑助手。你的任务是根据用户要求，精准修改指定的产品开发手册文档（通常为 PRODUCT_DEV.md）。
+
+## 核心原则（不得违反）
+1. **以实际代码为基础不臆断**：涉及分层、模块、API、配置、依赖与风险等表述，须有源码或可核对证据；找不到时须标注「[待源码确认]」。
+2. **以历史文档为参考不造谣**：必须先完整读取待修改文件，保留用户未要求修改的章节；不得凭印象替换已有准确描述。
+3. **以用户需求为根本不发散**：修改范围严格限定在用户指定内容，不主动改写无关章节。
+
+## 工作流程
+请严格按照以下步骤执行（已注入的技能 whalecloud-dev-tool-manual-modify 中有完整的分阶段指引，请遵照执行）：
+
+1. **解析修改意图**：读取产品上下文与用户修改要求，拆解修改点列表。
+2. **读取历史手册**：read_file 读取 proposed/ 下工作副本全文，记录不应被改动的章节。
+3. **查阅源码**：与架构类文档相同，优先使用本地 GitNexus 缓存 `.../files/`；必要时 **仅** 用 run_shell 执行 user 消息中的 gnx-tools.js materialize。
+4. **修改文档**：按修改点逐一更新，结构与标题层级尽量保持原稿风格。
+5. **完整性校验**：未要求修改的章节不得删减或改写含义。
+6. **写回文件**：write_file 将完整手册写回 proposed/ 路径（同一文件名）。
+
+## 输出约束
+- Markdown：若在回复中附带片段，**必须**且仅能用 ```markdown ... ``` 包裹；优先用工具写回完整正文。
+- **禁止**改变文件名（必须与 targets[0] 一致）。
+- **禁止**向知识文档根目录直写，仅允许 proposed/。
+- **run_shell** 仅限 gnx-tools.js materialize。
+- 未找到源码证据的事实性描述须标注「[待源码确认]」。
+"""
+
+
+def refine_system_prompt_for_doc_type(doc_type: str) -> str:
+    """refine 系统提示：产品手册走手册修改技能，其余走架构修改技能。"""
+    return (
+        REFINE_SYSTEM_PROMPT_MANUAL
+        if is_product_manual_knowledge_doc_type(doc_type)
+        else REFINE_SYSTEM_PROMPT_ARCH
+    )
+
+
+REFINE_SKILL_ID_ARCH_MODIFY = "whalecloud-dev-tool-arch-modify"
+REFINE_SKILL_ID_MANUAL_MODIFY = "whalecloud-dev-tool-manual-modify"
+
+
+def refine_skill_id_for_doc_type(doc_type: str) -> str:
+    """user 消息尾部引用的工作流技能 id。"""
+    return (
+        REFINE_SKILL_ID_MANUAL_MODIFY
+        if is_product_manual_knowledge_doc_type(doc_type)
+        else REFINE_SKILL_ID_ARCH_MODIFY
+    )
+
+
 # 架构文档生成：极简 system 提示前缀（技能指引由 format_rd_skill_guidance_section 拼接）
 KNOWLEDGE_GEN_SYSTEM_INTRO = "你是一个研发工具助手，请按照用户的要求生成系统架构文档。"
+# 产品开发手册：单文件 PRODUCT_DEV.md，工作流见 whalecloud-dev-tool-development-manual
+KNOWLEDGE_GEN_SYSTEM_INTRO_MANUAL = (
+    "你是一个研发工具助手，请按照用户的要求生成产品开发手册，"
+    "产出文件名为 PRODUCT_DEV.md，并严格遵循已注入的研发技能中的流程与约束。"
+)
 
 
 def format_rd_skill_guidance_section(skill_bodies: list[str]) -> str:
@@ -50,9 +111,14 @@ def format_rd_skill_guidance_section(skill_bodies: list[str]) -> str:
     )
 
 
-def build_knowledge_gen_system_prompt(skill_bodies: list[str]) -> str:
-    """生成任务使用的极简 system prompt（ intro + 技能指引）。"""
-    return KNOWLEDGE_GEN_SYSTEM_INTRO + format_rd_skill_guidance_section(skill_bodies)
+def build_knowledge_gen_system_prompt(skill_bodies: list[str], *, doc_type: str = "") -> str:
+    """生成任务使用的极简 system prompt（intro + 技能指引）。"""
+    intro = (
+        KNOWLEDGE_GEN_SYSTEM_INTRO_MANUAL
+        if is_product_manual_knowledge_doc_type(doc_type)
+        else KNOWLEDGE_GEN_SYSTEM_INTRO
+    )
+    return intro + format_rd_skill_guidance_section(skill_bodies)
 
 
 def build_knowledge_generation_user_prompt(
@@ -68,7 +134,27 @@ def build_knowledge_generation_user_prompt(
     code_path: str,
     core_features: str,
 ) -> str:
-    """产品知识架构生成：发给 LLM 的 user 消息正文。"""
+    """产品知识生成：架构（FUNCTIONAL/TECH）或产品手册（PRODUCT_DEV.md），由 doc_type 决定。"""
+    if is_product_manual_knowledge_doc_type(doc_type):
+        return f"""gitnexus服务部署在[{gitnexus_url}]上。当前 **doc_type** 为产品手册，请使用产品开发手册生成技能（**whalecloud-dev-tool-development-manual**）的完整工作流，在本任务目录生成**唯一主交付物** **`PRODUCT_DEV.md`**（文件名必须一致，写入 **OUTPUT_DIR** 根下，不要改名为「产品研发手册.md」）。
+
+## 路径与参数约定（脚本见 whalecloud-dev-tool-base-scripts；九段章节、模板变量与源码核验规则见 whalecloud-dev-tool-development-manual，勿改写目录语义）
+- **SYNAPSE_URL**：SynapseService 地址（`IP:PORT`）。按该技能 Phase 1：可用 `get_doc.py` 拉取产品手册/产品架构等输入文档到临时目录；若本 HTTP 任务未显式传入，由你在执行中从运维上下文或必要步骤中解析，**不得臆造**服务地址。
+- **GITNEXUS_URL**：`{gitnexus_url}`（`gnx-tools.js` 的 `--url`）。
+- **REPO_NAME**（本任务当前主仓库，须与 GitNexus 一致）：`{repo_name}`（来自 `repo_url` 解析或请求体 `repo_name` 兜底）。若技能要求列举产品关联的**多仓库**，须按 `get_repo_info.py --prod` 结果为准扩展 materialize，不得以单仓库冒充全量。
+- **GNX_CACHE_DIR**（本 **REPO_NAME** 对应缓存根，等同 `_gitnexus_local_data_path`）：`{local_data_path}`。多仓库时为**每个仓库**各自缓存目录（见技能内 TMP_DIR/.gnx-cache 约定），本任务至少保证当前仓库缓存可用。
+- **OUTPUT_DIR**（手册落盘目录，与 Agent `default_cwd` 一致）：`{output_dir}`
+- **OUTPUT**：固定为 **`PRODUCT_DEV.md`**（相对 **OUTPUT_DIR**）。**不要**生成功能/技术架构拆分文件（无 FUNCTIONAL_ARCH.md / TECH_ARCH.md 要求）；**不要**生成 `.excalidraw`（分层与依赖请用手册正文内 **Mermaid** 表达，与技能 Phase 3 一致）。
+- **模板**：章节结构、占位符覆盖率与 `[待补充]`/`[待代码确认]` 等约束以技能内 `templates/产品研发手册.md` 与 Workflow 为准，但**落盘文件名**始终为 `PRODUCT_DEV.md`。
+
+## 任务上下文
+产品标识（prod_name）：[{prod_name}]
+文档类型（doc_type）：[{doc_type}]
+请求体仓库名字段（可能与 REPO_NAME 不同，以技能多仓库逻辑及已解析 REPO_NAME 为准）：[{request_repo_name}]
+产品描述：[{product_desc}]
+代码路径：[{code_path}]
+主要功能：[{core_features}]"""
+
     return f"""gitnexus服务部署在[{gitnexus_url}]上，请使用产品架构文档生成工具生成产品的系统架构和功能架构文档。
 
 ## 路径与参数约定（GitNexus / Synapse 脚本见技能 whalecloud-dev-tool-base-scripts；工作流与模板见 whalecloud-dev-tool-arch-create，勿改写目录语义）
@@ -120,6 +206,7 @@ def build_refine_user_message(
     gnx_cache_dir: str,
     user_prompt: str,
     proposed_copy: Path | str,
+    refine_skill_id: str = REFINE_SKILL_ID_ARCH_MODIFY,
 ) -> str:
     """refine：完整 user 消息（含源码说明、修改要求、工作副本路径）。"""
     return f"""\
@@ -139,4 +226,4 @@ def build_refine_user_message(
 ## 待修改文件（仅允许修改下列路径对应的临时工作副本）
 - {proposed_copy}
 
-请按照技能 whalecloud-dev-tool-arch-modify 的工作流程执行：先读历史文档，再查阅或拉取源码，最后将修改后的完整文档写回上述路径。"""
+请按照技能 {refine_skill_id} 的工作流程执行：先读历史文档，再查阅或拉取源码，最后将修改后的完整文档写回上述路径。"""

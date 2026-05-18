@@ -1,7 +1,7 @@
 ---
 name: whalecloud-dev-tool-requirement-clarify
 description: "需求澄清技能 - 分析原始需求，结合 GitNexus 源码检索，生成需要澄清的问题列表，逐轮向用户确认直到需求清晰。"
-label:需求澄清技能
+label: 需求澄清技能
 ---
 
 # 需求澄清技能

@@ -18,12 +18,13 @@ from pydantic import BaseModel, Field
 
 from synapse.agents.profile import AgentProfile, SkillsMode, get_profile_store
 from synapse.api.routes.dev_iwhalecloud_prompt import (
-    REFINE_SYSTEM_PROMPT_BASE,
     build_knowledge_gen_system_prompt,
     build_knowledge_generation_user_prompt,
     build_refine_product_context,
     build_refine_user_message,
     format_rd_skill_guidance_section,
+    refine_skill_id_for_doc_type,
+    refine_system_prompt_for_doc_type,
 )
 from synapse.api.schemas import error_response, success_response
 from synapse.config import settings
@@ -113,7 +114,7 @@ class ProductKnowledgeGenerateRequest(BaseModel):
     )
     doc_type: str = Field(
         ...,
-        description="文档类型，与统一服务 doc_type 一致；与 prod_name 共同决定落盘目录",
+        description="文档类型：与统一服务一致；内置任务区分「产品架构」（FUNCTIONAL/TECH）与「产品手册」（PRODUCT_DEV.md）等",
         min_length=1,
         max_length=256,
     )
@@ -439,11 +440,19 @@ def _read_arch_from_doc_root(doc_type: str, prod_name: str) -> dict[str, Any]:
             tech_stack_excalidraw = ts_ex_path.read_text(encoding="utf-8")
         except OSError:
             pass
+    product_dev = ""
+    pd_path = output_dir / "PRODUCT_DEV.md"
+    if pd_path.is_file():
+        try:
+            product_dev = pd_path.read_text(encoding="utf-8")
+        except OSError:
+            pass
     return {
         "functional_arch": functional_arch,
         "tech_arch": tech_arch,
         "sys_arch_layers_excalidraw": sys_arch_layers_excalidraw,
         "tech_stack_excalidraw": tech_stack_excalidraw,
+        "product_dev": product_dev,
         "output": "",
     }
 
@@ -485,6 +494,7 @@ def _assemble_task_for_response(task_id: str) -> dict[str, Any] | None:
                 "tech_arch": "",
                 "sys_arch_layers_excalidraw": "",
                 "tech_stack_excalidraw": "",
+                "product_dev": "",
                 "output": "",
             }
         mem_data = meta.get("data") if isinstance(meta.get("data"), dict) else {}
@@ -557,7 +567,7 @@ async def _run_knowledge_generation_task(
                     skill_bodies.append(f"### 研发技能：{sid}\n\n{skill_path_line}{skill.body}")
 
         # 技能全量内容注入到 system prompt，让大模型在执行前完整获取技能指引
-        minimal_system_prompt = build_knowledge_gen_system_prompt(skill_bodies)
+        minimal_system_prompt = build_knowledge_gen_system_prompt(skill_bodies, doc_type=doc_type)
         prompt = build_knowledge_generation_user_prompt(
             gitnexus_url=req.gitnexus_url,
             repo_name=repo_name,
@@ -647,6 +657,13 @@ async def _run_knowledge_generation_task(
                     tech_stack_excalidraw = ts_ex_path.read_text(encoding="utf-8")
                 except OSError:
                     pass
+            product_dev = ""
+            pd_path = output_dir / "PRODUCT_DEV.md"
+            if pd_path.is_file():
+                try:
+                    product_dev = pd_path.read_text(encoding="utf-8")
+                except OSError:
+                    pass
             _knowledge_tasks[task_id] = {
                 "status": "completed",
                 "repo_name": repo_name,
@@ -657,6 +674,7 @@ async def _run_knowledge_generation_task(
                     "tech_arch": tech_arch,
                     "sys_arch_layers_excalidraw": sys_arch_layers_excalidraw,
                     "tech_stack_excalidraw": tech_stack_excalidraw,
+                    "product_dev": product_dev,
                     "output": str(result.data) if result.data else "",
                 },
             }
@@ -910,9 +928,9 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
                                 f"### 研发技能：{sid}\n\n{skill_path_line}{skill.body}"
                             )
 
-                refine_system = REFINE_SYSTEM_PROMPT_BASE + format_rd_skill_guidance_section(
-                    skill_bodies
-                )
+                refine_system = refine_system_prompt_for_doc_type(
+                    body.doc_type
+                ) + format_rd_skill_guidance_section(skill_bodies)
 
                 # refine 允许 run_shell，用于源码缓存缺失时调用 gnx-tools.js materialize 拉取
                 _REFINE_TOOL_NAMES = frozenset(
@@ -961,6 +979,7 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
                     gnx_cache_dir=_gnx_cache_dir,
                     user_prompt=body.user_prompt,
                     proposed_copy=proposed_copy,
+                    refine_skill_id=refine_skill_id_for_doc_type(body.doc_type),
                 )
 
                 agent.default_cwd = str(docs_root)

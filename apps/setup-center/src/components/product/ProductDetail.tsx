@@ -51,8 +51,10 @@ import { toast } from "sonner";
 import { IS_TAURI, proxyFetch } from "@/platform";
 import {
   buildRdSkillIdsForGenerate,
+  buildRdSkillIdsForGenerateManual,
   isWhalecloudBaseScriptsSkillId,
   isWhalecloudDevToolSkill,
+  RD_TOOL_GENERATE_MANUAL_REQUIRED,
   RD_TOOL_GENERATE_REQUIRED,
   rdToolDisplayLabel,
   uniqueRdSkillIds,
@@ -157,6 +159,7 @@ function archMarkdownDocsFromSynapseData(
   arch: {
     functional_arch?: string;
     tech_arch?: string;
+    product_dev?: string;
     sys_arch_layers_excalidraw?: string;
     tech_stack_excalidraw?: string;
   },
@@ -164,6 +167,15 @@ function archMarkdownDocsFromSynapseData(
   const exMap = excalidrawByFileNameFromArch(arch);
   const newDocs: OpenProductDoc[] = [];
   const ts = Date.now();
+  const productDev = (arch.product_dev ?? "").trim();
+  if (productDev && categoryKey === "manual") {
+    newDocs.push({
+      id: `doc-${categoryKey}-product-dev-${ts}`,
+      title: "PRODUCT_DEV.md",
+      content: arch.product_dev as string,
+      category: categoryKey,
+    });
+  }
   if (arch.functional_arch) {
     newDocs.push({
       id: `doc-${categoryKey}-func-${ts}`,
@@ -896,8 +908,10 @@ export function ProductDetail({
             displayLabel: rdToolDisplayLabel(s, i18n.language),
           }));
         setRdSkillCatalog(devTools);
+        const requiredPack =
+          cat === "manual" ? RD_TOOL_GENERATE_MANUAL_REQUIRED : RD_TOOL_GENERATE_REQUIRED;
         const defaultSel = withRdBaseScriptsSkillIds(
-          RD_TOOL_GENERATE_REQUIRED.filter((id) => devTools.some((s) => s.skillId === id)),
+          requiredPack.filter((id) => devTools.some((s) => s.skillId === id)),
         );
         setGenSelectedRdSkillIds(defaultSel);
       } catch {
@@ -962,7 +976,11 @@ export function ProductDetail({
       const rdSkillIds =
         opts?.rd_skill_ids !== undefined
           ? withRdBaseScriptsSkillIds(uniqueRdSkillIds(opts.rd_skill_ids))
-          : withRdBaseScriptsSkillIds(buildRdSkillIdsForGenerate([]));
+          : withRdBaseScriptsSkillIds(
+              (cat === "manual" ? buildRdSkillIdsForGenerateManual : buildRdSkillIdsForGenerate)(
+                [],
+              ),
+            );
       // 从仓库 URL 解析真实仓库名（去掉 .git 后缀的最后一段路径）
       const repoNameFromUrl = mainRepo.url
         ? mainRepo.url.replace(/\/$/, "").split("/").pop()?.replace(/\.git$/i, "") || product.name
@@ -1293,9 +1311,8 @@ export function ProductDetail({
                   const generating = kv.generating;
                   const isArchitecture = item.key === "architecture";
                   const isManual = item.key === "manual";
-                  const archDone = isProductKnowledgeSlotDone(product.knowledge.architecture);
                   const canGenerateArchitecture = isArchitecture && !done && mainRepoAnalysisDone;
-                  const canGenerateManual = isManual && !done && archDone;
+                  const canGenerateManual = isManual && !done && mainRepoAnalysisDone;
                   const rowActive =
                     done ||
                     hasGeneratedDocs ||
@@ -1342,11 +1359,7 @@ export function ProductDetail({
                                 disabled={generating}
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  if (canGenerateManual) {
-                                    toast.message(t("workbench.products.detail.manualGenerationPlanned", "规划中"));
-                                    return;
-                                  }
-                                  if (canGenerateArchitecture) {
+                                  if (canGenerateArchitecture || canGenerateManual) {
                                     openGenerateOptionsDialog(cat);
                                   }
                                 }}

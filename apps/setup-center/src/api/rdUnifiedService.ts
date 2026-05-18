@@ -938,6 +938,8 @@ export async function generateProductKnowledge(
 export type ProductKnowledgeStatusArchData = {
   functional_arch?: string;
   tech_arch?: string;
+  /** `PRODUCT_DEV.md` 正文（产品手册生成任务） */
+  product_dev?: string;
   /** 与仓库内 `sys-arch-layers.excalidraw` 同源 */
   sys_arch_layers_excalidraw?: string;
   /** 与仓库内 `tech-stack.excalidraw` 同源 */

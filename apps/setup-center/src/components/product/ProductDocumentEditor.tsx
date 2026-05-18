@@ -3,6 +3,8 @@ import MDEditor from "@uiw/react-md-editor";
 import { Editor, DiffEditor } from "@monaco-editor/react";
 import { Button } from "@/components/ui/button";
 import { ExcalidrawReadonlyEmbed } from "./ExcalidrawReadonlyEmbed";
+import { reactMarkdownCodeChildrenToText } from "./markdownCodeChildren";
+import { MermaidPreviewBlock } from "./MermaidPreviewBlock";
 import {
   applyAppThemeToExcalidrawInitialData,
   excalidrawThemeFromApp,
@@ -33,6 +35,8 @@ import type {
 } from "@/api/rdUnifiedService";
 import {
   isWhalecloudBaseScriptsSkillId,
+  isUnifiedManualDocType,
+  RD_TOOL_REFINE_MANUAL_REQUIRED,
   RD_TOOL_REFINE_REQUIRED,
   uniqueRdSkillIds,
   withRdBaseScriptsSkillIds,
@@ -182,11 +186,14 @@ export function ProductDocumentEditor({
 
   useEffect(() => {
     const skills = refineCatalog?.rdSkills ?? [];
+    const requiredPack = isUnifiedManualDocType(refineContext?.doc_type ?? "")
+      ? RD_TOOL_REFINE_MANUAL_REQUIRED
+      : RD_TOOL_REFINE_REQUIRED;
     const defaults =
       skills.length === 0
         ? []
         : withRdBaseScriptsSkillIds(
-            RD_TOOL_REFINE_REQUIRED.filter((rid) => skills.some((s) => s.skillId === rid)),
+            requiredPack.filter((rid) => skills.some((s) => s.skillId === rid)),
           );
     setRefineSelectedRdSkillIds(defaults);
   }, [
@@ -563,11 +570,21 @@ export function ProductDocumentEditor({
         code: (props: { inline?: boolean; className?: string; children?: React.ReactNode }) => {
           const { inline, className, children, ...rest } = props;
           const match = /language-(\w+)/.exec(className || "");
-          const lang = match ? match[1] : "";
+          const lang = (match ? match[1] : "").toLowerCase();
+
+          if (!inline && (lang === "mermaid" || lang === "mmd")) {
+            const chart = reactMarkdownCodeChildrenToText(children).replace(/\n$/, "");
+            if (!chart.trim()) {
+              return null;
+            }
+            return <MermaidPreviewBlock source={chart} isDark={isDark} />;
+          }
 
           if (!inline && lang === "excalidraw") {
             try {
-              const data = JSON.parse(String(children).replace(/\n$/, "")) as { elements?: object[] };
+              const data = JSON.parse(reactMarkdownCodeChildrenToText(children).replace(/\n$/, "")) as {
+                elements?: object[];
+              };
               const sceneJson = JSON.stringify(
                 applyAppThemeToExcalidrawInitialData(
                   parseExcalidrawFileToInitialData(
