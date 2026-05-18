@@ -17,6 +17,14 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from synapse.agents.profile import AgentProfile, SkillsMode, get_profile_store
+from synapse.api.routes.dev_iwhalecloud_prompt import (
+    REFINE_SYSTEM_PROMPT_BASE,
+    build_knowledge_gen_system_prompt,
+    build_knowledge_generation_user_prompt,
+    build_refine_product_context,
+    build_refine_user_message,
+    format_rd_skill_guidance_section,
+)
 from synapse.api.schemas import error_response, success_response
 from synapse.config import settings
 from synapse.utils.whaleclouddevtool import (
@@ -112,7 +120,9 @@ class ProductKnowledgeGenerateRequest(BaseModel):
 
 
 class ProductKnowledgeRefineRequest(BaseModel):
-    prod_name: str = Field(..., description="产品标识，与 docs_initialize prod 一致", min_length=1, max_length=512)
+    prod_name: str = Field(
+        ..., description="产品标识，与 docs_initialize prod 一致", min_length=1, max_length=512
+    )
     doc_type: str = Field(..., description="文档类型，与生成任务一致", min_length=1, max_length=256)
     targets: list[str] = Field(..., description="稳定文件名数组，必须恰好 1 个元素")
     user_prompt: str = Field(..., description="用户修改要求（不含产品信息块）")
@@ -124,7 +134,9 @@ class ProductKnowledgeRefineRequest(BaseModel):
     product_desc: str = Field(default="", description="产品描述（服务端注入 user 消息）")
     code_path: str = Field(default="", description="代码路径（服务端注入 user 消息）")
     core_features: str = Field(default="", description="主要功能（服务端注入 user 消息）")
-    gitnexus_url: str = Field(default="", description="GitNexus 服务地址（源码缓存不存在时用于拉取）")
+    gitnexus_url: str = Field(
+        default="", description="GitNexus 服务地址（源码缓存不存在时用于拉取）"
+    )
 
 
 class ProductKnowledgeRefineSessionBody(BaseModel):
@@ -132,41 +144,9 @@ class ProductKnowledgeRefineSessionBody(BaseModel):
 
     prod_name: str = Field(..., min_length=1, max_length=512)
     doc_type: str = Field(..., min_length=1, max_length=256)
-    target: str = Field(..., min_length=1, max_length=512, description="与本地草稿 doc_name 一致的文件名")
-
-
-# 系统提示词：产品知识文档 AI 编辑（refine 专用）
-_REFINE_SYSTEM_PROMPT_BASE = """\
-你是一个产品知识文档编辑助手。你的任务是根据用户要求，精准修改指定的产品知识文档。
-
-## 核心原则（不得违反）
-1. **以实际代码为基础不臆断**：所有新增/修改内容必须有源码依据；若源码缓存存在则优先读取，找不到依据时须标注「[待源码确认]」，不得凭空描述。
-2. **以历史文档为参考不造谣**：必须先完整读取待修改文件，保留用户未要求修改的所有章节与措辞；不得凭印象替换已有准确描述。
-3. **以用户需求为根本不发散**：修改范围严格限定在用户指定内容，不主动扩展修改其他章节。
-
-## 工作流程
-请严格按照以下步骤执行（已注入的技能 whalecloud-dev-tool-arch-modify 中有完整的分阶段指引，请遵照执行）：
-
-1. **解析修改意图**：读取 user 消息中的产品上下文与用户修改要求，拆解修改点列表。
-2. **读取历史文档**：使用 read_file 工具读取待修改文件（会话 proposed/ 目录下的工作副本），记录不应被修改的章节。
-3. **查阅源码**（若修改涉及功能描述/架构关系）：
-   - 先检查源码本地缓存路径（`synapse_home/tmp/gitnexus/<repo_name>/files/`）是否存在；
-   - 缓存存在则直接用 read_file / list_directory 读取，**不需要重新拉取**；
-   - 缓存不存在则从 CODE_PATH 指定路径直接读取源文件；
-   - 每个修改点记录「源码依据：<文件路径> → <具体证据>」。
-4. **修改文档**：按修改点逐一修改，不扩散到其他章节，新增内容附源码路径作为论据。
-5. **完整性校验**：确认未被要求修改的章节均已保留，修改点均有源码依据或标注「[待源码确认]」。
-6. **写回文件**：使用 write_file 将完整修改后的文档写回 proposed/ 目录（同一文件名）。
-
-## 输出约束
-- Markdown 文档：输出完整可替换的正文；若在回复文字中附带文档片段，**必须**且仅能用 ```markdown ... ``` 包裹。
-- `.excalidraw` 文件：输出合法 JSON；优先使用工具写文件，避免在聊天中贴大段 JSON；节点名称必须来自真实源码符号。
-- **禁止**改变文件名（必须与 targets[0] 一致）。
-- **禁止**删除用户未要求删除的章节。
-- **禁止**直接写入知识文档根目录下的权威源文件（只允许写 proposed/ 子目录）。
-- **禁止**调用不在白名单中的工具（如 run_shell）。
-- **禁止**臆断产品功能和代码实现；未找到源码证据的描述必须标注「[待源码确认]」。
-"""
+    target: str = Field(
+        ..., min_length=1, max_length=512, description="与本地草稿 doc_name 一致的文件名"
+    )
 
 
 class ProductKnowledgeLocalDraftQuery(BaseModel):
@@ -213,6 +193,7 @@ _REFINE_SESSION_TIMEOUT_SECS = 3600
 # ---------------------------------------------------------------------------
 # Refine session.status 落盘工具（目录：refine_sessions/<target>/）
 # ---------------------------------------------------------------------------
+
 
 def _refine_session_status_path(session_root: Path) -> Path:
     return session_root / "session.status"
@@ -576,33 +557,19 @@ async def _run_knowledge_generation_task(
                     skill_bodies.append(f"### 研发技能：{sid}\n\n{skill_path_line}{skill.body}")
 
         # 技能全量内容注入到 system prompt，让大模型在执行前完整获取技能指引
-        skill_section = ""
-        if skill_bodies:
-            skill_section = (
-                "\n\n---\n## 研发工具技能指引（请严格遵照以下指引执行任务）\n\n"
-                + "\n\n---\n\n".join(skill_bodies)
-            )
-        minimal_system_prompt = (
-            "你是一个研发工具助手，请按照用户的要求生成系统架构文档。" + skill_section
+        minimal_system_prompt = build_knowledge_gen_system_prompt(skill_bodies)
+        prompt = build_knowledge_generation_user_prompt(
+            gitnexus_url=req.gitnexus_url,
+            repo_name=repo_name,
+            local_data_path=local_data_path,
+            output_dir=output_dir,
+            prod_name=prod_name,
+            doc_type=doc_type,
+            request_repo_name=req.repo_name,
+            product_desc=req.product_desc,
+            code_path=req.code_path,
+            core_features=req.core_features,
         )
-
-        prompt = f"""gitnexus服务部署在[{req.gitnexus_url}]上，请使用产品架构文档生成工具生成产品的系统架构和功能架构文档。
-
-## 路径与参数约定（GitNexus / Synapse 脚本见技能 whalecloud-dev-tool-base-scripts；工作流与模板见 whalecloud-dev-tool-arch-create，勿改写目录语义）
-- **SYNAPSE_URL**：SynapseService 地址（`IP:PORT`）。若需按产品名调用 `scripts/get_repo_info.py` 拉取**全部**关联仓库列表，由对话或运维提供；本 HTTP 任务未单独传该字段时可为空（此时以下方已解析的 **REPO_NAME** 为准）。
-- **GITNEXUS_URL**：`{req.gitnexus_url}`（`gnx-tools.js` / `fetch-arch-data.js` 的 `--url`）。
-- **REPO_NAME**（本任务已解析，须与 GitNexus 图谱一致）：`{repo_name}`（来自 `repo_url` 解析或请求体 `repo_name` 兜底，**禁止**臆造其它仓库名）。
-- **GNX_CACHE_DIR**（当前 **REPO_NAME** 的 materialize/read/grep 缓存根，等同 `_gitnexus_local_data_path`）：`{local_data_path}`
-- **OUTPUT_DIR**（架构交付物唯一落盘目录，与 Agent `default_cwd` 一致，等同 `_knowledge_docs_root`）：`{output_dir}`
-- **OUTPUT**（固定文件名清单，须全部写入 **OUTPUT_DIR**）：`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`、`sys-arch-layers.excalidraw`、`tech-stack.excalidraw`
-
-## 任务上下文
-产品标识（prod_name）：[{prod_name}]
-文档类型（doc_type）：[{doc_type}]
-请求体仓库名字段（可能与 REPO_NAME 不同，以已解析 REPO_NAME 为准）：[{req.repo_name}]
-产品描述：[{req.product_desc}]
-代码路径：[{req.code_path}]
-主要功能：[{req.core_features}]"""
 
         agent.default_cwd = str(output_dir)
         if getattr(agent, "shell_tool", None):
@@ -640,7 +607,9 @@ async def _run_knowledge_generation_task(
             _knowledge_tasks[task_id]["status"] = "running"
             _persist_task(task_id)
             result = await asyncio.wait_for(
-                agent.execute_task_from_message(prompt, usage_scene=f"knowledge_generation_task_{prod_name}_{doc_type}"),
+                agent.execute_task_from_message(
+                    prompt, usage_scene=f"knowledge_generation_task_{prod_name}_{doc_type}"
+                ),
                 timeout=3600.0,
             )
         finally:
@@ -903,8 +872,12 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
             )
             try:
                 ep = (body.preferred_endpoint or "").strip() or None
-                base_profile = get_profile_store().get("default") or AgentProfile(id="default", name="小鲸")
-                _tmp_profile = replace(base_profile, id=prof_id, ephemeral=True, preferred_endpoint=ep)
+                base_profile = get_profile_store().get("default") or AgentProfile(
+                    id="default", name="小鲸"
+                )
+                _tmp_profile = replace(
+                    base_profile, id=prof_id, ephemeral=True, preferred_endpoint=ep
+                )
                 agent = await pool.get_or_create(run_id, _tmp_profile)
 
                 enabled_ids = _get_enabled_rd_skill_ids(agent)
@@ -933,15 +906,13 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
                         skill = loader.get_skill(sid)
                         if skill and skill.body:
                             skill_path_line = f"**技能路径**: {skill.skill_dir}\n\n"
-                            skill_bodies.append(f"### 研发技能：{sid}\n\n{skill_path_line}{skill.body}")
+                            skill_bodies.append(
+                                f"### 研发技能：{sid}\n\n{skill_path_line}{skill.body}"
+                            )
 
-                skill_section = ""
-                if skill_bodies:
-                    skill_section = (
-                        "\n\n---\n## 研发工具技能指引（请严格遵照以下指引执行任务）\n\n"
-                        + "\n\n---\n\n".join(skill_bodies)
-                    )
-                refine_system = _REFINE_SYSTEM_PROMPT_BASE + skill_section
+                refine_system = REFINE_SYSTEM_PROMPT_BASE + format_rd_skill_guidance_section(
+                    skill_bodies
+                )
 
                 # refine 允许 run_shell，用于源码缓存缺失时调用 gnx-tools.js materialize 拉取
                 _REFINE_TOOL_NAMES = frozenset(
@@ -971,34 +942,26 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
                             Path(_arch_skill.skill_dir) / "scripts" / "gnx-tools.js"
                         )
 
-                product_ctx = f"""\
-产品描述：[{body.product_desc}]
-代码路径：[{body.code_path}]
-主要功能：[{body.core_features}]
-产品标识：[{body.prod_name}]
-文档类型：[{body.doc_type}]
-GitNexus 服务地址(GITNEXUS_URL)：[{body.gitnexus_url}]
-GitNexus 本地数据根目录(GNX_CACHE_DIR)：[{_gnx_cache_dir}]
-gnx-tools.js 脚本路径：[{_gnx_tools_script}]"""
+                product_ctx = build_refine_product_context(
+                    product_desc=body.product_desc,
+                    code_path=body.code_path,
+                    core_features=body.core_features,
+                    prod_name=body.prod_name,
+                    doc_type=body.doc_type,
+                    gitnexus_url=body.gitnexus_url,
+                    gnx_cache_dir=_gnx_cache_dir,
+                    gnx_tools_script=_gnx_tools_script,
+                )
 
-                user_message = f"""\
-## 产品上下文（系统自动注入，请勿删除）
-{product_ctx}
-
-## 关于源码读取的说明
-1. 优先检查「源码缓存根目录」下的 files/ 子目录是否存在且有内容（用 list_directory 检查）。
-2. 若缓存存在，直接用 read_file / list_directory 读取，**无需拉取**。
-3. 若缓存不存在或为空，使用 run_shell 执行以下命令拉取：
-   node "{_gnx_tools_script}" materialize --url {body.gitnexus_url} --repo {_repo_name_hint} --cache {_gnx_cache_dir} --concurrency 8
-4. 拉取完成后，源码位于「源码缓存根目录/files/」下，再用 read_file / list_directory 读取。
-
-## 用户修改要求
-{body.user_prompt}
-
-## 待修改文件（仅允许修改下列路径对应的临时工作副本）
-- {proposed_copy}
-
-请按照技能 whalecloud-dev-tool-arch-modify 的工作流程执行：先读历史文档，再查阅或拉取源码，最后将修改后的完整文档写回上述路径。"""
+                user_message = build_refine_user_message(
+                    product_ctx=product_ctx,
+                    gnx_tools_script=_gnx_tools_script,
+                    gitnexus_url=body.gitnexus_url,
+                    repo_name_hint=_repo_name_hint,
+                    gnx_cache_dir=_gnx_cache_dir,
+                    user_prompt=body.user_prompt,
+                    proposed_copy=proposed_copy,
+                )
 
                 agent.default_cwd = str(docs_root)
                 if getattr(agent, "shell_tool", None):
@@ -1015,7 +978,10 @@ gnx-tools.js 脚本路径：[{_gnx_tools_script}]"""
                         agent._tools = _slim_tools  # type: ignore[attr-defined]
 
                     result = await asyncio.wait_for(
-                        agent.execute_task_from_message(user_message, usage_scene=f"knowledge_refine_task_{body.prod_name}_{body.doc_type}_{safe_name}"),
+                        agent.execute_task_from_message(
+                            user_message,
+                            usage_scene=f"knowledge_refine_task_{body.prod_name}_{body.doc_type}_{safe_name}",
+                        ),
                         timeout=3600.0,
                     )
                 finally:

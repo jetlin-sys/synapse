@@ -11,7 +11,9 @@ label: 产品架构文档生成工具
 **语言与工程类型**：默认**不**假设仓库为 C++。必须先执行 **Phase 0.1 工程类型判定**，得到 `PROJECT_KIND` 后再选用对应的 Phase 1b 阅读策略；若判定为 **C++ 原生或 C++ 混合主体**，必须叠加 **附录 A** 中的 C++ 专项要点。
 
 > **核心约束（违反则文档不完整）**
-> 1. **图示必须用 whalecloud-dev-tool-excalidraw 生成**：技术架构文档 §3.3 技术栈、§4.1 架构总览两张图必须通过调用 `whalecloud-dev-tool-excalidraw` 生成，不可用纯 Mermaid 文字块替代，不可省略。
+> 1. **图示交付与技能挂载一致（Phase 0e 判定 `DIAGRAM_MODE`）**：执行本技能前，根据 system 提示中「研发工具技能指引」是否包含 **`whalecloud-dev-tool-excalidraw`** 技能块（存在 `### 研发技能：whalecloud-dev-tool-excalidraw` 即为已挂载）选择模式：
+>    - **`DIAGRAM_MODE=excalidraw`（已挂载）**：技术架构 §3.3、§4.1 必须通过 **whalecloud-dev-tool-excalidraw** 规范生成 **`tech-stack.excalidraw`**、**`sys-arch-layers.excalidraw`** 至 **OUTPUT_DIR**，并在 `TECH_ARCH.md` 中引用；**不得**仅用 Mermaid 替代这两份独立 JSON 交付物。
+>    - **`DIAGRAM_MODE=mermaid`（未挂载）**：**不得**创建 `sys-arch-layers.excalidraw`、`tech-stack.excalidraw` 或任何图示用 `.excalidraw`；技术架构 §3.3、§4.1 **必须**各含至少一个可渲染的 ```mermaid 代码块（技术栈依赖图一张、分层总览一张），节点/层名须来自 Phase 1b 真实源码证据，图下附「图示来源」与路径；**禁止**在无该技能时手写 Excalidraw JSON。
 > 2. **源码必须直接读取**：不能仅依赖索引快照；Phase 1b 必须读取与 `PROJECT_KIND` 匹配的**代表性源文件**（入口、构建清单、典型模块），文档中有源码路径论据。
 > 3. **索引仅作定位辅助**：聚类在 embeddings=0 时不可靠，必须以源码与构建事实为准，**不得将索引分层结果不经源码验证写入文档**。
 > 4. **双文档输出，内容不交叉**：功能架构文档（FUNCTIONAL_ARCH.md）不包含技术栈/分层图/运行态；技术架构文档（TECH_ARCH.md）不重复产品定位/场景/业务能力描述。
@@ -34,7 +36,7 @@ label: 产品架构文档生成工具
 | `PROD` | 条件 | 产品名称。与 `SYNAPSE_URL` 同时出现时，用于 `get_repo_info.py`，**不得手填 `REPO_NAME` 替代接口结果** |
 | `REPO_NAME` | 条件 | GitNexus 图谱中的仓库名。**优先**由 `{PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_repo_info.py --server-url={SYNAPSE_URL} --prod={PROD}` 解析输出得到列表 `GNX_REPO_LIST`（多仓时逐项处理）；若用户/请求体已给出确定仓库名且无产品拉仓需求，可视为单元素列表 |
 | `OUTPUT_DIR` | 否 | 架构文档产出目录（`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`、`.excalidraw` 等）。**Synapse 内置任务**下等价于 `_knowledge_docs_root(doc_type, prod_name)`，即 `{SYNAPSE_HOME}/tmp/docs/<prod_name>/<doc_type>/`；Cursor 独立执行时由用户指定或使用团队约定目录 |
-| `OUTPUT` | 否 | **固定交付物文件名集合**（与 `dev_iwhalecloud_knowledge.py` 读取逻辑一致）：`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`、`sys-arch-layers.excalidraw`、`tech-stack.excalidraw`。写入时均落在 `OUTPUT_DIR` 下 |
+| `OUTPUT` | 否 | **必选文件**：`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`。**条件文件**：仅当 **`DIAGRAM_MODE=excalidraw`**（已挂载 `whalecloud-dev-tool-excalidraw`）时，还须写入 `sys-arch-layers.excalidraw`、`tech-stack.excalidraw`（与 `dev_iwhalecloud_knowledge.py` 读取逻辑一致）。**`DIAGRAM_MODE=mermaid` 时不创建**上述 `.excalidraw`，图示仅写入 `TECH_ARCH.md` 的 Mermaid 代码块 |
 | `GNX_CACHE_DIR` | 是（每仓） | 该仓库的 materialize 根；**read/grep 仅访问其下 `files/`**。`gnx-tools.js` 的 `--cache` 必须指向此目录。**Synapse 内置任务**下为 `{SYNAPSE_HOME}/tmp/gitnexus/<REPO_NAME>/`（`_gitnexus_local_data_path`）。**独立 Cursor / 研发手册式流程**下由调用方显式给定目录（常见：工作区下 `.gnx-cache/<REPO_NAME>/` 或团队约定的绝对路径），不要求再套一层「临时根」变量名 |
 | **工作区仓库根** | — | 当前 Cursor 打开的 Git 工作区根。用于判断「源码是否在本地」：`arch-data.json` 的 `repoPath` 若为本机路径且落在该根下，则优先 **Read/Grep**；否则以 `GNX_CACHE_DIR` + `gnx-tools.js read|grep` 为主 |
 | `PROJECT_KIND` | — | Phase 0.1 输出，如 `cpp_native` / `python` / `node_ts` / `go` / `jvm` / `mixed_polyglot` 等 |
@@ -243,6 +245,7 @@ Phase 0 — 用户传入信息整理（必选，首先执行）
       | 功能1   | 待追踪 | — | — |
       ...
   0d. 若 CODE_PATH 非空，标记为「指定入口目录/文件」，Phase 1b 步骤 B/C 优先从此处开始。
+  0e. **图示模式判定（必选）**：若 system 提示「研发工具技能指引」中包含 **`whalecloud-dev-tool-excalidraw`** 的技能正文块，则记 **`DIAGRAM_MODE=excalidraw`**；否则 **`DIAGRAM_MODE=mermaid`**。后续 Phase 3 仅允许执行对应分支，**禁止混用**（例如在 mermaid 模式下仍写 `.excalidraw`）。
 
 Phase 0.1 — 工程类型判定（必选，可与 0.5b 顺序微调）
   0.1a. 若尚未有缓存：先执行下方 Phase 0.5b `materialize`（至少需要 `cache/files` 才能跑检测脚本）。
@@ -304,27 +307,30 @@ Phase 2 — 产品与架构综合
       - 将 Phase 1b-E 的 `GAP_CANDIDATES` 整理为功能架构 **§4** 表格草案，并撰写「产品管理人员待办」段落
       - 汇总多仓**术语/接口前缀/错误码**不一致点，供功能架构 §4 或技术架构 §2.4 引用（避免在 §1～3 重复长表）
 
-Phase 3 — 图示（必须执行，不可省略）
-  ⚠ 本 Phase 是强制步骤：必须调用 whalecloud-dev-tool-excalidraw 生成以下两张图，图分别用于两份文档。
-  ⚠ 不得用 Mermaid 代码块替代 whalecloud-dev-tool-excalidraw 的调用——Mermaid 是备注用途，图示产物必须来自该技能。
+Phase 3 — 图示（必须执行；按 **Phase 0e 的 `DIAGRAM_MODE` 二选一）
 
-  图 A：技术栈依赖图（技术架构文档 §3.3）
-    - 调用 whalecloud-dev-tool-excalidraw，主题：技术栈依赖关系
-    - 展示：语言/运行时 → 核心框架/库 → 外部依赖（数据库/消息队列等）
-    - 内容来自 Phase 1b 步骤 A 读到的构建文件和依赖声明
+**当 `DIAGRAM_MODE=excalidraw` 时**：
+  ⚠ 必须按 **whalecloud-dev-tool-excalidraw**（见文末「图示技能」）生成以下两张图，分别对应技术架构 §3.3、§4.1；产物为 **OUTPUT_DIR** 下的 `tech-stack.excalidraw` 与 `sys-arch-layers.excalidraw`。
+  ⚠ **不得**以「仅写 Mermaid」代替上述两份 JSON 文件；Mermaid 若存在，仅可作附录性补充，非 Synapse 约定的主图示交付物。
 
-  图 B：系统分层架构概览图（技术架构文档 §4.1）
-    - 调用 whalecloud-dev-tool-excalidraw，主题：系统分层架构
-    - 展示：各架构层（从用户侧到数据侧）、层间依赖方向、每层承载的核心功能标注
-    - 内容来自 Phase 1b 步骤 B/C 读到的目录结构和入口文件
+  图 A：技术栈依赖图（§3.3）
+    - 主题：技术栈依赖关系；内容来自 Phase 1b 步骤 A 构建清单
 
-  生成规则：
-    - 提供给 whalecloud-dev-tool-excalidraw 的描述中，节点名称必须来自源码中真实的类名/函数名/目录名，不得编造
-    - 每张图下方写 1 句「图示来源说明」，注明对应的源码路径证据
-    - 若某图暂无充分源码依据，先生成占位图，再在图下标注「[待源码补充：<缺失内容>]」
+  图 B：系统分层架构概览（§4.1）
+    - 主题：系统分层架构；层与连线来自 Phase 1b 目录结构与 Grep 验证的依赖方向
+
+  生成规则（Excalidraw）：
+    - 节点名称必须来自源码中真实的类名/函数名/目录名/依赖名，不得编造
+    - 每张图配套文档中写 1 句「图示来源」+ 源码路径
+    - 依据不足时可在图中或图下标注「[待源码补充：<缺失内容>]」
+
+**当 `DIAGRAM_MODE=mermaid` 时**：
+  ⚠ **不得**读取或执行 whalecloud-dev-tool-excalidraw；**不得**在 **OUTPUT_DIR** 创建 `*.excalidraw`（含 `tech-stack.excalidraw`、`sys-arch-layers.excalidraw`）。
+  ⚠ 在组装 **TECH_ARCH.md** 时，**§3.3** 必须包含完整 **技术栈依赖** `mermaid` 代码块（推荐 `flowchart`/`graph`）；**§4.1** 必须包含完整 **分层架构总览** `mermaid` 代码块；方向与节点标签须与 Phase 1b 证据一致；图下「图示来源」+ 路径。
+  ⚠ 节点与层命名规则与 Excalidraw 模式相同（真实源码符号）；多仓时在标签或子图中区分仓库亦可。
 
 Phase 4 — 组装输出（双文档）
-  ⚠ 输出两份文档至 **OUTPUT_DIR**，互不交叉；文件名须与 **OUTPUT** 约定一致（Synapse 任务下含 `sys-arch-layers.excalidraw`、`tech-stack.excalidraw`）：
+  ⚠ 输出至 **OUTPUT_DIR**，互不交叉；**必选**：`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`。**仅当 `DIAGRAM_MODE=excalidraw`** 时，还须写入 `sys-arch-layers.excalidraw`、`tech-stack.excalidraw`；**`DIAGRAM_MODE=mermaid` 时不要创建**上述 `.excalidraw`，图示仅在 `TECH_ARCH.md` 的 Mermaid 代码块中：
   4a. 主文档：FUNCTIONAL_ARCH.md（功能架构）
       - 按 func-arch-template.md 填写，以业务能力和用户感知为核心
       - 核心功能详解（§3）：逐项展开 CORE_FEATURES，每项含「功能说明」+「代码影响范围（文件列表）」；多仓路径带 **`仓库名:`** 前缀
@@ -337,11 +343,11 @@ Phase 4 — 组装输出（双文档）
       - 每个技术层注明「承载核心功能：xxx」，与功能架构形成交叉引用而非内容重复
 
 Phase 5 — 迭代
-  7. 用户补充 → 更新 user_overrides → 仅重画受影响图、更新对应章节
+  7. 用户补充 → 更新 user_overrides → 仅重画受影响图（Excalidraw）或更新对应 Mermaid 块、更新对应章节
   8. 若用户新增 CORE_FEATURES 项 → 补充追踪 → 更新功能架构 §3、**§4（清单外表可能缩行或改标注）**、技术架构各层与 §2.4
 ```
 
-> 脚本连接失败时检查 URL 与网络；**无服务时仍可完成文档**，须弱化「执行流/聚类」章节并标明数据缺口，但**图示和源码阅读不受影响，仍须执行**。
+> 脚本连接失败时检查 URL 与网络；**无服务时仍可完成文档**，须弱化「执行流/聚类」章节并标明数据缺口，但**图示（按 Phase 0e：Excalidraw 或 Mermaid）与源码阅读仍须执行**。
 
 ## Phase 1: 结构化信号采集
 
@@ -483,35 +489,38 @@ node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url http://10.x.x.x:11011
 - 若用户**明确要求交互确认**（如「帮我分析一下再继续」），则等待确认后进入 Phase 3。
 - 若用户**直接要求生成并保存文档**（如「生成架构文档保存到目录 X」），可在消息中展示分层摘要后**直接继续**执行 Phase 3，无需等待回复。
 
-## Phase 3: 图示（强制执行）
+## Phase 3: 图示（强制执行；按 Phase 0e `DIAGRAM_MODE`）
 
-**此步骤不可被跳过**，必须生成技术架构所需的 **两张** `.excalidraw` JSON 文件（与核心约束 §1 一致）。
+**此步骤不可被跳过**。交付形式由 **`DIAGRAM_MODE`** 决定（见上文 Workflow Phase 3 与 Phase 0e）。
 
-### 实际操作流程
+### 当 `DIAGRAM_MODE=excalidraw` 时
 
-"调用 whalecloud-dev-tool-excalidraw" 的完整含义是：
+必须产出 **两张** `.excalidraw` JSON（`tech-stack.excalidraw`、`sys-arch-layers.excalidraw`）至 **OUTPUT_DIR**。
+
+**「调用 whalecloud-dev-tool-excalidraw」的完整含义**：
 
 1. 用 Read 工具读取技能文件 `../whalecloud-dev-tool-excalidraw/SKILL.md`（若在工作区 skills 目录中找不到，尝试系统 skills 目录 `C:\Users\<用户>\.cursor\skills\EXCALIDRAW-DIAGRAM-SKILL\SKILL.md`）
 2. 读取 `../whalecloud-dev-tool-excalidraw/references/color-palette.md` 获取颜色规范
 3. 读取 `../whalecloud-dev-tool-excalidraw/references/element-templates.md` 获取 JSON 元素模板
-  4. **按该技能的规则，直接用 Write 工具写出 `.excalidraw` JSON 文件**到 **OUTPUT_DIR**，文件名与 **OUTPUT** 约定一致：技术栈图为 `tech-stack.excalidraw`，分层总览为 `sys-arch-layers.excalidraw`（与 `dev_iwhalecloud_knowledge.py` 读取名一致）。
+4. **按该技能的规则，直接用 Write 工具写出 `.excalidraw` JSON 文件**到 **OUTPUT_DIR**，文件名：`tech-stack.excalidraw`（技术栈）、`sys-arch-layers.excalidraw`（分层总览，与 `dev_iwhalecloud_knowledge.py` 读取名一致）。
 
 > ⚠ 这不是「调用另一个 Agent」或「子进程调用」，而是读取 excalidraw 技能规范后，自己生成符合规范的 JSON 文件。不要等待外部工具响应。
 
 **与 PNG 导出**：若团队使用 **Markdown + Excalidraw 插件（如 React 预览）** 在同页渲染 `.md` 与 `.excalidraw`，则**不必**再走 `render_excalidraw.py` 生成 PNG；技术架构文档中用 **指向 `.excalidraw` 的链接** 即可。PNG 渲染循环仅作为**无插件环境下的可选质控**（与「内嵌链接」不是同一硬性步骤）。
 
-### 两张图的调用时机
+| 图 | 所属文档 | 章节 | 要点 |
+|----|---------|------|------|
+| 图 A：技术栈依赖 | TECH_ARCH.md | §3.3 | 语言 → 依赖库 → 外部系统；节点来自构建文件 |
+| 图 B：系统分层 | TECH_ARCH.md | §4.1 | 分层框与依赖方向；层名来自源码目录 |
 
-| 图 | 所属文档 | 章节 | 调用描述要点 |
-|----|---------|------|-------------|
-| 图 A：技术栈依赖图 | 技术架构文档 | §3.3 | 语言 → 依赖库 → 外部系统；节点来自构建文件 |
-| 图 B：系统分层架构 | 技术架构文档 | §4.1 | 从用户入口到数据层的分层框；层名来自源码目录；各层注明核心功能 |
+- 将生成的图以链接或嵌入约定填入 `{{DIAGRAM_TECH_STACK}}`、`{{DIAGRAM_SYSTEM_OVERVIEW}}`；图下「图示来源」+ 源码路径
+- 两张 JSON 文件落盘后再进入 Phase 4
 
-### 图示与文档的合并
+### 当 `DIAGRAM_MODE=mermaid` 时
 
-- 将 whalecloud-dev-tool-excalidraw 生成的图（嵌入链接或内嵌内容）放入对应章节的 `{{DIAGRAM_*}}` 占位符处
-- 图下方补一句「图示来源」，说明对应源码路径
-- 两张图都完成后再进入 Phase 4 组装文档
+**不要**读取 whalecloud-dev-tool-excalidraw、**不要**写入任何 `.excalidraw`。
+
+在 **TECH_ARCH.md** 的 **§3.3**、**§4.1** 各放入 **一个完整、可渲染的** ```mermaid 代码块（技术栈依赖一张、分层总览一张），内容与 Phase 1b 证据一致；图下「图示来源」+ 路径。完成后进入 Phase 4。
 
 ## Phase 4: 文档组装（双文档）
 
@@ -540,8 +549,8 @@ node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url http://10.x.x.x:11011
 
 1. **§1**：技术概览（1 段，引用功能架构文档，不重复产品定位）
 2. **§2**：仓库与工程事实（README 摘要、目录边界、构建系统、**§2.4 多仓库与跨仓关联**）
-3. **§3**：技术栈（语言分布、框架依赖、技术栈依赖图 A）
-4. **§4**：系统分层架构（分层架构概览图 B、各层详解）
+3. **§3**：技术栈（语言分布、框架依赖、§3.3 技术栈依赖图：Excalidraw 链接或 Mermaid 块，依 `DIAGRAM_MODE`）
+4. **§4**：系统分层架构（§4.1 分层总览：同上；各层详解）
    - 每层必须注明「承载核心功能：[功能名列表]」（与功能架构形成交叉引用）
 5. **§5**：运行形态与执行流（常驻进程、工具进程、核心执行流）
    - 执行流需标注涉及的核心功能项；跨仓调用注明仓库
@@ -562,6 +571,7 @@ node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url http://10.x.x.x:11011
 - [ ] PRODUCT_DESC 已提取（或标记为空，使用 README 替代）
 - [ ] CODE_PATH 已提取（或标记为空，使用默认扫描策略）
 - [ ] CORE_FEATURES 已提取并建立追踪表格（或标记为空）
+- [ ] **Phase 0e**：`DIAGRAM_MODE` 已判定（system 提示含 `whalecloud-dev-tool-excalidraw` → excalidraw，否则 mermaid）
 
 索引与源码读取：
 - [ ] GITNEXUS_URL 已确认；若按产品拉仓则 **SYNAPSE_URL + PROD** 已确认且已跑 `get_repo_info.py`，`GNX_REPO_LIST` 已建立
@@ -589,18 +599,18 @@ node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url http://10.x.x.x:11011
 - [ ] 产品定位（以 PRODUCT_DESC 为基础）已写（每段有源码路径作为论据）
 - [ ] 动态分层已提出并与用户确认（含源码路径证据 + 覆盖的核心功能项）
 
-图示生成：
-- [ ] 已调用 whalecloud-dev-tool-excalidraw 生成图 A（技术栈）并内嵌到技术架构 §3.3
-- [ ] 已调用 whalecloud-dev-tool-excalidraw 生成图 B（架构总览）并内嵌到技术架构 §4.1
+图示生成（按 Phase 0e `DIAGRAM_MODE`）：
+- [ ] **`DIAGRAM_MODE=excalidraw`**：已读取 whalecloud-dev-tool-excalidraw 规范；`tech-stack.excalidraw`、`sys-arch-layers.excalidraw` 已写入 **OUTPUT_DIR**；TECH_ARCH §3.3 / §4.1 已引用并附「图示来源」
+- [ ] **`DIAGRAM_MODE=mermaid`**：**未**创建任何 `.excalidraw`；TECH_ARCH §3.3、§4.1 各含完整可渲染 ```mermaid 块 +「图示来源」
 
 文档输出：
 - [ ] func-arch-template 已填满（§3 CORE_FEATURES 逐项含代码影响范围；**§4 遗漏功能/候选能力**已填满）
 - [ ] tech-arch-template 已填满（**§2.4** 多仓与跨仓关联；各层注明承载核心功能，不重复功能描述）
-- [ ] **OUTPUT** 所列文件已写入 **OUTPUT_DIR**（含 FUNCTIONAL_ARCH.md、TECH_ARCH.md 及约定 excalidraw 名）
+- [ ] **OUTPUT_DIR** 已含 `FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`；**若 `DIAGRAM_MODE=excalidraw`** 还须含约定名两份 `.excalidraw`
 - [ ] 两份文档内容不交叉（功能架构无技术栈/分层图，技术架构无产品定位/场景）
 ```
 
-**迭代：** 更新 overrides → 重映射层 → 仅重画受影响图、更新对应章节。
+**迭代：** 更新 overrides → 重映射层 → 仅重画受影响图（Excalidraw）或同步修订 Mermaid、更新对应章节。
 新增 CORE_FEATURES 项时：补充代码追踪 → 更新功能架构 §3 → 更新技术架构各层标注。
 
 ## Error Handling
@@ -647,5 +657,5 @@ node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url http://10.x.x.x:11011
 - [func-arch-template.md](func-arch-template.md) — 功能架构文档模板（主文档）
 - [tech-arch-template.md](tech-arch-template.md) — 技术架构文档模板（补充文档）
 - [../whalecloud-dev-tool-base-scripts/references/get_repo_info_readme.md](../whalecloud-dev-tool-base-scripts/references/get_repo_info_readme.md) — `get_repo_info.py` 用法（与 `whalecloud-dev-tool-development-manual` 同源接口）
-- **图示技能（必须调用）**：`../whalecloud-dev-tool-excalidraw/SKILL.md` — 安装在系统 skills 目录，当前工作区不可见不代表不可用，Phase 3 必须读取并执行该技能
+- **图示技能（仅 `DIAGRAM_MODE=excalidraw` 时必读）**：`../whalecloud-dev-tool-excalidraw/SKILL.md` — 用于生成 `tech-stack.excalidraw` / `sys-arch-layers.excalidraw`；未挂载该技能时走 Mermaid 分支，勿读此文件
 - 代码探索：[gitnexus-exploring](../gitnexus-exploring/SKILL.md)（在需要 MCP 深入某符号时）

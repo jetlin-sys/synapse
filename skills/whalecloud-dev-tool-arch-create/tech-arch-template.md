@@ -83,12 +83,13 @@
 
 ### 3.3 技术栈依赖图
 
-<!-- ⚠ 必须调用 whalecloud-dev-tool-excalidraw 生成此图，不可用 Mermaid 文字块或描述性文字替代。
-     调用时提供的描述内容：
-       - 图类型：技术栈依赖关系（flowchart / layered）
-       - 节点来源：Phase 1b 步骤 A 读到的构建文件（Makefile/CMakeLists 等）
-       - 节点只能使用源码中真实出现的库/框架/语言名称，不得编造
-     图下方一句「图示来源」说明对应的源码路径。
+<!--
+  图示模式（由 whalecloud-dev-tool-arch-create Phase 0 判定，见 SKILL.md「图示模式」）：
+
+  · Excalidraw 模式：仅当本任务已挂载技能 whalecloud-dev-tool-excalidraw 时——按该技能规范写出 tech-stack.excalidraw，
+    此处 {{DIAGRAM_TECH_STACK}} 放指向该文件的 Markdown 链接或嵌入约定；不可用纯文字描述替代图示产物。
+  · Mermaid 模式：未挂载上述技能时——**不得**生成 .excalidraw；须在本节填入完整 ```mermaid … ``` 代码块
+    （推荐 flowchart TB / graph LR 表达依赖方向），节点名须来自 Phase 1b 构建清单中的真实依赖名；图下一句「图示来源」+ 源码路径。
 -->
 
 {{DIAGRAM_TECH_STACK}}
@@ -99,15 +100,13 @@
 
 ### 4.1 分层架构概览图
 
-<!-- ⚠ 必须调用 whalecloud-dev-tool-excalidraw 生成此图，不可用 Mermaid 文字块或描述性文字替代。
-     调用时提供的描述内容：
-       - 图类型：系统分层架构（layered architecture）
-       - 层名称来自源码目录实际结构（非索引聚类分类）
-       - 连线方向来自 #include / import 关系（Phase 1b 步骤 D Grep 验证）
-       - 每层注明承载的核心功能项（来自 CORE_FEATURES 追踪结果）；**多仓时**可在层说明中标注「主实现仓库」
-       - 若 arch-data.json 中 indexQuality.clusterCollapseDetected=true，
-         必须忽略 layeredClusters，改用 sourceScan.subDirectories 派生分层
-     图下方一句「图示来源」说明对应的源码路径证据。
+<!--
+  图示模式（同 §3.3，见 SKILL.md「图示模式」）：
+
+  · Excalidraw 模式：已挂载 whalecloud-dev-tool-excalidraw 时——写出 sys-arch-layers.excalidraw，此处放链接/嵌入约定。
+  · Mermaid 模式：未挂载时——**不得**生成 .excalidraw；须在本节填入完整 ```mermaid … ```（分层框 + 依赖方向），
+    层名来自源码目录结构，连线依据 Phase 1b #include/import；每层关联 CORE_FEATURES；clusterCollapse 规则同 SKILL。
+     图下「图示来源」+ 源码路径证据。
 -->
 
 {{DIAGRAM_SYSTEM_OVERVIEW}}
