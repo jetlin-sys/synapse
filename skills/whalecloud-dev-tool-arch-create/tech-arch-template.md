@@ -52,6 +52,17 @@
 <!-- 构建目标列表（每个 target 对应一个可执行产物）、链接库（-l 标志）、编译宏（-D 标志）、
      编译顺序（来自 makeall/CMakeLists 顶层结构） -->
 
+### 2.4 多仓库组成与跨仓关联（产品多仓时必填）
+
+{{MULTI_REPO_OVERVIEW}}
+
+<!-- 当产品对应多个 Git 仓库时填写；单仓产品写「不适用：本产品单仓库交付」并一句说明即可。
+     建议内容：
+     - 仓库清单：`仓库名` → 主要职责一句话（与 `get_repo_info` / `GNX_REPO_LIST` 一致）
+     - **跨仓关联证据**：配置中的 URL/服务名、proto/OpenAPI 依赖、gRPC/HTTP 客户端、消息 topic、共享 DB 名等（须 `仓库名:路径`）
+     - **一致性观察**：错误码分段、API 前缀、包命名在多仓间是否对齐；明显不一致处标「[待产品/架构确认]」
+     勿重复 FUNCTIONAL_ARCH 中的业务故事，只保留工程与集成事实。-->
+
 ---
 
 ## 3. 技术栈
@@ -93,7 +104,7 @@
        - 图类型：系统分层架构（layered architecture）
        - 层名称来自源码目录实际结构（非索引聚类分类）
        - 连线方向来自 #include / import 关系（Phase 1b 步骤 D Grep 验证）
-       - 每层注明承载的核心功能项（来自 CORE_FEATURES 追踪结果）
+       - 每层注明承载的核心功能项（来自 CORE_FEATURES 追踪结果）；**多仓时**可在层说明中标注「主实现仓库」
        - 若 arch-data.json 中 indexQuality.clusterCollapseDetected=true，
          必须忽略 layeredClusters，改用 sourceScan.subDirectories 派生分层
      图下方一句「图示来源」说明对应的源码路径证据。
@@ -249,7 +260,7 @@
 - **结构化索引服务**：`{{GITNEXUS_URL}}`（仅团队内部部署时使用）
 - **索引中的仓库名**：`{{PROJECT_NAME}}`
 - **原始采集文件**：`arch-data.json`（与本文档同目录时可附）
-- **采集命令**：`node scripts/fetch-arch-data.js --url <URL> --repo <NAME>`；需要符号正文片段时加 `--with-snippets`
+- **采集命令**：`node <BASE_SCRIPTS_DIR>/scripts/fetch-arch-data.js --url <URL> --repo <NAME>`（`BASE_SCRIPTS_DIR` = 技能 `whalecloud-dev-tool-base-scripts` 根目录）；需要符号正文片段时加 `--with-snippets`
 
 ---
 

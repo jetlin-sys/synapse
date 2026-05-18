@@ -553,6 +553,11 @@ class SkillsHandler:
         if not changes:
             return "❌ 未指定要变更的技能"
 
+        from synapse.utils.whaleclouddevtool import (
+            WHALECLOUD_BASE_SCRIPTS_SKILL_ID,
+            is_whalecloud_base_scripts_skill_id,
+        )
+
         try:
             from synapse.config import settings
 
@@ -602,6 +607,10 @@ class SkillsHandler:
                 skipped.append(f"{sid}（系统技能，不可禁用）")
                 continue
 
+            if not enabled and is_whalecloud_base_scripts_skill_id(sid):
+                skipped.append(f"{sid}（研发工具必选依赖，不可禁用）")
+                continue
+
             if sid not in all_external_ids:
                 skipped.append(f"{sid}（未找到）")
                 continue
@@ -617,6 +626,8 @@ class SkillsHandler:
             if skipped:
                 msg += f"\n跳过: {', '.join(skipped)}"
             return msg
+
+        existing_allowlist.add(WHALECLOUD_BASE_SCRIPTS_SKILL_ID)
 
         # 写入 data/skills.json
         content = {

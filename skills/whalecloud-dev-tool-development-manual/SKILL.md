@@ -8,6 +8,12 @@ label: 产品研发手册生成工具
 
 通过产品名称获取产品描述信息和功能架构文档，结合 GitNexus 源码缓存检索，生成覆盖templates/产品研发手册.md模板文件中所有章节的完整产品用户手册。
 
+## 共享系统脚本（BASE_SCRIPTS_DIR）
+
+与 SynapseService / GitNexus 交互的脚本位于技能 **`whalecloud-dev-tool-base-scripts`**（与本技能同级目录 `skills/whalecloud-dev-tool-base-scripts/`）。**BASE_SCRIPTS_DIR** 为该技能根目录（系统提示中「研发技能：whalecloud-dev-tool-base-scripts」下的 `**技能路径**:`）。下文凡写 `<BASE_SCRIPTS_DIR>/scripts/...` 均指该路径。
+
+本技能目录下**不再**包含 `get_doc.py`、`get_repo_info.py`、`gnx-tools.js`、`detect-project-kind.js` 等副本；仅保留 `templates/` 与本 SKILL。
+
 ---
 
 ## Parameters
@@ -22,7 +28,7 @@ label: 产品研发手册生成工具
 | `TMP_DIR` | 否 | 临时文件目录，默认 `{OUTPUT_DIR}/.tmp/`，其下存储 `docs/`（架构文档）和 `.gnx-cache/`（源码缓存，按仓库分目录） |
 | `DEBUG` | 否 | 调试模式，默认 `false`。为 `true` 时：①每个工作流程步骤输出关键调试信息到 `{TMP_DIR}/user_manual_debug.md`；②保留临时文件（`.gnx-cache/`）以便复查。为 `false` 时生成目标文件后自动清理临时源码缓存 |
 
-> **仓库名称**：无需手动传递。技能启动时自动通过 `scripts/get_repo_info.py` 从 SynapseService 获取该产品关联的**所有代码仓库**列表。一个产品通常由多个仓库组合而成（如 `仓库A` + `仓库B`），最终用户手册整合所有仓库的源码分析结果。
+> **仓库名称**：无需手动传递。技能启动时自动通过 `<BASE_SCRIPTS_DIR>/scripts/get_repo_info.py` 从 SynapseService 获取该产品关联的**所有代码仓库**列表。一个产品通常由多个仓库组合而成（如 `仓库A` + `仓库B`），最终用户手册整合所有仓库的源码分析结果。
 
 ---
 
@@ -63,13 +69,13 @@ label: 产品研发手册生成工具
 Phase 0 — 参数校验与环境准备
   0a. 校验必填参数：对照 Parameters 章节，校验Parameters章节中必填字段是否均已提供；缺失则中止并列出缺失参数。
   0b. 自动获取产品关联的所有仓库：
-        → {PYTHON} scripts/get_repo_info.py --server-url={SYNAPSE_URL} --prod={PROD}
+        → {PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_repo_info.py --server-url={SYNAPSE_URL} --prod={PROD}
       解析输出 "产品：XXX 一共有N个仓库：REPO1,REPO2"，提取所有仓库名列表，记为 GNX_REPO_LIST（示例：GNX_REPO_LIST = ["仓库A", "仓库B"]）。
       若输出包含 "未找到仓库信息" 则**中止**并提示：该产品未关联代码仓库，请检查 PROD 参数。
   0c. 创建输出目录和临时目录（若不存在）：
         → mkdir -p {OUTPUT_DIR} {TMP_DIR} {TMP_DIR}/docs
         → 为每个仓库创建独立缓存目录：mkdir -p {TMP_DIR}/.gnx-cache/{REPO_NAME}
-  0d. 确认 scripts/get_repo_info.py、scripts/get_doc.py、scripts/gnx-tools.js、scripts/detect-project-kind.js 存在且可执行。
+  0d. 确认 <BASE_SCRIPTS_DIR>/scripts/get_repo_info.py、<BASE_SCRIPTS_DIR>/scripts/get_doc.py、<BASE_SCRIPTS_DIR>/scripts/gnx-tools.js、<BASE_SCRIPTS_DIR>/scripts/detect-project-kind.js 存在且可执行。
   0e. Python 命令适配：优先使用 `python3`，若不可用则尝试 `py`（Windows），均不可用则尝试 `python`。
   0f. 调试日志初始化（仅 DEBUG=true 时执行）：
         → 创建/清空 {TMP_DIR}/user_manual_debug.md
@@ -87,11 +93,11 @@ Phase 0 — 参数校验与环境准备
 
 Phase 1 — 获取产品资料（从 SynapseService）
   1a. 获取产品描述信息：
-        → {PYTHON} scripts/get_doc.py --doc_type=产品手册 --server_url {SYNAPSE_URL} --prod {PROD} --output {TMP_DIR}/docs
+        → {PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_doc.py --doc_type=产品手册 --server_url {SYNAPSE_URL} --prod {PROD} --output {TMP_DIR}/docs
   1b. 获取功能架构文档：
-        → {PYTHON} scripts/get_doc.py --doc_type=产品架构 --server_url {SYNAPSE_URL} --prod {PROD} --doc_name=FUNCTIONAL_ARCH.md --output {TMP_DIR}/docs
+        → {PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_doc.py --doc_type=产品架构 --server_url {SYNAPSE_URL} --prod {PROD} --doc_name=FUNCTIONAL_ARCH.md --output {TMP_DIR}/docs
   1c. 获取技术架构文档：
-        → {PYTHON} scripts/get_doc.py --doc_type=产品架构 --server_url {SYNAPSE_URL} --prod {PROD} --doc_name=TECH_ARCH.md --output {TMP_DIR}/docs
+        → {PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_doc.py --doc_type=产品架构 --server_url {SYNAPSE_URL} --prod {PROD} --doc_name=TECH_ARCH.md --output {TMP_DIR}/docs
   1d. 校验关键文档：确认 {TMP_DIR}/docs/ 下存在 FUNCTIONAL_ARCH 和 TECH_ARCH 相关文件；任一缺失则中止并提示文档下载失败。
   1e. 阅读并提取产品概述信息：
         - 产品简介、核心能力、适用场景、技术栈（用于 §1）
@@ -101,11 +107,11 @@ Phase 2 — 获取源码资料（从 GitNexus，按仓库遍历）
   **对 GNX_REPO_LIST 中的每个仓库依次执行以下步骤：**
 
   2a. 下载源码到本地缓存：
-        → node scripts/gnx-tools.js materialize --url {GITNEXUS_URL} --repo {REPO_NAME} --cache {TMP_DIR}/.gnx-cache/{REPO_NAME} --concurrency 8
+        → node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js materialize --url {GITNEXUS_URL} --repo {REPO_NAME} --cache {TMP_DIR}/.gnx-cache/{REPO_NAME} --concurrency 8
   2b. 获取项目概览：
-        → node scripts/gnx-tools.js overview --url {GITNEXUS_URL} --repo {REPO_NAME} --out {TMP_DIR}/.gnx-cache/{REPO_NAME}/overview.json
+        → node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js overview --url {GITNEXUS_URL} --repo {REPO_NAME} --out {TMP_DIR}/.gnx-cache/{REPO_NAME}/overview.json
   2c. 检测工程类型：
-        → node scripts/detect-project-kind.js --cache {TMP_DIR}/.gnx-cache/{REPO_NAME} --overview {TMP_DIR}/.gnx-cache/{REPO_NAME}/overview.json
+        → node <BASE_SCRIPTS_DIR>/scripts/detect-project-kind.js --cache {TMP_DIR}/.gnx-cache/{REPO_NAME} --overview {TMP_DIR}/.gnx-cache/{REPO_NAME}/overview.json
       将每个仓库的工程类型检测结果汇总，形成「仓库 → 技术栈」映射表（用于 §1 技术栈和 §4 代码风格）。
   2d. 分析源码结构：
         从各仓库的 overview.json 提取 Community（模块群）和 Process（关键流程），形成跨仓库的模块全景图。
@@ -184,7 +190,7 @@ Phase 3 — 逐章节分析填充（跨仓库聚合）
     - 代码确认：直接 gnx-tools.js read 表格中标注的入口文件，提取类/接口、职责、关键方法
     - 从 TECH_ARCH §6.1「核心依赖关系」获取模块间依赖描述
     - 代码确认：对 TECH_ARCH §6.1 列出的关键依赖边，用 cypher 验证依赖方数量是否匹配：
-      → node scripts/gnx-tools.js cypher --url {GITNEXUS_URL} --repo {REPO_NAME} --cypher "MATCH (a)-[:CodeRelation]->(b) WHERE a.filePath CONTAINS '入口文件路径' RETURN b.filePath LIMIT 20"
+      → node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js cypher --url {GITNEXUS_URL} --repo {REPO_NAME} --cypher "MATCH (a)-[:CodeRelation]->(b) WHERE a.filePath CONTAINS '入口文件路径' RETURN b.filePath LIMIT 20"
     - 标注每个模块的所属仓库
 
   §7 API 接口规范：
@@ -209,7 +215,7 @@ Phase 3 — 逐章节分析填充（跨仓库聚合）
     - 从 TECH_ARCH §4「系统分层架构」提取分层依赖方向，处于底层的公共层改动影响大
     - 从 FUNCTIONAL_ARCH「代码影响范围」表格统计各目录被功能模块引用的频次
     - 代码确认：对 TECH_ARCH §6 标注的高风险目录，用 cypher 验证依赖方数量：
-      → node scripts/gnx-tools.js cypher --url {GITNEXUS_URL} --repo {REPO_NAME} --cypher "MATCH (a)-[:CodeRelation]->(b) WHERE b.filePath CONTAINS '高风险目录路径' RETURN count(a) AS depCount"
+      → node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js cypher --url {GITNEXUS_URL} --repo {REPO_NAME} --cypher "MATCH (a)-[:CodeRelation]->(b) WHERE b.filePath CONTAINS '高风险目录路径' RETURN count(a) AS depCount"
     - 风险评估规则：
       · 🔴 高风险：TECH_ARCH §6 标注的高风险、或处于底层公共层（接口定义、数据模型、核心协议）
       · 🟡 中风险：TECH_ARCH §6 标注的中风险、或处于中间服务层
@@ -241,10 +247,10 @@ Phase 4 — 生成用户手册
 
 | 脚本 | 用途 | 详细文档 |
 |------|------|----------|
-| `scripts/get_repo_info.py` | 获取产品关联的代码仓库列表 | `references/get_repo_info_readme.md` |
-| `scripts/get_doc.py` | 从 SynapseService 下载产品文档 | `references/get_doc_readme.md` |
-| `scripts/gnx-tools.js` | 与 GitNexus 交互（下载/检索/查询） | `references/README-GNX-TOOLS.md` |
-| `scripts/detect-project-kind.js` | 检测项目工程类型（语言栈、构建体系） | `references/README-GNX-TOOLS.md` |
+| `<BASE_SCRIPTS_DIR>/scripts/get_repo_info.py` | 获取产品关联的代码仓库列表 | [../whalecloud-dev-tool-base-scripts/references/get_repo_info_readme.md](../whalecloud-dev-tool-base-scripts/references/get_repo_info_readme.md) |
+| `<BASE_SCRIPTS_DIR>/scripts/get_doc.py` | 从 SynapseService 下载产品文档 | [../whalecloud-dev-tool-base-scripts/references/get_doc_readme.md](../whalecloud-dev-tool-base-scripts/references/get_doc_readme.md) |
+| `<BASE_SCRIPTS_DIR>/scripts/gnx-tools.js` | 与 GitNexus 交互（下载/检索/查询） | [../whalecloud-dev-tool-base-scripts/references/README-GNX-TOOLS.md](../whalecloud-dev-tool-base-scripts/references/README-GNX-TOOLS.md) |
+| `<BASE_SCRIPTS_DIR>/scripts/detect-project-kind.js` | 检测项目工程类型（语言栈、构建体系） | [../whalecloud-dev-tool-base-scripts/references/README-GNX-TOOLS.md](../whalecloud-dev-tool-base-scripts/references/README-GNX-TOOLS.md) |
 
 ---
 

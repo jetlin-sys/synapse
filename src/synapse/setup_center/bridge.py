@@ -1674,6 +1674,11 @@ def uninstall_skill(workspace_dir: str, skill_name: str) -> None:
         if "system: true" in content.lower()[:500]:
             raise ValueError(f"不允许删除系统技能: {skill_name}")
 
+    from synapse.utils.whaleclouddevtool import is_whalecloud_base_scripts_skill_id
+
+    if is_whalecloud_base_scripts_skill_id(skill_name):
+        raise ValueError(f"不允许删除研发工具必选依赖技能: {skill_name}")
+
     shutil.rmtree(str(target))
     _json_print({"status": "ok", "removed": skill_name})
 

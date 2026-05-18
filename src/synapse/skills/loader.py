@@ -448,9 +448,15 @@ class SkillLoader:
 
         - skills.json 存在且有 external_allowlist -> 直接使用（用户显式选择）
         - skills.json 不存在（external_allowlist is None）-> 用全部外部技能 - DEFAULT_DISABLED_SKILLS
+
+        另：`whalecloud-dev-tool-base-scripts` 为研发工具强制依赖，使用显式 allowlist 时始终并入。
         """
+        from synapse.utils.whaleclouddevtool import WHALECLOUD_BASE_SCRIPTS_SKILL_ID
+
         if external_allowlist is not None:
-            return external_allowlist
+            merged = set(external_allowlist)
+            merged.add(WHALECLOUD_BASE_SCRIPTS_SKILL_ID)
+            return merged
 
         if not DEFAULT_DISABLED_SKILLS:
             return None
@@ -485,6 +491,8 @@ class SkillLoader:
                 self.registry.set_disabled(name, False)
             return 0
 
+        from synapse.utils.whaleclouddevtool import WHALECLOUD_BASE_SCRIPTS_SKILL_ID
+
         keep_extra = agent_referenced_skills or set()
         removed = 0
         disabled_count = 0
@@ -494,6 +502,10 @@ class SkillLoader:
                     self.registry.set_disabled(name, False)
                     continue
             except Exception:
+                continue
+
+            if name == WHALECLOUD_BASE_SCRIPTS_SKILL_ID:
+                self.registry.set_disabled(name, False)
                 continue
 
             if name in external_allowlist:

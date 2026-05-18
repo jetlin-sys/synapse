@@ -551,10 +551,19 @@ async def read_skills_config():
 @router.post("/api/config/skills")
 async def write_skills_config(body: SkillsWriteRequest):
     """Write data/skills.json."""
+    from synapse.utils.whaleclouddevtool import WHALECLOUD_BASE_SCRIPTS_SKILL_ID
+
     sk_path = _project_root() / "data" / "skills.json"
     sk_path.parent.mkdir(parents=True, exist_ok=True)
+    content = dict(body.content)
+    al = content.get("external_allowlist")
+    if isinstance(al, list):
+        merged = [str(x).strip() for x in al if str(x).strip()]
+        if WHALECLOUD_BASE_SCRIPTS_SKILL_ID not in merged:
+            merged.append(WHALECLOUD_BASE_SCRIPTS_SKILL_ID)
+        content["external_allowlist"] = merged
     sk_path.write_text(
-        json.dumps(body.content, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(content, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     logger.info("[Config API] Updated skills.json")

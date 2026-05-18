@@ -20,8 +20,8 @@ import argparse
 import json
 import re
 import sys
-import urllib.request
 import urllib.error
+import urllib.request
 
 
 def extract_repo_name(url: str) -> str:
@@ -37,7 +37,7 @@ def extract_repo_name(url: str) -> str:
     if not url:
         return ""
 
-    match = re.search(r'/([^/]+?)(?:\.git)?$', url)
+    match = re.search(r"/([^/]+?)(?:\.git)?$", url)
     if match:
         return match.group(1)
     return ""
@@ -56,39 +56,33 @@ def call_get_repo_info_api(server_url: str, prod: str) -> dict:
     """
     url = f"http://{server_url}/dev/iwhalecloud/synapse/get_repo_info"
 
-    payload = {
-        "prod": prod
-    }
+    payload = {"prod": prod}
 
-    json_data = json.dumps(payload).encode('utf-8')
+    json_data = json.dumps(payload).encode("utf-8")
 
-    req = urllib.request.Request(
-        url,
-        data=json_data,
-        headers={'Content-Type': 'application/json'}
-    )
+    req = urllib.request.Request(url, data=json_data, headers={"Content-Type": "application/json"})
 
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode('utf-8'))
+            result = json.loads(response.read().decode("utf-8"))
             return result
     except urllib.error.HTTPError as e:
         return {
             "code": e.code,
             "message": f"HTTP 错误: {e.reason}",
-            "data": None
+            "data": None,
         }
     except urllib.error.URLError as e:
         return {
             "code": -1,
             "message": f"连接失败: {e.reason}",
-            "data": None
+            "data": None,
         }
     except Exception as e:
         return {
             "code": -1,
             "message": f"未知错误: {str(e)}",
-            "data": None
+            "data": None,
         }
 
 
@@ -100,21 +94,21 @@ def main():
 示例:
     python get_repo_info.py --server-url=192.168.1.100:8080 --prod=分布式内存数据库
     python get_repo_info.py --server-url=localhost:5000 --prod=XXX营销
-        """
+        """,
     )
 
     parser.add_argument(
         "--server-url",
         type=str,
         required=True,
-        help="服务地址，格式为 IP:PORT，例如 192.168.1.100:8080"
+        help="服务地址，格式为 IP:PORT，例如 192.168.1.100:8080",
     )
 
     parser.add_argument(
         "--prod",
         type=str,
         required=True,
-        help="产品名称"
+        help="产品名称",
     )
 
     args = parser.parse_args()

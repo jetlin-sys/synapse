@@ -24,7 +24,12 @@ import {
 } from "@/components/ui/alert-dialog";
 import { ModalOverlay } from "../components/ModalOverlay";
 import { cn } from "@/lib/utils";
-import { isWhalecloudDevToolSkill, rdToolDisplayLabel } from "../utils/whalecloudDevToolSkill";
+import {
+  isWhalecloudBaseScriptsSkillId,
+  isWhalecloudDevToolSkill,
+  rdToolDisplayLabel,
+  withRdBaseScriptsSkillIds,
+} from "../utils/whalecloudDevToolSkill";
 
 // ─── i18n 辅助：按当前语言优先显示中文名/描述 ───
 
@@ -197,6 +202,7 @@ export function SkillCard({
   saving,
   leadVariant = "default",
   lockEnabled = false,
+  lockEnabledHint,
 }: {
   skill: SkillInfo;
   expanded: boolean;
@@ -213,6 +219,8 @@ export function SkillCard({
   leadVariant?: "default" | "devTool";
   /** 引导页：研发工具须始终启用，禁用开关 */
   lockEnabled?: boolean;
+  /** 与 lockEnabled 配套：锁定原因（优先于引导页默认提示） */
+  lockEnabledHint?: string;
 }) {
   const hasConfig = skill.config && skill.config.length > 0;
   const configComplete = skill.configComplete ?? true;
@@ -311,7 +319,7 @@ export function SkillCard({
                 skill.system
                   ? t("skills.systemRequiredToggle")
                   : lockEnabled
-                    ? t("onboarding.coreAgent.whaleDevToolsLockHint")
+                    ? (lockEnabledHint ?? t("onboarding.coreAgent.whaleDevToolsLockHint"))
                     : undefined
               }
             >
@@ -829,6 +837,7 @@ export function SkillManager({
   // ── 切换启用/禁用（仅更新本地 draft，不自动保存） ──
   const handleToggleEnabled = useCallback((skill: SkillInfo) => {
     if (skill.system) return;
+    if (isWhalecloudBaseScriptsSkillId(skill.skillId)) return;
     const cur = enabledDraft[skill.skillId] ?? (skill.enabled !== false);
     setEnabledDraft((prev) => ({ ...prev, [skill.skillId]: !cur }));
     setEnabledDirty(true);
@@ -839,9 +848,11 @@ export function SkillManager({
     setSavingEnabled(true);
     setError(null);
     try {
-      const externalAllowlist = skills
-        .filter((s) => !s.system && (enabledDraft[s.skillId] ?? (s.enabled !== false)))
-        .map((s) => s.skillId);
+      const externalAllowlist = withRdBaseScriptsSkillIds(
+        skills
+          .filter((s) => !s.system && (enabledDraft[s.skillId] ?? (s.enabled !== false)))
+          .map((s) => s.skillId),
+      );
 
       const content = {
         version: 1,

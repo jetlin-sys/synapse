@@ -458,7 +458,7 @@ function printHelp() {
 
 子命令: materialize | cypher | search | read | grep | overview | explore | impact
 
-示例见同目录 README-GNX-TOOLS.md`);
+示例见 ../references/README-GNX-TOOLS.md`);
 }
 
 async function main() {

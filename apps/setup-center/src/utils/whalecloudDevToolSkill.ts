@@ -12,6 +12,8 @@ export const RD_TOOL_ARCH_CREATE = "whalecloud-dev-tool-arch-create";
 export const RD_TOOL_EXCALIDRAW = "whalecloud-dev-tool-excalidraw";
 /** 产品架构文档修改（refine）：推荐默认勾选的修改技能 */
 export const RD_TOOL_ARCH_MODIFY = "whalecloud-dev-tool-arch-modify";
+/** 研发工具共享脚本（GitNexus / Synapse 脚本包）：系统强制启用，不可卸载、不可从 allowlist 移除 */
+export const RD_TOOL_BASE_SCRIPTS = "whalecloud-dev-tool-base-scripts";
 
 /** 架构文档生成：推荐默认勾选的技能（用户可取消，也可另选其他技能） */
 export const RD_TOOL_GENERATE_REQUIRED = [RD_TOOL_ARCH_CREATE, RD_TOOL_EXCALIDRAW] as const;
@@ -27,6 +29,7 @@ export const RD_TOOL_FALLBACK_LABELS: Record<string, string> = {
   [RD_TOOL_ARCH_CREATE]: "产品架构文档生成工具",
   [RD_TOOL_EXCALIDRAW]: "设计画图工具",
   [RD_TOOL_ARCH_MODIFY]: "产品架构文档修改工具",
+  [RD_TOOL_BASE_SCRIPTS]: "研发工具共享脚本",
 };
 
 /** 去重、去空白，保持首次出现顺序 */
@@ -60,7 +63,7 @@ export function buildRdSkillIdsForGenerate(optionalSkillIds: string[]): string[]
       out.push(id);
     }
   }
-  return out;
+  return withRdBaseScriptsSkillIds(out);
 }
 
 /** refine：推荐默认 + 额外可选（向后兼容；新 UI 请用 uniqueRdSkillIds） */
@@ -81,7 +84,18 @@ export function buildRdSkillIdsForRefine(optionalSkillIds: string[]): string[] {
       out.push(id);
     }
   }
-  return out;
+  return withRdBaseScriptsSkillIds(out);
+}
+
+/** 是否为强制启用的研发工具共享脚本技能 id */
+export function isWhalecloudBaseScriptsSkillId(skillId: string): boolean {
+  return skillId.trim().toLowerCase().replace(/_/g, "-") === RD_TOOL_BASE_SCRIPTS;
+}
+
+/** 在任意研发工具技能列表中保证包含共享脚本技能（去重保持顺序） */
+export function withRdBaseScriptsSkillIds(ids: string[]): string[] {
+  const u = uniqueRdSkillIds(ids);
+  return u.includes(RD_TOOL_BASE_SCRIPTS) ? u : [...u, RD_TOOL_BASE_SCRIPTS];
 }
 
 export function isWhalecloudDevToolSkill(skill: SkillInfo): boolean {

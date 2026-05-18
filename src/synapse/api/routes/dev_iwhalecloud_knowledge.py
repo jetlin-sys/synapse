@@ -19,11 +19,20 @@ from pydantic import BaseModel, Field
 from synapse.agents.profile import AgentProfile, SkillsMode, get_profile_store
 from synapse.api.schemas import error_response, success_response
 from synapse.config import settings
+from synapse.utils.whaleclouddevtool import (
+    WHALECLOUD_BASE_SCRIPTS_SKILL_ID,
+    is_whalecloud_dev_tool_skill_id,
+)
 
 logger = logging.getLogger(__name__)
 
-# gnx-tools.js 由「产品架构文档生成」技能包提供；refine 仅用于解析脚本路径，与请求缺省无关
-_GNX_TOOLS_HOST_SKILL_ID = "whalecloud-dev-tool-arch-create"
+
+def _with_base_scripts_skill_ids(ids: list[str]) -> list[str]:
+    """产品知识生成 / refine 依赖共享脚本技能；INCLUSIVE 模式下须显式挂载才能解析脚本路径。"""
+    out = list(ids)
+    if WHALECLOUD_BASE_SCRIPTS_SKILL_ID not in out:
+        out.append(WHALECLOUD_BASE_SCRIPTS_SKILL_ID)
+    return out
 
 
 def _get_enabled_rd_skill_ids(agent: Any) -> set[str]:
@@ -32,8 +41,6 @@ def _get_enabled_rd_skill_ids(agent: Any) -> set[str]:
         loader = getattr(agent, "skill_loader", None)
         if not loader:
             return set()
-        from synapse.utils.whaleclouddevtool import is_whalecloud_dev_tool_skill_id
-
         # _loaded_skills: dict[skill_id, ParsedSkill]
         loaded: dict = getattr(loader, "_loaded_skills", {})
         return {sid for sid in loaded if is_whalecloud_dev_tool_skill_id(sid)}
@@ -530,7 +537,9 @@ async def _run_knowledge_generation_task(
         agent = await pool.get_or_create(session_id, _tmp_profile)
 
         enabled_ids = _get_enabled_rd_skill_ids(agent)
-        rd_skills = _normalize_rd_skill_ids(req.rd_skill_ids, enabled_ids)
+        rd_skills = _with_base_scripts_skill_ids(
+            _normalize_rd_skill_ids(req.rd_skill_ids, enabled_ids)
+        )
 
         # 重建 profile 挂载过滤后的技能列表
         test_profile = replace(
@@ -577,12 +586,23 @@ async def _run_knowledge_generation_task(
             "你是一个研发工具助手，请按照用户的要求生成系统架构文档。" + skill_section
         )
 
-        prompt = f"""gitnexus服务部署在[{req.gitnexus_url}]上，请使用工具whalecloud-dev-tool-arch-create生成仓库[{repo_name}]的系统架构和功能架构文档。
+        prompt = f"""gitnexus服务部署在[{req.gitnexus_url}]上，请使用产品架构文档生成工具生成产品的系统架构和功能架构文档。
+
+## 路径与参数约定（GitNexus / Synapse 脚本见技能 whalecloud-dev-tool-base-scripts；工作流与模板见 whalecloud-dev-tool-arch-create，勿改写目录语义）
+- **SYNAPSE_URL**：SynapseService 地址（`IP:PORT`）。若需按产品名调用 `scripts/get_repo_info.py` 拉取**全部**关联仓库列表，由对话或运维提供；本 HTTP 任务未单独传该字段时可为空（此时以下方已解析的 **REPO_NAME** 为准）。
+- **GITNEXUS_URL**：`{req.gitnexus_url}`（`gnx-tools.js` / `fetch-arch-data.js` 的 `--url`）。
+- **REPO_NAME**（本任务已解析，须与 GitNexus 图谱一致）：`{repo_name}`（来自 `repo_url` 解析或请求体 `repo_name` 兜底，**禁止**臆造其它仓库名）。
+- **GNX_CACHE_DIR**（当前 **REPO_NAME** 的 materialize/read/grep 缓存根，等同 `_gitnexus_local_data_path`）：`{local_data_path}`
+- **OUTPUT_DIR**（架构交付物唯一落盘目录，与 Agent `default_cwd` 一致，等同 `_knowledge_docs_root`）：`{output_dir}`
+- **OUTPUT**（固定文件名清单，须全部写入 **OUTPUT_DIR**）：`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`、`sys-arch-layers.excalidraw`、`tech-stack.excalidraw`
+
+## 任务上下文
+产品标识（prod_name）：[{prod_name}]
+文档类型（doc_type）：[{doc_type}]
+请求体仓库名字段（可能与 REPO_NAME 不同，以已解析 REPO_NAME 为准）：[{req.repo_name}]
 产品描述：[{req.product_desc}]
 代码路径：[{req.code_path}]
-主要功能：[{req.core_features}]
-GitNexus 本地数据根目录(GNX_CACHE_DIR)：[{local_data_path}]（materialize/缓存等请使用此路径，作为只读的图谱与源码缓存根）
-架构文档产出目录：[{output_dir}]（FUNCTIONAL_ARCH.md、TECH_ARCH.md、*.excalidraw 等所有交付物必须写入此目录，不要使用 GitNexus 数据目录作为产出路径）"""
+主要功能：[{req.core_features}]"""
 
         agent.default_cwd = str(output_dir)
         if getattr(agent, "shell_tool", None):
@@ -888,7 +908,9 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
                 agent = await pool.get_or_create(run_id, _tmp_profile)
 
                 enabled_ids = _get_enabled_rd_skill_ids(agent)
-                rd_skills = _normalize_rd_skill_ids(body.rd_skill_ids, enabled_ids)
+                rd_skills = _with_base_scripts_skill_ids(
+                    _normalize_rd_skill_ids(body.rd_skill_ids, enabled_ids)
+                )
 
                 refine_skills = list(rd_skills)
 
@@ -943,7 +965,7 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
                 # 获取 arch-create 技能的脚本目录路径，供 LLM 调用 gnx-tools.js
                 _gnx_tools_script = ""
                 if loader:
-                    _arch_skill = loader.get_skill(_GNX_TOOLS_HOST_SKILL_ID)
+                    _arch_skill = loader.get_skill(WHALECLOUD_BASE_SCRIPTS_SKILL_ID)
                     if _arch_skill and _arch_skill.skill_dir:
                         _gnx_tools_script = str(
                             Path(_arch_skill.skill_dir) / "scripts" / "gnx-tools.js"

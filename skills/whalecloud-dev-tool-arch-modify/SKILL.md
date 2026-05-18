@@ -88,7 +88,7 @@ Phase 2 — 源码查阅（按修改点决定是否执行）
       ```
       ⚠ Windows PowerShell 不支持 `&&` 链式，须使用绝对路径直接调用（参数均来自 user 消息注入，无需猜测）。
       ⚠ 不要加 `--max-files` 限制，默认全量拉取。
-      ⚠ gnx-tools.js 来自 whalecloud-dev-tool-arch-create 技能的 scripts/ 目录，
+      ⚠ gnx-tools.js 来自 **`whalecloud-dev-tool-base-scripts`** 技能的 `scripts/` 目录，
          路径由系统注入到 user 消息「gnx-tools.js 脚本路径」字段，无需手动查找。
 
       拉取完成后，源码位于 `<源码缓存根目录>/files/` 下，继续步骤 2b。
@@ -159,7 +159,7 @@ Phase 5 — 写回文件
 | user 消息字段 | 含义 |
 |-------------|------|
 | `源码缓存根目录：[...]` | GitNexus materialize 产物根目录，源码位于其下 `files/` 子目录 |
-| `gnx-tools.js 脚本路径：[...]` | 来自 `whalecloud-dev-tool-arch-create` 技能的 scripts/gnx-tools.js 绝对路径 |
+| `gnx-tools.js 脚本路径：[...]` | 来自 `whalecloud-dev-tool-base-scripts` 技能的 `scripts/gnx-tools.js` 绝对路径 |
 | `GitNexus 服务地址：[...]` | 拉取时使用的 `--url` 参数 |
 | `代码路径：[...]` | 仓库内相对路径或 URL，用于确定 `--repo <repo_name>` |
 

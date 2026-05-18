@@ -602,6 +602,7 @@
     "configIncomplete": "Config incomplete",
     "system": "System",
     "systemRequiredToggle": "System skills are required and always on",
+    "rdBaseScriptsLockHint": "Shared scripts skill is required for R&D tools; always on and cannot be uninstalled",
     "external": "External",
     "devToolShortLabel": "R&D tool",
     "enabled": "Enabled",

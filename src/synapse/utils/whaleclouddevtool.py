@@ -5,6 +5,15 @@ from __future__ import annotations
 _WHALECLOUD_DEV_TOOL_PREFIX = "whalecloud_dev_tool_"
 _WHALECLOUD_DEV_TOOL_DIR_PREFIX = "whalecloud-dev-tool-"
 
+# 与仓库 skills/whalecloud-dev-tool-base-scripts 目录名一致；产品知识 / 研发工具链强制依赖，不可卸载、不可从 allowlist 移除
+WHALECLOUD_BASE_SCRIPTS_SKILL_ID = "whalecloud-dev-tool-base-scripts"
+
+
+def is_whalecloud_base_scripts_skill_id(skill_id: str) -> bool:
+    """是否为研发工具共享脚本技能（强制启用、不可卸载）。"""
+    s = (skill_id or "").strip().lower().replace("_", "-")
+    return s == WHALECLOUD_BASE_SCRIPTS_SKILL_ID
+
 
 def is_whalecloud_dev_tool_skill_id(skill_id: str) -> bool:
     """判断一个技能 id 是否属于研发工具类别。

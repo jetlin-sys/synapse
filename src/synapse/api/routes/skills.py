@@ -14,7 +14,7 @@ import shutil
 import tempfile
 import uuid
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -62,7 +62,7 @@ def _merge_external_allowlist_add(skill_id: str) -> None:
     if skill_id in ids:
         return
     data["external_allowlist"] = list(al) + [skill_id]
-    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    data["updated_at"] = datetime.now(UTC).isoformat()
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -259,7 +259,11 @@ async def list_skills(request: Request):
         if registry is None:
             return {"skills": []}
         all_skills = registry.list_all()
-        effective_allowlist = external_allowlist
+        loader2 = getattr(actual_agent, "skill_loader", None)
+        if loader2 is not None:
+            effective_allowlist = loader2.compute_effective_allowlist(external_allowlist)
+        else:
+            effective_allowlist = external_allowlist
 
     skills = []
     for skill in all_skills:
@@ -478,6 +482,11 @@ async def uninstall_skill(request: Request):
     skill_id = (body.get("skill_id") or "").strip()
     if not skill_id:
         return {"error": "skill_id is required"}
+
+    from synapse.utils.whaleclouddevtool import is_whalecloud_base_scripts_skill_id
+
+    if is_whalecloud_base_scripts_skill_id(skill_id):
+        return {"error": "研发工具共享脚本技能为系统强制依赖，不可卸载"}
 
     try:
         from synapse.config import settings

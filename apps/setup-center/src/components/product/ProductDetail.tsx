@@ -51,10 +51,12 @@ import { toast } from "sonner";
 import { IS_TAURI, proxyFetch } from "@/platform";
 import {
   buildRdSkillIdsForGenerate,
+  isWhalecloudBaseScriptsSkillId,
   isWhalecloudDevToolSkill,
   RD_TOOL_GENERATE_REQUIRED,
   rdToolDisplayLabel,
   uniqueRdSkillIds,
+  withRdBaseScriptsSkillIds,
 } from "@/utils/whalecloudDevToolSkill";
 import type { SkillInfo } from "@/types";
 import { ProductDocumentEditor } from "./ProductDocumentEditor";
@@ -894,8 +896,8 @@ export function ProductDetail({
             displayLabel: rdToolDisplayLabel(s, i18n.language),
           }));
         setRdSkillCatalog(devTools);
-        const defaultSel = RD_TOOL_GENERATE_REQUIRED.filter((id) =>
-          devTools.some((s) => s.skillId === id),
+        const defaultSel = withRdBaseScriptsSkillIds(
+          RD_TOOL_GENERATE_REQUIRED.filter((id) => devTools.some((s) => s.skillId === id)),
         );
         setGenSelectedRdSkillIds(defaultSel);
       } catch {
@@ -959,8 +961,8 @@ export function ProductDetail({
       // 2. 触发生成：显式传入由用户勾选；未传时与弹窗推荐默认一致
       const rdSkillIds =
         opts?.rd_skill_ids !== undefined
-          ? uniqueRdSkillIds(opts.rd_skill_ids)
-          : buildRdSkillIdsForGenerate([]);
+          ? withRdBaseScriptsSkillIds(uniqueRdSkillIds(opts.rd_skill_ids))
+          : withRdBaseScriptsSkillIds(buildRdSkillIdsForGenerate([]));
       // 从仓库 URL 解析真实仓库名（去掉 .git 后缀的最后一段路径）
       const repoNameFromUrl = mainRepo.url
         ? mainRepo.url.replace(/\/$/, "").split("/").pop()?.replace(/\.git$/i, "") || product.name
@@ -1930,13 +1932,15 @@ export function ProductDetail({
                 {rdSkillCatalog.map((skill) => (
                   <label
                     key={skill.skillId}
-                    className="flex items-center gap-2 text-sm cursor-pointer py-0.5"
+                    className={`flex items-center gap-2 text-sm py-0.5 ${isWhalecloudBaseScriptsSkillId(skill.skillId) ? "cursor-not-allowed opacity-90" : "cursor-pointer"}`}
                   >
                     <input
                       type="checkbox"
                       className="accent-primary"
                       checked={genSelectedRdSkillIds.includes(skill.skillId)}
+                      disabled={isWhalecloudBaseScriptsSkillId(skill.skillId)}
                       onChange={(e) => {
+                        if (isWhalecloudBaseScriptsSkillId(skill.skillId)) return;
                         setGenSelectedRdSkillIds((prev) =>
                           e.target.checked
                             ? [...prev, skill.skillId]
@@ -1997,7 +2001,7 @@ export function ProductDetail({
               }
               setGenOptsOpen(false);
               void handleGenerateKnowledge(genCategoryKey, {
-                rd_skill_ids: uniqueRdSkillIds(genSelectedRdSkillIds),
+                rd_skill_ids: withRdBaseScriptsSkillIds(genSelectedRdSkillIds),
                 preferred_endpoint: genEndpoint.trim() || null,
               });
             }}

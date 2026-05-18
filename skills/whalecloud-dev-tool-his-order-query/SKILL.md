@@ -6,6 +6,8 @@ label: 产品历史工单分析工具
 
 # whalecloud-dev-tool-his-order-query
 
+与图谱服务交互的 Python 脚本位于技能 **`whalecloud-dev-tool-base-scripts`**。**BASE_SCRIPTS_DIR** 为该技能根目录（系统提示中 `**技能路径**:`）。
+
 ## 技能目标
 基于给定的需求单描述信息（`DEMAND_DESC`）和功能影响信息（`DEMAND_IMPACT`）作为主要检索依据，并结合功能特性（`PROD_FEATURE`）作为目标系统包含哪些功能模块的辅助理解材料，通过调用底层的图谱检索能力，精准查找到相似的历史工单单号列表，并提供有理有据的相似性证明说明。
 
@@ -30,19 +32,19 @@ label: 产品历史工单分析工具
 
 ### 步骤一：语义与特性的初步召回
 1.  **意图提炼**：以 `PROD_FEATURE` 为业务上下文辅助理解，从 `DEMAND_DESC` 和 `DEMAND_IMPACT` 中准确提炼出用于检索的核心搜索词。
-2.  **执行检索**：调用 `hybrid_query.py` 脚本，获取初步的相似历史需求节点列表（候选集），提取这些节点的 UUID 和单号。
-    - 参考：[references/hybrid_query.md](references/hybrid_query.md)
+2.  **执行检索**：调用 **`<BASE_SCRIPTS_DIR>/scripts/hybrid_query.py`**（`BASE_SCRIPTS_DIR` = 技能 `whalecloud-dev-tool-base-scripts` 根目录，见系统提示中该技能的 `**技能路径**:`），获取初步的相似历史需求节点列表（候选集），提取这些节点的 UUID 和单号。
+    - 参考：[../whalecloud-dev-tool-base-scripts/references/hybrid_query.md](../whalecloud-dev-tool-base-scripts/references/hybrid_query.md)
 3.  *(DEBUG)*：若 `DEBUG=true`，需将“提取出的核心搜索词”、“调用 `hybrid_query.py` 的完整命令参数”以及“初步召回的 UUID 和单号列表（含相似度得分）”写入调试日志。
 
 ### 步骤二：影响范围的拓扑交叉验证
-1.  **执行展开**：针对步骤一获取的高置信度历史工单，遍历其 UUID，调用 `relation_query.py` 脚本进行拓扑检索。
-    - 参考：[references/relation_query.md](references/relation_query.md)
+1.  **执行展开**：针对步骤一获取的高置信度历史工单，遍历其 UUID，调用 **`<BASE_SCRIPTS_DIR>/scripts/relation_query.py`** 进行拓扑检索。
+    - 参考：[../whalecloud-dev-tool-base-scripts/references/relation_query.md](../whalecloud-dev-tool-base-scripts/references/relation_query.md)
 2.  **重合度计算**：获取历史工单实际关联的模块、代码文件等拓扑数据，将其与用户输入的 `DEMAND_IMPACT` 信息进行对比，筛选出在影响范围上真实存在重合的工单，剔除“描述相似但改动完全不同”的干扰项。
 3.  *(DEBUG)*：若 `DEBUG=true`，需将“为哪些 UUID 执行了拓扑展开”、“调用 `relation_query.py` 的命令”、“实际查出的影响模块/代码列表”以及“与输入 `DEMAND_IMPACT` 交叉对比匹配和剔除的详细判定过程”写入调试日志。
 
 ### 步骤三：深度关联检索（进阶使用）
-1.  **高级过滤**：如果常规检索无法快速缩小范围，将主动构造 Cypher 语句，调用 `cypher_query.py`。利用对 `PROD_FEATURE` 模块背景的理解，结合 `DEMAND_DESC` 映射到图谱中的特定节点，例如：通过图谱直接过滤出业务描述匹配，且存在边指向特定 `Impact` 节点的工单，实现“一击必中”。
-    - 参考：[references/cypher_query.md](references/cypher_query.md)
+1.  **高级过滤**：如果常规检索无法快速缩小范围，将主动构造 Cypher 语句，调用 **`<BASE_SCRIPTS_DIR>/scripts/cypher_query.py`**。利用对 `PROD_FEATURE` 模块背景的理解，结合 `DEMAND_DESC` 映射到图谱中的特定节点，例如：通过图谱直接过滤出业务描述匹配，且存在边指向特定 `Impact` 节点的工单，实现“一击必中”。
+    - 参考：[../whalecloud-dev-tool-base-scripts/references/cypher_query.md](../whalecloud-dev-tool-base-scripts/references/cypher_query.md)
 2.  *(DEBUG)*：若 `DEBUG=true`，需将“决定使用 Cypher 的推理理由”、“构造出的原始 Cypher 查询语句”、“传入的 `parameters`”以及“Cypher 返回的精确结果集”写入调试日志。
 
 ### 步骤四：结果整合与输出

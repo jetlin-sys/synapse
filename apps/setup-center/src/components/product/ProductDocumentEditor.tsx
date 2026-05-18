@@ -32,8 +32,10 @@ import type {
   ProductKnowledgeRefineStatusResult,
 } from "@/api/rdUnifiedService";
 import {
+  isWhalecloudBaseScriptsSkillId,
   RD_TOOL_REFINE_REQUIRED,
   uniqueRdSkillIds,
+  withRdBaseScriptsSkillIds,
 } from "@/utils/whalecloudDevToolSkill";
 
 /** 文档预览中 Excalidraw 外框：占视口高度为主，大屏最高约 800px，避免原 400px 过小 */
@@ -183,7 +185,9 @@ export function ProductDocumentEditor({
     const defaults =
       skills.length === 0
         ? []
-        : RD_TOOL_REFINE_REQUIRED.filter((rid) => skills.some((s) => s.skillId === rid));
+        : withRdBaseScriptsSkillIds(
+            RD_TOOL_REFINE_REQUIRED.filter((rid) => skills.some((s) => s.skillId === rid)),
+          );
     setRefineSelectedRdSkillIds(defaults);
   }, [
     refineContext?.prod_name,
@@ -392,7 +396,7 @@ export function ProductDocumentEditor({
       setHasOpenedEdit(false);
     }
 
-    const rdSkillIds = uniqueRdSkillIds(refineSelectedRdSkillIds);
+    const rdSkillIds = withRdBaseScriptsSkillIds(uniqueRdSkillIds(refineSelectedRdSkillIds));
     if (rdSkillIds.length === 0) {
       toast.warning(
         t("workbench.products.detail.rdToolsSelectAtLeastOne", "请至少选择一个研发工具"),
@@ -909,13 +913,15 @@ export function ProductDocumentEditor({
                   {(refineCatalog?.rdSkills ?? []).map((skill) => (
                     <label
                       key={skill.skillId}
-                      className="flex items-center gap-2 text-sm cursor-pointer py-0.5"
+                      className={`flex items-center gap-2 text-sm py-0.5 ${isWhalecloudBaseScriptsSkillId(skill.skillId) ? "cursor-not-allowed opacity-90" : "cursor-pointer"}`}
                     >
                       <input
                         type="checkbox"
                         className="rounded"
                         checked={refineSelectedRdSkillIds.includes(skill.skillId)}
+                        disabled={isWhalecloudBaseScriptsSkillId(skill.skillId)}
                         onChange={(e) => {
+                          if (isWhalecloudBaseScriptsSkillId(skill.skillId)) return;
                           setRefineSelectedRdSkillIds((prev) =>
                             e.target.checked
                               ? [...prev, skill.skillId]

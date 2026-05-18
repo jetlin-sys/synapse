@@ -8,7 +8,12 @@ import { Loader2, Play, Plus } from "lucide-react";
 import { invoke, IS_TAURI } from "../../platform";
 import type { SkillInfo, SkillConfigField, EnvMap } from "../../types";
 import { envSet } from "../../utils";
-import { isWhalecloudDevToolSkill, rdToolDisplayLabel } from "../../utils/whalecloudDevToolSkill";
+import {
+  isWhalecloudBaseScriptsSkillId,
+  isWhalecloudDevToolSkill,
+  rdToolDisplayLabel,
+  withRdBaseScriptsSkillIds,
+} from "../../utils/whalecloudDevToolSkill";
 import { safeFetch } from "../../providers";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -411,6 +416,7 @@ export function DevToolsSkillPanel({
 
   const handleToggleEnabled = useCallback((skill: SkillInfo) => {
     if (skill.system) return;
+    if (isWhalecloudBaseScriptsSkillId(skill.skillId)) return;
     const cur = enabledDraft[skill.skillId] ?? (skill.enabled !== false);
     setEnabledDraft((prev) => ({ ...prev, [skill.skillId]: !cur }));
     setEnabledDirty(true);
@@ -420,9 +426,11 @@ export function DevToolsSkillPanel({
     setSavingEnabled(true);
     setError(null);
     try {
-      const externalAllowlist = skills
-        .filter((s) => !s.system && (enabledDraft[s.skillId] ?? (s.enabled !== false)))
-        .map((s) => s.skillId);
+      const externalAllowlist = withRdBaseScriptsSkillIds(
+        skills
+          .filter((s) => !s.system && (enabledDraft[s.skillId] ?? (s.enabled !== false)))
+          .map((s) => s.skillId),
+      );
       const content = {
         version: 1,
         external_allowlist: externalAllowlist,
@@ -789,12 +797,18 @@ export function DevToolsSkillPanel({
               onToggleExpand={() => setExpandedSkill(expandedSkill === skill.skillId ? null : skill.skillId)}
               onToggleEnabled={() => handleToggleEnabled(skill)}
               onViewDetail={() => void handleViewDetail(skill)}
-              onUninstall={!skill.system ? () => requestUninstall(skill) : undefined}
+              onUninstall={
+                !skill.system && !isWhalecloudBaseScriptsSkillId(skill.skillId)
+                  ? () => requestUninstall(skill)
+                  : undefined
+              }
               uninstalling={uninstallingSet.has(skill.skillId)}
               envDraft={envDraft}
               onEnvChange={onEnvChange}
               onSaveConfig={() => void handleSaveConfig(skill)}
               saving={saving}
+              lockEnabled={isWhalecloudBaseScriptsSkillId(skill.skillId)}
+              lockEnabledHint={t("skills.rdBaseScriptsLockHint")}
             />
           </div>
         ))}
@@ -809,14 +823,18 @@ export function DevToolsSkillPanel({
           isEditing={detailEditing}
           editContent={detailEditContent}
           savingContent={detailSaving}
-          isSystem={detailSkill.system}
+          isSystem={detailSkill.system || isWhalecloudBaseScriptsSkillId(detailSkill.skillId)}
           serviceRunning={serviceRunning}
           onClose={handleCloseDetail}
           onStartEdit={() => { setDetailEditing(true); setDetailEditContent(detailContent); }}
           onCancelEdit={() => { setDetailEditing(false); setDetailEditContent(""); }}
           onEditChange={setDetailEditContent}
           onSave={() => void handleSaveContent()}
-          onUninstall={!detailSkill.system ? () => requestUninstall(detailSkill) : undefined}
+          onUninstall={
+            !detailSkill.system && !isWhalecloudBaseScriptsSkillId(detailSkill.skillId)
+              ? () => requestUninstall(detailSkill)
+              : undefined
+          }
           uninstalling={uninstallingSet.has(detailSkill.skillId)}
         />
       )}

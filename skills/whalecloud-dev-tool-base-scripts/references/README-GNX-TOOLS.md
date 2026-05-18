@@ -5,13 +5,18 @@
 - **在线**：`cypher` / `search` / `overview` / `explore` / `impact` 仅通过 GitNexus **REST**（`/api/query`、`/api/search`），与 `gitnexus-web` `createHttpExecuteQuery` / `createHttpHybridSearch` 同源。
 - **read / grep**：默认只读 **`materialize` 写入的本地缓存**（`--cache/files/`），避免 Phase 1b 反复 `GET /api/file`。
 
+## 产品关联仓库名（勿手填 `REPO_NAME`）
+
+用本技能（`whalecloud-dev-tool-base-scripts`）根目录下 `scripts/get_repo_info.py`（`--server-url` + `--prod`）从 SynapseService 拉取产品对应的 Git 仓库名列表，再作为 `gnx-tools.js --repo` 与 `--cache` 目录名。详见 [get_repo_info_readme.md](get_repo_info_readme.md)。
+
 ## 工程类型检测（与 SKILL Phase 0.1 对齐）
 
 在 `materialize` 完成后，可在同一 `$CACHE` 上运行：
 
 ```powershell
-node "D:\git\ai_dev\GitNexus\.cursor\skills\whalecloud-dev-tool-arch-create\scripts\gnx-tools.js" overview --url $GNX --repo $REPO --out "$CACHE\overview.json"
-node "D:\git\ai_dev\GitNexus\.cursor\skills\whalecloud-dev-tool-arch-create\scripts\detect-project-kind.js" --cache $CACHE --overview "$CACHE\overview.json"
+$BASE = "<BASE_SCRIPTS_DIR>"   # 技能 whalecloud-dev-tool-base-scripts 根目录（见该技能 SKILL.md）
+node "$BASE\scripts\gnx-tools.js" overview --url $GNX --repo $REPO --out "$CACHE\overview.json"
+node "$BASE\scripts\detect-project-kind.js" --cache $CACHE --overview "$CACHE\overview.json"
 ```
 
 **勿用** `overview ... > file.json`（PowerShell 默认 UTF-16，`detect-project-kind` 虽已尽量兼容，仍建议 `--out` 写 UTF-8）。
@@ -71,12 +76,14 @@ node gnx-tools.js impact --url http://127.0.0.1:11011 --repo YOUR_REPO --target 
 $GNX = "http://127.0.0.1:11011"
 $REPO = "你的仓库键"   # 与 11001 图谱页 repo= 一致
 $CACHE = "$PWD\gnx-cache-test"
+$BASE = "<BASE_SCRIPTS_DIR>"   # 技能 whalecloud-dev-tool-base-scripts 根目录
 ```
 
 ### B. 拉缓存（唯一应大量访问 /api/file 的步骤）
 
 ```powershell
-node "D:\git\ai_dev\GitNexus\.cursor\skills\whalecloud-dev-tool-arch-create\scripts\gnx-tools.js" materialize --url $GNX --repo $REPO --cache $CACHE --max-files 300 --concurrency 6
+$BASE = "<BASE_SCRIPTS_DIR>"
+node "$BASE\scripts\gnx-tools.js" materialize --url $GNX --repo $REPO --cache $CACHE --max-files 300 --concurrency 6
 ```
 
 预期：
@@ -92,8 +99,8 @@ node "D:\git\ai_dev\GitNexus\.cursor\skills\whalecloud-dev-tool-arch-create\scri
 3. 执行：
 
 ```powershell
-node "...\scripts\gnx-tools.js" read --cache $CACHE --path $REL
-node "...\scripts\gnx-tools.js" grep --cache $CACHE --pattern "include" --max 20
+node "$BASE\scripts\gnx-tools.js" read --cache $CACHE --path $REL
+node "$BASE\scripts\gnx-tools.js" grep --cache $CACHE --pattern "include" --max 20
 ```
 
 预期：仍能输出内容；**此时无 GitNexus 进程**，证明 read/grep 走本地缓存。
@@ -103,8 +110,8 @@ node "...\scripts\gnx-tools.js" grep --cache $CACHE --pattern "include" --max 20
 重新启动 `gitnexus serve`，执行：
 
 ```powershell
-node "...\scripts\gnx-tools.js" search --url $GNX --repo $REPO --query "test" --limit 5
-node "...\scripts\gnx-tools.js" overview --url $GNX --repo $REPO
+node "$BASE\scripts\gnx-tools.js" search --url $GNX --repo $REPO --query "test" --limit 5
+node "$BASE\scripts\gnx-tools.js" overview --url $GNX --repo $REPO
 ```
 
 预期：stdout 为合法 JSON；无 `HTTP 4xx/5xx`。
@@ -116,7 +123,7 @@ node "...\scripts\gnx-tools.js" overview --url $GNX --repo $REPO
 对同一 `$GNX`、`$REPO` 仍运行一次：
 
 ```powershell
-node "...\scripts\fetch-arch-data.js" --url $GNX --repo $REPO --out arch-data.json --debug-dump "$PWD\debug-fetch-dump"
+node "$BASE\scripts\fetch-arch-data.js" --url $GNX --repo $REPO --out arch-data.json --debug-dump "$PWD\debug-fetch-dump"
 ```
 
 比对：`gnx-tools.js overview` 中的 clusters/processes 数量级与 `arch-data.json` 中摘要是否矛盾；若有明显差异，先检查 **`REPO` 字符串是否完全一致**（含 `@@` 分支后缀）。**`--debug-dump`** 会在该目录写入原始 `GET /api/*` 与 MCP SSE 正文，便于与浏览器或 Nexus 抓包对照。
