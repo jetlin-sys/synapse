@@ -344,8 +344,8 @@ async function httpGetText(fullUrl, timeoutMs) {
 async function cmdMaterialize(args) {
   const base = normalizeBaseUrl(args.url || process.env.GITNEXUS_URL);
   const repo = args.repo || process.env.GNX_REPO;
-  const cache = args.cache || process.env.GNX_CACHE;
-  if (!repo || !cache) die('materialize: need --repo and --cache');
+  const cache = args.cache || process.env.GNX_CACHE || '.gnx-cache';
+  if (!repo) die('materialize: need --repo');
   // 默认不限制文件数量（传 --max-files 0 或不传均表示无上限）；仅在明确传了正整数时才限制
   const rawMaxFiles = parseInt(args.max_files || '0', 10);
   const maxFiles = rawMaxFiles > 0 ? Math.min(rawMaxFiles, 200000) : Infinity;

@@ -38,7 +38,8 @@ node "<SKILL_DIR>\scripts\detect-project-kind.js" --cache $CACHE --overview "$CA
 ```bash
 # 1）一次性拉取文件正文到缓存（会打 /api/graph 与若干 /api/file）
 #    大仓库建议：不要加 --max-files，除非磁盘/网络受限（避免缓存截断）
-node gnx-tools.js materialize --url http://127.0.0.1:11011 --repo YOUR_REPO --cache ./gnx-cache --concurrency 8 --verbose --progress-every 50
+#    注意：如果不指定 --cache，默认使用 .gnx-cache/ 目录
+node gnx-tools.js materialize --url http://127.0.0.1:11011 --repo YOUR_REPO --concurrency 8 --verbose --progress-every 50
 
 # 2）结构化查询（POST /api/query）
 node gnx-tools.js cypher --url http://127.0.0.1:11011 --repo YOUR_REPO --cypher "MATCH (f:File) RETURN f.filePath AS p LIMIT 5"
