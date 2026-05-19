@@ -8,7 +8,6 @@ import {
   displayIdPipeName,
   defaultProdBranchForAppModuleSelection,
   filterAppModuleOptionsForRow,
-  filterProdBranchOptionsForRow,
   filterRepoBranchOptionsForRow,
   findRepoUrlForDetailComposite,
   isValidProductTag,
@@ -545,11 +544,6 @@ export function ProductModal({
           toast.error(t("workbench.products.modal.prodBranchRequired"));
           return;
         }
-        const pbVals = formState.repositories.map((r) => r.prodBranch?.trim() ?? "").filter(Boolean);
-        if (new Set(pbVals).size !== pbVals.length) {
-          toast.error(t("workbench.products.modal.prodBranchDuplicate"));
-          return;
-        }
         const badRepoBranch = formState.repositories.some((r) => !isValidRepoBranchComposite(r.branch));
         if (badRepoBranch) {
           toast.error(t("workbench.products.modal.repoBranchCompositeRequired"));
@@ -903,12 +897,7 @@ export function ProductModal({
                             <SearchableVirtualSelect
                               value={repo.prodBranch ?? ""}
                               onValueChange={(v) => handleRepoProdBranchChange(index, v)}
-                              options={filterProdBranchOptionsForRow(
-                                prodBranchOptions,
-                                formState.repositories,
-                                index,
-                                repo.prodBranch ?? "",
-                              )}
+                              options={prodBranchOptions}
                               placeholder={t("workbench.products.modal.prodBranchPlaceholder")}
                               searchPlaceholder={t("workbench.products.modal.searchFilterPlaceholder")}
                               emptyText={
