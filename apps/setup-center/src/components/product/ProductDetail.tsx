@@ -101,7 +101,7 @@ import "./product-workbench.css";
  * 详情页单一节拍：先 get_prod_process_info，再仅对 I/P 且未在「已终态 task」集合中的行调用
  * product_knowledge/status。与列表页仅用 get_prod_info 区分。
  */
-const PRODUCT_DETAIL_POLL_MS = 30_000;
+const PRODUCT_DETAIL_POLL_MS = 10_000;
 
 /** 打开详情时主区不默认展示任何视图，左侧也不高亮卡片，直至用户点击 */
 const PRODUCT_DETAIL_MAIN_NONE = "";

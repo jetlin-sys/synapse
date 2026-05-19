@@ -107,3 +107,72 @@
 [data-sonner-toaster] {
   z-index: 99999 !important;
 }
+
+/* 修改 Monaco Diff Editor 中还原箭头的样式为红色不透明，且更大更清晰 */
+.monaco-diff-editor .codicon-arrow-right,
+.monaco-diff-editor .codicon-arrow-left,
+.monaco-diff-editor .codicon-revert,
+.monaco-diff-editor .revert-change-button,
+.monaco-diff-editor .diff-revert-button {
+  color: #ef4444 !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  font-size: 16px !important;
+  font-weight: bold !important;
+  transform: scale(1.2);
+  transition: transform 0.2s ease, color 0.2s ease;
+  position: relative; /* 为 tooltip 提供定位参考 */
+}
+
+.monaco-diff-editor .codicon-arrow-right:hover,
+.monaco-diff-editor .codicon-arrow-left:hover,
+.monaco-diff-editor .codicon-revert:hover,
+.monaco-diff-editor .revert-change-button:hover,
+.monaco-diff-editor .diff-revert-button:hover {
+  transform: scale(1.4);
+  color: #b91c1c !important; /* hover 时颜色加深 */
+  z-index: 99999 !important;
+}
+
+/* 悬停时显示“还原差异分段”提示框 */
+.monaco-diff-editor .codicon-arrow-right::after,
+.monaco-diff-editor .codicon-arrow-left::after,
+.monaco-diff-editor .codicon-revert::after,
+.monaco-diff-editor .revert-change-button::after,
+.monaco-diff-editor .diff-revert-button::after {
+  content: "还原";
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-4px);
+  background-color: var(--popover, #1f2937);
+  color: var(--popover-foreground, #f9fafb);
+  border: 1px solid var(--border, #374151);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-family: system-ui, -apple-system, sans-serif;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+  z-index: 2147483647 !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+/* 提升 Monaco 编辑器边缘和遮罩层的层级，防止 tooltip 被遮挡 */
+.monaco-diff-editor .margin-view-overlays,
+.monaco-diff-editor .margin,
+.monaco-diff-editor .diffOverview {
+  z-index: 9999 !important;
+}
+
+.monaco-diff-editor .codicon-arrow-right:hover::after,
+.monaco-diff-editor .codicon-arrow-left:hover::after,
+.monaco-diff-editor .codicon-revert:hover::after,
+.monaco-diff-editor .revert-change-button:hover::after,
+.monaco-diff-editor .diff-revert-button:hover::after {
+  opacity: 1;
+  visibility: visible;
+}

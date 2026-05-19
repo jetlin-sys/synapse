@@ -136,7 +136,7 @@ function fileNameFromMarkdownSrc(src: string | undefined): string {
   return (parts[parts.length - 1] || noQuery).trim();
 }
 
-const REFINE_POLL_INTERVAL_MS = 30_000;
+const REFINE_POLL_INTERVAL_MS = 10_000;
 
 export function ProductDocumentEditor({
   content: initialContent,
@@ -172,8 +172,62 @@ export function ProductDocumentEditor({
   // Diff 状态（接受/拒绝面板）
   const [diffResult, setDiffResult] = useState<ProductKnowledgeRefineResult | null>(null);
   const diffEditorRef = useRef<any>(null);
+  const diffLabelBarRef = useRef<HTMLDivElement>(null);
+  const diffEditorHostRef = useRef<HTMLDivElement>(null);
+  const monacoResizeObserverRef = useRef<ResizeObserver | null>(null);
+  const [diffPaneLayout, setDiffPaneLayout] = useState<{
+    splitLeft: number;
+  } | null>(null);
 
-  /** 是否对当前 target 做 30s 一次的 refine/status 轮询 */
+  const syncDiffPaneLayout = useCallback(() => {
+    const labelBar = diffLabelBarRef.current;
+    const diffEditor = diffEditorRef.current;
+    if (!labelBar || !diffEditor) return;
+
+    const labelRect = labelBar.getBoundingClientRect();
+    const anchorLeft = labelRect.left;
+    const labelWidth = labelRect.width;
+    if (labelWidth <= 0) return;
+
+    const monacoRoot =
+      (diffEditor.getContainerDomNode?.() as HTMLElement | undefined) ??
+      diffEditorHostRef.current?.querySelector(".monaco-diff-editor");
+
+    const gutterEl = monacoRoot?.querySelector(".gutter") as HTMLElement | null;
+    let splitLeft: number | null = null;
+
+    if (gutterEl) {
+      const gutterRect = gutterEl.getBoundingClientRect();
+      splitLeft = gutterRect.left + gutterRect.width / 2 - anchorLeft;
+    } else {
+      const originalNode = diffEditor.getOriginalEditor?.()?.getDomNode?.() as
+        | HTMLElement
+        | undefined;
+      const modifiedNode = diffEditor.getModifiedEditor?.()?.getDomNode?.() as
+        | HTMLElement
+        | undefined;
+      if (originalNode && modifiedNode) {
+        const originalRect = originalNode.getBoundingClientRect();
+        const modifiedRect = modifiedNode.getBoundingClientRect();
+        if (originalRect.width > 0 && modifiedRect.width > 0) {
+          splitLeft = (originalRect.right + modifiedRect.left) / 2 - anchorLeft;
+        }
+      }
+    }
+
+    if (splitLeft == null || splitLeft <= 0 || splitLeft >= labelWidth) return;
+    setDiffPaneLayout({ splitLeft });
+  }, []);
+
+  const scheduleDiffPaneLayoutSync = useCallback(() => {
+    syncDiffPaneLayout();
+    requestAnimationFrame(syncDiffPaneLayout);
+    for (const delay of [50, 150, 300, 600]) {
+      window.setTimeout(syncDiffPaneLayout, delay);
+    }
+  }, [syncDiffPaneLayout]);
+
+  /** 是否对当前 target 做 10s 一次的 refine/status 轮询 */
   const [refinePollActive, setRefinePollActive] = useState(false);
   const [refineStatusText, setRefineStatusText] = useState<string>("");
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -235,6 +289,30 @@ export function ProductDocumentEditor({
   useEffect(() => {
     onDirtyChangeRef.current?.(isDirty);
   }, [isDirty]);
+
+  useEffect(() => {
+    if (!diffResult) {
+      setDiffPaneLayout(null);
+      monacoResizeObserverRef.current?.disconnect();
+      monacoResizeObserverRef.current = null;
+      return;
+    }
+
+    const labelBar = diffLabelBarRef.current;
+    if (!labelBar) return;
+
+    const ro = new ResizeObserver(() => syncDiffPaneLayout());
+    ro.observe(labelBar);
+    if (diffEditorHostRef.current) {
+      ro.observe(diffEditorHostRef.current);
+    }
+
+    scheduleDiffPaneLayoutSync();
+
+    return () => {
+      ro.disconnect();
+    };
+  }, [diffResult, syncDiffPaneLayout, scheduleDiffPaneLayoutSync, isDark]);
 
   // 是否有挂起的未审核 refine 会话（diff 已就绪待用户决策）
   const hasPendingSession = diffResult !== null;
@@ -655,27 +733,64 @@ export function ProductDocumentEditor({
           </div>
         </div>
         {/* Monaco DiffEditor */}
-        <div className="flex-1 min-h-0">
-          <DiffEditor
-            original={diffResult.original}
-            modified={diffResult.proposed}
-            language="markdown"
-            theme={isDark ? "vs-dark" : "light"}
-            onMount={(editor) => {
-              diffEditorRef.current = editor;
-            }}
-            options={{
-              renderSideBySide: true,
-              wordWrap: "on",
-              minimap: { enabled: false },
-              fontSize: 13,
-              readOnly: false,
-              scrollBeyondLastLine: false,
-            }}
-          />
+        <div className="flex-1 min-h-0 flex flex-col">
+          <div ref={diffLabelBarRef} className="relative shrink-0 h-7 border-b bg-muted/5">
+            {diffPaneLayout ? (
+              <>
+                <div
+                  className="absolute inset-y-0 left-0 flex items-center justify-center border-r border-border/50 text-xs font-medium text-muted-foreground"
+                  style={{ width: diffPaneLayout.splitLeft }}
+                >
+                  {t("workbench.products.detail.diffOriginal", "修改前的文档")}
+                </div>
+                <div
+                  className="absolute inset-y-0 right-0 flex items-center justify-center text-xs font-medium text-muted-foreground"
+                  style={{ left: diffPaneLayout.splitLeft }}
+                >
+                  {t("workbench.products.detail.diffModified", "修改后的文档")}
+                </div>
+              </>
+            ) : (
+              <div className="flex h-full">
+                <div className="flex flex-1 items-center justify-center text-xs font-medium text-muted-foreground/60">
+                  {t("workbench.products.detail.diffOriginal", "修改前的文档")}
+                </div>
+                <div className="flex flex-1 items-center justify-center text-xs font-medium text-muted-foreground/60">
+                  {t("workbench.products.detail.diffModified", "修改后的文档")}
+                </div>
+              </div>
+            )}
+          </div>
+          <div ref={diffEditorHostRef} className="flex-1 min-h-0">
+            <DiffEditor
+              original={diffResult.original}
+              modified={diffResult.proposed}
+              language="markdown"
+              theme={isDark ? "vs-dark" : "light"}
+              onMount={(editor) => {
+                diffEditorRef.current = editor;
+                monacoResizeObserverRef.current?.disconnect();
+                const container = editor.getContainerDomNode?.() as HTMLElement | undefined;
+                if (container) {
+                  const ro = new ResizeObserver(() => syncDiffPaneLayout());
+                  ro.observe(container);
+                  monacoResizeObserverRef.current = ro;
+                }
+                scheduleDiffPaneLayoutSync();
+              }}
+              options={{
+                renderSideBySide: true,
+                wordWrap: "on",
+                minimap: { enabled: false },
+                fontSize: 13,
+                readOnly: false,
+                scrollBeyondLastLine: false,
+              }}
+            />
+          </div>
         </div>
         <div className="shrink-0 px-4 py-1.5 text-xs border-t bg-muted/10 text-muted-foreground">
-          {t("workbench.products.detail.refineDiffHint", "左侧为原文，右侧为 AI 修改建议。你可以在右侧直接编辑，或点击撤销箭头恢复局部。确认无误后点击接受。")}
+          {t("workbench.products.detail.refineDiffHint", "左侧为原文，右侧为 AI 修改建议。你可以在右侧直接编辑。点击两列中间的箭头（撤销修改）可部分回退到修改前内容。确认无误后点击接受全部。")}
         </div>
       </div>
     );
