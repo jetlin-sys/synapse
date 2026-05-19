@@ -1291,7 +1291,13 @@ async def get_patch_version(body: GetPatchVersionRequest) -> dict:
     用法：传入产品分支版本ID列表，获取模块版本（补丁计划）。
     接口类型：研发云界面抓取请求（研发平台 --> 版本管理 --> 查询）
     返回数据格式：{
-        "patchName": "补丁计划名称",
+        "patches": [
+            {
+                "patchName": "补丁计划名称",
+                "state": "状态",
+                "closingDate": "封版日期",
+            }
+        ],
     }
     转调：GET /portal/zcm-devspace/patch/page/list/{userId}?page=1&limit=1000，返回码code为“9999”表示成功
     """
@@ -1339,12 +1345,24 @@ async def _get_patch_version(body: GetPatchVersionRequest) -> dict:
     except ValueError:
         return error_response(502, f"研发云获取补丁计划返回非 JSON：{resp.text}")
 
-    # 提取数据
+    # 提取数据：列表每一项的 adPatch 中取 patchName / state / closingDate
     items = ((raw.get("data") or {}).get("list") or [])
     if not items:
-        return success_response({"patchName": None}, "未找到补丁计划")
-    patch_name = (((items[0] or {}).get("adPatch") or {}).get("patchName"))
-    return success_response({"patchName": patch_name})
+        return success_response({"patches": []}, "未找到补丁计划")
+
+    patches: list[dict[str, Any]] = []
+    for row in items:
+        ap = ((row or {}).get("adPatch") or {}) if isinstance(row, dict) else {}
+        if not isinstance(ap, dict):
+            ap = {}
+        patches.append(
+            {
+                "patchName": ap.get("patchName"),
+                "state": ap.get("state"),
+                "closingDate": ap.get("closingDate"),
+            }
+        )
+    return success_response({"patches": patches})
 
 
 
