@@ -10,6 +10,7 @@ DEFAULT_HOST_PROFILE_ID = "default"
 DEFAULT_LLM_ENDPOINT_KEY = "default"
 
 # 与 setup-center rd-sop/constants 对齐的节点类型
+# human/human_start=人工主导；ai=AI主导；ai_human=协同；system=系统独立
 NODE_TYPES: dict[str, str] = {
     "pending": "system",
     "req_clarify": "human",
@@ -36,7 +37,7 @@ NODE_TYPES: dict[str, str] = {
     "solution_consistency": "ai",
     "risk_review": "ai",
     "entropy_review": "ai",
-    "leader_review": "human_multi",
+    "leader_review": "ai_human",
 }
 
 NODE_INTENTS: dict[str, str] = {

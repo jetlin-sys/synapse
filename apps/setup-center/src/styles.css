@@ -5476,3 +5476,79 @@ button.rd-meeting-config-switch--on:hover {
 button.rd-meeting-config-switch--off:hover {
   background: #64748b !important;
 }
+
+/* 研发会议室配置：左侧 SOP 导航 */
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-stage"],
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-node"] {
+  font-weight: inherit !important;
+  letter-spacing: normal !important;
+  color: inherit !important;
+}
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-node"] {
+  padding: 0.625rem 0.75rem !important;
+  border-radius: 0.75rem !important;
+}
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-stage"] {
+  padding: 0.625rem 0.75rem !important;
+  border-radius: 0 !important;
+  border: none !important;
+  background: transparent !important;
+}
+.rd-meeting-sop-node-list {
+  position: relative;
+  margin-left: 0.35rem;
+  padding-left: 0.5rem;
+  border-left: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+}
+.rd-meeting-sop-node--active {
+  transform: translateX(1px);
+  animation: rd-meeting-sop-node-glow 2.8s ease-in-out infinite;
+}
+@keyframes rd-meeting-sop-node-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 14px rgba(16, 185, 129, 0.16);
+  }
+  50% {
+    box-shadow: 0 0 22px rgba(16, 185, 129, 0.28);
+  }
+}
+.rd-meeting-sop-stage--focus {
+  animation: rd-meeting-sop-stage-focus 3s ease-in-out infinite;
+}
+@keyframes rd-meeting-sop-stage-focus {
+  0%,
+  100% {
+    box-shadow: 0 0 18px rgba(16, 185, 129, 0.08);
+  }
+  50% {
+    box-shadow: 0 0 26px rgba(16, 185, 129, 0.14);
+  }
+}
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-node"]:hover:not(.rd-meeting-sop-node--active) {
+  transform: translateY(-1px);
+}
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-node"]:focus-visible,
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-stage"]:focus-visible,
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-pipeline"]:focus-visible {
+  outline: 2px solid rgba(16, 185, 129, 0.45);
+  outline-offset: 2px;
+}
+.rd-meeting-config-drawer button[data-slot="rd-meeting-nav-pipeline"] {
+  padding: 0.25rem 0.125rem !important;
+  border-radius: 0.5rem !important;
+  background: transparent !important;
+  font-weight: inherit !important;
+}
+.rd-meeting-sop-node-pill {
+  animation: rd-meeting-sop-pill 1.6s ease-in-out infinite;
+}
+@keyframes rd-meeting-sop-pill {
+  0%,
+  100% {
+    opacity: 0.85;
+  }
+  50% {
+    opacity: 1;
+  }
+}

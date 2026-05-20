@@ -14,7 +14,14 @@ import { consumeMeetingRoomFocus } from '../../../rd-meeting/focus';
 import { MeetingRoomConfigDrawer } from './MeetingRoomConfigDrawer';
 import { MeetingHitlForm, type HitlFormSchema } from './MeetingHitlForm';
 import { toast } from 'sonner';
-import { SOP_STAGES, ALL_NODES, type SOPNode, type SOPStage } from '../../../rd-sop/constants';
+import {
+  NODE_TYPE_LABEL,
+  SOP_STAGES,
+  ALL_NODES,
+  type NodeType,
+  type SOPNode,
+  type SOPStage,
+} from '../../../rd-sop/constants';
 import { RequirementAnalysisPanel } from './panels/RequirementAnalysisPanel';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -669,15 +676,23 @@ const InterventionDialog = ({
     || stageNodes[0];
 
   const getNodeTypeInfo = (type: NodeType) => {
+    const label = NODE_TYPE_LABEL[type] ?? '未知';
     switch (type) {
-      case 'ai': return { label: 'AI 自动处理', color: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-500/30' };
-      case 'human': return { label: '人工确认操作', color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/30' };
-      case 'human_start': return { label: '人工启动确认', color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/30' };
-      case 'ai_human': return { label: 'AI + 人工协同', color: 'text-purple-400', bg: 'bg-purple-500/10 border-purple-500/30' };
-      case 'human_multi': return { label: '多人联合审批', color: 'text-orange-400', bg: 'bg-orange-500/10 border-orange-500/30' };
-      case 'system': return { label: '系统自动执行', color: 'text-muted-foreground', bg: 'bg-muted/10 border-border/30' };
-      case 'ai_exception': return { label: 'AI异常降级人工', color: 'text-red-400', bg: 'bg-red-500/10 border-red-500/30' };
-      default: return { label: '未知', color: 'text-muted-foreground', bg: 'bg-muted/30 border-border/30' };
+      case 'ai':
+        return { label, color: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-500/30' };
+      case 'human':
+      case 'human_start':
+        return { label, color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/30' };
+      case 'ai_human':
+        return { label, color: 'text-purple-400', bg: 'bg-purple-500/10 border-purple-500/30' };
+      case 'human_multi':
+        return { label, color: 'text-orange-400', bg: 'bg-orange-500/10 border-orange-500/30' };
+      case 'system':
+        return { label, color: 'text-muted-foreground', bg: 'bg-muted/10 border-border/30' };
+      case 'ai_exception':
+        return { label, color: 'text-red-400', bg: 'bg-red-500/10 border-red-500/30' };
+      default:
+        return { label, color: 'text-muted-foreground', bg: 'bg-muted/30 border-border/30' };
     }
   };
 

@@ -1,5 +1,12 @@
 /** 研发 SOP 流水线定义（工单管理 / 研发会议室共用，Phase 0 单源） */
 
+/**
+ * 节点处理方式（展示语义，与会议室/工单 UI 一致）：
+ * - `human` / `human_start`：人工主导，AI 辅助
+ * - `ai`：AI 主导，人工辅助
+ * - `ai_human`：人工与 AI 协同处理
+ * - `system`：由应用或脚本独立实现
+ */
 export type NodeType =
   | 'ai'
   | 'human'
@@ -8,6 +15,17 @@ export type NodeType =
   | 'ai_human'
   | 'system'
   | 'human_multi';
+
+/** 节点类型短标签（导航、看板、配置抽屉共用） */
+export const NODE_TYPE_LABEL: Record<NodeType, string> = {
+  ai: 'AI',
+  human: '人工',
+  human_start: '人工',
+  ai_exception: '降级',
+  ai_human: '协同',
+  system: '系统',
+  human_multi: '会审',
+};
 
 export interface SOPNode {
   id: string;
@@ -82,7 +100,12 @@ export const SOP_STAGES: SOPStage[] = [
       { id: 'solution_consistency', name: '方案一致性', type: 'ai', desc: '二次核对涉及的文件/模块/功能是否严遵方案' },
       { id: 'risk_review', name: '风险评审', type: 'ai', desc: '综合评定开发中的情况及测试充分率是否存在风险' },
       { id: 'entropy_review', name: '控熵评审', type: 'ai', desc: '双向校验控熵文件内容与代码改造差异点的各类结构' },
-      { id: 'leader_review', name: '研发组长评审', type: 'human_multi', desc: '全员线上评审通过后，方可继续转单发布' },
+      {
+        id: 'leader_review',
+        name: '研发组长评审',
+        type: 'ai_human',
+        desc: '研发组长与 AI 协同综合评审，全员通过后转单发布',
+      },
     ],
   },
 ];

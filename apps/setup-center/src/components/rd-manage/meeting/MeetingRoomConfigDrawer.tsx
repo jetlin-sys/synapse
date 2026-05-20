@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Drawer, Input, Select, Button, Collapse, Tag, Spin } from 'antd';
+import { Drawer, Input, Select, Button, Tag, Spin } from 'antd';
 import {
   Settings2,
   Users,
@@ -11,11 +11,19 @@ import {
   UserCheck,
   FileOutput,
   Target,
+  ChevronDown,
+  ChevronRight,
+  GitBranch,
+  Sparkles,
+  User,
+  Cog,
+  AlertCircle,
+  type LucideIcon,
 } from 'lucide-react';
 import { MeetingHitlForm, type HitlFormSchema } from './MeetingHitlForm';
 import type { MeetingRoomNodeBinding } from '../../../api/meetingRoomService';
 import { toast } from 'sonner';
-import { SOP_STAGES } from '../../../rd-sop/constants';
+import { NODE_TYPE_LABEL, SOP_STAGES, type NodeType, type SOPNode } from '../../../rd-sop/constants';
 import {
   fetchLlmEndpointsCatalog,
   type LlmEndpointCatalogItem,
@@ -56,6 +64,108 @@ const FALLBACK_HOST_AGENT: AgentProfile = {
 
 function allSopNodeIds(): string[] {
   return SOP_STAGES.flatMap((s) => s.nodes.map((n) => n.id));
+}
+
+const PIPELINE_STAGES = SOP_STAGES.filter((s) => s.id > 0);
+
+/** 各 SOP 阶段侧栏主题色 */
+const STAGE_NAV_THEME: Record<
+  number,
+  { accent: string; badge: string; panel: string; dot: string }
+> = {
+  1: {
+    accent: 'text-sky-400',
+    badge: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
+    panel: 'border-sky-500/20 bg-sky-500/[0.06]',
+    dot: 'bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.6)]',
+  },
+  2: {
+    accent: 'text-violet-400',
+    badge: 'bg-violet-500/15 text-violet-300 border-violet-500/30',
+    panel: 'border-violet-500/20 bg-violet-500/[0.06]',
+    dot: 'bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.6)]',
+  },
+  3: {
+    accent: 'text-indigo-400',
+    badge: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30',
+    panel: 'border-indigo-500/20 bg-indigo-500/[0.06]',
+    dot: 'bg-indigo-400 shadow-[0_0_8px_rgba(129,140,248,0.6)]',
+  },
+  4: {
+    accent: 'text-amber-400',
+    badge: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+    panel: 'border-amber-500/20 bg-amber-500/[0.06]',
+    dot: 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.6)]',
+  },
+  5: {
+    accent: 'text-rose-400',
+    badge: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
+    panel: 'border-rose-500/20 bg-rose-500/[0.06]',
+    dot: 'bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.6)]',
+  },
+};
+
+const DEFAULT_STAGE_THEME = STAGE_NAV_THEME[1];
+
+const STAGE_PIPELINE_BAR: Record<number, string> = {
+  1: 'bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.55)]',
+  2: 'bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.55)]',
+  3: 'bg-indigo-400 shadow-[0_0_8px_rgba(129,140,248,0.55)]',
+  4: 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.55)]',
+  5: 'bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.55)]',
+};
+
+function nodeTypeNavMeta(type: NodeType): {
+  label: string;
+  chip: string;
+  Icon: LucideIcon;
+} {
+  const label = NODE_TYPE_LABEL[type] ?? '节点';
+  switch (type) {
+    case 'ai':
+      return {
+        label,
+        chip: 'bg-blue-500/12 text-blue-300 border-blue-500/25',
+        Icon: Sparkles,
+      };
+    case 'human':
+    case 'human_start':
+      return {
+        label,
+        chip: 'bg-amber-500/12 text-amber-300 border-amber-500/25',
+        Icon: User,
+      };
+    case 'ai_human':
+      return {
+        label,
+        chip: 'bg-purple-500/12 text-purple-300 border-purple-500/25',
+        Icon: Users,
+      };
+    case 'human_multi':
+      return {
+        label,
+        chip: 'bg-orange-500/12 text-orange-300 border-orange-500/25',
+        Icon: Users,
+      };
+    case 'ai_exception':
+      return {
+        label,
+        chip: 'bg-red-500/12 text-red-300 border-red-500/25',
+        Icon: AlertCircle,
+      };
+    case 'system':
+      return {
+        label,
+        chip: 'bg-muted/40 text-muted-foreground border-border/50',
+        Icon: Cog,
+      };
+    default:
+      return {
+        label,
+        chip: 'bg-muted/40 text-muted-foreground border-border/50',
+        Icon: Cog,
+      };
+  }
 }
 
 /** 与后端 `_coerce_enabled` 一致：未配置视为开启 */
@@ -184,6 +294,9 @@ export const MeetingRoomConfigDrawer: React.FC<{
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [llmEndpoints, setLlmEndpoints] = useState<LlmEndpointCatalogItem[]>([]);
   const [llmEndpointsErr, setLlmEndpointsErr] = useState<string | null>(null);
+  const [expandedStages, setExpandedStages] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(PIPELINE_STAGES.map((s) => [String(s.id), true])),
+  );
 
   const workerAgents = useMemo(
     () => agents.filter((a) => a.id !== HOST_PROFILE_ID),
@@ -233,6 +346,18 @@ export const MeetingRoomConfigDrawer: React.FC<{
   useEffect(() => {
     if (open) void load();
   }, [open, load]);
+
+  const selectedStageId = useMemo(() => {
+    for (const stage of PIPELINE_STAGES) {
+      if (stage.nodes.some((n) => n.id === selectedNodeId)) return stage.id;
+    }
+    return null;
+  }, [selectedNodeId]);
+
+  useEffect(() => {
+    if (selectedStageId == null) return;
+    setExpandedStages((prev) => ({ ...prev, [String(selectedStageId)]: true }));
+  }, [selectedStageId]);
 
   const binding = useMemo(
     () => config?.bindings?.find((b) => b.node_id === selectedNodeId),
@@ -379,42 +504,118 @@ export const MeetingRoomConfigDrawer: React.FC<{
     placeholder: { color: 'var(--muted)' },
   } as const;
 
-  const collapseItems = SOP_STAGES.filter((s) => s.id > 0).map((stage) => ({
-    key: String(stage.id),
-    label: (
-      <span className="text-sm font-medium">
-        {stage.name}{' '}
-        <Tag className="ml-1 font-mono text-[10px]">{stage.nodes.length}</Tag>
-      </span>
-    ),
-    children: (
-      <div className="flex flex-col gap-1">
-        {stage.nodes.map((n) => {
-          const enabled = isNodeEnabled(config?.node_overrides ?? {}, n.id);
-          return (
-            <button
-              key={n.id}
-              type="button"
-              onClick={() => setSelectedNodeId(n.id)}
-              className={`rounded-lg border px-3 py-2 text-left text-xs transition-colors ${
-                selectedNodeId === n.id
-                  ? 'border-blue-500/50 bg-blue-500/10 text-foreground shadow-[0_0_10px_rgba(59,130,246,0.1)]'
-                  : 'border-border bg-muted/20 text-muted-foreground hover:border-blue-500/30'
-              } ${!enabled ? 'opacity-60' : ''}`}
-            >
-              <span className="font-medium text-foreground">{n.name}</span>
-              <span className="ml-2 font-mono text-[10px] opacity-70">{n.id}</span>
-              {!enabled ? (
-                <Tag className="ml-2 m-0 border-border/60 text-[9px] text-muted-foreground">
-                  已关闭
-                </Tag>
+  const bindingByNodeId = useMemo(() => {
+    const map = new Map<string, MeetingRoomNodeBinding>();
+    for (const b of config?.bindings ?? []) {
+      if (b?.node_id) map.set(b.node_id, b);
+    }
+    return map;
+  }, [config?.bindings]);
+
+  const navStats = useMemo(() => {
+    const overrides = config?.node_overrides ?? {};
+    let enabled = 0;
+    let disabled = 0;
+    for (const stage of PIPELINE_STAGES) {
+      for (const n of stage.nodes) {
+        if (isNodeEnabled(overrides, n.id)) enabled += 1;
+        else disabled += 1;
+      }
+    }
+    return { enabled, disabled, total: enabled + disabled };
+  }, [config?.node_overrides]);
+
+  const stageEnableStats = useMemo(() => {
+    const overrides = config?.node_overrides ?? {};
+    const map = new Map<number, { enabled: number; total: number }>();
+    for (const stage of PIPELINE_STAGES) {
+      let enabled = 0;
+      for (const n of stage.nodes) {
+        if (isNodeEnabled(overrides, n.id)) enabled += 1;
+      }
+      map.set(stage.id, { enabled, total: stage.nodes.length });
+    }
+    return map;
+  }, [config?.node_overrides]);
+
+  const toggleStage = (stageId: number) => {
+    const key = String(stageId);
+    setExpandedStages((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const renderSopNodeNavItem = (node: SOPNode, index: number, total: number) => {
+    const enabled = isNodeEnabled(config?.node_overrides ?? {}, node.id);
+    const selected = selectedNodeId === node.id;
+    const typeMeta = nodeTypeNavMeta(node.type);
+    const TypeIcon = typeMeta.Icon;
+    const b = bindingByNodeId.get(node.id);
+    const humanConfirm =
+      config?.node_overrides?.[node.id]?.human_confirm ??
+      b?.human_confirm ??
+      b?.default_human_confirm ??
+      false;
+
+    return (
+      <button
+        key={node.id}
+        type="button"
+        data-slot="rd-meeting-nav-node"
+        onClick={() => setSelectedNodeId(node.id)}
+        className={`rd-meeting-sop-node group relative w-full text-left rounded-xl border px-3 py-2.5 transition-all duration-200 ${
+          selected
+            ? 'rd-meeting-sop-node--active border-emerald-500/45 bg-emerald-500/10 shadow-[0_0_16px_rgba(16,185,129,0.18)]'
+            : 'border-border/45 bg-background/40 hover:border-emerald-500/25 hover:bg-emerald-500/[0.04]'
+        } ${!enabled ? 'opacity-55' : ''}`}
+      >
+        {selected ? (
+          <span
+            className="absolute left-0 top-2 bottom-2 w-1 rounded-r-full bg-gradient-to-b from-emerald-400 to-emerald-600"
+            aria-hidden
+          />
+        ) : null}
+        <div className="flex items-start gap-2.5 pl-0.5">
+          <span
+            className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md border text-[10px] font-semibold ${typeMeta.chip}`}
+          >
+            <TypeIcon className="h-3 w-3" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className={`text-xs font-semibold ${selected ? 'text-foreground' : 'text-foreground/90'}`}>
+                {node.name}
+              </span>
+              <span
+                className={`rounded border px-1 py-0 text-[9px] font-medium ${typeMeta.chip} ${
+                  selected ? 'ring-1 ring-emerald-500/35' : ''
+                }`}
+              >
+                {typeMeta.label}
+              </span>
+              {selected ? (
+                <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-1.5 py-0 text-[9px] font-medium text-emerald-300 rd-meeting-sop-node-pill">
+                  配置中
+                </span>
               ) : null}
-            </button>
-          );
-        })}
-      </div>
-    ),
-  }));
+              {!enabled ? (
+                <span className="rounded border border-border/50 bg-muted/40 px-1 py-0 text-[9px] text-muted-foreground">
+                  已关闭
+                </span>
+              ) : null}
+              {humanConfirm && enabled ? (
+                <span className="rounded border border-emerald-500/30 bg-emerald-500/10 px-1 py-0 text-[9px] text-emerald-400/90">
+                  人工确认
+                </span>
+              ) : null}
+            </div>
+            <span className="font-mono text-[10px] text-muted-foreground/80">{node.id}</span>
+          </div>
+          <span className="text-[10px] tabular-nums text-muted-foreground/50 shrink-0">
+            {index + 1}/{total}
+          </span>
+        </div>
+      </button>
+    );
+  };
 
   return (
     <Drawer
@@ -433,7 +634,7 @@ export const MeetingRoomConfigDrawer: React.FC<{
       }
       open={open}
       onClose={onClose}
-      width={780}
+      width={1000}
       destroyOnClose
       rootClassName="rd-meeting-config-drawer"
       className="rd-meeting-config-drawer"
@@ -459,16 +660,152 @@ export const MeetingRoomConfigDrawer: React.FC<{
         </div>
       ) : (
         <div className="flex h-full divide-x divide-border/50">
-          <div className="w-[280px] overflow-y-auto custom-scrollbar bg-muted/5 p-4">
-            <Collapse
-              defaultActiveKey={SOP_STAGES.filter((s) => s.id > 0).map((s) => String(s.id))}
-              ghost
-              items={collapseItems}
-              className="rd-meeting-config-stages"
-            />
-          </div>
+          <aside className="rd-meeting-sop-nav w-[380px] shrink-0 flex flex-col border-r border-border/40 bg-gradient-to-b from-muted/15 via-background to-background">
+            <div className="shrink-0 px-4 pt-4 pb-3 border-b border-border/40">
+              <div className="flex items-center gap-2.5 mb-2">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-emerald-500/20 to-blue-500/10 border border-emerald-500/25">
+                  <GitBranch className="h-4 w-4 text-emerald-400" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold tracking-tight text-foreground">研发会议室SOP节点</h3>
+                  <p className="text-[10px] text-muted-foreground leading-snug">选择议程节点进行配置</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-1.5 mb-3">
+                <span className="rounded-md border border-border/50 bg-muted/30 px-2 py-0.5 text-[10px] text-muted-foreground">
+                  共 {navStats.total} 节点
+                </span>
+                <span className="rounded-md border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-400/90">
+                  {navStats.enabled} 启用
+                </span>
+                {navStats.disabled > 0 ? (
+                  <span className="rounded-md border border-border/50 bg-muted/25 px-2 py-0.5 text-[10px] text-muted-foreground">
+                    {navStats.disabled} 关闭
+                  </span>
+                ) : null}
+              </div>
+              <div
+                className="flex gap-1.5"
+                role="tablist"
+                aria-label="SOP 阶段概览"
+              >
+                {PIPELINE_STAGES.map((stage) => {
+                  const theme = STAGE_NAV_THEME[stage.id] ?? DEFAULT_STAGE_THEME;
+                  const active = selectedStageId === stage.id;
+                  const stats = stageEnableStats.get(stage.id);
+                  const ratio =
+                    stats && stats.total > 0 ? Math.round((stats.enabled / stats.total) * 100) : 0;
+                  return (
+                    <button
+                      key={stage.id}
+                      type="button"
+                      data-slot="rd-meeting-nav-pipeline"
+                      role="tab"
+                      aria-selected={active}
+                      title={`${stage.name} · ${stats?.enabled ?? 0}/${stats?.total ?? 0} 启用`}
+                      onClick={() => {
+                        setExpandedStages((prev) => ({ ...prev, [String(stage.id)]: true }));
+                        const first = stage.nodes[0];
+                        if (first) setSelectedNodeId(first.id);
+                      }}
+                      className={`group relative flex-1 min-w-0 rounded-lg border px-1 py-1.5 transition-all duration-300 ${
+                        active
+                          ? `${theme.panel} border-opacity-80 scale-[1.02] shadow-[0_4px_14px_rgba(0,0,0,0.12)]`
+                          : 'border-border/40 bg-muted/20 hover:border-border/60 hover:bg-muted/35'
+                      }`}
+                    >
+                      <span
+                        className={`block text-center text-[9px] font-bold tabular-nums leading-none ${
+                          active ? theme.accent : 'text-muted-foreground/80'
+                        }`}
+                      >
+                        {stage.id}
+                      </span>
+                      <span
+                        className={`mx-auto mt-1 block h-1 max-w-[2.25rem] rounded-full overflow-hidden bg-border/50 ${
+                          active ? 'opacity-100' : 'opacity-70'
+                        }`}
+                      >
+                        <span
+                          className={`block h-full rounded-full transition-all duration-500 ${
+                            STAGE_PIPELINE_BAR[stage.id] ?? 'bg-muted-foreground'
+                          }`}
+                          style={{ width: `${ratio}%` }}
+                        />
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto custom-scrollbar px-3 py-3 space-y-2.5">
+              {PIPELINE_STAGES.map((stage) => {
+                const theme = STAGE_NAV_THEME[stage.id] ?? DEFAULT_STAGE_THEME;
+                const expanded = expandedStages[String(stage.id)] ?? true;
+                const hasSelected = stage.nodes.some((n) => n.id === selectedNodeId);
+                const stats = stageEnableStats.get(stage.id);
+                const enableRatio =
+                  stats && stats.total > 0 ? (stats.enabled / stats.total) * 100 : 0;
+
+                return (
+                  <div
+                    key={stage.id}
+                    className={`rd-meeting-sop-stage rounded-xl border overflow-hidden transition-all duration-300 ${theme.panel} ${
+                      hasSelected
+                        ? 'rd-meeting-sop-stage--focus shadow-[0_0_22px_rgba(16,185,129,0.12)] ring-1 ring-emerald-500/20'
+                        : ''
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      data-slot="rd-meeting-nav-stage"
+                      className="flex w-full items-center gap-2 px-3 py-2.5 text-left hover:bg-foreground/[0.03] transition-colors"
+                      onClick={() => toggleStage(stage.id)}
+                    >
+                      <span className="text-muted-foreground/70 shrink-0">
+                        {expanded ? (
+                          <ChevronDown className="h-4 w-4" />
+                        ) : (
+                          <ChevronRight className="h-4 w-4" />
+                        )}
+                      </span>
+                      <span
+                        className={`flex h-6 min-w-[1.5rem] items-center justify-center rounded-md border px-1.5 text-[10px] font-bold tabular-nums ${theme.badge}`}
+                      >
+                        {stage.id}
+                      </span>
+                      <span className={`flex-1 text-sm font-semibold truncate ${theme.accent}`}>
+                        {stage.name}
+                      </span>
+                      <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${theme.dot}`} aria-hidden />
+                      <span className="text-[10px] tabular-nums text-muted-foreground/70 shrink-0">
+                        {stats?.enabled ?? 0}/{stats?.total ?? stage.nodes.length}
+                      </span>
+                    </button>
+                    <div className="px-3 pb-2 -mt-0.5">
+                      <div className="h-0.5 rounded-full bg-border/35 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${
+                            STAGE_PIPELINE_BAR[stage.id] ?? 'bg-muted-foreground'
+                          }`}
+                          style={{ width: `${enableRatio}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {expanded ? (
+                      <div className="px-2 pb-2.5 pt-0 space-y-1.5 rd-meeting-sop-node-list">
+                        {stage.nodes.map((n, idx) => renderSopNodeNavItem(n, idx, stage.nodes.length))}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          </aside>
           <div className="flex-1 overflow-y-auto custom-scrollbar p-6 bg-background">
-            <div className="max-w-xl space-y-6">
+            <div className="max-w-2xl space-y-6">
               {/* 当前节点配置 */}
               <section className="relative overflow-hidden rounded-2xl border border-emerald-500/25 bg-gradient-to-br from-emerald-500/[0.12] via-background to-background p-5 shadow-[0_12px_40px_rgba(16,185,129,0.1)]">
                 <div
