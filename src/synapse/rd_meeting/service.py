@@ -476,6 +476,18 @@ class MeetingRoomService:
                 save_room_state(sid, rs)
 
         if auto_run_first_node and run_node not in ("pending", ""):
+            append_history_event(
+                sid,
+                {
+                    "event": "run_node_scheduled",
+                    "room_id": room_id,
+                    "scope_type": scope_type,
+                    "current_node_id": run_node,
+                    "trigger": "open_meeting_auto_run",
+                    "log_type": "info",
+                    "agent_id": "system",
+                },
+            )
             schedule_run_node(
                 scope_type=scope_type,
                 scope_id=sid,

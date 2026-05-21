@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from synapse.rd_meeting.dev_status import read_dev_status_file
+from synapse.rd_meeting.participants import resolve_profile_display_name
 from synapse.rd_meeting.paths import iter_work_order_directories
 from synapse.rd_meeting.room_runtime import append_history_event, load_room_state, save_room_state
 
@@ -65,12 +66,20 @@ def append_meeting_live_event(
     append_history_event(scope_id, row)
 
 
+def _meeting_agent_label(agent_id: str) -> str:
+    aid = (agent_id or "").strip()
+    if not aid or aid.lower() == "host":
+        return "小鲸"
+    return resolve_profile_display_name(aid)
+
+
 def record_delegation_started(
     session_id: str,
     *,
     from_agent: str,
     to_agent: str,
     reason: str = "",
+    task_preview: str = "",
 ) -> None:
     parsed = parse_rd_meeting_session(session_id)
     if not parsed:
@@ -78,15 +87,23 @@ def record_delegation_started(
     scope_id = scope_id_for_room_id(parsed["room_id"])
     if not scope_id:
         return
-    reason_txt = f"（{reason}）" if reason else ""
+    to_label = _meeting_agent_label(to_agent)
+    reason_txt = f"（{reason}）" if reason.strip() else ""
+    preview = (task_preview or "").strip().replace("\n", " ")
+    preview_txt = f"\n任务：{preview[:280]}" if preview else ""
     append_meeting_live_event(
         scope_id,
         room_id=parsed["room_id"],
         event="delegation_started",
-        text=f"小鲸 → {to_agent}：已委派{reason_txt}",
+        text=f"小鲸 → {to_label}：已委派协作{reason_txt}{preview_txt}",
         agent_id=from_agent or "host",
         log_type="info",
-        extra={"to_agent": to_agent, "from_agent": from_agent, "reason": reason},
+        extra={
+            "to_agent": to_agent,
+            "from_agent": from_agent,
+            "reason": reason,
+            "task_preview": preview[:500],
+        },
     )
     _touch_agents_active(scope_id, parsed["room_id"], to_agent, "worker", "delegating")
 
@@ -109,11 +126,12 @@ def record_delegation_finished(
     status = "completed" if ok else "failed"
     preview = (summary or "")[:240].replace("\n", " ")
     elapsed = f" · {elapsed_s:.0f}s" if elapsed_s is not None else ""
+    to_label = _meeting_agent_label(to_agent)
     append_meeting_live_event(
         scope_id,
         room_id=parsed["room_id"],
         event="delegation_finished",
-        text=f"{to_agent} {status}{elapsed}" + (f"：{preview}" if preview else ""),
+        text=f"{to_label} {status}{elapsed}" + (f"：{preview}" if preview else ""),
         agent_id=to_agent,
         log_type="info" if ok else "warning",
         extra={"to_agent": to_agent, "ok": ok, "status": status},

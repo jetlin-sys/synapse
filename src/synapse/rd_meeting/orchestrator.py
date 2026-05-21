@@ -19,6 +19,7 @@ from synapse.rd_meeting.hitl_form import (
     HitlGateFromReport,
     extract_hitl_from_agent_output,
     format_hitl_schema_for_prompt,
+    infer_clarify_hitl_schema,
     resolve_hitl_schema_for_gate,
 )
 from synapse.rd_meeting.notifications import schedule_human_intervention_notify
@@ -144,10 +145,12 @@ def build_node_prompt(
             parts.append(f"\n### 结果确认表单字段\n{schema_txt}")
         parts.append(
             "\n### 动态人机问卷（技能 `whalecloud-dev-tool-ask-user`）\n"
-            "会议期间向用户收集**需求澄清/选项/确认**时，须在回复末尾附带 "
-            "``<!-- hitl-questionnaire kind=interactive -->`` 的 questionnaire JSON，"
-            "题目须来自当前议题与协作智能体产出（勿使用系统默认的归档验收题）。"
-            "系统检测到标记后会暂停并渲染表单；勿宣称已归档或已推进。"
+            "会议期间向用户收集**需求澄清/选项/确认**时：\n"
+            "1. 先 ``delegate_to_agent`` 让协作智能体（如需求专家）产出澄清问题；\n"
+            "2. 将协作产出整理为 questionnaire JSON，在回复末尾附带 "
+            "``<!-- hitl-questionnaire kind=interactive -->`` 标记块；\n"
+            "3. 题目必须来自当前议题与协作智能体产出，**禁止**依赖系统默认兜底问卷。\n"
+            "未附带有效问卷时，系统只会展示通用模板，视为未完成 ask-user 流程。"
         )
     else:
         parts.append(
@@ -682,6 +685,18 @@ class MeetingRoomOrchestrator:
         if node_id == "pending":
             raise ValueError("invalid_current_node")
 
+        append_history_event(
+            sid,
+            {
+                "event": "run_node_begin",
+                "room_id": room_id,
+                "node_id": node_id,
+                "scope_type": scope_type,
+                "log_type": "info",
+                "agent_id": "system",
+            },
+        )
+
         skipped_nodes: list[str] = []
         for _ in range(_MAX_SKIP_CHAIN):
             binding = resolve_node_binding(
@@ -796,6 +811,22 @@ class MeetingRoomOrchestrator:
             else:
                 scope_dir(sid).mkdir(parents=True, exist_ok=True)
 
+                worker_ids = [
+                    str(w).strip()
+                    for w in (binding.get("worker_profile_ids") or [])
+                    if str(w).strip() and str(w).strip() != host_profile_id
+                ]
+                append_history_event(
+                    sid,
+                    {
+                        "event": "prewarm_workers",
+                        "room_id": room_id,
+                        "node_id": node_id,
+                        "worker_profile_ids": worker_ids,
+                        "log_type": "info",
+                        "agent_id": host_profile_id,
+                    },
+                )
                 await self._prewarm_meeting_room(
                     agent_pool=agent_pool,
                     room_id=room_id,
@@ -843,6 +874,17 @@ class MeetingRoomOrchestrator:
                     body = str(pending_ctx.get("report_body") or "").strip()
                     if body:
                         prompt = f"{prompt}\n\n## 上一轮待续上下文\n{body}\n"
+                append_history_event(
+                    sid,
+                    {
+                        "event": "host_llm_begin",
+                        "room_id": room_id,
+                        "node_id": node_id,
+                        "host_profile_id": host_profile_id,
+                        "log_type": "info",
+                        "agent_id": host_profile_id,
+                    },
+                )
                 result = await host_agent.execute_task_from_message(
                     prompt,
                     usage_scene=f"rd_meeting_{sid}_{node_id}",
@@ -885,6 +927,20 @@ class MeetingRoomOrchestrator:
 
                 usage = getattr(host_agent, "last_usage", None) or {}
                 tokens_used = int(usage.get("total_tokens") or usage.get("tokens") or 256)
+                append_history_event(
+                    sid,
+                    {
+                        "event": "host_llm_end",
+                        "room_id": room_id,
+                        "node_id": node_id,
+                        "host_profile_id": host_profile_id,
+                        "success": bool(result.success),
+                        "report_preview": report_body[:400],
+                        "tokens_used": tokens_used,
+                        "log_type": "info" if result.success else "warning",
+                        "agent_id": host_profile_id,
+                    },
+                )
 
         hitl_gate = extract_hitl_from_agent_output(report_body)
         report_body = hitl_gate.clean_body
@@ -893,6 +949,20 @@ class MeetingRoomOrchestrator:
         duration = max(1, int(time.monotonic() - started))
 
         if hitl_gate.explicit:
+            append_history_event(
+                sid,
+                {
+                    "event": "hitl_dynamic",
+                    "room_id": room_id,
+                    "node_id": node_id,
+                    "detail": (
+                        f"主控输出动态问卷 kind={hitl_gate.intervention_kind} "
+                        f"questions={len((hitl_gate.schema or {}).get('questions') or [])}"
+                    ),
+                    "log_type": "info",
+                    "agent_id": host_id,
+                },
+            )
             return self._gate_from_agent_hitl(
                 scope_type=scope_type,
                 scope_id=sid,
@@ -966,6 +1036,27 @@ class MeetingRoomOrchestrator:
                     "duration_seconds": duration,
                     "stage_id": stage_id,
                 }
+                clarify_schema = infer_clarify_hitl_schema(
+                    report_body, scope_id=sid, node_id=node_id
+                )
+                append_history_event(
+                    sid,
+                    {
+                        "event": "hitl_dynamic",
+                        "room_id": room_id,
+                        "node_id": node_id,
+                        "detail": (
+                            "会中澄清门控："
+                            + (
+                                f"动态问卷 {len((clarify_schema or {}).get('questions') or [])} 题"
+                                if clarify_schema
+                                else "使用默认兜底问卷（未解析到 ask-user / .questions.json）"
+                            )
+                        ),
+                        "log_type": "info",
+                        "agent_id": host_id,
+                    },
+                )
                 gate = self.mark_human_gate(
                     scope_type=scope_type,
                     scope_id=sid,
@@ -978,11 +1069,20 @@ class MeetingRoomOrchestrator:
                     ticket_title=ticket_title,
                     hitl_form_schema=resolve_hitl_schema_for_gate(
                         binding,
-                        dynamic_schema=None,
+                        dynamic_schema=clarify_schema,
                         intervention_kind="interactive",
                     ),
                     pending_delivery=pending,
                     intervention_kind="interactive",
+                )
+                clarify_hint = (
+                    "小鲸已整理协作产出，请在下方的动态澄清问卷中作答；提交后将续跑本节点。"
+                    if clarify_schema
+                    else (
+                        "小鲸已整理当前议题，请在下方的会中澄清问卷中补充信息；"
+                        "（未检测到 ask-user 动态问卷，建议主控下次附带 hitl-questionnaire）"
+                        "提交后将续跑本节点。"
+                    )
                 )
                 append_history_event(
                     sid,
@@ -990,10 +1090,7 @@ class MeetingRoomOrchestrator:
                         "event": "node_pending_clarify",
                         "room_id": room_id,
                         "node_id": node_id,
-                        "text": (
-                            "小鲸已整理当前议题，请在下方的「需求澄清 — 会中澄清」问卷中"
-                            "补充业务信息；提交后将续跑本节点。"
-                        ),
+                        "text": clarify_hint,
                         "agent_id": host_id,
                         "log_type": "info",
                     },
@@ -1080,6 +1177,17 @@ def schedule_run_node(
     if existing and not existing.done():
         return key
 
+    append_history_event(
+        scope_id.strip(),
+        {
+            "event": "run_node_scheduled",
+            "room_id": room_id,
+            "scope_type": scope_type,
+            "log_type": "info",
+            "agent_id": "system",
+        },
+    )
+
     orch = MeetingRoomOrchestrator()
 
     async def _runner() -> None:
@@ -1100,7 +1208,10 @@ def schedule_run_node(
                     "event": "node_failed",
                     "room_id": room_id,
                     "error": str(exc),
+                    "text": str(exc),
                     "id": uuid.uuid4().hex[:12],
+                    "log_type": "error",
+                    "agent_id": "system",
                 },
             )
         finally:

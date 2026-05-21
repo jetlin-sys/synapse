@@ -37,10 +37,25 @@ def set_phase(scope_id: str, phase: str, *, extra: dict[str, Any] | None = None)
     if phase not in _VALID:
         phase = "running"
     rs = dict(load_room_state(scope_id) or {})
+    prev = str(rs.get("phase") or "idle")
     rs["phase"] = phase
     if extra:
         rs.update(extra)
     save_room_state(scope_id, rs)
+    if prev != phase:
+        from synapse.rd_meeting.room_runtime import append_history_event
+
+        append_history_event(
+            scope_id,
+            {
+                "event": "phase_change",
+                "room_id": str(rs.get("room_id") or ""),
+                "from_phase": prev,
+                "to_phase": phase,
+                "log_type": "info",
+                "agent_id": "system",
+            },
+        )
 
 
 def phase_prompt_hint(scope_id: str, *, human_confirm: bool) -> str:

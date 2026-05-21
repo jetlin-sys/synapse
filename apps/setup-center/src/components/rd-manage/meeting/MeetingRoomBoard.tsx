@@ -1079,16 +1079,11 @@ const InterventionDialog = ({
                  <span className="mx-1 text-muted-foreground/70">|</span>
                  {room.agents.map(a => (
                    <Tooltip key={a.id} title={`${a.name} · ${a.role}`}>
-                     <div className="flex flex-col items-center gap-0.5 max-w-[56px]">
-                       <div className="relative">
-                         <div className={`w-6 h-6 rounded-full flex items-center justify-center text-white text-[10px] ${a.avatarColor} ring-2 ring-background`}>
-                           {a.icon}
-                         </div>
-                         <div className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full border border-background ${a.status === 'error' ? 'bg-red-500' : a.status === 'processing' ? 'bg-blue-500' : 'bg-muted-foreground'}`} />
+                     <div className="relative">
+                       <div className={`w-6 h-6 rounded-full flex items-center justify-center text-white text-[10px] ${a.avatarColor} ring-2 ring-background`}>
+                         {a.icon}
                        </div>
-                       <span className="text-[9px] text-muted-foreground truncate w-full text-center leading-tight">
-                         {a.name}
-                       </span>
+                       <div className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full border border-background ${a.status === 'error' ? 'bg-red-500' : a.status === 'processing' ? 'bg-blue-500' : 'bg-muted-foreground'}`} />
                      </div>
                    </Tooltip>
                  ))}

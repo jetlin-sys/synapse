@@ -24,8 +24,9 @@ def build_node_init_message(binding: dict[str, Any], *, node_id: str) -> str:
     if intent_txt:
         lines.append(f"会议目标：{intent_txt}")
     lines.append(
-        "接下来我会梳理议程、委派协作智能体并汇总产出；请在本对话流关注进展，"
-        "需要您澄清需求时会弹出「需求澄清」类问卷（非归档验收题）。"
+        "接下来我会梳理议程，并通过 delegate 向上述协作智能体安排任务；"
+        "本对话流将展示【任务安排】与【协作反馈】记录。"
+        "需要您澄清时，将依据协作产出动态生成问卷（技能 ask-user），非固定模板。"
     )
     return "\n".join(lines)
 

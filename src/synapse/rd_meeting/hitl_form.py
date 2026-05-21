@@ -140,6 +140,73 @@ def extract_hitl_from_agent_output(text: str) -> HitlGateFromReport:
     )
 
 
+_LOOSE_JSON_FENCE_RE = re.compile(
+    r"```(?:json)?\s*\n(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _extract_loose_questionnaire_json(text: str) -> dict[str, Any] | None:
+    """从回复中解析裸 questionnaire JSON（协作智能体 / question-transform 常见输出）。"""
+    body = str(text or "").strip()
+    if not body:
+        return None
+    if body.startswith("{"):
+        parsed = _loads_hitl_json(body)
+        if parsed and _is_valid_hitl_schema(parsed):
+            return parsed
+    for m in _LOOSE_JSON_FENCE_RE.finditer(body):
+        parsed = _loads_hitl_json(m.group(1))
+        if parsed and _is_valid_hitl_schema(parsed):
+            return parsed
+    return None
+
+
+def load_scope_questions_json(scope_id: str) -> dict[str, Any] | None:
+    """读取工单目录下需求澄清技能写入的 ``.questions.json``。"""
+    sid = (scope_id or "").strip()
+    if not sid:
+        return None
+    from synapse.rd_meeting.paths import scope_dir
+
+    root = scope_dir(sid)
+    for rel in (".questions.json", ".tmp/.questions.json"):
+        path = root.joinpath(*rel.split("/"))
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and _is_valid_hitl_schema(data):
+            return data
+    return None
+
+
+def infer_clarify_hitl_schema(
+    report_body: str,
+    *,
+    scope_id: str = "",
+    node_id: str = "req_clarify",
+) -> dict[str, Any] | None:
+    """会中澄清门控：从主控/协作产出推断动态问卷，避免一律使用兜底模板。"""
+    gate = extract_hitl_from_agent_output(report_body)
+    if gate.schema:
+        return gate.schema
+    loose = _extract_loose_questionnaire_json(report_body)
+    if loose:
+        return normalize_hitl_schema(loose)
+    if node_id == "req_clarify" and scope_id.strip():
+        file_schema = load_scope_questions_json(scope_id)
+        if file_schema:
+            out = normalize_hitl_schema(file_schema)
+            if out and not out.get("title"):
+                name = node_display_name(node_id)
+                out["title"] = f"{name} — 待澄清问题"
+            return out
+    return None
+
+
 def resolve_hitl_schema_for_gate(
     binding: dict[str, Any],
     *,

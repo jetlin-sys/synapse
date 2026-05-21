@@ -97,6 +97,50 @@ def test_service_put_persists_human_confirm_and_intent(isolated_config_dir: Path
     assert ov["human_confirm"] is True
 
 
+def test_infer_clarify_hitl_schema_from_loose_json():
+    from synapse.rd_meeting.hitl_form import infer_clarify_hitl_schema
+
+    schema = {
+        "type": "questionnaire",
+        "version": "1.0",
+        "title": "澄清 — 限流档位",
+        "questions": [
+            {
+                "id": "q1",
+                "type": "single",
+                "title": "限流档位如何表示？",
+                "options": [{"value": "A", "label": "固定三级", "selected": False}],
+            }
+        ],
+    }
+    body = json.dumps(schema, ensure_ascii=False)
+    out = infer_clarify_hitl_schema(body, scope_id="x", node_id="req_clarify")
+    assert out is not None
+    assert out.get("title") == "澄清 — 限流档位"
+    assert out["questions"][0]["id"] == "q1"
+
+
+def test_infer_clarify_hitl_schema_from_scope_file(tmp_path, monkeypatch):
+    from synapse.rd_meeting.hitl_form import infer_clarify_hitl_schema
+
+    scope_id = "scope-qjson"
+    work = tmp_path / scope_id
+    work.mkdir(parents=True)
+    q = {
+        "type": "questionnaire",
+        "version": "1.0",
+        "questions": [{"id": "biz", "type": "text", "title": "业务目标"}],
+    }
+    (work / ".tmp").mkdir(parents=True)
+    (work / ".tmp" / ".questions.json").write_text(
+        json.dumps(q, ensure_ascii=False), encoding="utf-8"
+    )
+    monkeypatch.setattr("synapse.rd_meeting.paths.scope_dir", lambda sid: work)
+    out = infer_clarify_hitl_schema("", scope_id=scope_id, node_id="req_clarify")
+    assert out is not None
+    assert out["questions"][0]["title"] == "业务目标"
+
+
 def test_extract_hitl_from_agent_output_fence():
     schema = {"type": "questionnaire", "version": "1.0", "questions": [{"id": "q1", "type": "text", "title": "t"}]}
     body = (

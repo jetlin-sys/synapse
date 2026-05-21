@@ -115,6 +115,7 @@ class AgentToolHandler:
                 from_agent=current_agent,
                 to_agent=agent_id,
                 reason=reason,
+                task_preview=message[:280],
             )
             result = await orchestrator.delegate(
                 session=session,
@@ -324,6 +325,7 @@ class AgentToolHandler:
                     from_agent=current_agent,
                     to_agent=aid,
                     reason=rsn,
+                    task_preview=msg[:280],
                 )
                 if parent_browser and parent_browser.is_ready:
                     try:

@@ -150,9 +150,11 @@ def sync_room_state_from_dev(
 
 
 def append_history_event(scope_id: str, event: dict[str, Any]) -> dict[str, Any]:
+    from synapse.rd_meeting.flow_log import apply_flow_log_format
+
     path = room_history_path(scope_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    row = dict(event)
+    row = apply_flow_log_format(dict(event))
     row.setdefault("ts", _now_iso())
     line = json.dumps(row, ensure_ascii=False, default=str)
     with path.open("a", encoding="utf-8") as fh:
@@ -284,30 +286,18 @@ def build_meeting_summary_nodes(
 
 def history_to_chat_logs(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """会议室 UI 用的简化聊天流（Phase 1：来自 history 事件）。"""
+    from synapse.rd_meeting.flow_log import CHAT_VISIBLE_EVENTS, build_event_body, format_flow_log, resolve_flow_stage
+
     logs: list[dict[str, Any]] = []
     for i, ev in enumerate(history):
         et = str(ev.get("event") or "")
-        if et in (
-            "chat_message",
-            "human_intervene",
-            "room_opened",
-            "system",
-            "node_started",
-            "node_init",
-            "human_gate",
-            "delegation_started",
-            "delegation_finished",
-            "node_failed",
-            "hitl_approved",
-            "hitl_rejected",
-            "node_pending_confirm",
-            "node_pending_clarify",
-        ):
-            text = str(ev.get("text") or ev.get("message") or "").strip()
-            if not text and et == "room_opened":
-                text = "会议室已开启"
-            if not text:
-                continue
+        if et not in CHAT_VISIBLE_EVENTS:
+            continue
+        text = str(ev.get("text") or ev.get("message") or "").strip()
+        if not text:
+            text = format_flow_log(resolve_flow_stage(ev), build_event_body(ev))
+        if not text:
+            continue
             logs.append(
                 {
                     "id": str(ev.get("id") or f"hist-{i}"),
