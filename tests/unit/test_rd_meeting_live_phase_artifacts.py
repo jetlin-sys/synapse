@@ -10,13 +10,11 @@ import pytest
 
 from synapse.rd_meeting.artifacts import validate_archive_outputs, write_node_deliverables
 from synapse.rd_meeting.hitl_form import (
-    default_hitl_form_schema,
-    normalize_hitl_schema,
     resolve_hitl_form_schema,
     resolve_hitl_schema_for_gate,
 )
-from synapse.rd_meeting.participants import build_meeting_participants
 from synapse.rd_meeting.live import parse_rd_meeting_session, record_delegation_started
+from synapse.rd_meeting.participants import build_meeting_participants
 from synapse.rd_meeting.phase import get_phase, set_phase
 from synapse.rd_meeting.room_runtime import history_to_chat_logs
 
@@ -149,14 +147,25 @@ def test_interactive_gate_uses_agent_schema_only() -> None:
     assert out["questions"][0]["id"] == "q1"
 
 
-def test_exception_gate_has_no_builtin_schema() -> None:
+def test_exception_gate_uses_default_template() -> None:
+    """异常门控不再返回 None，应渲染默认异常表单（避免前端白屏）。"""
     binding = {"node_id": "req_clarify", "human_confirm": True}
+    schema = resolve_hitl_schema_for_gate(
+        binding,
+        dynamic_schema=None,
+        reason="委派失败",
+        intervention_kind="exception",
+    )
+    assert schema is not None
+    assert schema["summary_kind"] == "exception"
+    ids = {q["id"] for q in schema["questions"]}
+    assert "decision" in ids
+    # 业务期望保留：interactive 仍不兜底
     assert (
         resolve_hitl_schema_for_gate(
             binding,
             dynamic_schema=None,
-            reason="委派失败",
-            intervention_kind="exception",
+            intervention_kind="interactive",
         )
         is None
     )

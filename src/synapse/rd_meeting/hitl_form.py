@@ -204,7 +204,6 @@ def resolve_hitl_schema_for_gate(
     ``interactive`` / ``exception`` 不提供系统内置题目；``result_confirm`` 在无动态问卷时
     可使用节点默认结果确认模板（归档验收结构化字段）。
     """
-    del reason  # 异常说明写入 gate reason，不用于生成题目
     if dynamic_schema:
         return dynamic_schema
     preset = binding.get("hitl_form_schema")
@@ -212,13 +211,162 @@ def resolve_hitl_schema_for_gate(
         return normalize_hitl_schema(preset)
     node_id = str(binding.get("node_id") or "")
     kind = (intervention_kind or "interactive").strip().lower()
-    if kind in ("interactive", "exception"):
+    if kind == "interactive":
+        # 会中澄清的题面必须由 ask-user / submit_hitl_questionnaire 提供；
+        # 此处不兜底，避免给用户看到无意义的占位题目。
         return None
+    if kind == "exception":
+        return default_exception_hitl_schema(node_id, reason=reason)
     if kind == "result_confirm" and node_id and binding.get("human_confirm"):
         return default_hitl_form_schema(node_id)
-    if node_id and binding.get("human_confirm") and kind not in ("interactive", "exception"):
+    if node_id and binding.get("human_confirm"):
         return default_hitl_form_schema(node_id)
     return None
+
+
+_VALID_HITL_KINDS = ("interactive", "result_confirm", "exception")
+
+# 颗粒度启发式：从 summary 推断「待确认决策点数量」
+_DECISION_COUNT_PATTERNS = [
+    # "14 个 P0 问题"、"10 个待确认项"、"6 个决策点"
+    re.compile(r"(\d{1,3})\s*个\s*(?:P[0-9]\s*)?(?:问题|决策点|待澄清|待确认项?|要点)", re.IGNORECASE),
+    # "14 questions" / "14 decisions"
+    re.compile(r"(\d{1,3})\s*(?:questions?|decisions?|items?)\b", re.IGNORECASE),
+]
+# 编号列表项："1." / "1、" / "1) " / "1）" / "问题1：" / "Q1." 等
+_LIST_ITEM_PATTERNS = [
+    re.compile(r"(?m)^\s*\d{1,3}\s*[\.\、\)\）]\s+\S"),
+    re.compile(r"(?m)^\s*问题\s*\d{1,3}\s*[：:.]\s*\S"),
+    re.compile(r"(?m)^\s*Q\d{1,3}\s*[\.\、\):：]\s*\S", re.IGNORECASE),
+]
+
+
+def _infer_expected_question_count(summary: str) -> int:
+    """从 summary 推断「至少应有多少道题」。0 表示无法判定。"""
+    text = (summary or "").strip()
+    if not text:
+        return 0
+    best = 0
+    for pat in _DECISION_COUNT_PATTERNS:
+        for m in pat.finditer(text):
+            try:
+                n = int(m.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 2 <= n <= 200:
+                best = max(best, n)
+    list_total = 0
+    for pat in _LIST_ITEM_PATTERNS:
+        list_total = max(list_total, len(pat.findall(text)))
+    if list_total >= 3:
+        best = max(best, list_total)
+    return best
+
+
+def coerce_questionnaire_schema(
+    *,
+    kind: str,
+    questions: Any,
+    title: str = "",
+    description: str = "",
+    summary: str = "",
+    render: dict[str, Any] | None = None,
+    enforce_granularity: bool = True,
+) -> dict[str, Any]:
+    """工具入参 → 标准 questionnaire schema；用于 submit_hitl_questionnaire。
+
+    若 ``enforce_granularity=True`` 且 ``summary`` 推断出的待确认决策点数显著
+    多于 ``questions`` 数量（默认阈值：questions < expected/2），抛 ValueError，
+    强迫 LLM 按「一个决策点一道题」重组问卷。
+    """
+    if not isinstance(questions, list) or not questions:
+        raise ValueError("questions 必须为非空数组")
+
+    kind_norm = (kind or "").strip().lower()
+    if kind_norm not in _VALID_HITL_KINDS:
+        raise ValueError(
+            f"kind 必须是 {'/'.join(_VALID_HITL_KINDS)}，收到 {kind!r}"
+        )
+
+    valid_questions: list[dict[str, Any]] = []
+    for idx, q in enumerate(questions):
+        if not isinstance(q, dict):
+            raise ValueError(f"questions[{idx}] 必须为对象")
+        qid = str(q.get("id") or "").strip() or f"q{idx + 1}"
+        qtype = str(q.get("type") or "single").strip().lower()
+        if qtype not in ("single", "multiple", "boolean", "text", "textarea"):
+            raise ValueError(
+                f"questions[{idx}].type 必须是 single/multiple/boolean/text/textarea"
+            )
+        qtitle = str(q.get("title") or "").strip()
+        if not qtitle:
+            raise ValueError(f"questions[{idx}].title 不能为空")
+        entry = dict(q)
+        entry["id"] = qid
+        entry["type"] = qtype
+        entry["title"] = qtitle
+        # 兼容 LLM 输出 ``{"id": "...", "label": "..."}``（无 value）的题型选项；
+        # 统一为 ``{"value": "...", "label": "..."}``，避免前端用 undefined 主键。
+        raw_opts = entry.get("options")
+        if isinstance(raw_opts, list):
+            normalized_opts: list[dict[str, Any]] = []
+            for opt_idx, opt in enumerate(raw_opts):
+                if not isinstance(opt, dict):
+                    continue
+                value = (
+                    str(opt.get("value") or "").strip()
+                    or str(opt.get("id") or "").strip()
+                    or str(opt.get("label") or "").strip()
+                    or f"opt_{opt_idx}"
+                )
+                normalized_opts.append(
+                    {
+                        "value": value,
+                        "label": str(opt.get("label") or value),
+                        **{
+                            k: v
+                            for k, v in opt.items()
+                            if k not in ("value", "label", "id")
+                        },
+                    }
+                )
+            entry["options"] = normalized_opts
+        valid_questions.append(entry)
+
+    schema: dict[str, Any] = {
+        "type": QUESTIONNAIRE_TYPE,
+        "version": QUESTIONNAIRE_VERSION,
+        "title": (title or "").strip() or "人工确认",
+        "description": (description or "").strip(),
+        "questions": valid_questions,
+    }
+    if render and isinstance(render, dict):
+        schema["render"] = render
+    else:
+        accent_map = {"exception": "violet", "result_confirm": "blue", "interactive": "emerald"}
+        schema["render"] = {
+            "layout": "stepped",
+            "showOverallProgress": True,
+            "accent": accent_map[kind_norm],
+            "animate": True,
+        }
+    if summary.strip():
+        schema["summary_markdown"] = summary.strip()
+    schema["intervention_kind"] = kind_norm
+
+    if enforce_granularity and kind_norm in ("result_confirm", "interactive"):
+        expected = _infer_expected_question_count(summary)
+        actual = len(valid_questions)
+        if expected >= 3 and actual * 2 < expected:
+            raise ValueError(
+                "问卷题目颗粒度不达标："
+                f"summary 中推断到至少 {expected} 个待确认决策点，"
+                f"当前只提供 {actual} 道题。请按「一个决策点 = 一道独立题」拆分："
+                "每个待澄清问题（如「问题1～问题14」）都要单独成题，把可默认结论作为"
+                "推荐选项（可标 ✅），即使你已经给出建议值也不要合并题目。"
+            )
+
+    return normalize_hitl_schema(schema) or schema
 
 
 def _option_style_for(qtype: QuestionType) -> OptionStyle:
@@ -382,6 +530,95 @@ def default_hitl_form_schema(node_id: str) -> dict[str, Any]:
             "animate": True,
         },
         "questions": questions,
+    }
+
+
+def _exception_questions(node_name: str, reason: str) -> list[dict[str, Any]]:
+    short_reason = (reason or "").strip().splitlines()[0] if reason else ""
+    short_reason = short_reason[:160] if short_reason else "（系统未捕获到具体原因）"
+    raw = [
+        build_question(
+            qid="exception_ack",
+            qtype="boolean",
+            title="我已知悉本次异常",
+            context=(
+                f"节点「{node_name}」执行过程中出现异常：{short_reason}\n"
+                "请确认你已阅读上方异常摘要后再决定下一步操作。"
+            ),
+            input_enabled=False,
+            required=True,
+        ),
+        build_question(
+            qid="decision",
+            qtype="single",
+            title="下一步操作",
+            context="选择系统应执行的恢复动作。",
+            options=_value_options(
+                [
+                    ("retry", "重跑本节点 — 智能体会带上你的备注重新执行"),
+                    ("abort", "终止节点 — 标记会议异常结束，等待人工兜底"),
+                    ("escalate", "升级人工接管 — 暂停流水线，转交研发组长"),
+                ]
+            ),
+            input_enabled=False,
+            required=True,
+            option_style="radio",
+        ),
+        build_question(
+            qid="risk_level",
+            qtype="single",
+            title="风险级别评估",
+            context="本次异常对整体研发流水线的潜在影响。",
+            options=_value_options(
+                [
+                    ("low", "可控 — 仅本节点受影响"),
+                    ("medium", "需关注 — 可能波及后续节点"),
+                    ("high", "重大 — 需阻塞流水线立即处理"),
+                ]
+            ),
+            input_enabled=False,
+            required=False,
+            option_style="radio",
+        ),
+        build_question(
+            qid="comment",
+            qtype="textarea",
+            title="备注 / 重跑指引",
+            context="可选：补充异常上下文、指明重跑时智能体应注意的事项。",
+            options=[],
+            input_enabled=True,
+            input_placeholder="例如：忽略 X 字段格式异常 / 重新校验 Y 接口…",
+            required=False,
+        ),
+    ]
+    return attach_question_progress(raw)
+
+
+def default_exception_hitl_schema(
+    node_id: str, *, reason: str = ""
+) -> dict[str, Any]:
+    """异常门控默认问卷（避免 ``human_intervention`` 时前端白屏）。"""
+    entry = get_node_manifest_entry(node_id)
+    name = str(entry.get("name") if entry else node_display_name(node_id))
+    short_reason = (reason or "").strip()
+    desc = (
+        f"节点「{name}」未通过系统校验或主控未提交结构化问卷，已进入异常门控。"
+        "请审阅下方异常摘要后选择处置动作；提交后系统会按你的选择继续执行。"
+    )
+    return {
+        "type": QUESTIONNAIRE_TYPE,
+        "version": QUESTIONNAIRE_VERSION,
+        "title": f"{name} — 异常人工裁决",
+        "description": desc,
+        "render": {
+            "layout": "stepped",
+            "showOverallProgress": True,
+            "accent": "violet",
+            "animate": True,
+        },
+        "summary_kind": "exception",
+        "summary_reason": short_reason,
+        "questions": _exception_questions(name, short_reason),
     }
 
 

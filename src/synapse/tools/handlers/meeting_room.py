@@ -12,15 +12,26 @@ logger = logging.getLogger(__name__)
 
 
 class MeetingRoomToolHandler:
-    TOOLS = ["submit_meeting_work_plan"]
+    TOOLS = ["submit_meeting_work_plan", "submit_hitl_questionnaire"]
 
     def __init__(self, agent: Agent):
         self.agent = agent
 
     async def handle(self, tool_name: str, params: dict[str, Any]) -> str:
-        if tool_name != "submit_meeting_work_plan":
-            return f"❌ Unknown meeting room tool: {tool_name}"
-        return await self._submit_work_plan(params)
+        if tool_name == "submit_meeting_work_plan":
+            return await self._submit_work_plan(params)
+        if tool_name == "submit_hitl_questionnaire":
+            return await self._submit_questionnaire(params)
+        return f"❌ Unknown meeting room tool: {tool_name}"
+
+    def _resolve_session_id(self) -> str:
+        session = getattr(self.agent, "_current_session", None)
+        return (
+            getattr(session, "id", None)
+            or getattr(session, "session_id", None)
+            or getattr(self.agent, "_current_session_id", None)
+            or ""
+        )
 
     async def _submit_work_plan(self, params: dict[str, Any]) -> str:
         from synapse.rd_meeting.work_plan import format_plan_summary_text, submit_work_plan
@@ -32,13 +43,7 @@ class MeetingRoomToolHandler:
         if not isinstance(items, list) or not items:
             return "❌ items 必须为非空数组"
 
-        session = getattr(self.agent, "_current_session", None)
-        session_id = (
-            getattr(session, "id", None)
-            or getattr(session, "session_id", None)
-            or getattr(self.agent, "_current_session_id", None)
-            or ""
-        )
+        session_id = self._resolve_session_id()
         try:
             plan = submit_work_plan(
                 session_id=str(session_id),
@@ -58,8 +63,61 @@ class MeetingRoomToolHandler:
             f"请按 items 使用 delegate_to_agent / delegate_parallel 执行。\n\n{preview}"
         )
 
+    async def _submit_questionnaire(self, params: dict[str, Any]) -> str:
+        from synapse.rd_meeting.hitl_submit import submit_questionnaire
 
-def create_meeting_room_handler(agent: "Agent"):
+        kind = str(params.get("kind") or "").strip().lower()
+        questions = params.get("questions")
+        title = str(params.get("title") or "").strip()
+        description = str(params.get("description") or "").strip()
+        summary = str(params.get("summary") or "").strip()
+        render = params.get("render") if isinstance(params.get("render"), dict) else None
+        raw_await = params.get("await_confirm")
+        await_confirm: bool | None
+        if raw_await is None:
+            await_confirm = None
+        elif isinstance(raw_await, bool):
+            await_confirm = raw_await
+        else:
+            await_confirm = str(raw_await).strip().lower() in ("true", "1", "yes")
+
+        session_id = self._resolve_session_id()
+        try:
+            result = submit_questionnaire(
+                session_id=str(session_id),
+                kind=kind,
+                questions=questions,
+                title=title,
+                description=description,
+                summary=summary,
+                await_confirm=await_confirm,
+                render=render,
+            )
+        except ValueError as exc:
+            return f"❌ {exc}"
+        except Exception as exc:
+            logger.exception("submit_hitl_questionnaire failed: %s", exc)
+            return f"❌ 提交人机问卷失败: {exc}"
+
+        # 标记 agent 应停止后续行动；orchestrator 在 execute_task 完成后会优先
+        # 读 room_state.pending_questionnaire，不依赖 LLM 终稿。
+        try:
+            self.agent._hitl_locked = True
+        except Exception:
+            pass
+
+        q_count = len(result["schema"].get("questions") or [])
+        kind_norm = result["kind"]
+        await_text = "true" if result["await_confirm"] else "false"
+        return (
+            f"✅ 人机问卷已提交（kind={kind_norm}, await_confirm={await_text}, "
+            f"questions={q_count}）。\n"
+            "**会议室已锁定为 human_intervention**：请立即停止后续工具调用与正文输出，"
+            "不要重复总结或宣称已交付；系统会按本次提交的问卷渲染表单，等待用户回复。"
+        )
+
+
+def create_meeting_room_handler(agent: Agent):
     """Return bound ``handle`` so SystemHandlerRegistry maps TOOLS correctly."""
     handler = MeetingRoomToolHandler(agent)
     return handler.handle

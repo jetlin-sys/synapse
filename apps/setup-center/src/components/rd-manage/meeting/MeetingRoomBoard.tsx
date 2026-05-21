@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { ConfigProvider, theme, Avatar, Modal, Button, Input, Tag, Badge, Tooltip, Progress } from 'antd';
 import {
   approveAndResumeMeetingNode,
@@ -32,7 +32,7 @@ import {
   Users, MessageSquare, CheckCircle2, ChevronRight, Hash, Activity, Send, Zap, Settings2, PlayCircle,
   Globe, Clock, Coins, BrainCircuit, Coffee, MoreHorizontal, CircleDashed, 
   Terminal, Code2, GitBranch, FileCode2, Play, User, Info, Network, Code, 
-  TestTube, CheckSquare, Flame, TrendingUp, Loader2, AlertCircle, MessageSquareText
+  TestTube, CheckSquare, Flame, TrendingUp, Loader2, AlertCircle, MessageSquareText, ClipboardCheck
 } from 'lucide-react';
 
 const { darkAlgorithm } = theme;
@@ -825,9 +825,25 @@ const InterventionDialog = ({
   const [inputText, setInputText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [centerTab, setCenterTab] = useState<'detail' | 'hitl'>('detail');
 
   const logsEndRef = useRef<HTMLDivElement>(null);
   const lastLogKeyRef = useRef('');
+
+  const hitlAvailable = !!(room && room.status === 'human_intervention' && room.hitlFormSchema);
+  const hitlKind = (room?.hitlFormSchema as { summary_kind?: string; intervention_kind?: string } | undefined);
+  const hitlBadgeText = useMemo(() => {
+    const k = (hitlKind?.summary_kind || hitlKind?.intervention_kind || '').toLowerCase();
+    if (k === 'exception') return '异常待裁决';
+    if (k === 'result_confirm') return '结果待确认';
+    if (k === 'interactive') return '澄清待回复';
+    return '待人工确认';
+  }, [hitlKind]);
+
+  useEffect(() => {
+    if (hitlAvailable) setCenterTab('hitl');
+    else setCenterTab('detail');
+  }, [hitlAvailable, room?.id]);
 
   const scrollLogsToBottom = useCallback(() => {
     setTimeout(() => {
@@ -905,18 +921,22 @@ const InterventionDialog = ({
       open={open}
       onCancel={onClose}
       footer={null}
-      width={1560}
+      width={1840}
+      style={{ maxWidth: '96vw' }}
       centered
       className="intervention-modal"
       classNames={{
-        content: 'bg-[color:var(--panel)] p-0 overflow-hidden border border-border/50 rounded-2xl shadow-2xl',
-        mask: 'backdrop-blur-sm bg-black/70'
+        // antd v5: 部分版本不在 ModalClassNamesType 中暴露 content；通过 className 兜底
+        ...({
+          content: 'bg-[color:var(--panel)] p-0 overflow-hidden border border-border/50 rounded-2xl shadow-2xl',
+          mask: 'backdrop-blur-sm bg-black/70',
+        } as Record<string, string>),
       }}
     >
-      <div className="flex h-[820px] divide-x divide-slate-800/60">
+      <div className="flex h-[min(92vh,960px)] divide-x divide-slate-800/60">
         
-        {/* COL 1: Current Stage Agenda List (300px) */}
-        <div className="w-[300px] bg-[color:var(--panel)] flex flex-col shrink-0">
+        {/* COL 1: Current Stage Agenda List (320px) */}
+        <div className="w-[320px] bg-[color:var(--panel)] flex flex-col shrink-0">
           {/* Ticket Header */}
           <div className="p-4 border-b border-border/60 flex flex-col justify-center gap-1.5 h-[72px]">
             <div className="text-xs text-muted-foreground font-mono flex items-center gap-1.5">
@@ -1018,81 +1038,146 @@ const InterventionDialog = ({
           </div>
         </div>
 
-        {/* COL 2: Node Detail View — directly from OrderManagement Drawer */}
+        {/* COL 2: Tabs【节点详情 / 人工确认】 */}
         <div className="flex-1 bg-background flex flex-col relative overflow-hidden">
-          {selectedNode ? (
-            <>
-              {/* Node Header */}
-              <div className="h-[72px] border-b border-border/60 px-6 flex items-center justify-between bg-[color:var(--panel)] shrink-0">
-                <div className="flex items-center gap-3">
-                  <div className={`p-2 rounded-lg ${
-                    selectedNode.type.includes('ai') ? 'bg-blue-500/20 text-blue-400' :
-                    selectedNode.type === 'system' ? 'bg-muted/20 text-muted-foreground' :
-                    'bg-amber-500/20 text-amber-500'
-                  }`}>
-                    {selectedNode.type.includes('ai') ? <Bot className="w-5 h-5" /> :
-                     selectedNode.type === 'system' ? <TerminalSquare className="w-5 h-5" /> :
-                     <User className="w-5 h-5" />}
-                  </div>
-                  <div>
-                    <h3 className="font-semibold text-base text-foreground flex items-center gap-2.5">
-                      {selectedNode.name}
-                      {selectedNode.id === room.currentNode ? (
-                        <Badge
-                          status={room.status === 'human_intervention' ? 'error' : 'processing'}
-                          text={
-                            <span className={`text-xs ${room.status === 'human_intervention' ? 'text-red-400' : 'text-blue-400'}`}>
-                              {room.status === 'human_intervention' ? '等待人工干预' : '智能体处理中'}
-                            </span>
-                          }
-                        />
-                      ) : (() => {
-                        const st = getNodeStateGlobal(room, selectedNode.id);
-                        return st === 'completed'
-                          ? <Badge status="success" text={<span className="text-xs text-green-400">已完成</span>} />
-                          : st === 'pending'
-                          ? <Badge status="default" text={<span className="text-xs text-muted-foreground">待执行</span>} />
-                          : null;
-                      })()}
-                    </h3>
-                    <p className="text-[10px] text-muted-foreground mt-0.5">{selectedNode.desc}</p>
-                  </div>
-                </div>
-                <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs ${getNodeTypeInfo(selectedNode.type).bg} ${getNodeTypeInfo(selectedNode.type).color}`}>
-                  <Zap className="w-3 h-3" />
-                  {getNodeTypeInfo(selectedNode.type).label}
-                </div>
-              </div>
-
-              {/* Body: stage-specific panel component */}
-              <div className="flex-1 overflow-hidden">
-                {room.stageIndex === 1 ? (
-                  <RequirementAnalysisPanel
-                    nodeDesc={selectedNode.desc}
-                    nodeTypeLabel={getNodeTypeInfo(selectedNode.type).label}
-                    nodeTypeColor={getNodeTypeInfo(selectedNode.type).color}
-                    stageName={currentStage?.name ?? ''}
-                    nodeOutput={renderNodeOutput(selectedNode, room)}
-                  />
-                ) : (
-                  <div className="flex flex-col items-center justify-center h-full text-muted-foreground/80 gap-3">
-                    <CircleDashed className="w-10 h-10 opacity-20" />
-                    <p className="text-sm">该阶段的中栏面板正在建设中</p>
-                    <p className="text-xs text-muted-foreground/70">stageIndex: {room.stageIndex}</p>
-                  </div>
-                )}
-              </div>
-            </>
-          ) : (
-            <div className="flex flex-col items-center justify-center h-full text-muted-foreground/80">
-              <CircleDashed className="w-12 h-12 mb-3 opacity-30" />
-              <p className="text-sm">请从左侧选择议题节点</p>
+          {/* Tab Header */}
+          <div className="h-[72px] border-b border-border/60 px-6 flex items-center justify-between bg-[color:var(--panel)] shrink-0">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setCenterTab('detail')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-all border ${
+                  centerTab === 'detail'
+                    ? 'bg-blue-500/15 border-blue-500/40 text-blue-300 shadow-[0_0_12px_rgba(59,130,246,0.18)]'
+                    : 'bg-transparent border-transparent text-muted-foreground hover:text-foreground hover:bg-muted/40'
+                }`}
+              >
+                <FileText className="w-4 h-4" />
+                节点详情
+                {selectedNode ? (
+                  <span className="text-[10px] text-muted-foreground/70 font-mono">· {selectedNode.name}</span>
+                ) : null}
+              </button>
+              <button
+                type="button"
+                onClick={() => hitlAvailable && setCenterTab('hitl')}
+                disabled={!hitlAvailable}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-all border relative ${
+                  centerTab === 'hitl'
+                    ? 'bg-amber-500/15 border-amber-500/45 text-amber-300 shadow-[0_0_14px_rgba(245,158,11,0.22)]'
+                    : hitlAvailable
+                      ? 'bg-transparent border-transparent text-amber-400 hover:bg-amber-500/10'
+                      : 'bg-transparent border-transparent text-muted-foreground/40 cursor-not-allowed'
+                }`}
+              >
+                <ClipboardCheck className="w-4 h-4" />
+                人工确认
+                {hitlAvailable ? (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-amber-500/25 text-amber-200 border border-amber-500/40">
+                    {hitlBadgeText}
+                  </span>
+                ) : null}
+                {hitlAvailable && centerTab !== 'hitl' ? (
+                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                ) : null}
+              </button>
             </div>
-          )}
+            {selectedNode && centerTab === 'detail' ? (
+              <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs ${getNodeTypeInfo(selectedNode.type).bg} ${getNodeTypeInfo(selectedNode.type).color}`}>
+                <Zap className="w-3 h-3" />
+                {getNodeTypeInfo(selectedNode.type).label}
+              </div>
+            ) : null}
+          </div>
+
+          {/* Tab Body */}
+          <div className="flex-1 overflow-hidden">
+            {centerTab === 'hitl' && hitlAvailable && room.hitlFormSchema ? (
+              <div className="h-full overflow-y-auto custom-scrollbar p-6 bg-[color:var(--panel)]">
+                <div className="max-w-[920px] mx-auto">
+                  <MeetingHitlForm
+                    schema={room.hitlFormSchema}
+                    summaryMarkdown={room.hitlPendingSummary ?? undefined}
+                    submitLabel={room.hitlPendingSummary ? '确认总结并归档推进' : '提交确认并推进'}
+                    onSubmit={(values) => {
+                      const summary = Object.entries(values)
+                        .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(',') : String(v)}`)
+                        .join('\n');
+                      onIntervene(`[人工确认表单]\n${summary}`, { resumeRun: true });
+                    }}
+                  />
+                </div>
+              </div>
+            ) : selectedNode ? (
+              <>
+                {/* Node sub-header（节点名 / 状态） */}
+                <div className="px-6 pt-4 pb-3 border-b border-border/40 bg-[color:var(--panel)]/40">
+                  <div className="flex items-center gap-3">
+                    <div className={`p-2 rounded-lg ${
+                      selectedNode.type.includes('ai') ? 'bg-blue-500/20 text-blue-400' :
+                      selectedNode.type === 'system' ? 'bg-muted/20 text-muted-foreground' :
+                      'bg-amber-500/20 text-amber-500'
+                    }`}>
+                      {selectedNode.type.includes('ai') ? <Bot className="w-5 h-5" /> :
+                       selectedNode.type === 'system' ? <TerminalSquare className="w-5 h-5" /> :
+                       <User className="w-5 h-5" />}
+                    </div>
+                    <div>
+                      <h3 className="font-semibold text-base text-foreground flex items-center gap-2.5">
+                        {selectedNode.name}
+                        {selectedNode.id === room.currentNode ? (
+                          <Badge
+                            status={room.status === 'human_intervention' ? 'error' : 'processing'}
+                            text={
+                              <span className={`text-xs ${room.status === 'human_intervention' ? 'text-red-400' : 'text-blue-400'}`}>
+                                {room.status === 'human_intervention' ? '等待人工干预' : '智能体处理中'}
+                              </span>
+                            }
+                          />
+                        ) : (() => {
+                          const st = getNodeStateGlobal(room, selectedNode.id);
+                          return st === 'completed'
+                            ? <Badge status="success" text={<span className="text-xs text-green-400">已完成</span>} />
+                            : st === 'pending'
+                            ? <Badge status="default" text={<span className="text-xs text-muted-foreground">待执行</span>} />
+                            : null;
+                        })()}
+                      </h3>
+                      <p className="text-[10px] text-muted-foreground mt-0.5">{selectedNode.desc}</p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Body: stage-specific panel component */}
+                <div className="flex-1 overflow-hidden">
+                  {room.stageIndex === 1 ? (
+                    <RequirementAnalysisPanel
+                      nodeDesc={selectedNode.desc}
+                      nodeTypeLabel={getNodeTypeInfo(selectedNode.type).label}
+                      nodeTypeColor={getNodeTypeInfo(selectedNode.type).color}
+                      stageName={currentStage?.name ?? ''}
+                      nodeOutput={renderNodeOutput(selectedNode, room)}
+                    />
+                  ) : (
+                    <div className="flex flex-col items-center justify-center h-full text-muted-foreground/80 gap-3">
+                      <CircleDashed className="w-10 h-10 opacity-20" />
+                      <p className="text-sm">该阶段的中栏面板正在建设中</p>
+                      <p className="text-xs text-muted-foreground/70">stageIndex: {room.stageIndex}</p>
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="flex flex-col items-center justify-center h-full text-muted-foreground/80">
+                <CircleDashed className="w-12 h-12 mb-3 opacity-30" />
+                <p className="text-sm">请从左侧选择议题节点</p>
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* COL 3: Multi-Agent Chat / Interventions (420px) */}
-        <div className="w-[420px] flex flex-col h-full bg-[color:var(--panel)] shrink-0">
+        {/* COL 3: Multi-Agent Chat / Interventions (440px) */}
+        <div className="w-[440px] flex flex-col h-full bg-[color:var(--panel)] shrink-0">
           {/* Main Header / Members Top Bar */}
           <div className="p-3 border-b border-border bg-[color:var(--panel2)] shrink-0 h-[72px] flex flex-col justify-center">
             <div className="flex items-center justify-between mb-1.5">
@@ -1192,20 +1277,18 @@ const InterventionDialog = ({
 
           {/* Input Area */}
           <div className="p-4 bg-[color:var(--panel2)] border-t border-border shrink-0">
-            {room.status === 'human_intervention' && room.hitlFormSchema ? (
-              <div className="mb-3">
-                <MeetingHitlForm
-                  schema={room.hitlFormSchema}
-                  summaryMarkdown={room.hitlPendingSummary ?? undefined}
-                  submitLabel={room.hitlPendingSummary ? '确认总结并归档推进' : '提交确认并推进'}
-                  onSubmit={(values) => {
-                    const summary = Object.entries(values)
-                      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(',') : String(v)}`)
-                      .join('\n');
-                    onIntervene(`[人工确认表单]\n${summary}`, { resumeRun: true });
-                  }}
-                />
-              </div>
+            {hitlAvailable ? (
+              <button
+                type="button"
+                onClick={() => setCenterTab('hitl')}
+                className="w-full mb-3 px-3 py-2 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs flex items-center justify-between hover:bg-amber-500/15 transition-colors"
+              >
+                <span className="flex items-center gap-2">
+                  <ClipboardCheck className="w-3.5 h-3.5" />
+                  {hitlBadgeText}：请到中栏「人工确认」Tab 提交
+                </span>
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
             ) : null}
             <div className="flex items-end gap-2.5 bg-[color:var(--panel)] border border-border p-2 rounded-xl focus-within:border-blue-500/50 focus-within:ring-1 focus-within:ring-blue-500/20 transition-all">
               <Input.TextArea

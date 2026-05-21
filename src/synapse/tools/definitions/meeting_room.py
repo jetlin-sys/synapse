@@ -2,6 +2,78 @@
 
 MEETING_ROOM_TOOLS = [
     {
+        "name": "submit_hitl_questionnaire",
+        "category": "Meeting Room",
+        "description": (
+            "Submit a structured HITL questionnaire (questionnaire v1.0) for the current R&D "
+            "meeting room node. REQUIRED whenever you need user confirmation: clarify gates, "
+            "result confirmation, or exception escalation. Once submitted the room enters "
+            "human_intervention immediately; do NOT claim the questionnaire is delivered without "
+            "calling this tool."
+        ),
+        "detail": (
+            "提交研发会议室本节点的人机问卷（主控小鲸专用，结构化版本）。\n\n"
+            "**优先级最高**：在异常 / 结果确认 / 会中澄清场景，**必须**调用本工具，"
+            "替代旧的 ``<!-- hitl-questionnaire -->`` Markdown 标记块。\n\n"
+            "**调用即锁定**：返回成功后，房间立即进入 ``human_intervention``，"
+            "你应停止后续工具调用与正文输出；系统会忽略本轮后续文本，以工具写入的 schema 为准。\n\n"
+            "**参数要点**：\n"
+            "- ``kind``：``interactive``（会中澄清）/ ``result_confirm``（节点终稿确认）/ ``exception``（异常裁决）\n"
+            "- ``await_confirm``：true 表示提交后等待确认才推进；result_confirm 默认 true，其余默认 false\n"
+            "- ``questions``：至少 1 条 questionnaire v1.0 题目；每题需含 id / type / title\n"
+            "- ``summary``：可选 Markdown，用于在表单上方展示给用户的待确认要点 / 异常原因\n\n"
+            "**题目颗粒度（强约束）**：每个独立可决策点 = 一道独立题。\n"
+            "- 禁止把 N 个决策点合并成一道「整体确认 / 部分修改 / 拒绝」单选；\n"
+            "- 即使你已经给出推荐默认结论，**仍要**把每个决策点单独成题，把默认结论作为推荐选项；\n"
+            "- 如果交付文档列出 14 个 P0 问题，``questions`` 必须 ≥14 道。\n"
+            "- 系统会校验：当 ``summary`` 中明显列举了多个待确认项却只给 1~2 道题时，"
+            "工具会拒绝提交并要求按颗粒度规则重新组织。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["interactive", "result_confirm", "exception"],
+                    "description": "介入类型",
+                },
+                "await_confirm": {
+                    "type": "boolean",
+                    "description": "true 表示提交后须用户确认才推进；省略时按 kind 推断",
+                },
+                "title": {"type": "string", "description": "表单标题"},
+                "description": {"type": "string", "description": "表单说明"},
+                "summary": {
+                    "type": "string",
+                    "description": "可选；要在表单上方展示给用户的待确认 / 异常原因 Markdown",
+                },
+                "questions": {
+                    "type": "array",
+                    "description": "questionnaire v1.0 题目数组（至少 1 条）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "type": {
+                                "type": "string",
+                                "enum": ["single", "multiple", "boolean", "text", "textarea"],
+                            },
+                            "title": {"type": "string"},
+                            "context": {"type": "string"},
+                            "required": {"type": "boolean"},
+                            "options": {"type": "array"},
+                            "inputEnabled": {"type": "boolean"},
+                            "inputPlaceholder": {"type": "string"},
+                            "render": {"type": "object"},
+                        },
+                        "required": ["id", "type", "title"],
+                    },
+                },
+            },
+            "required": ["kind", "questions"],
+        },
+    },
+    {
         "name": "submit_meeting_work_plan",
         "category": "Meeting Room",
         "description": (

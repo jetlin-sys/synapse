@@ -10,6 +10,10 @@ label: 人机问卷（Ask User）
 
 Schema 定义与 Python 工具见：`src/synapse/rd_meeting/hitl_form.py`（`build_question`、`normalize_hitl_schema`、`questionnaire v1.0`）。
 
+> **首选方式（强约束）**：研发会议室主控请**直接调用** `submit_hitl_questionnaire(kind, questions, summary, ...)` 工具提交问卷，工具返回成功后立即停止后续输出。**只有**工具不可用时才使用本技能描述的「HTML 注释 + JSON」Markdown 标记块作为兼容回退。
+
+> **题目颗粒度（强约束）**：**每个独立可决策点对应一道独立题**，禁止把 N 个决策点合并成一道「整体确认 / 部分修改 / 拒绝」单选。如果交付物里列了 14 个 P0 待澄清问题，`questions[]` **就必须有 14 道（或更多）题**，每道题把「默认结论」作为推荐选项之一（标 ✅ 推荐）。即使你已经给出推荐值，仍要让用户对每个决策点单独表态——这是会议室人工确认的核心价值。
+
 ---
 
 ## 何时使用

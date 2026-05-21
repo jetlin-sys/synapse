@@ -4,7 +4,7 @@
  */
 import React, { useCallback, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { CheckCircle2, ChevronRight, Sparkles } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronRight, ListChecks, Sparkles } from 'lucide-react';
 import { Button, Form, Input, Progress } from 'antd';
 
 const { TextArea } = Input;
@@ -16,9 +16,22 @@ export type HitlQuestionType = 'single' | 'multiple' | 'boolean' | 'text' | 'tex
 export type HitlOptionStyle = 'radio' | 'checkbox' | 'boolean';
 
 export interface HitlQuestionOption {
+  /** 选项主键；LLM 偶尔输出 `id` 而不是 `value`，渲染时会自动回退 */
   value: string;
+  /** 兼容字段：当 LLM 输出 ``{"id": "...", "label": "..."}`` 时使用 */
+  id?: string;
   label: string;
   selected?: boolean;
+}
+
+/** 归一化选项主键：避免 LLM 漏 value 导致全部选项共享 undefined 主键。 */
+function optionKey(o: HitlQuestionOption, idx: number): string {
+  const raw =
+    (typeof o.value === 'string' && o.value.trim()) ||
+    (typeof o.id === 'string' && o.id.trim()) ||
+    (typeof o.label === 'string' && o.label.trim()) ||
+    '';
+  return raw || `opt_${idx}`;
 }
 
 export interface HitlQuestionRender {
@@ -40,6 +53,8 @@ export interface HitlQuestion {
   render?: HitlQuestionRender;
 }
 
+export type HitlSummaryKind = 'exception' | 'result_confirm' | 'interactive';
+
 export interface HitlFormSchema {
   type?: 'questionnaire';
   version?: string;
@@ -52,6 +67,13 @@ export interface HitlFormSchema {
     accent?: 'blue' | 'violet' | 'emerald';
     animate?: boolean;
   };
+  /** 工具 / 异常默认模板写入：表单上方展示给用户的 markdown 摘要 */
+  summary_markdown?: string;
+  /** 异常原因短文本（与 summary_kind 一起渲染醒目卡片） */
+  summary_reason?: string;
+  /** 介入类型；驱动摘要的颜色 / 图标 */
+  summary_kind?: HitlSummaryKind;
+  intervention_kind?: HitlSummaryKind;
 }
 
 export type HitlFormValues = Record<string, string | string[] | boolean>;
@@ -65,7 +87,10 @@ function isBooleanQuestion(q: HitlQuestion): boolean {
   const opts = q.options || [];
   return (
     opts.length === 2 &&
-    opts.every((o) => o.value === 'true' || o.value === 'false')
+    opts.every((o, idx) => {
+      const key = optionKey(o, idx);
+      return key === 'true' || key === 'false';
+    })
   );
 }
 
@@ -205,17 +230,18 @@ const HitlQuestionnaireForm: React.FC<{
     if (boolStyle) {
       return (
         <div className="flex gap-3 mt-3">
-          {opts.map((o) => {
-            const active = sel.has(o.value);
-            const yes = o.value === 'true';
+          {opts.map((o, idx) => {
+            const key = optionKey(o, idx);
+            const active = sel.has(key);
+            const yes = key === 'true';
             return (
               <motion.button
-                key={o.value}
+                key={key}
                 type="button"
                 disabled={preview}
                 whileHover={preview ? undefined : { scale: 1.02 }}
                 whileTap={preview ? undefined : { scale: 0.98 }}
-                onClick={() => toggleOption(q, o.value)}
+                onClick={() => toggleOption(q, key)}
                 className={`flex-1 py-3 px-4 rounded-xl border text-sm font-medium transition-all ${
                   active
                     ? yes
@@ -235,18 +261,19 @@ const HitlQuestionnaireForm: React.FC<{
     return (
       <div className="flex flex-col gap-2 mt-3">
         {opts.map((o, idx) => {
-          const active = sel.has(o.value);
+          const key = optionKey(o, idx);
+          const active = sel.has(key);
           const letter = OPTION_LETTERS[idx] || String(idx + 1);
           const isDecision = q.id === 'decision';
-          const approve = o.value === 'approve';
-          const reject = o.value === 'reject';
+          const approve = key === 'approve';
+          const reject = key === 'reject';
           return (
             <motion.button
-              key={o.value}
+              key={key}
               type="button"
               disabled={preview}
               whileHover={preview ? undefined : { x: 2 }}
-              onClick={() => toggleOption(q, o.value)}
+              onClick={() => toggleOption(q, key)}
               className={`group flex items-start gap-3 w-full text-left p-3 rounded-xl border transition-all duration-200 ${
                 active
                   ? isDecision && approve
@@ -356,16 +383,71 @@ const HitlQuestionnaireForm: React.FC<{
         </div>
       ) : null}
 
-      {summaryMarkdown && !preview ? (
-        <div className="rounded-xl border border-border/50 bg-background/60 p-3 max-h-44 overflow-y-auto custom-scrollbar backdrop-blur-sm">
-          <div className="text-[10px] font-medium text-muted-foreground mb-2 flex items-center gap-1">
-            <CheckCircle2 className="w-3 h-3" /> 待确认总结
+      {(() => {
+        if (preview) return null;
+        const kind: HitlSummaryKind | undefined =
+          schema.summary_kind ?? schema.intervention_kind;
+        const reason = (schema.summary_reason || '').trim();
+        const fromSchema = (schema.summary_markdown || '').trim();
+        const fromProp = (summaryMarkdown || '').trim();
+        const body = fromSchema || fromProp;
+        if (!body && !reason) return null;
+        const isException = kind === 'exception';
+        const isResult = kind === 'result_confirm';
+        const palette = isException
+          ? {
+              card: 'border-violet-500/40 bg-violet-500/10 ring-1 ring-violet-500/25',
+              chip: 'bg-violet-500/20 text-violet-200 border border-violet-500/40',
+              label: 'text-violet-200/90',
+              Icon: AlertTriangle,
+              title: '异常摘要',
+              hint: '系统在主控未通过结构化方式提交问卷时进入异常门控；请审阅以下原因后选择处置方式。',
+            }
+          : isResult
+          ? {
+              card: 'border-blue-500/40 bg-blue-500/10 ring-1 ring-blue-500/25',
+              chip: 'bg-blue-500/20 text-blue-200 border border-blue-500/40',
+              label: 'text-blue-200/90',
+              Icon: CheckCircle2,
+              title: '待确认总结',
+              hint: '请审阅以下待确认要点；填写表单后系统将归档并推进下一节点。',
+            }
+          : {
+              card: 'border-emerald-500/40 bg-emerald-500/10 ring-1 ring-emerald-500/25',
+              chip: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40',
+              label: 'text-emerald-200/90',
+              Icon: ListChecks,
+              title: '澄清要点',
+              hint: '主控已收集到以下澄清要点，请逐题填写后提交。',
+            };
+        const Icon = palette.Icon;
+        return (
+          <div className={`rounded-xl border p-3.5 backdrop-blur-sm ${palette.card}`}>
+            <div className="flex items-center justify-between mb-2">
+              <div className={`text-[11px] font-semibold flex items-center gap-1.5 ${palette.label}`}>
+                <Icon className="w-3.5 h-3.5" />
+                {palette.title}
+              </div>
+              {kind ? (
+                <span className={`text-[10px] px-1.5 py-0.5 rounded-md ${palette.chip}`}>
+                  {kind}
+                </span>
+              ) : null}
+            </div>
+            {reason ? (
+              <div className="text-[12px] font-medium text-foreground/95 mb-2 leading-relaxed">
+                {reason}
+              </div>
+            ) : null}
+            {body ? (
+              <pre className="text-[11px] text-foreground/85 whitespace-pre-wrap font-sans leading-relaxed m-0 max-h-52 overflow-y-auto custom-scrollbar">
+                {body}
+              </pre>
+            ) : null}
+            <p className="text-[10px] text-muted-foreground mt-2 leading-relaxed">{palette.hint}</p>
           </div>
-          <pre className="text-[11px] text-foreground/90 whitespace-pre-wrap font-sans leading-relaxed m-0">
-            {summaryMarkdown}
-          </pre>
-        </div>
-      ) : null}
+        );
+      })()}
 
       <AnimatePresence mode="wait">
         {visibleQuestions.map((q) => (

@@ -19,25 +19,30 @@ from synapse.rd_meeting.agent_session import (
 )
 from synapse.rd_meeting.artifacts import write_node_deliverables
 from synapse.rd_meeting.binding import resolve_node_binding
-from synapse.rd_meeting.bootstrap import append_node_init_chat, build_node_init_message
+from synapse.rd_meeting.bootstrap import build_node_init_message
 from synapse.rd_meeting.dev_status import load_dev_status, save_dev_status
+from synapse.rd_meeting.dynamic_prompt import build_meeting_user_turn_prompt
 from synapse.rd_meeting.hitl_form import (
     HitlGateFromReport,
     extract_hitl_from_agent_output,
     infer_clarify_hitl_schema,
+    normalize_hitl_schema,
     resolve_hitl_schema_for_gate,
 )
-from synapse.rd_meeting.notifications import schedule_human_intervention_notify
-from synapse.rd_meeting.paths import archive_root, scope_dir
-from synapse.rd_meeting.participants import build_meeting_participants
-from synapse.rd_meeting.dynamic_prompt import build_meeting_user_turn_prompt
+from synapse.rd_meeting.hitl_submit import (
+    clear_pending_questionnaire,
+    consume_pending_questionnaire,
+)
 from synapse.rd_meeting.host_prompt_cache import (
     resolve_cached_host_meeting_prompt,
     resolve_cached_host_user_prompt,
 )
 from synapse.rd_meeting.init_context import build_node_init_log_data
-from synapse.rd_meeting.pipeline_chat import format_host_first_call_chat
+from synapse.rd_meeting.notifications import schedule_human_intervention_notify
+from synapse.rd_meeting.participants import build_meeting_participants
+from synapse.rd_meeting.paths import archive_root, scope_dir
 from synapse.rd_meeting.phase import set_phase
+from synapse.rd_meeting.pipeline_chat import format_host_first_call_chat
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
     load_room_state,
@@ -417,6 +422,104 @@ class MeetingRoomOrchestrator:
             ticket_title=ticket_title,
         )
 
+    def _gate_from_tool_questionnaire(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        room_id: str,
+        node_id: str,
+        binding: dict[str, Any],
+        questionnaire: dict[str, Any],
+        report_body: str,
+        tokens_used: int,
+        duration_seconds: int,
+        stage_id: int,
+        ticket_title: str,
+        skipped_nodes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """主控通过 ``submit_hitl_questionnaire`` 工具直接锁定时的门控分支。"""
+        schema = normalize_hitl_schema(questionnaire.get("schema")) or questionnaire.get("schema")
+        kind = (questionnaire.get("kind") or "interactive").strip().lower()
+        await_confirm = bool(questionnaire.get("await_confirm"))
+        summary = str(questionnaire.get("summary") or "").strip()
+
+        phase_map = {
+            "result_confirm": "result_gate",
+            "exception": "exception_gate",
+            "interactive": "clarify_gate",
+        }
+        set_phase(scope_id, phase_map.get(kind, "clarify_gate"))
+
+        # report_body 仅做摘要展示，不再用作 LLM 终稿
+        body = (report_body or "").strip()
+        if summary:
+            body = f"{summary}\n\n---\n\n{body}" if body else summary
+        pending = {
+            "node_id": node_id,
+            "report_body": body,
+            "await_confirm": await_confirm,
+            "tokens_used": tokens_used,
+            "duration_seconds": duration_seconds,
+            "stage_id": stage_id,
+            "source": "tool",
+        }
+        reason_map = {
+            "result_confirm": f"{node_display_name(node_id)} 待确认总结，请填写表单后归档推进",
+            "exception": f"{node_display_name(node_id)} 异常待人工裁决，请填写表单后继续",
+            "interactive": f"{node_display_name(node_id)} 需人工填写问卷后继续",
+        }
+        reason = reason_map.get(kind, reason_map["interactive"])
+        gate_state = self.mark_human_gate(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            room_id=room_id,
+            node_id=node_id,
+            reason=reason,
+            ticket_title=ticket_title,
+            hitl_form_schema=schema,
+            pending_delivery=pending,
+            intervention_kind=kind,
+        )
+        append_history_event(
+            scope_id,
+            {
+                "event": "hitl_dynamic",
+                "room_id": room_id,
+                "node_id": node_id,
+                "detail": (
+                    f"主控通过工具提交问卷 kind={kind} "
+                    f"questions={len((schema or {}).get('questions') or [])} "
+                    f"await_confirm={await_confirm}"
+                ),
+                "log_type": "info",
+                "agent_id": str(binding.get("host_profile_id") or "default"),
+                "source": "tool",
+            },
+        )
+        if await_confirm:
+            append_history_event(
+                scope_id,
+                {
+                    "event": "node_pending_confirm",
+                    "room_id": room_id,
+                    "node_id": node_id,
+                    "tokens_used": tokens_used,
+                    "duration_seconds": duration_seconds,
+                    "dynamic_form": True,
+                    "source": "tool",
+                },
+            )
+        return {
+            "status": "human_intervention",
+            "node_id": node_id,
+            "skipped_nodes": skipped_nodes or None,
+            "pending_confirm": await_confirm,
+            "dynamic_hitl": True,
+            "source": "tool",
+            **gate_state,
+        }
+
     def _gate_from_agent_hitl(
         self,
         *,
@@ -767,6 +870,8 @@ class MeetingRoomOrchestrator:
         started = time.monotonic()
         tokens_used = 0
         report_body = ""
+        tool_questionnaire: dict[str, Any] | None = None
+        clear_pending_questionnaire(sid)
 
         if use_dry:
             report_body = (
@@ -869,14 +974,21 @@ class MeetingRoomOrchestrator:
                     },
                 )
                 meeting_session = ensure_host_session(room_id, host_profile_id)
-                bind_meeting_agent_session(host_agent, meeting_session)
-                try:
-                    result = await host_agent.execute_task_from_message(
-                        prompt,
-                        usage_scene=f"rd_meeting_{sid}_{node_id}",
-                    )
-                finally:
-                    clear_meeting_agent_session(host_agent)
+
+                async def _run_host(message: str) -> Any:
+                    bind_meeting_agent_session(host_agent, meeting_session)
+                    try:
+                        host_agent._hitl_locked = False
+                        return await host_agent.execute_task_from_message(
+                            message,
+                            usage_scene=f"rd_meeting_{sid}_{node_id}",
+                        )
+                    finally:
+                        clear_meeting_agent_session(host_agent)
+
+                result = await _run_host(prompt)
+                # 主控通过 submit_hitl_questionnaire 工具直接锁定时优先采用
+                tool_questionnaire = consume_pending_questionnaire(sid)
                 if result.success:
                     report_body = str(result.data or result.error or "完成")
                 else:
@@ -930,11 +1042,81 @@ class MeetingRoomOrchestrator:
                     },
                 )
 
-        hitl_gate = extract_hitl_from_agent_output(report_body)
-        report_body = hitl_gate.clean_body
+                # E：human_confirm 节点的「自动重跑一次」
+                # 触发：未通过工具提交问卷 + 终稿无标记块 + 校验失败
+                if (
+                    bool(binding.get("human_confirm"))
+                    and tool_questionnaire is None
+                    and not extract_hitl_from_agent_output(report_body).explicit
+                    and not validate_node_output(node_id, report_body).ok
+                ):
+                    append_history_event(
+                        sid,
+                        {
+                            "event": "host_retry",
+                            "room_id": room_id,
+                            "node_id": node_id,
+                            "reason": "主控未提交结构化问卷且终稿未通过校验，自动重跑一次",
+                            "log_type": "warning",
+                            "agent_id": host_profile_id,
+                        },
+                    )
+                    retry_prompt = (
+                        f"{prompt}\n\n"
+                        "## ⚠️ 系统提示：上一次输出未提交合法问卷\n"
+                        "你上一次的回复既没有调用 `submit_hitl_questionnaire` 工具，"
+                        "也没有按 `whalecloud-dev-tool-ask-user` 技能在末尾输出 "
+                        "`<!-- hitl-questionnaire -->` 标记块；同时正文未通过节点校验。\n\n"
+                        "**本次重跑要求**：直接调用 `submit_hitl_questionnaire` 工具提交问卷，"
+                        "无需再写工具调用前的总结性文字；若已有可定稿内容，请按需求选择 "
+                        "`kind=result_confirm`（节点终稿确认），否则使用 "
+                        "`kind=interactive`（继续会中澄清）或 `kind=exception`（异常裁决）。\n"
+                        "调用工具后立即停止，不要重复总结。\n\n"
+                        "**题目颗粒度（强约束）**：每个独立可决策点 = 一道独立题。\n"
+                        "- 禁止把多个决策点合并成一道「整体确认 / 部分修改 / 拒绝」单选；\n"
+                        "- 交付文档中列出的每个 P0 问题 / 待澄清项都要单独成题，"
+                        "把「可默认结论」放进选项里（可标 ✅ 推荐）；\n"
+                        "- 即使有 14 题也要全部列出，前端会用 stepped 布局分步引导。"
+                    )
+                    retry_result = await _run_host(retry_prompt)
+                    retry_questionnaire = consume_pending_questionnaire(sid)
+                    if retry_result.success:
+                        report_body = str(retry_result.data or retry_result.error or "完成")
+                    tool_questionnaire = retry_questionnaire or tool_questionnaire
+                    append_history_event(
+                        sid,
+                        {
+                            "event": "host_retry_end",
+                            "room_id": room_id,
+                            "node_id": node_id,
+                            "tool_used": bool(retry_questionnaire),
+                            "log_type": "info",
+                            "agent_id": host_profile_id,
+                        },
+                    )
 
         stage_id = int(dev.get("stage_id") or stage_id_for_node_id(node_id))
         duration = max(1, int(time.monotonic() - started))
+
+        # 工具提交的问卷优先于 LLM 终稿解析
+        if tool_questionnaire and tool_questionnaire.get("schema"):
+            return self._gate_from_tool_questionnaire(
+                scope_type=scope_type,
+                scope_id=sid,
+                room_id=room_id,
+                node_id=node_id,
+                binding=binding,
+                questionnaire=tool_questionnaire,
+                report_body=report_body,
+                tokens_used=tokens_used,
+                duration_seconds=duration,
+                stage_id=stage_id,
+                ticket_title=ticket_title,
+                skipped_nodes=skipped_nodes or None,
+            )
+
+        hitl_gate = extract_hitl_from_agent_output(report_body)
+        report_body = hitl_gate.clean_body
 
         if hitl_gate.explicit:
             append_history_event(
