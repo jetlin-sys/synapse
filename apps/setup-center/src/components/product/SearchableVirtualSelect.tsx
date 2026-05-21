@@ -79,7 +79,7 @@ export function SearchableVirtualSelect({
           "focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50",
           "disabled:cursor-not-allowed disabled:opacity-50",
           "dark:bg-input/30 dark:hover:bg-input/50",
-          !selectedLabel && "text-muted-foreground",
+          selectedLabel ? "text-foreground" : "text-foreground/55",
         )}
       >
         <span className="truncate text-left" title={selectedLabel || undefined}>

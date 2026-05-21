@@ -2729,8 +2729,16 @@
     "panelFullManualTitle": "Full manual (external)",
     "panelFullManualBody": "This work order is handled outside the in-app intelligent pipeline. To use automation later, advance it to requirement design and eligible stages.",
     "oneClickOpenMeeting": "Open meeting room",
+    "selectProductForMeeting": "Select product",
+    "selectProductForMeetingHint": "Choose a product registered in the unified service (same list as Product Management).",
+    "selectProductPlaceholder": "Select product",
+    "selectProductRequired": "Please select a product",
+    "prodCatalogLoading": "Loading product list…",
+    "prodCatalogLoadFailed": "Failed to load product list: {{message}}",
+    "prodCatalogEmpty": "Product list is empty. Add products in Product Management first.",
     "actNow": "Act now",
     "openMeetingSuccess": "Meeting room opened",
-    "openMeetingFailed": "Failed to open meeting: {{message}}"
+    "openMeetingFailed": "Failed to open meeting: {{message}}",
+    "productUnspecified": "Product not specified"
   }
 }

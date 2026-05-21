@@ -59,7 +59,9 @@ def build_meeting_runtime_context_section(
         lines.append(f"- DEMAND_DESC: {wo['demand_desc'][:2000]}")
     if wo.get("demand_impact"):
         lines.append(f"- DEMAND_IMPACT: {wo['demand_impact'][:800]}")
-    if wo.get("product_version_code"):
+    if wo.get("prod"):
+        lines.append(f"- PROD: {wo['prod']}")
+    elif wo.get("product_version_code"):
         lines.append(f"- PRODUCT_VERSION: {wo['product_version_code']}")
     if archive_dir:
         lines.append(f"- ARCHIVE_DIR: {archive_dir}")

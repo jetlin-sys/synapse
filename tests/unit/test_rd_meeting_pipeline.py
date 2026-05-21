@@ -57,9 +57,20 @@ def test_pipeline_file_created_on_open_flow(monkeypatch, tmp_path):
         "synapse.rd_meeting.room_runtime.room_history_path",
         lambda sid: work / "room_history.jsonl",
     )
+    monkeypatch.setattr(
+        "synapse.rd_meeting.product_context.ensure_prod_in_catalog",
+        lambda p: ([{"prod": p, "version": "v", "repo_info": [], "doc_process": []}], ""),
+    )
+    monkeypatch.setattr(
+        "synapse.rd_meeting.init_context.resolve_product_for_meeting",
+        lambda *_a, **_k: (
+            {"locator_code": "ok", "prod": "myprod", "repos": [], "docs": []},
+            {"synapse_url": "http://h:10001", "gitnexus_url": "http://h:11011", "gnx_cache_base_dir": "/gnx"},
+        ),
+    )
 
     svc = MeetingRoomService()
-    detail = svc.open_meeting("demand", scope_id, auto_run_first_node=False)
+    detail = svc.open_meeting("demand", scope_id, prod="myprod", auto_run_first_node=False)
 
     ppath = meeting_pipeline_path(scope_id)
     assert ppath.is_file()

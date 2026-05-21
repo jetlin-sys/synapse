@@ -112,14 +112,22 @@ def test_open_meeting_step1_userwork_and_init_log(monkeypatch, tmp_path):
         ),
     )
 
+    monkeypatch.setattr(
+        "synapse.rd_meeting.product_context.ensure_prod_in_catalog",
+        lambda p: ([{"prod": p, "version": "v", "repo_info": [], "doc_process": []}], ""),
+    )
+
     svc = MeetingRoomService()
-    detail = svc.open_meeting("demand", scope_id, sync_userwork=True, auto_run_first_node=False)
+    detail = svc.open_meeting(
+        "demand", scope_id, prod="p", sync_userwork=True, auto_run_first_node=False
+    )
 
     assert detail.get("auto_run_started") is not True
     saved = json.loads(uw_path.read_text(encoding="utf-8"))
     demand = saved["list"][0]
     assert demand["local_process_state"] == "处理中"
     assert demand["sop_node"] == "需求澄清"
+    assert demand["prod"] == "p"
 
     hist_lines = [json.loads(ln) for ln in hist.read_text(encoding="utf-8").splitlines() if ln.strip()]
     events = [h["event"] for h in hist_lines]
@@ -132,6 +140,7 @@ def test_open_meeting_step1_userwork_and_init_log(monkeypatch, tmp_path):
     opened_data = json.loads(opened["text"])
     assert opened_data["sop_node"] == "需求澄清"
     assert opened_data["local_process_state"] == "处理中"
+    assert opened_data["prod"] == "p"
     assert "payload" not in opened
 
     init_row = next(h for h in hist_lines if h["event"] == "node_init")

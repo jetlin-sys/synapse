@@ -65,9 +65,12 @@ import {
   patchProductKnowledgeSlots,
   prodInfoWireToProduct,
   prodWireMatchesWorkItemModuleName,
+  displayIdPipeName,
   type ProductKnowledgePatch,
 } from '@/components/product/types';
 import { ViewId } from '../../types';
+import { Label } from '@/components/ui/label';
+import { SearchableVirtualSelect } from '@/components/product/SearchableVirtualSelect';
 import {
   SOP_STAGES,
   ALL_NODES,
@@ -117,6 +120,21 @@ export interface Ticket {
   description: string;
   createdAt: string;
   workItems: WorkItem[];
+  /** userwork.json 中的 prod（统一服务产品标识） */
+  prod?: string;
+}
+
+/** 工单卡片 / SOP 顶栏：有 prod 显示产品名，否则「未指定产品」 */
+function ProductProdTag({ prod, className }: { prod?: string; className?: string }) {
+  const { t } = useTranslation();
+  const trimmed = (prod || '').trim();
+  const hasProd = Boolean(trimmed);
+  const label = hasProd ? trimmed : t('rdManageOrder.productUnspecified');
+  return (
+    <Tag bordered={false} className={className} color={hasProd ? 'processing' : 'warning'}>
+      {label}
+    </Tag>
+  );
 }
 
 function focusNodeIdForTicket(ticket: Ticket): string {
@@ -312,6 +330,7 @@ function mapDemandListItemToTicket(d: DemandListItem, flags: Record<string, bool
     currentNode: demandNodeId,
     currentStage: 0,
     workItems,
+    prod: (d.prod || '').trim() || undefined,
   };
 }
 
@@ -381,6 +400,7 @@ function demandItemFallbackFromTicket(ticket: Ticket): DemandListItem {
     demand_designer: ticket.owner,
     product_version_id: null,
     product_version_code: ticket.branch,
+    prod: ticket.prod,
     sop_node: '',
     local_process_state: '',
     owned_work_items: items,
@@ -526,6 +546,16 @@ export const OrderManagement: React.FC<{
   const [boardDataInitialized, setBoardDataInitialized] = useState(false);
   const [boardRefreshBusy, setBoardRefreshBusy] = useState(false);
   const [openingMeetingKey, setOpeningMeetingKey] = useState<string | null>(null);
+  const [prodCatalog, setProdCatalog] = useState<ProdInfoWireItem[]>([]);
+  const [prodCatalogLoading, setProdCatalogLoading] = useState(false);
+  const [openMeetingPickerOpen, setOpenMeetingPickerOpen] = useState(false);
+  const [openMeetingPending, setOpenMeetingPending] = useState<{
+    ticket: Ticket;
+    workItemId?: string;
+    scopeType: 'demand' | 'task';
+    scopeId: string;
+  } | null>(null);
+  const [selectedProdKey, setSelectedProdKey] = useState('');
   const [meetingSummary, setMeetingSummary] = useState<MeetingSummaryPayload | null>(null);
   const [meetingSummaryLoading, setMeetingSummaryLoading] = useState(false);
   const [meetingSummaryErr, setMeetingSummaryErr] = useState<string | null>(null);
@@ -539,6 +569,49 @@ export const OrderManagement: React.FC<{
 
   const containerRef = useRef<HTMLDivElement>(null);
   const antDark = useAntThemeDark();
+
+  useEffect(() => {
+    if (!IS_TAURI) return;
+    let cancelled = false;
+    setProdCatalogLoading(true);
+    void getProdInfo(synapseApiBase)
+      .then((resp) => {
+        if (cancelled) return;
+        const raw = Array.isArray(resp.data) ? resp.data : [];
+        setProdCatalog(raw.filter((row): row is ProdInfoWireItem => row != null));
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg === 'missing_devservice_ip') {
+          toast.error(t('workbench.products.createMissingDevservice'));
+        } else {
+          toast.error(t('rdManageOrder.prodCatalogLoadFailed', { message: msg }));
+        }
+        setProdCatalog([]);
+      })
+      .finally(() => {
+        if (!cancelled) setProdCatalogLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [synapseApiBase, t]);
+
+  const prodSelectOptions = useMemo(
+    () =>
+      prodCatalog
+        .map((row) => {
+          const prod = (row.prod || '').trim();
+          if (!prod) return null;
+          const version = displayIdPipeName(row.version ?? '') || (row.version ?? '');
+          const space = (row.space || '').trim();
+          const label = [prod, version, space].filter(Boolean).join(' · ');
+          return { value: prod, label };
+        })
+        .filter((x): x is { value: string; label: string } => x != null),
+    [prodCatalog],
+  );
 
   useEffect(() => {
     if (!ticketModalOpen || !modalDemand) return;
@@ -1058,40 +1131,70 @@ export const OrderManagement: React.FC<{
   };
 
   const handleOneClickOpenMeeting = useCallback(
-    async (e: React.MouseEvent, ticket: Ticket, workItemId?: string) => {
+    (e: React.MouseEvent, ticket: Ticket, workItemId?: string) => {
       e.stopPropagation();
+      if (!IS_TAURI) {
+        toast.message(t('rdManageOrder.productOpenTauriOnly'));
+        return;
+      }
+      if (prodCatalogLoading) {
+        toast.message(t('rdManageOrder.prodCatalogLoading'));
+        return;
+      }
+      if (!prodCatalog.length) {
+        toast.error(t('rdManageOrder.prodCatalogEmpty'));
+        return;
+      }
       const scopeType = workItemId ? ('task' as const) : ('demand' as const);
       const scopeId = (workItemId || ticket.id).trim();
       if (!scopeId) return;
-      const busyKey = `${scopeType}:${scopeId}`;
-      setOpeningMeetingKey(busyKey);
-      try {
-        const detail = await openMeetingRoom(synapseApiBase, scopeType, scopeId, {
-          promoteToProcessing: true,
-          autoRunFirstNode: false,
-        });
-        setMeetingRoomFocus({
-          roomId: detail.room_id,
-          scopeType,
-          scopeId,
-        });
-        setActiveTicketId(ticket.id);
-        setActiveWorkItemId(workItemId || '');
-        toast.success(t('rdManageOrder.openMeetingSuccess'));
-        if (onViewChange) {
-          onViewChange('workbench_meeting');
-        } else {
-          window.dispatchEvent(new CustomEvent('changeView', { detail: 'workbench_meeting' }));
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        toast.error(t('rdManageOrder.openMeetingFailed', { message: msg }));
-      } finally {
-        setOpeningMeetingKey(null);
-      }
+      const raw = demandListRaw.find((d) => (d.demand_no || '').trim() === ticket.id.trim());
+      const preProd = String((raw as { prod?: string } | undefined)?.prod || '').trim();
+      setSelectedProdKey(preProd);
+      setOpenMeetingPending({ ticket, workItemId, scopeType, scopeId });
+      setOpenMeetingPickerOpen(true);
     },
-    [synapseApiBase, t, onViewChange],
+    [demandListRaw, prodCatalog.length, prodCatalogLoading, t],
   );
+
+  const confirmOpenMeetingWithProd = useCallback(async () => {
+    const pending = openMeetingPending;
+    const prod = selectedProdKey.trim();
+    if (!pending || !prod) {
+      toast.error(t('rdManageOrder.selectProductRequired'));
+      return;
+    }
+    const { ticket, workItemId, scopeType, scopeId } = pending;
+    const busyKey = `${scopeType}:${scopeId}`;
+    setOpeningMeetingKey(busyKey);
+    try {
+      const detail = await openMeetingRoom(synapseApiBase, scopeType, scopeId, {
+        prod,
+        promoteToProcessing: true,
+        autoRunFirstNode: false,
+      });
+      setOpenMeetingPickerOpen(false);
+      setOpenMeetingPending(null);
+      setMeetingRoomFocus({
+        roomId: detail.room_id,
+        scopeType,
+        scopeId,
+      });
+      setActiveTicketId(ticket.id);
+      setActiveWorkItemId(workItemId || '');
+      toast.success(t('rdManageOrder.openMeetingSuccess'));
+      if (onViewChange) {
+        onViewChange('workbench_meeting');
+      } else {
+        window.dispatchEvent(new CustomEvent('changeView', { detail: 'workbench_meeting' }));
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(t('rdManageOrder.openMeetingFailed', { message: msg }));
+    } finally {
+      setOpeningMeetingKey(null);
+    }
+  }, [openMeetingPending, selectedProdKey, synapseApiBase, t, onViewChange]);
 
   const renderMeetingArchiveOutput = (nodeId: string) => {
     const files = meetingArchiveByNodeId.get(nodeId);
@@ -1549,12 +1652,13 @@ export const OrderManagement: React.FC<{
                       {ticketInfoButton}
                     </div>
 
-                    {/* Top: Created At */}
-                    <div className="mb-2 flex items-center pl-2 pr-10">
+                    {/* Top: Created At + 产品标签（需求单维度 prod，子单继承父单） */}
+                    <div className="mb-2 flex flex-wrap items-center gap-1.5 pl-2 pr-10">
                       <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground/80">
                         <Clock className="h-3 w-3 opacity-70" />
                         {item.createdAt.replace('T', ' ').substring(0, 16)}
                       </span>
+                      <ProductProdTag prod={ticket.prod} className="!m-0 text-[10px]" />
                     </div>
                     
                     {/* Middle: Title */}
@@ -1668,6 +1772,7 @@ export const OrderManagement: React.FC<{
             </div>
             
             <motion.div className="flex shrink-0 flex-wrap items-center gap-2">
+              <ProductProdTag prod={displayTicket.prod} />
               {displayTicket.status === 'full_manual' && (
                 <motion.div
                   initial={{ opacity: 0, scale: 0.9 }}
@@ -2480,6 +2585,44 @@ export const OrderManagement: React.FC<{
             ]}
           />
         )}
+      </Modal>
+
+      <Modal
+        title={t('rdManageOrder.selectProductForMeeting')}
+        open={openMeetingPickerOpen}
+        onCancel={() => {
+          setOpenMeetingPickerOpen(false);
+          setOpenMeetingPending(null);
+        }}
+        onOk={() => void confirmOpenMeetingWithProd()}
+        okText={t('rdManageOrder.oneClickOpenMeeting')}
+        cancelText={t('common.cancel', { defaultValue: '取消' })}
+        confirmLoading={Boolean(openingMeetingKey)}
+        destroyOnClose
+      >
+        <p className="mb-3 text-sm text-foreground/80">
+          {t('rdManageOrder.selectProductForMeetingHint')}
+        </p>
+        <div className="space-y-2">
+          <Label className="text-foreground">
+            {t('rdManageOrder.selectProductForMeeting')}{' '}
+            <span className="text-destructive">*</span>
+          </Label>
+          <SearchableVirtualSelect
+            value={selectedProdKey}
+            onValueChange={setSelectedProdKey}
+            options={prodSelectOptions}
+            placeholder={t('rdManageOrder.selectProductPlaceholder')}
+            searchPlaceholder={t('workbench.products.modal.searchFilterPlaceholder')}
+            emptyText={
+              prodCatalogLoading
+                ? t('rdManageOrder.prodCatalogLoading')
+                : t('rdManageOrder.prodCatalogEmpty')
+            }
+            disabled={prodCatalogLoading || prodSelectOptions.length === 0}
+            isLoading={prodCatalogLoading}
+          />
+        </div>
       </Modal>
 
       <ProductDetail
