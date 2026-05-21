@@ -59,5 +59,7 @@ class MeetingRoomToolHandler:
         )
 
 
-def create_meeting_room_handler(agent: "Agent") -> MeetingRoomToolHandler:
-    return MeetingRoomToolHandler(agent)
+def create_meeting_room_handler(agent: "Agent"):
+    """Return bound ``handle`` so SystemHandlerRegistry maps TOOLS correctly."""
+    handler = MeetingRoomToolHandler(agent)
+    return handler.handle

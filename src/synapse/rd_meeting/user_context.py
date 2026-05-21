@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from synapse.rd_meeting.host_prompt_cache import clear_host_prompt_cache
 from synapse.rd_meeting.room_runtime import load_room_state, save_room_state
 
 _MAX_PENDING = 32
@@ -28,6 +29,7 @@ def append_user_context_pending(scope_id: str, text: str) -> None:
         pending = pending[-_MAX_PENDING :]
     rs["user_context_pending"] = pending
     save_room_state(sid, rs)
+    clear_host_prompt_cache(sid)
 
 
 def drain_user_context_for_prompt(scope_id: str) -> str:

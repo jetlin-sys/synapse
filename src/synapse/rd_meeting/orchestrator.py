@@ -11,6 +11,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from synapse.rd_meeting.agent_session import (
+    bind_meeting_agent_session,
+    clear_meeting_agent_session,
+    ensure_host_session,
+    host_session_id,
+)
 from synapse.rd_meeting.artifacts import write_node_deliverables
 from synapse.rd_meeting.binding import resolve_node_binding
 from synapse.rd_meeting.bootstrap import append_node_init_chat, build_node_init_message
@@ -25,7 +31,12 @@ from synapse.rd_meeting.notifications import schedule_human_intervention_notify
 from synapse.rd_meeting.paths import archive_root, scope_dir
 from synapse.rd_meeting.participants import build_meeting_participants
 from synapse.rd_meeting.dynamic_prompt import build_meeting_user_turn_prompt
+from synapse.rd_meeting.host_prompt_cache import (
+    resolve_cached_host_meeting_prompt,
+    resolve_cached_host_user_prompt,
+)
 from synapse.rd_meeting.init_context import build_node_init_log_data
+from synapse.rd_meeting.pipeline_chat import format_host_first_call_chat
 from synapse.rd_meeting.phase import set_phase
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
@@ -198,13 +209,19 @@ class MeetingRoomOrchestrator:
         scope_path: str,
         skill_body: str | None = None,
         self_profile_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         """覆盖 agent 实例的 cwd / preferred_endpoint / prompt suffix。
 
         会议室 SKILL 渲染后写入 ``_custom_prompt_suffix``，并强制重建 system
         prompt 让新内容生效。Worker 视角会把同事的能力卡片暴露给它，方便互
         相协作。
+
+        主控（host）优先复用第三步 ``room_state.host_prompt_cache``。
+
+        Returns:
+            主控是否复用了缓存提示词（worker 恒为 False）。
         """
+        reused_host_prompt = False
         agent.default_cwd = scope_path
         shell_tool = getattr(agent, "shell_tool", None)
         if shell_tool is not None:
@@ -243,13 +260,19 @@ class MeetingRoomOrchestrator:
         )
         dev = load_dev_status(scope_id)
         sop_display = str(dev.get("sop_node_display") or "") if dev else ""
-        suffix = build_room_skill_prompt(
-            ctx,
-            skill_body=skill_body,
-            init_context=init_data,
-            binding=binding,
-            sop_node_display=sop_display,
-        )
+        suffix: str | None = None
+        if role == "host":
+            cached, reused_host_prompt = resolve_cached_host_meeting_prompt(scope_id, binding)
+            if cached:
+                suffix = cached
+        if suffix is None:
+            suffix = build_room_skill_prompt(
+                ctx,
+                skill_body=skill_body,
+                init_context=init_data,
+                binding=binding,
+                sop_node_display=sop_display,
+            )
         agent._custom_prompt_suffix = suffix
         agent_ctx = getattr(agent, "_context", None)
         if agent_ctx is not None and hasattr(agent, "_build_system_prompt"):
@@ -257,6 +280,7 @@ class MeetingRoomOrchestrator:
                 agent_ctx.system = agent._build_system_prompt()
             except Exception as exc:
                 logger.debug("rebuild system prompt failed for role=%s: %s", role, exc)
+        return reused_host_prompt
 
     def on_node_complete(
         self,
@@ -790,12 +814,12 @@ class MeetingRoomOrchestrator:
                     host_profile_id=host_profile_id,
                 )
 
-                host_session_id = f"rd_meeting:{room_id}:host"
+                host_sid = host_session_id(room_id)
                 host_agent = await agent_pool.get_or_create(
-                    session_id=host_session_id,
+                    session_id=host_sid,
                     profile=host_profile,
                 )
-                self._configure_meeting_agent(
+                reused_prompt = self._configure_meeting_agent(
                     host_agent,
                     role="host",
                     binding=binding,
@@ -805,13 +829,17 @@ class MeetingRoomOrchestrator:
                     scope_path=str(scope_dir(sid)),
                 )
 
-                prompt = build_node_prompt(
-                    scope_type=scope_type,
-                    scope_id=sid,
-                    node_id=node_id,
-                    binding=binding,
-                    ticket_title=ticket_title,
-                )
+                cached_user, _ = resolve_cached_host_user_prompt(sid, binding)
+                if cached_user:
+                    prompt = cached_user
+                else:
+                    prompt = build_node_prompt(
+                        scope_type=scope_type,
+                        scope_id=sid,
+                        node_id=node_id,
+                        binding=binding,
+                        ticket_title=ticket_title,
+                    )
                 user_ctx = drain_user_context_for_prompt(sid)
                 if user_ctx:
                     prompt = f"{prompt}\n\n{user_ctx}"
@@ -836,12 +864,19 @@ class MeetingRoomOrchestrator:
                         "host_profile_id": host_profile_id,
                         "log_type": "info",
                         "agent_id": host_profile_id,
+                        "reused_host_prompt_cache": reused_prompt,
+                        "chat_text": format_host_first_call_chat(reused_prompt=reused_prompt),
                     },
                 )
-                result = await host_agent.execute_task_from_message(
-                    prompt,
-                    usage_scene=f"rd_meeting_{sid}_{node_id}",
-                )
+                meeting_session = ensure_host_session(room_id, host_profile_id)
+                bind_meeting_agent_session(host_agent, meeting_session)
+                try:
+                    result = await host_agent.execute_task_from_message(
+                        prompt,
+                        usage_scene=f"rd_meeting_{sid}_{node_id}",
+                    )
+                finally:
+                    clear_meeting_agent_session(host_agent)
                 if result.success:
                     report_body = str(result.data or result.error or "完成")
                 else:
@@ -1129,14 +1164,28 @@ def schedule_run_node(
     if existing and not existing.done():
         return key
 
+    sid = scope_id.strip()
+    dev = load_dev_status(sid)
+    node_id = str(dev.get("current_node_id") or "pending") if dev else "pending"
+    bind = resolve_node_binding(
+        node_id,
+        scope_type=scope_type,
+        scope_id=sid,
+        ticket_title=ticket_title,
+    )
+    host_id = str(bind.get("host_profile_id") or "default")
+    from synapse.rd_meeting.pipeline_chat import format_run_node_scheduled_chat
+
     append_history_event(
-        scope_id.strip(),
+        sid,
         {
             "event": "run_node_scheduled",
             "room_id": room_id,
             "scope_type": scope_type,
+            "current_node_id": node_id,
             "log_type": "info",
-            "agent_id": "system",
+            "agent_id": host_id,
+            "chat_text": format_run_node_scheduled_chat(),
         },
     )
 

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from synapse.rd_meeting.host_prompt import assemble_host_prompt_bundle, format_host_prompt_chat_display
+from synapse.rd_meeting.host_prompt import (
+    assemble_host_prompt_bundle,
+    format_host_prompt_chat_display,
+    format_host_prompt_snapshot,
+)
+from synapse.rd_meeting.host_prompt_cache import clear_host_prompt_cache
 from synapse.rd_meeting.init_context import format_node_init_log
 from synapse.rd_meeting.participants import build_meeting_participants
-from synapse.rd_meeting.flow_log import flow_log_to_text
-from synapse.rd_meeting.pipeline_chat import format_host_prompt_step_chat, format_node_init_chat
+from synapse.rd_meeting.pipeline_chat import format_node_init_chat
 from synapse.rd_meeting.room_runtime import append_history_event
 
 ScopeType = Literal["demand", "task"]
@@ -36,6 +40,7 @@ def append_node_init_chat(
     scope_type: ScopeType = "demand",
 ) -> str:
     """将节点初始化上下文追加到 room_history。"""
+    clear_host_prompt_cache(scope_id)
     text = format_node_init_log(scope_type, scope_id, node_id=node_id)
     host_id = str(binding.get("host_profile_id") or "default")
     participants = build_meeting_participants(binding)
@@ -66,9 +71,10 @@ def append_host_prompt_chat(
     node_id: str,
     binding: dict[str, Any],
     ticket_title: str = "",
+    bundle: dict[str, Any] | None = None,
 ) -> str:
     """第三步：主控提示词组装结果写入协作会议流。"""
-    bundle = assemble_host_prompt_bundle(
+    bundle = bundle or assemble_host_prompt_bundle(
         scope_type=scope_type,
         scope_id=scope_id,
         node_id=node_id,
@@ -85,15 +91,8 @@ def append_host_prompt_chat(
             "node_id": node_id,
             "scope_type": scope_type,
             "scope_id": scope_id,
-            "text": flow_log_to_text(
-                {
-                    "step": 3,
-                    "message": "主控提示词组装完成",
-                    "meeting_prompt_chars": len(str(bundle.get("meeting_prompt") or "")),
-                    "dynamic_chars": len(str(bundle.get("dynamic_context") or "")),
-                    "skill_id": str(bundle.get("meeting_skill_id") or ""),
-                }
-            ),
+            # text：完整组装结果（归档/排查）；chat_text：会议流流程说明（仅展示）
+            "text": format_host_prompt_snapshot(bundle),
             "chat_text": chat_text,
             "agent_id": host_id,
             "log_type": "info",

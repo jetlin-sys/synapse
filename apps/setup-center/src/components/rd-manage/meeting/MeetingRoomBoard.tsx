@@ -280,6 +280,13 @@ function mapChatWireToLog(w: MeetingRoomChatLogWire): LogEntry {
   };
 }
 
+/** live 轮询会重建 logs 数组；用尾部指纹判断是否有新消息，避免无变化时反复滚到底。 */
+function getLogsTailKey(logs: LogEntry[]): string {
+  if (!logs.length) return '';
+  const last = logs[logs.length - 1];
+  return `${logs.length}:${last.id}:${last.timestamp}:${last.text.length}`;
+}
+
 function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
   const timeStr = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const chatLogs = (item.chat_logs || []).map(mapChatWireToLog);
@@ -820,6 +827,13 @@ const InterventionDialog = ({
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const lastLogKeyRef = useRef('');
+
+  const scrollLogsToBottom = useCallback(() => {
+    setTimeout(() => {
+      logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, 100);
+  }, []);
 
   useEffect(() => {
     if (open && room) {
@@ -828,12 +842,24 @@ const InterventionDialog = ({
   }, [open, room?.id]);
 
   useEffect(() => {
-    if (open) {
-      setTimeout(() => {
-        logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-      }, 100);
+    if (!open || !room) return;
+    lastLogKeyRef.current = getLogsTailKey(room.logs);
+    scrollLogsToBottom();
+  }, [open, room?.id, scrollLogsToBottom]);
+
+  useEffect(() => {
+    if (!open || !room) return;
+    const key = getLogsTailKey(room.logs);
+    if (key === lastLogKeyRef.current) return;
+    lastLogKeyRef.current = key;
+    scrollLogsToBottom();
+  }, [open, room?.logs, scrollLogsToBottom]);
+
+  useEffect(() => {
+    if (open && isTyping) {
+      scrollLogsToBottom();
     }
-  }, [open, room?.logs, isTyping]);
+  }, [open, isTyping, scrollLogsToBottom]);
 
   if (!room) return null;
 

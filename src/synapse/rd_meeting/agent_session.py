@@ -1,0 +1,47 @@
+"""研发会议室 host Agent 会话绑定（委派工具需要 Session 对象）。"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from synapse.sessions.session import Session, SessionContext, SessionState
+
+
+def host_session_id(room_id: str) -> str:
+    return f"rd_meeting:{(room_id or '').strip()}:host"
+
+
+def ensure_host_session(room_id: str, host_profile_id: str) -> Session:
+    """构造与 agent pool key 一致的 host Session（内存对象，供委派链路使用）。"""
+    sid = host_session_id(room_id)
+    ctx = SessionContext(agent_profile_id=(host_profile_id or "default").strip() or "default")
+    return Session(
+        id=sid,
+        channel="rd_meeting",
+        chat_id=(room_id or "").strip(),
+        user_id="meeting_room",
+        state=SessionState.ACTIVE,
+        context=ctx,
+        metadata={"room_id": room_id, "role": "host"},
+    )
+
+
+def bind_meeting_agent_session(agent: Any, session: Session) -> None:
+    """在执行 host 任务前绑定会话，使 delegate_* / submit_meeting_work_plan 可用。"""
+    agent._current_session = session
+    agent._current_session_id = session.id
+    if getattr(agent, "agent_state", None) is not None:
+        agent.agent_state.current_session = session
+    try:
+        from synapse.logging import get_session_log_buffer
+
+        get_session_log_buffer().set_current_session(session.id)
+    except Exception:
+        pass
+
+
+def clear_meeting_agent_session(agent: Any) -> None:
+    """任务结束后清理，避免池化 Agent 残留会话指针。"""
+    agent._current_session = None
+    if getattr(agent, "agent_state", None) is not None:
+        agent.agent_state.current_session = None

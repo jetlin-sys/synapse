@@ -39,6 +39,16 @@ STEP_RUN_NODE_SCHEDULE_SUMMARY = (
     "已提交当前 SOP 节点后台执行，主控将开始推理并按计划委派协作智能体。"
 )
 
+STEP_HOST_FIRST_CALL_SUMMARY = (
+    "【步骤 4/4】主控首次调用\n\n"
+    "小鲸开始执行本 SOP 节点：使用已组装的会议室提示词进行推理，并按 SKILL 提交工作安排与委派协作智能体。"
+)
+
+STEP_HOST_FIRST_CALL_REUSED_SUMMARY = (
+    "【步骤 4/4】主控首次调用\n\n"
+    "小鲸开始执行本 SOP 节点：复用步骤 3 已组装的会议室提示词（未重新渲染 SKILL）。"
+)
+
 
 def format_room_opened_chat() -> str:
     """步骤 1：开启会议室（流程说明）。"""
@@ -68,6 +78,11 @@ def format_run_node_scheduled_chat() -> str:
     return STEP_RUN_NODE_SCHEDULE_SUMMARY
 
 
+def format_host_first_call_chat(*, reused_prompt: bool = False) -> str:
+    """步骤 4：主控首次 LLM 调用（流程说明）。"""
+    return STEP_HOST_FIRST_CALL_REUSED_SUMMARY if reused_prompt else STEP_HOST_FIRST_CALL_SUMMARY
+
+
 def format_event_chat_display(event: dict[str, Any]) -> str:
     """将 history 事件转为协作会议流展示文案（优先 ``chat_text``）。"""
     explicit = str(event.get("chat_text") or "").strip()
@@ -87,6 +102,9 @@ def format_event_chat_display(event: dict[str, Any]) -> str:
         return str(event.get("text") or "").strip()
     if et == "run_node_scheduled":
         return format_run_node_scheduled_chat()
+    if et == "host_llm_begin":
+        reused = bool(event.get("reused_host_prompt_cache"))
+        return format_host_first_call_chat(reused_prompt=reused)
 
     text = str(event.get("text") or event.get("message") or "").strip()
     if text and not text.startswith("{"):

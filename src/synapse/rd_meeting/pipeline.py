@@ -13,12 +13,9 @@ from typing import Any, Callable, Literal
 
 from synapse.rd_meeting.bootstrap import append_host_prompt_chat, append_node_init_chat
 from synapse.rd_meeting.host_prompt import assemble_host_prompt_bundle, save_host_prompt_snapshot
+from synapse.rd_meeting.host_prompt_cache import save_host_prompt_cache
 from synapse.rd_meeting.binding import resolve_node_binding
-from synapse.rd_meeting.pipeline_chat import (
-    format_phase_change_chat,
-    format_room_opened_chat,
-    format_run_node_scheduled_chat,
-)
+from synapse.rd_meeting.pipeline_chat import format_phase_change_chat, format_room_opened_chat
 from synapse.rd_meeting.dev_status import (
     ensure_room_id,
     load_dev_status,
@@ -100,8 +97,8 @@ FLOW_STEP_LABEL: dict[str, str] = {
     STEP_OPEN_MEETING: "开启会议室",
     STEP_NODE_INIT: "节点初始化",
     STEP_ASSEMBLE_HOST_PROMPT: "主控提示词组装",
-    STEP_RUN_NODE_SCHEDULE: "调度节点执行",
-    STEP_RUN_NODE: "执行当前节点",
+    STEP_RUN_NODE_SCHEDULE: "主控首次调用调度",
+    STEP_RUN_NODE: "主控首次调用执行中",
     STEP_WAITING: "流程待机",
     STEP_DONE: "流程结束",
 }
@@ -540,6 +537,7 @@ def _step_assemble_host_prompt(pipe: MeetingPipeline, ctx: PipelineRunContext) -
         ticket_title=ticket_title,
     )
     snapshot_path = save_host_prompt_snapshot(sid, bundle)
+    save_host_prompt_cache(sid, bundle)
     append_host_prompt_chat(
         sid,
         room_id=room_id,
@@ -547,6 +545,7 @@ def _step_assemble_host_prompt(pipe: MeetingPipeline, ctx: PipelineRunContext) -
         node_id=run_node,
         binding=run_binding,
         ticket_title=ticket_title,
+        bundle=bundle,
     )
 
     pctx = pipe._data.get("context")
@@ -577,24 +576,6 @@ def _step_run_node_schedule(pipe: MeetingPipeline, ctx: PipelineRunContext) -> N
 
     sid = ctx.scope_id
     room_id = pipe.room_id
-    host_id = _host_profile_id_for_scope(
-        sid,
-        node_id=pipe.current_node_id,
-        scope_type=ctx.scope_type,
-    )
-    append_history_event(
-        sid,
-        {
-            "event": "run_node_scheduled",
-            "room_id": room_id,
-            "scope_type": ctx.scope_type,
-            "current_node_id": pipe.current_node_id,
-            "trigger": "pipeline_run_node_schedule",
-            "chat_text": format_run_node_scheduled_chat(),
-            "log_type": "info",
-            "agent_id": host_id,
-        },
-    )
     schedule_run_node(
         scope_type=ctx.scope_type,
         scope_id=sid,
@@ -608,6 +589,16 @@ def _step_run_node_schedule(pipe: MeetingPipeline, ctx: PipelineRunContext) -> N
     pipe.set_flow_step(STEP_RUN_NODE, reason="已调度 run_node")
     ctx.auto_run_started = True
     ctx.detail["auto_run_started"] = True
+
+
+def mark_pipeline_host_run_started(scope_id: str, *, reason: str = "用户触发主控首次调用") -> None:
+    """第四步入口：更新 meeting_pipeline.flow_step（执行仍由 orchestrator 完成）。"""
+    pipe = MeetingPipeline.load(scope_id)
+    if pipe is None:
+        return
+    pipe.set_flow_step(STEP_RUN_NODE_SCHEDULE, reason=reason)
+    pipe.set_phase("running", sync_room_state=True)
+    pipe.save()
 
 
 # 流程标识 → 执行函数（主流程登记表，新增步骤在此挂载）

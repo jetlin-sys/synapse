@@ -317,12 +317,16 @@ def create_app(
         path = request.url.path
         if not path.startswith("/api"):
             return await call_next(request)
-        # 健康检查 / 聊天占用轮询频繁，不打访问日志
+        # 健康检查 / 聊天占用 / 会议室 live 轮询频繁，不打访问日志
         if (
             path == "/api/health"
             or path.startswith("/api/health/")
             or path == "/api/chat/busy"
             or path == "/api/logs/service"
+            or (
+                path.startswith("/api/dev/meeting-rooms/")
+                and path.endswith("/live")
+            )
         ):
             return await call_next(request)
         access_logger.info("收到请求 %s %s", request.method, path)

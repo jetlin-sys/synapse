@@ -134,6 +134,9 @@ class MeetingRoomService:
         if is_room_run_in_progress(room_id):
             return {**ctx, "run_status": "already_running"}
 
+        from synapse.rd_meeting.pipeline import mark_pipeline_host_run_started
+
+        mark_pipeline_host_run_started(ctx["scope_id"])
         schedule_run_node(
             scope_type=ctx["scope_type"],
             scope_id=ctx["scope_id"],
