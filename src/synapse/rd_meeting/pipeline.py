@@ -19,7 +19,7 @@ from synapse.rd_meeting.dev_status import (
     load_or_create_dev_status,
     save_dev_status,
 )
-from synapse.rd_meeting.flow_log import format_flow_log
+from synapse.rd_meeting.flow_log import format_flow_log_json
 from synapse.rd_meeting.participants import build_meeting_participants
 from synapse.rd_meeting.paths import meeting_pipeline_path, scope_dir
 from synapse.rd_meeting.room_runtime import (
@@ -214,20 +214,22 @@ class MeetingPipeline:
             )
 
     def _log_flow_transition(self, from_step: str, to_step: str, reason: str) -> None:
-        body = (
-            f"flow_step: {from_step}({FLOW_STEP_LABEL.get(from_step, from_step)})"
-            f" → {to_step}({FLOW_STEP_LABEL.get(to_step, to_step)})"
-        )
-        if reason:
-            body += f"；{reason}"
+        payload = {
+            "from_step": from_step,
+            "from_step_label": FLOW_STEP_LABEL.get(from_step, from_step),
+            "to_step": to_step,
+            "to_step_label": FLOW_STEP_LABEL.get(to_step, to_step),
+            "reason": reason or "",
+        }
         append_history_event(
             self.scope_id,
             {
                 "event": "pipeline_transition",
                 "room_id": self.room_id,
-                "text": format_flow_log("流程迁移", body),
+                "payload": payload,
                 "from_step": from_step,
                 "to_step": to_step,
+                "reason": reason,
                 "log_type": "info",
                 "agent_id": "system",
                 "flow_stage": "流程迁移",
@@ -382,6 +384,16 @@ def _step_open_meeting(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
             local_process_state=local,
         )
 
+    room_payload = {
+        "room_id": room_id,
+        "scope_type": scope_type,
+        "scope_id": sid,
+        "stage_id": data.get("stage_id"),
+        "current_node_id": data.get("current_node_id"),
+        "sop_display": sop_display,
+        "local_process_state": local,
+        "userwork_synced": userwork_synced,
+    }
     append_history_event(
         sid,
         {
@@ -391,11 +403,10 @@ def _step_open_meeting(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
             "scope_id": sid,
             "stage_id": data.get("stage_id"),
             "current_node_id": data.get("current_node_id"),
-            "text": (
-                f"已开启会议室；当前节点={sop_display}（{node_id}），"
-                f"local_process_state={local}；"
-                f"userwork 回写={'成功' if userwork_synced else '未更新或跳过'}"
-            ),
+            "payload": room_payload,
+            "sop_display": sop_display,
+            "local_process_state": local,
+            "userwork_synced": userwork_synced,
             "flow_stage": "开启会议室",
             "log_type": "info",
             "agent_id": "system",

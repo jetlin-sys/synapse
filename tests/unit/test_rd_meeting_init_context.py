@@ -1,4 +1,4 @@
-"""会议室节点初始化上下文日志。"""
+"""会议室节点初始化上下文日志（JSON）。"""
 
 from __future__ import annotations
 
@@ -7,15 +7,28 @@ import json
 import pytest
 
 from synapse.rd_meeting.bootstrap import build_node_init_message
-from synapse.rd_meeting.init_context import format_node_init_log
-from synapse.rd_meeting.room_runtime import append_history_event
+from synapse.rd_meeting.flow_log import is_flow_log_json
+from synapse.rd_meeting.init_context import collect_meeting_init_sections, format_node_init_log
 
 
-def test_format_node_init_log_sections():
+def test_format_node_init_log_is_json():
     text = format_node_init_log("demand", "21881451", node_id="req_clarify")
-    assert "【工单信息】" in text
-    assert "【产品信息】" in text
-    assert "【系统信息】" in text
+    assert is_flow_log_json(text)
+    obj = json.loads(text)
+    assert obj["flow_stage"] == "节点初始化"
+    assert obj["event"] == "node_init"
+    data = obj["data"]
+    assert "order" in data
+    assert "product" in data
+    assert "system" in data
+
+
+def test_collect_meeting_init_sections_structure():
+    sec = collect_meeting_init_sections("demand", "x", node_id="req_clarify")
+    assert sec["node"]["node_id"] == "req_clarify"
+    assert "id" in sec["order"]
+    assert "repos" in sec["product"]
+    assert "synapse_url" in sec["system"]
 
 
 def test_open_meeting_step1_userwork_and_init_log(monkeypatch, tmp_path):
@@ -49,19 +62,13 @@ def test_open_meeting_step1_userwork_and_init_log(monkeypatch, tmp_path):
     work = tmp_path / "work" / scope_id
     work.mkdir(parents=True)
 
-    monkeypatch.setattr(
-        "synapse.rd_meeting.userwork_sync._owner_order_file_name",
-        lambda: uw_path,
-    )
-    monkeypatch.setattr(
-        "synapse.rd_meeting.userwork_sync._owner_order_file_lock_path",
-        lambda: tmp_path / "userwork.lock",
-    )
-
-    def _work_root():
-        return tmp_path / "work"
-
-    monkeypatch.setattr("synapse.rd_meeting.paths.work_root", _work_root)
+    for mod in (
+        "synapse.api.routes.dev_iwhalecloud",
+        "synapse.rd_meeting.userwork_sync",
+    ):
+        monkeypatch.setattr(f"{mod}._owner_order_file_name", lambda: uw_path)
+        monkeypatch.setattr(f"{mod}._owner_order_file_lock_path", lambda: tmp_path / "userwork.lock")
+    monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
     hist = work / "room_history.jsonl"
     monkeypatch.setattr(
         "synapse.rd_meeting.room_runtime.room_history_path",
@@ -81,9 +88,16 @@ def test_open_meeting_step1_userwork_and_init_log(monkeypatch, tmp_path):
     events = [h["event"] for h in hist_lines]
     assert "room_opened" in events
     assert "node_init" in events
+
+    opened = next(h for h in hist_lines if h["event"] == "room_opened")
+    assert is_flow_log_json(opened["text"])
+    opened_data = json.loads(opened["text"])["data"]
+    assert opened_data["userwork_synced"] is True
+
     init_row = next(h for h in hist_lines if h["event"] == "node_init")
-    assert "【工单信息】" in init_row["text"]
-    assert "【产品信息】" in init_row["text"]
-    assert "【系统信息】" in init_row["text"]
+    assert is_flow_log_json(init_row["text"])
+    init_data = json.loads(init_row["text"])["data"]
+    assert init_data["order"]["id"] == scope_id
+    assert init_data["order"]["title"] == "标题A"
     assert "小鲸" not in init_row["text"]
-    assert "21881451" in init_row["text"] or scope_id in init_row["text"]
+    assert isinstance(init_row.get("payload"), dict)

@@ -1,10 +1,12 @@
-"""研发会议室流程日志：统一 ``会议室流程日志 -- 阶段 -- 内容`` 格式。"""
+"""研发会议室流程日志：``text`` 字段统一为可解析 JSON（便于排查）。"""
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 FLOW_LOG_PREFIX = "会议室流程日志"
+FLOW_LOG_JSON_VERSION = "1.0"
 
 # event → 流程阶段（UI / room_history 展示用）
 EVENT_FLOW_STAGE: dict[str, str] = {
@@ -36,7 +38,6 @@ EVENT_FLOW_STAGE: dict[str, str] = {
     "chat_message": "对话",
 }
 
-# 写入 room_history 且需在右侧协作流展示的事件
 CHAT_VISIBLE_EVENTS = frozenset(
     {
         "chat_message",
@@ -69,14 +70,40 @@ CHAT_VISIBLE_EVENTS = frozenset(
 
 
 def format_flow_log(stage: str, content: str) -> str:
-    """``会议室流程日志 -- {阶段} -- {内容}``"""
-    stage_txt = (stage or "流程").strip()
-    body = (content or "").strip() or "（无详情）"
-    return f"{FLOW_LOG_PREFIX} -- {stage_txt} -- {body}"
+    """兼容旧调用：包装为 JSON ``text``。"""
+    return format_flow_log_json(stage, {"message": (content or "").strip() or "（无详情）"})
+
+
+def format_flow_log_json(
+    stage: str,
+    data: dict[str, Any],
+    *,
+    event: str = "",
+) -> str:
+    """生成写入 history ``text`` 的 JSON 字符串。"""
+    envelope = {
+        "log": FLOW_LOG_PREFIX,
+        "version": FLOW_LOG_JSON_VERSION,
+        "flow_stage": (stage or "流程").strip(),
+        "event": (event or "").strip(),
+        "data": data,
+    }
+    return json.dumps(envelope, ensure_ascii=False, indent=2, default=str)
 
 
 def is_flow_log_formatted(text: str) -> bool:
     return str(text or "").strip().startswith(FLOW_LOG_PREFIX)
+
+
+def is_flow_log_json(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw.startswith("{"):
+        return False
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(obj, dict) and obj.get("log") == FLOW_LOG_PREFIX
 
 
 def resolve_flow_stage(event: dict[str, Any]) -> str:
@@ -87,102 +114,87 @@ def resolve_flow_stage(event: dict[str, Any]) -> str:
     return EVENT_FLOW_STAGE.get(et, et or "流程")
 
 
-def build_event_body(event: dict[str, Any]) -> str:
-    """为缺少 text/message 的事件合成可读正文（格式化前）。"""
+def _event_meta_fields(event: dict[str, Any]) -> dict[str, Any]:
+    """从事件行提取适合放入 JSON 的元字段（排除 text/payload 等大字段）。"""
+    skip = frozenset({"text", "message", "payload", "ts", "flow_stage"})
+    out: dict[str, Any] = {}
+    for key, val in event.items():
+        if key in skip:
+            continue
+        if isinstance(val, (str, int, float, bool)) or val is None:
+            out[key] = val
+        elif isinstance(val, (list, dict)):
+            out[key] = val
+    return out
+
+
+def build_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    """为缺少 payload 的事件合成结构化 data。"""
     et = str(event.get("event") or "")
     text = str(event.get("text") or event.get("message") or "").strip()
-    if text and not is_flow_log_formatted(text):
-        return text
+    meta = _event_meta_fields(event)
 
     if et == "room_opened":
-        return (
-            f"room_id={event.get('room_id')} "
-            f"scope={event.get('scope_type')}/{event.get('scope_id')} "
-            f"node={event.get('current_node_id')} stage={event.get('stage_id')}"
-        )
-    if et == "run_node_scheduled":
-        return f"已调度后台执行当前节点 room={event.get('room_id')}"
-    if et == "run_node_begin":
-        return f"开始执行节点 {event.get('node_id')} room={event.get('room_id')}"
-    if et == "prewarm_workers":
-        workers = event.get("worker_profile_ids") or []
-        return f"预热协作智能体：{', '.join(str(w) for w in workers) or '（无）'}"
-    if et == "host_llm_begin":
-        return f"主控 {event.get('host_profile_id')} 开始处理议程 node={event.get('node_id')}"
-    if et == "host_llm_end":
-        preview = str(event.get("report_preview") or "")[:200].replace("\n", " ")
-        ok = event.get("success", True)
-        return f"主控结束 success={ok}" + (f" · {preview}" if preview else "")
-    if et == "node_completed":
-        nxt = event.get("next_node_id")
-        return (
-            f"节点 {event.get('node_id')} 已完成"
-            f" tokens={event.get('tokens_used')} duration={event.get('duration_seconds')}s"
-            f" 下一节点={nxt or '（流水线结束）'}"
-        )
-    if et == "node_skipped":
-        return f"节点 {event.get('node_id')} 已跳过（配置关闭）"
-    if et == "node_failed":
-        return str(event.get("error") or event.get("message") or "执行失败")
-    if et == "node_validation_failed":
-        errs = event.get("errors") or []
-        if isinstance(errs, list):
-            return "; ".join(str(e) for e in errs)
-        return str(errs)
-    if et == "node_pending_confirm":
-        dyn = "动态问卷" if event.get("dynamic_form") else "默认确认表单"
-        return (
-            f"节点 {event.get('node_id')} 等待结果确认（{dyn}）"
-            f" tokens={event.get('tokens_used')}"
-        )
-    if et == "hitl_approved":
-        c = str(event.get("comment") or "").strip()
-        return f"用户确认通过 node={event.get('node_id')}" + (f" · {c}" if c else "")
-    if et == "hitl_rejected":
-        c = str(event.get("comment") or "").strip()
-        return f"用户要求返工 node={event.get('node_id')}" + (f" · {c}" if c else "")
-    if et == "hitl_dynamic":
-        return str(event.get("detail") or "检测到动态 HITL 问卷")
+        return {
+            **meta,
+            "room_id": event.get("room_id"),
+            "scope_type": event.get("scope_type"),
+            "scope_id": event.get("scope_id"),
+            "current_node_id": event.get("current_node_id"),
+            "stage_id": event.get("stage_id"),
+            "userwork_synced": event.get("userwork_synced"),
+            "sop_display": event.get("sop_display"),
+            "local_process_state": event.get("local_process_state"),
+        }
+    if et == "pipeline_transition":
+        return {
+            **meta,
+            "from_step": event.get("from_step"),
+            "to_step": event.get("to_step"),
+            "reason": event.get("reason"),
+        }
+    if et == "node_init":
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            return payload
+        return meta
     if et == "human_intervene":
-        mt = event.get("message_type") or "instruction"
-        raw = str(event.get("text") or "").strip()
-        if raw and not is_flow_log_formatted(raw):
-            return f"[{mt}] {raw[:500]}"
-        return f"用户消息 type={mt}"
-    if et == "phase_change":
-        return f"phase: {event.get('from_phase')} → {event.get('to_phase')}"
-    if et == "delegation_started":
-        to_a = event.get("to_agent") or ""
-        reason = event.get("reason") or ""
-        preview = event.get("task_preview") or ""
-        parts = [f"→ {to_a}"]
-        if reason:
-            parts.append(f"原因={reason}")
-        if preview:
-            parts.append(f"任务={preview}")
-        return " ".join(parts)
-    if et == "delegation_finished":
-        return str(event.get("text") or event.get("summary") or "").strip() or (
-            f"协作 {event.get('to_agent')} status={event.get('status')}"
-        )
-    return text
+        return {
+            **meta,
+            "message_type": event.get("message_type"),
+            "content": text if text and not is_flow_log_json(text) else "",
+        }
+    if et == "delegation_finished" and text and not is_flow_log_json(text):
+        return {**meta, "summary": text}
+    if text and not is_flow_log_formatted(text) and not is_flow_log_json(text):
+        return {**meta, "message": text}
+    return meta
+
+
+def build_event_body(event: dict[str, Any]) -> str:
+    """兼容：由 payload 生成单行摘要（内部很少直接使用）。"""
+    payload = build_event_payload(event)
+    return json.dumps(payload, ensure_ascii=False, default=str)[:500]
 
 
 def apply_flow_log_format(event: dict[str, Any]) -> dict[str, Any]:
-    """为 history 事件写入统一流程日志文案（就地修改并返回）。"""
+    """为 history 事件写入 JSON 格式 ``text``，并保留 ``payload`` 副本。"""
     row = dict(event)
     existing = str(row.get("text") or row.get("message") or "").strip()
-    if is_flow_log_formatted(existing):
+    if is_flow_log_json(existing):
         row.setdefault("flow_stage", resolve_flow_stage(row))
+        if not isinstance(row.get("payload"), dict):
+            try:
+                row["payload"] = json.loads(existing).get("data")
+            except json.JSONDecodeError:
+                pass
         return row
+
     stage = resolve_flow_stage(row)
-    body = build_event_body(row)
-    formatted = format_flow_log(stage, body)
-    if row.get("text") is not None or "text" in row:
-        row["text"] = formatted
-    elif row.get("message") is not None or "message" in row:
-        row["message"] = formatted
-    else:
-        row["text"] = formatted
+    et = str(row.get("event") or "")
+    payload = row.get("payload")
+    data = payload if isinstance(payload, dict) else build_event_payload(row)
+    row["payload"] = data
+    row["text"] = format_flow_log_json(stage, data, event=et)
     row["flow_stage"] = stage
     return row
