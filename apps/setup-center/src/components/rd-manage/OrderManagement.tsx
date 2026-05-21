@@ -1068,6 +1068,7 @@ export const OrderManagement: React.FC<{
       try {
         const detail = await openMeetingRoom(synapseApiBase, scopeType, scopeId, {
           promoteToProcessing: true,
+          autoRunFirstNode: true,
         });
         setMeetingRoomFocus({
           roomId: detail.room_id,

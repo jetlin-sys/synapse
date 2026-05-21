@@ -37,6 +37,10 @@ from synapse.rd_meeting.room_runtime import (
     sync_room_state_from_dev,
 )
 from synapse.rd_meeting.room_skill import meeting_skill_preview
+from synapse.rd_meeting.user_context import (
+    append_user_context_pending,
+    is_hitl_form_submission,
+)
 from synapse.rd_meeting.userwork_sync import build_title_index, patch_userwork_summary
 from synapse.rd_sop.manifest import list_manifest_stages
 from synapse.rd_sop.nodes import (
@@ -288,7 +292,7 @@ class MeetingRoomService:
         *,
         sync_userwork: bool = True,
         promote_to_processing: bool = True,
-        auto_run_first_node: bool = False,
+        auto_run_first_node: bool = True,
     ) -> dict[str, Any]:
         sid = (scope_id or "").strip()
         if not sid:
@@ -409,17 +413,21 @@ class MeetingRoomService:
         ticket_title = str(detail.get("ticket_title") or "")
 
         room_state = load_room_state(scope_id)
+        append_user_context_pending(scope_id, text)
+
         pending = (
             room_state.get("pending_delivery")
             if isinstance(room_state, dict)
             else None
         )
-        if (
+        is_result_confirm_gate = (
             isinstance(pending, dict)
             and pending.get("report_body")
             and pending.get("await_confirm", True)
             and message_type == "instruction"
-        ):
+            and is_hitl_form_submission(text)
+        )
+        if is_result_confirm_gate:
             approved, comment = self._parse_hitl_decision(text, resume_run=resume_run)
             orch = MeetingRoomOrchestrator()
             orch.confirm_node_delivery(
@@ -457,13 +465,24 @@ class MeetingRoomService:
             },
         )
 
-        if room_state and message_type == "instruction":
-            room_state = dict(room_state)
-            room_state["status"] = "processing"
-            save_room_state(scope_id, room_state)
+        effective_resume = resume_run
+        if message_type == "instruction":
+            rs = dict(room_state) if isinstance(room_state, dict) else {}
+            if is_hitl_form_submission(text) or str(rs.get("status") or "") == "human_intervention":
+                effective_resume = True
+                rs["status"] = "processing"
+                if not (
+                    isinstance(pending, dict)
+                    and pending.get("report_body")
+                    and pending.get("await_confirm", True)
+                ):
+                    rs.pop("hitl_form_schema", None)
+                save_room_state(scope_id, rs)
+        elif message_type == "chat":
+            effective_resume = False
 
         out = self.get_room_detail(rid) or detail
-        if resume_run and message_type == "instruction":
+        if effective_resume and message_type == "instruction":
             schedule_run_node(
                 scope_type=scope_type,  # type: ignore[arg-type]
                 scope_id=scope_id,

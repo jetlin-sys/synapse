@@ -213,6 +213,25 @@ async def test_human_confirm_defers_archive_until_approved(synapse_work_home):
     assert rs2["current_node_id"] == next_node_id("boundary")
 
 
+def test_user_context_pending_drain(synapse_work_home):
+    from synapse.rd_meeting.room_runtime import load_room_state, save_room_state
+    from synapse.rd_meeting.user_context import (
+        append_user_context_pending,
+        drain_user_context_for_prompt,
+    )
+
+    scope_id = "21883502"
+    save_room_state(scope_id, {"room_id": "mr_test", "status": "processing"})
+    append_user_context_pending(scope_id, "用户补充：边界要写明")
+    append_user_context_pending(scope_id, "[人工确认表单]\ndecision: approve")
+    block = drain_user_context_for_prompt(scope_id)
+    assert "用户补充" in block
+    assert "人工确认表单" in block
+    rs = load_room_state(scope_id)
+    assert rs is not None
+    assert not rs.get("user_context_pending")
+
+
 @pytest.mark.asyncio
 async def test_human_confirm_reject_triggers_rework(synapse_work_home, monkeypatch):
     from synapse.rd_meeting.dev_status import load_dev_status, save_dev_status

@@ -635,7 +635,7 @@ const InterventionDialog = ({
   room: MeetingRoom | null; 
   open: boolean; 
   onClose: () => void;
-  onIntervene: (text: string) => void;
+  onIntervene: (text: string, options?: { resumeRun?: boolean }) => void;
   onRunNode?: () => void;
   onApprovePass?: () => void;
   runNodeBusy?: boolean;
@@ -1002,7 +1002,7 @@ const InterventionDialog = ({
                     const summary = Object.entries(values)
                       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(',') : String(v)}`)
                       .join('\n');
-                    onIntervene(`[人工确认表单]\n${summary}`);
+                    onIntervene(`[人工确认表单]\n${summary}`, { resumeRun: true });
                   }}
                 />
               </div>
@@ -1173,12 +1173,17 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
       .finally(() => setApproveBusy(false));
   };
 
-  const handleIntervene = (text: string) => {
+  const handleIntervene = (text: string, options?: { resumeRun?: boolean }) => {
     if (!activeRoom) return;
     const base = (synapseApiBase || '').trim();
     if (!base) return;
 
-    void interveneMeetingRoom(base, activeRoom.id, text, 'instruction')
+    const messageType =
+      activeRoom.status === 'processing' && !options?.resumeRun ? 'chat' : 'instruction';
+
+    void interveneMeetingRoom(base, activeRoom.id, text, messageType, {
+      resumeRun: options?.resumeRun ?? messageType === 'instruction',
+    })
       .then((detail) => {
         const updatedRoom = mapDetailToRoom(detail);
         updatedRoom.brief = '人类专家已介入并下发指令，正在重新评估状态...';

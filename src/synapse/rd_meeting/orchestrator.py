@@ -34,6 +34,7 @@ from synapse.rd_meeting.room_skill import (
 )
 from synapse.rd_meeting.runtime_context import runtime_context_for_binding
 from synapse.rd_meeting.userwork_sync import patch_userwork_summary
+from synapse.rd_meeting.user_context import drain_user_context_for_prompt
 from synapse.rd_meeting.validation import validate_node_output
 from synapse.rd_sop.manifest import (
     next_node_id,
@@ -785,8 +786,21 @@ class MeetingRoomOrchestrator:
                     binding=binding,
                     ticket_title=ticket_title,
                 )
+                user_ctx = drain_user_context_for_prompt(sid)
+                if user_ctx:
+                    prompt = f"{prompt}\n\n{user_ctx}"
                 if rework:
                     prompt = f"{prompt}\n\n## 人工返工意见\n{rework}\n"
+                rs_cont = load_room_state(sid) or {}
+                pending_ctx = rs_cont.get("pending_delivery")
+                if (
+                    isinstance(pending_ctx, dict)
+                    and pending_ctx.get("report_body")
+                    and not pending_ctx.get("await_confirm", True)
+                ):
+                    body = str(pending_ctx.get("report_body") or "").strip()
+                    if body:
+                        prompt = f"{prompt}\n\n## 上一轮待续上下文\n{body}\n"
                 result = await host_agent.execute_task_from_message(
                     prompt,
                     usage_scene=f"rd_meeting_{sid}_{node_id}",
