@@ -261,6 +261,28 @@ def test_coerce_normalizes_option_value_from_id():
     assert all(isinstance(v, str) and v.strip() for v in values)
 
 
+def test_coerce_rejects_roadmap_in_summary():
+    summary = (
+        "## 待确认\n| Q1 | 备份 |\n\n### 下一步\n"
+        "确认后 → 方案设计（Phase 1：备份文件格式）"
+    )
+    with pytest.raises(ValueError) as excinfo:
+        coerce_questionnaire_schema(
+            kind="result_confirm",
+            questions=[{"id": "q1", "type": "single", "title": "Q1"}],
+            summary=summary,
+        )
+    assert "summary" in str(excinfo.value).lower() or "路线图" in str(excinfo.value)
+
+
+def test_coerce_allows_clean_summary():
+    coerce_questionnaire_schema(
+        kind="result_confirm",
+        questions=[{"id": "q1", "type": "single", "title": "Q1 备份方式"}],
+        summary="## 本节点待确认\n- Q1 备份方式：推荐全量（✅）\n",
+    )
+
+
 def test_coerce_granularity_can_be_disabled():
     """允许测试 / 系统场景跳过校验。"""
     summary = "10 个待确认项："

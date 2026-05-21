@@ -14,6 +14,8 @@ Schema 定义与 Python 工具见：`src/synapse/rd_meeting/hitl_form.py`（`bui
 
 > **题目颗粒度（强约束）**：**每个独立可决策点对应一道独立题**，禁止把 N 个决策点合并成一道「整体确认 / 部分修改 / 拒绝」单选。如果交付物里列了 14 个 P0 待澄清问题，`questions[]` **就必须有 14 道（或更多）题**，每道题把「默认结论」作为推荐选项之一（标 ✅ 推荐）。即使你已经给出推荐值，仍要让用户对每个决策点单独表态——这是会议室人工确认的核心价值。
 
+> **`summary`（若通过 `submit_hitl_questionnaire` 提交）**：只写本节点待确认简表，**不要**写「### 下一步」、SOP 后续节点名、Worker 文档里的 Phase 路线图；细则见 `whalecloud-dev-tool-meeting-room` SKILL §4.5.2。
+
 ---
 
 ## 何时使用

@@ -1076,7 +1076,9 @@ class MeetingRoomOrchestrator:
                         "- 禁止把多个决策点合并成一道「整体确认 / 部分修改 / 拒绝」单选；\n"
                         "- 交付文档中列出的每个 P0 问题 / 待澄清项都要单独成题，"
                         "把「可默认结论」放进选项里（可标 ✅ 推荐）；\n"
-                        "- 即使有 14 题也要全部列出，前端会用 stepped 布局分步引导。"
+                        "- 即使有 14 题也要全部列出，前端会用 stepped 布局分步引导。\n"
+                        "- ``summary`` 只写与 questions 对齐的待确认简表；"
+                        "禁止 ``### 下一步``、确认后进入某阶段、Phase 1~N、SOP 下一节点预告。"
                     )
                     retry_result = await _run_host(retry_prompt)
                     retry_questionnaire = consume_pending_questionnaire(sid)

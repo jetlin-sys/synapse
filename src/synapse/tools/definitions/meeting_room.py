@@ -21,7 +21,8 @@ MEETING_ROOM_TOOLS = [
             "- ``kind``：``interactive``（会中澄清）/ ``result_confirm``（节点终稿确认）/ ``exception``（异常裁决）\n"
             "- ``await_confirm``：true 表示提交后等待确认才推进；result_confirm 默认 true，其余默认 false\n"
             "- ``questions``：至少 1 条 questionnaire v1.0 题目；每题需含 id / type / title\n"
-            "- ``summary``：可选 Markdown，用于在表单上方展示给用户的待确认要点 / 异常原因\n\n"
+            "- ``summary``：可选 Markdown，表单上方「待确认总结」；**仅**列本节点待确认简表（与 questions 题号对齐），"
+            "**禁止**写 ``### 下一步``、SOP 下一节点预告、Worker 文档 Phase 1~N 路线图（见 meeting-room SKILL §4.5.2）\n\n"
             "**题目颗粒度（强约束）**：每个独立可决策点 = 一道独立题。\n"
             "- 禁止把 N 个决策点合并成一道「整体确认 / 部分修改 / 拒绝」单选；\n"
             "- 即使你已经给出推荐默认结论，**仍要**把每个决策点单独成题，把默认结论作为推荐选项；\n"
@@ -45,7 +46,10 @@ MEETING_ROOM_TOOLS = [
                 "description": {"type": "string", "description": "表单说明"},
                 "summary": {
                     "type": "string",
-                    "description": "可选；要在表单上方展示给用户的待确认 / 异常原因 Markdown",
+                    "description": (
+                        "可选；表单上方待确认总结。仅列本节点待确认要点简表（与 questions 编号一致）；"
+                        "禁止 ### 下一步、确认后进入某阶段、Phase 1~N 路线图、SOP 下一节点预告"
+                    ),
                 },
                 "questions": {
                     "type": "array",

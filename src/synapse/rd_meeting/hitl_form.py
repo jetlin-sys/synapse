@@ -241,6 +241,35 @@ _LIST_ITEM_PATTERNS = [
 ]
 
 
+# summary 禁止混入 SOP 预告 / Worker Phase 路线图（见 meeting-room SKILL §4.5.2）
+_SUMMARY_ROADMAP_CHECKS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?m)^\s*#{1,3}\s*下一步\s*$", re.IGNORECASE), "「### 下一步」章节"),
+    (re.compile(r"确认后\s*[→\-—>]", re.IGNORECASE), "「确认后 → …」式流程预告"),
+    (re.compile(r"Phase\s*[1-9]\d*", re.IGNORECASE), "Phase 1~N 实施路线图表述"),
+    (
+        re.compile(r"进入\s*.{0,16}?(方案设计|下一阶段|下一节点|下一\s*SOP)", re.IGNORECASE),
+        "「进入某某阶段/节点」式预告",
+    ),
+]
+
+
+def _validate_summary_no_roadmap(summary: str, *, kind: str) -> None:
+    """``summary`` 仅列本节点待确认要点，不得写路线图或 SOP 流程预告。"""
+    text = (summary or "").strip()
+    if not text or kind == "exception":
+        return
+    hits = [label for pat, label in _SUMMARY_ROADMAP_CHECKS if pat.search(text)]
+    if not hits:
+        return
+    raise ValueError(
+        "summary 待确认总结不得包含流程/路线图预告："
+        + "、".join(hits)
+        + "。请只保留与 questions 题号对齐的待确认简表，"
+        "勿写 ### 下一步、确认后进入某阶段、Phase 1~N 或 SOP 下一节点预告"
+        "（见 whalecloud-dev-tool-meeting-room SKILL §4.5.2）。"
+    )
+
+
 def _infer_expected_question_count(summary: str) -> int:
     """从 summary 推断「至少应有多少道题」。0 表示无法判定。"""
     text = (summary or "").strip()
@@ -350,8 +379,10 @@ def coerce_questionnaire_schema(
             "accent": accent_map[kind_norm],
             "animate": True,
         }
-    if summary.strip():
-        schema["summary_markdown"] = summary.strip()
+    summary_text = summary.strip()
+    if summary_text:
+        _validate_summary_no_roadmap(summary_text, kind=kind_norm)
+        schema["summary_markdown"] = summary_text
     schema["intervention_kind"] = kind_norm
 
     if enforce_granularity and kind_norm in ("result_confirm", "interactive"):
