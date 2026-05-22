@@ -5,7 +5,6 @@ import {
   Users,
   Bot,
   Cpu,
-  BookOpen,
   Crown,
   Layers,
   UserCheck,
@@ -403,10 +402,7 @@ export const MeetingRoomConfigDrawer: React.FC<{
 
   const patchRoomLevel = (
     patch: Partial<
-      Pick<
-        MeetingRoomConfigPayload,
-        'host_llm_endpoint_key' | 'worker_llm_endpoint_key' | 'meeting_skill_id'
-      >
+      Pick<MeetingRoomConfigPayload, 'host_llm_endpoint_key' | 'worker_llm_endpoint_key'>
     >,
   ) => {
     if (!config) return;
@@ -432,7 +428,6 @@ export const MeetingRoomConfigDrawer: React.FC<{
         version: config.version || '1',
         host_llm_endpoint_key: hostLlmEndpoint,
         worker_llm_endpoint_key: workerLlmEndpoint,
-        meeting_skill_id: config.meeting_skill_id,
         node_overrides: normalizeOverridesForSave(
           config.node_overrides || {},
           config.bindings,
@@ -1053,29 +1048,6 @@ export const MeetingRoomConfigDrawer: React.FC<{
                     <p className="text-[10px] text-muted-foreground mt-2">
                       所有协作智能体默认共用；单节点可在「协作智能体」下单独覆盖
                     </p>
-                  </div>
-
-                  <div>
-                    <label className="mb-2.5 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-foreground/80">
-                      <BookOpen className="w-3.5 h-3.5 text-amber-400" />
-                      会议室专属 SKILL
-                    </label>
-                    <ConfigFieldBox>
-                      <div className="text-xs">
-                        <span className="font-mono text-muted-foreground">
-                          {config?.meeting_skill_id ?? config?.meeting_skill?.skill_id ?? 'whalecloud-dev-tool-meeting-room'}
-                        </span>
-                        {config?.meeting_skill?.exists === false ? (
-                          <Tag className="ml-2 m-0 border-amber-500/40 bg-amber-500/10 text-amber-500 text-[10px]">
-                            未找到文件
-                          </Tag>
-                        ) : null}
-                      </div>
-                      <p className="text-[11px] leading-relaxed text-muted-foreground mt-2.5 mb-0">
-                        {config?.meeting_skill?.summary ??
-                          '参会智能体进入会议室后自动加载，统一协作规范与能力边界。'}
-                      </p>
-                    </ConfigFieldBox>
                   </div>
                 </div>
               </section>

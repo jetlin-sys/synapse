@@ -10,7 +10,7 @@ from synapse.rd_meeting.dynamic_prompt import build_dynamic_meeting_context, bui
 from synapse.rd_meeting.init_context import build_node_init_log_data
 from synapse.rd_meeting.paths import archive_root, scope_dir
 from synapse.rd_meeting.pipeline_chat import format_host_prompt_step_chat
-from synapse.rd_meeting.room_skill import build_room_skill_prompt, load_meeting_skill_body, make_context
+from synapse.rd_meeting.room_skill import build_room_skill_prompt, get_meeting_room_rules, make_context
 from synapse.rd_sop.nodes import node_display_name, stage_id_for_node_id
 
 ScopeType = Literal["demand", "task"]
@@ -48,7 +48,7 @@ def assemble_host_prompt_bundle(
         sop_node_display=sop_display,
     )
 
-    skill_body = load_meeting_skill_body(str(bind.get("meeting_skill_id") or ""))
+    skill_body = get_meeting_room_rules()
     ctx = make_context(
         role="host",
         binding=bind,
@@ -80,7 +80,6 @@ def assemble_host_prompt_bundle(
         "node_name": str(bind.get("node_name") or node_display_name(nid)),
         "host_profile_id": host_id,
         "worker_profile_ids": worker_ids,
-        "meeting_skill_id": str(bind.get("meeting_skill_id") or ""),
         "dynamic_context": dynamic_context,
         "meeting_prompt": meeting_prompt,
         "user_prompt": user_prompt,

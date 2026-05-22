@@ -39,9 +39,6 @@ class PutMeetingRoomConfigBody(BaseModel):
     worker_llm_endpoint_key: str | None = Field(
         None, description="协作智能体（Worker）统一 LLM 端点 key（会议室级）"
     )
-    meeting_skill_id: str | None = Field(
-        None, description="会议室专属 SKILL ID（host / worker 均加载）"
-    )
     node_overrides: dict[str, Any] | None = None
 
 

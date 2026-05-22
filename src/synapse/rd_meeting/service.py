@@ -13,7 +13,6 @@ from synapse.rd_meeting.agent_context_probe import (
 )
 from synapse.rd_meeting.binding import list_resolved_bindings, resolve_node_binding
 from synapse.rd_meeting.config_store import (
-    DEFAULT_MEETING_SKILL_ID,
     load_meeting_room_config,
     save_meeting_room_config,
 )
@@ -51,7 +50,6 @@ from synapse.rd_meeting.room_runtime import (
     save_room_state,
     sync_room_state_from_dev,
 )
-from synapse.rd_meeting.room_skill import meeting_skill_preview
 from synapse.rd_meeting.user_context import (
     append_user_context_pending,
     is_hitl_form_submission,
@@ -72,13 +70,11 @@ ScopeType = Literal["demand", "task"]
 class MeetingRoomService:
     def get_meeting_room_config(self) -> dict[str, Any]:
         cfg = load_meeting_room_config()
-        skill_id = str(cfg.get("meeting_skill_id") or DEFAULT_MEETING_SKILL_ID)
         return {
             **cfg,
             "manifest_version": "1.0.0",
             "stages": list_manifest_stages(),
             "bindings": list_resolved_bindings(),
-            "meeting_skill": meeting_skill_preview(skill_id),
         }
 
     def put_meeting_room_config(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -88,7 +84,6 @@ class MeetingRoomService:
         for key in (
             "host_llm_endpoint_key",
             "worker_llm_endpoint_key",
-            "meeting_skill_id",
         ):
             if key in body:
                 value = body.get(key)

@@ -141,28 +141,16 @@ export interface MeetingRoomNodeOverride {
   llm_endpoint_key?: string;
 }
 
-export interface MeetingRoomSkillPreview {
-  skill_id: string;
-  exists: boolean;
-  path?: string | null;
-  title?: string;
-  summary?: string;
-  length?: number;
-}
-
 export interface MeetingRoomConfigPayload {
   version: string;
   /** 小鲸（Host）专属 LLM 端点 key，会议室级 */
   host_llm_endpoint_key?: string;
   /** 协作智能体（Worker）统一 LLM 端点 key，会议室级 */
   worker_llm_endpoint_key?: string;
-  /** 会议室专属 SKILL ID（host / worker 进入会议室时都会加载） */
-  meeting_skill_id?: string;
   node_overrides: Record<string, MeetingRoomNodeOverride>;
   manifest_version?: string;
   stages?: { id: number; name: string; nodes: string[] }[];
   bindings?: MeetingRoomNodeBinding[];
-  meeting_skill?: MeetingRoomSkillPreview;
 }
 
 export interface MeetingRoomNodeBinding {
@@ -185,7 +173,6 @@ export interface MeetingRoomNodeBinding {
   llm_endpoint_key?: string;
   host_llm_endpoint_key?: string;
   worker_llm_endpoint_key?: string;
-  meeting_skill_id?: string;
   prompt_supplement?: string;
 }
 
@@ -438,11 +425,7 @@ export async function putMeetingRoomConfig(
   synapseApiBase: string,
   body: Pick<
     MeetingRoomConfigPayload,
-    | 'version'
-    | 'node_overrides'
-    | 'host_llm_endpoint_key'
-    | 'worker_llm_endpoint_key'
-    | 'meeting_skill_id'
+    'version' | 'node_overrides' | 'host_llm_endpoint_key' | 'worker_llm_endpoint_key'
   >,
 ): Promise<MeetingRoomConfigPayload> {
   const base = synapseApiBase.replace(/\/$/, '');

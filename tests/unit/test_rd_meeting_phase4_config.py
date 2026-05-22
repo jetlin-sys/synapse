@@ -11,7 +11,6 @@ from synapse.rd_meeting.binding import resolve_node_binding
 from synapse.rd_meeting.config_store import (
     CONFIG_VERSION,
     DEFAULT_LLM_ENDPOINT_KEY,
-    DEFAULT_MEETING_SKILL_ID,
     default_meeting_room_config,
     load_meeting_room_config,
     save_meeting_room_config,
@@ -35,7 +34,7 @@ def test_default_config_contains_v2_fields():
     assert cfg["version"] == CONFIG_VERSION
     assert cfg["host_llm_endpoint_key"] == DEFAULT_LLM_ENDPOINT_KEY
     assert cfg["worker_llm_endpoint_key"] == DEFAULT_LLM_ENDPOINT_KEY
-    assert cfg["meeting_skill_id"] == DEFAULT_MEETING_SKILL_ID
+    assert "meeting_skill_id" not in cfg, "meeting_skill_id 字段已彻底移除"
     assert cfg["node_overrides"] == {}
 
 
@@ -49,8 +48,29 @@ def test_load_v1_config_upgrades_to_v2(isolated_config_dir: Path):
     cfg = load_meeting_room_config()
     assert cfg["host_llm_endpoint_key"] == DEFAULT_LLM_ENDPOINT_KEY
     assert cfg["worker_llm_endpoint_key"] == DEFAULT_LLM_ENDPOINT_KEY
-    assert cfg["meeting_skill_id"] == DEFAULT_MEETING_SKILL_ID
+    assert "meeting_skill_id" not in cfg
     assert cfg["node_overrides"] == {"boundary": {"prompt_supplement": "x"}}
+
+
+def test_load_legacy_config_ignores_meeting_skill_id(isolated_config_dir: Path):
+    """磁盘上残留的 meeting_skill_id 字段应被静默忽略，不报错。"""
+    cfg_path = isolated_config_dir / "meeting_room_config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "version": "2",
+                "host_llm_endpoint_key": "host-a",
+                "worker_llm_endpoint_key": "worker-a",
+                "meeting_skill_id": "whalecloud-dev-tool-meeting-room",  # 老字段
+                "node_overrides": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_meeting_room_config()
+    assert cfg["host_llm_endpoint_key"] == "host-a"
+    assert cfg["worker_llm_endpoint_key"] == "worker-a"
+    assert "meeting_skill_id" not in cfg, "老字段应被剔除而非保留"
 
 
 def test_save_meeting_room_config_partial_write(isolated_config_dir: Path):
@@ -92,7 +112,7 @@ def test_resolve_binding_includes_room_level_endpoints(isolated_config_dir: Path
     assert binding["host_llm_endpoint_key"] == "host-strong"
     assert binding["worker_llm_endpoint_key"] == "worker-cheap"
     assert binding["llm_endpoint_key"] == "worker-cheap"
-    assert binding["meeting_skill_id"] == DEFAULT_MEETING_SKILL_ID
+    assert "meeting_skill_id" not in binding
 
 
 def test_node_override_only_changes_worker_endpoint(isolated_config_dir: Path):
@@ -126,10 +146,9 @@ def test_service_exposes_new_config_fields(isolated_config_dir: Path):
     cfg = svc.get_meeting_room_config()
     assert cfg["host_llm_endpoint_key"] == "host-strong"
     assert cfg["worker_llm_endpoint_key"] == "worker-cheap"
-    assert cfg["meeting_skill_id"] == DEFAULT_MEETING_SKILL_ID
-    assert "meeting_skill" in cfg
-    assert isinstance(cfg["meeting_skill"], dict)
-    assert "exists" in cfg["meeting_skill"]
+    assert "meeting_skill_id" not in cfg, "meeting_skill_id 已彻底移除"
+    assert "meeting_skill" not in cfg, "meeting_skill preview 已彻底移除"
+    assert "meeting_room_rules" not in cfg, "meeting_room_rules preview 也已移除（前端不展示）"
 
 
 def test_service_put_meeting_room_config_validates_types(isolated_config_dir: Path):

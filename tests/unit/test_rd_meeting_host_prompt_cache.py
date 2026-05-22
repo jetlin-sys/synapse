@@ -24,7 +24,6 @@ def host_binding() -> dict:
         "stage_id": 1,
         "host_profile_id": "default",
         "worker_profile_ids": [],
-        "meeting_skill_id": "whalecloud-dev-tool-meeting-room",
         "host_llm_endpoint_key": "default",
         "worker_llm_endpoint_key": "default",
     }

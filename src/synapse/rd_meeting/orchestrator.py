@@ -51,7 +51,7 @@ from synapse.rd_meeting.room_runtime import (
 from synapse.rd_meeting.room_skill import (
     DEFAULT_LLM_ENDPOINT_KEY,
     build_room_skill_prompt,
-    load_meeting_skill_body,
+    get_meeting_room_rules,
     make_context,
 )
 from synapse.rd_meeting.user_context import drain_user_context_for_prompt
@@ -174,9 +174,7 @@ class MeetingRoomOrchestrator:
         ]
         if not worker_ids:
             return
-        skill_body = load_meeting_skill_body(
-            str(binding.get("meeting_skill_id") or "whalecloud-dev-tool-meeting-room")
-        )
+        skill_body = get_meeting_room_rules()
         for wid in worker_ids:
             profile = _resolve_profile(wid)
             if profile is None:

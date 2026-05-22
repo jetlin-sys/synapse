@@ -6,7 +6,6 @@ from typing import Any
 
 from synapse.rd_meeting.config_store import (
     DEFAULT_LLM_ENDPOINT_KEY,
-    DEFAULT_MEETING_SKILL_ID,
     load_meeting_room_config,
 )
 from synapse.rd_meeting.hitl_form import resolve_hitl_form_schema
@@ -83,9 +82,6 @@ def resolve_node_binding(
     worker_llm_endpoint = str(
         cfg.get("worker_llm_endpoint_key") or DEFAULT_LLM_ENDPOINT_KEY
     ).strip() or DEFAULT_LLM_ENDPOINT_KEY
-    meeting_skill_id = str(
-        cfg.get("meeting_skill_id") or DEFAULT_MEETING_SKILL_ID
-    ).strip() or DEFAULT_MEETING_SKILL_ID
 
     overrides = cfg.get("node_overrides")
     override = overrides.get(node_id) if isinstance(overrides, dict) else {}
@@ -122,7 +118,6 @@ def resolve_node_binding(
             "llm_endpoint_key": worker_llm_endpoint,
             "host_llm_endpoint_key": host_llm_endpoint,
             "worker_llm_endpoint_key": worker_llm_endpoint,
-            "meeting_skill_id": meeting_skill_id,
             "prompt_supplement": "",
         }
 
@@ -159,7 +154,6 @@ def resolve_node_binding(
         "default_node_intent": default_node_intent,
         "host_llm_endpoint_key": host_llm_endpoint,
         "worker_llm_endpoint_key": node_worker_endpoint,
-        "meeting_skill_id": meeting_skill_id,
         **merged,
     }
 

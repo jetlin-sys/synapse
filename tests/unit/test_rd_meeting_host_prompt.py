@@ -26,7 +26,6 @@ def host_binding() -> dict:
         "worker_profile_ids": ["whalecloud-requirement-expert"],
         "host_llm_endpoint_key": "reasoning-heavy",
         "worker_llm_endpoint_key": "worker-default",
-        "meeting_skill_id": "whalecloud-dev-tool-meeting-room",
         "prompt_supplement": "",
     }
 

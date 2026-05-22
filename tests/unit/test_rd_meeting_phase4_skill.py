@@ -1,16 +1,14 @@
-"""Phase 4：会议室专属 SKILL 加载、角色裁剪、能力卡片渲染。"""
+"""Phase 4：会议室通用规范装配、角色裁剪、能力卡片渲染。"""
 
 from __future__ import annotations
 
 import pytest
 
 from synapse.rd_meeting.room_skill import (
-    DEFAULT_MEETING_SKILL_ID,
     build_capability_cards,
     build_room_skill_prompt,
-    load_meeting_skill_body,
+    get_meeting_room_rules,
     make_context,
-    meeting_skill_preview,
     trim_skill_for_role,
 )
 
@@ -33,14 +31,13 @@ def host_binding() -> dict:
         "llm_endpoint_key": "worker-default",
         "host_llm_endpoint_key": "reasoning-heavy",
         "worker_llm_endpoint_key": "worker-default",
-        "meeting_skill_id": DEFAULT_MEETING_SKILL_ID,
         "prompt_supplement": "本产品为账务中心，优先复用存量限流方案。",
     }
 
 
-def test_meeting_skill_is_builtin_no_external_file():
-    """会议室通用规范已内嵌到 room_skill.py，不再依赖外部 SKILL.md。"""
-    body = load_meeting_skill_body(DEFAULT_MEETING_SKILL_ID)
+def test_meeting_room_rules_is_builtin_no_external_file():
+    """会议室通用规范内嵌在 room_skill.py，与 SKILL 加载机制无关。"""
+    body = get_meeting_room_rules()
     assert body, "内置规范正文不应为空"
     assert "## 1. 节点成功标准" in body
     assert "## 6. 不变量" in body
@@ -48,7 +45,7 @@ def test_meeting_skill_is_builtin_no_external_file():
 
 
 def test_trim_skill_for_role_hides_other_perspective():
-    body = load_meeting_skill_body(DEFAULT_MEETING_SKILL_ID)
+    body = get_meeting_room_rules()
     host_view = trim_skill_for_role(body, "host")
     worker_view = trim_skill_for_role(body, "worker")
 
@@ -142,7 +139,7 @@ def test_build_room_skill_prompt_renders_context_vars(host_binding, monkeypatch)
     assert "本产品为账务中心" in rendered, "运营补充应出现在四段式第一节"
     assert "## 一、本 SOP 环节工作信息" in rendered
     assert "{DYNAMIC_MEETING_CONTEXT}" not in rendered
-    assert rendered.count("## 二、工单信息") == 1, "工单段不应在 SKILL 正文中重复出现"
+    assert rendered.count("## 二、工单信息") == 1, "工单段不应在通用规范正文中重复出现"
     # 能力卡片应排除自己（host 视角时不渲染 host 自己卡）
     assert "## 参会能力卡片" in rendered
     # 会议任务展示为「阶段名 + 节点名」格式
@@ -172,19 +169,15 @@ def test_build_room_skill_prompt_worker_view(host_binding):
     assert "Worker ↔ Worker 协作" not in rendered, "worker 之间不能直接协作，§4.6 应被移除"
 
 
-def test_meeting_skill_preview_returns_metadata():
-    preview = meeting_skill_preview(DEFAULT_MEETING_SKILL_ID)
-    assert preview["skill_id"] == DEFAULT_MEETING_SKILL_ID
-    assert preview["exists"] is True
-    assert preview["path"] is None, "已内嵌为常量，不再有文件路径"
-    assert preview.get("length", 0) > 0
-    assert preview.get("source") == "builtin"
+def test_no_legacy_meeting_skill_api():
+    """确保旧的 meeting_skill 相关 API 已彻底移除。"""
+    import synapse.rd_meeting.room_skill as room_skill
 
-
-def test_unknown_skill_id_falls_back_to_builtin():
-    """未知 id 同样回落到内置规范（不再有"找不到文件"的分支）。"""
-    body = load_meeting_skill_body("non-existent-skill-id-xyz")
-    assert "## 6. 不变量" in body, "回落到内置规范"
-    preview = meeting_skill_preview("non-existent-skill-id-xyz")
-    assert preview["exists"] is True
-    assert preview["source"] == "builtin"
+    for name in (
+        "DEFAULT_MEETING_SKILL_ID",
+        "load_meeting_skill_body",
+        "meeting_skill_preview",
+        "meeting_room_rules_preview",
+        "find_meeting_skill_file",
+    ):
+        assert not hasattr(room_skill, name), f"{name} 应已从 room_skill 模块中移除"

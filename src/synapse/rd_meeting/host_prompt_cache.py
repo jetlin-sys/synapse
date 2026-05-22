@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 ROOM_STATE_CACHE_KEY = "host_prompt_cache"
 
 # 会议室提示词 schema 版本：每次提示词拼装结构有破坏性变更时 +1，强制旧缓存失效。
-# v2: 提示词改为完整 system prompt（含运行时头 + 能力卡片 + SKILL 主体），不再追加于通用编译段。
-MEETING_PROMPT_SCHEMA_VERSION = "v2"
+# v2: 提示词改为完整 system prompt（含运行时头 + 能力卡片 + 规范主体），不再追加于通用编译段。
+# v3: 通用规范内嵌于代码，移除 meeting_skill_id 维度；角色卡片按 host/worker 分别渲染。
+MEETING_PROMPT_SCHEMA_VERSION = "v3"
 
 
 def _now_iso() -> str:
@@ -24,7 +25,6 @@ def _now_iso() -> str:
 def cache_binding_key(binding: dict[str, Any]) -> dict[str, str]:
     return {
         "node_id": str(binding.get("node_id") or "").strip(),
-        "meeting_skill_id": str(binding.get("meeting_skill_id") or "").strip(),
         "host_profile_id": str(binding.get("host_profile_id") or "default").strip() or "default",
     }
 
@@ -40,7 +40,6 @@ def save_host_prompt_cache(scope_id: str, bundle: dict[str, Any]) -> None:
     bind_key = cache_binding_key(
         {
             "node_id": bundle.get("node_id"),
-            "meeting_skill_id": bundle.get("meeting_skill_id"),
             "host_profile_id": bundle.get("host_profile_id"),
         }
     )

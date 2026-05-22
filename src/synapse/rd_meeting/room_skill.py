@@ -1,12 +1,13 @@
-"""会议室专属规范与 prompt 渲染。
+"""会议室运行时 system 上下文装配。
 
 设计目标（对齐《多智能体研发会议室实现方案》§9）：
 
-- 会议室通用规范不再依赖外部 SKILL.md 文件，而是以 `_MEETING_SKILL_BODY` 常量
-  内嵌在本模块中。小鲸（host）与所有协作智能体（worker）进入会议室后，都会在
-  system prompt 中加载这份规范，并按角色裁剪可见段落。
-- 同时把"参会能力卡片"渲染进去，让小鲸按能力边界分派任务、让 worker 互相协助。
-- ask-user 仍以独立 SKILL.md 形式存在（人机问卷格式与示例较多，单独维护）。
+- 会议室通用规范是一段内嵌字符串（`_MEETING_ROOM_RULES`），与 SKILL 加载机制无关，
+  仅作为本会议室的 system 上下文片段。小鲸（host）与所有协作智能体（worker）进入会议室后，
+  都会拿到这份规范，并按角色裁剪可见段落。
+- 同时渲染「参会能力卡片」（host 视角）/「你的能力档案」（worker 视角），让小鲸按能力
+  边界派单、让 worker 清楚自己的身份与边界。
+- `ask-user` 仍以独立 SKILL.md 形式存在（人机问卷格式与示例较多，单独维护）。
 
 本模块只负责**装配 prompt 片段**，不直接调用 LLM；由 `orchestrator.run_current_node`
 在执行节点时把渲染结果拼接到节点提示词中。
@@ -28,16 +29,15 @@ logger = logging.getLogger(__name__)
 
 Role = Literal["host", "worker"]
 
-DEFAULT_MEETING_SKILL_ID = "whalecloud-dev-tool-meeting-room"
 DEFAULT_ASK_USER_SKILL_ID = "whalecloud-dev-tool-ask-user"
 DEFAULT_LLM_ENDPOINT_KEY = "default"
 
 
-# ─── SKILL.md 定位 ──────────────────────────────────────────────────────
+# ─── SKILL.md 定位（仅供 ask-user 等真正的外部 SKILL 使用） ────────────
 
 
 def _candidate_skill_dirs() -> list[Path]:
-    """按优先级返回会议室 SKILL 可能的根目录。
+    """按优先级返回外部 SKILL 可能的根目录。
 
     顺序：
     1. settings.skills_path（生产模式：~/.synapse/workspaces/<ws>/skills）
@@ -73,13 +73,10 @@ def _candidate_skill_dirs() -> list[Path]:
     return out
 
 
-def find_meeting_skill_file(skill_id: str = DEFAULT_MEETING_SKILL_ID) -> Path | None:
-    """在标准技能目录中查找 SKILL.md 文件（仅供 ask-user 等外部 SKILL 使用）。
-
-    会议室通用规范已内嵌为 ``_MEETING_SKILL_BODY``，本函数对该 id 始终返回 ``None``。
-    """
+def _find_external_skill_file(skill_id: str) -> Path | None:
+    """在标准技能目录中查找外部 SKILL.md 文件（ask-user 等）。"""
     sid = (skill_id or "").strip()
-    if not sid or sid == DEFAULT_MEETING_SKILL_ID:
+    if not sid:
         return None
     for root in _candidate_skill_dirs():
         if not root.is_dir():
@@ -92,7 +89,7 @@ def find_meeting_skill_file(skill_id: str = DEFAULT_MEETING_SKILL_ID) -> Path | 
 
 def load_ask_user_skill_body(skill_id: str = DEFAULT_ASK_USER_SKILL_ID) -> str:
     """读取人机问卷技能正文（host 专用片段，仍为外部 SKILL）。"""
-    path = find_meeting_skill_file(skill_id)
+    path = _find_external_skill_file(skill_id)
     if path is None:
         return ""
     try:
@@ -102,13 +99,9 @@ def load_ask_user_skill_body(skill_id: str = DEFAULT_ASK_USER_SKILL_ID) -> str:
         return ""
 
 
-def load_meeting_skill_body(skill_id: str = DEFAULT_MEETING_SKILL_ID) -> str:
-    """返回会议室通用规范正文（已内嵌，不再依赖外部文件）。
-
-    `skill_id` 仅用于日志/审计；未知 id 同样回落到内置规范。
-    """
-    _ = skill_id
-    return _MEETING_SKILL_BODY
+def get_meeting_room_rules() -> str:
+    """返回会议室通用规范正文（内嵌常量，不再涉及 SKILL 加载）。"""
+    return _MEETING_ROOM_RULES
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -126,11 +119,12 @@ def _strip_frontmatter(text: str) -> str:
 
 # ─── 内置会议室通用规范 ────────────────────────────────────────────────
 #
-# 取代原 `skills/whalecloud-dev-tool-meeting-room/SKILL.md`。仅保留**规范性**
-# 内容；议程 / 工单 / 产品 / 系统等数据由 `build_dynamic_meeting_context`
-# 注入 `{DYNAMIC_MEETING_CONTEXT}`；角色身份、参会能力卡片由
-# `build_meeting_runtime_header` 渲染，**不在本规范正文中重复**。
-_MEETING_SKILL_BODY = """# 研发会议室通用规范
+# 这是会议室 system 上下文的"规则"部分，与 SKILL 加载机制无关——之前它曾经
+# 是一份外部 `skills/whalecloud-dev-tool-meeting-room/SKILL.md`，现在直接内嵌。
+# 仅保留**规范性**内容；议程 / 工单 / 产品 / 系统等数据由
+# `build_dynamic_meeting_context` 注入 `{DYNAMIC_MEETING_CONTEXT}`；角色身份、
+# 参会能力卡片由 `build_meeting_runtime_header` 渲染，**不在本规范正文中重复**。
+_MEETING_ROOM_RULES = """# 研发会议室通用规范
 
 > 本规范是研发会议室的「桌签」。任何参会智能体——主持人 **小鲸** 或协作智能体（需求 / 设计 / 研发 / 测试 / 质量 等专家）——进入会议室后都会在 system prompt 中加载这份规范，作为本场议程的协作宪法。
 >
@@ -316,7 +310,7 @@ Worker 返回结果后，逐项核对：
 
 @dataclass
 class MeetingRoomContext:
-    """会议室运行时上下文（注入 SKILL 用）。"""
+    """会议室运行时上下文（用于装配 system prompt）。"""
 
     role: Role
     scope_type: str
@@ -332,7 +326,6 @@ class MeetingRoomContext:
     host_llm_endpoint: str
     worker_llm_endpoint: str
     worker_profile_ids: list[str]
-    meeting_skill_id: str
     archive_dir: str
     prompt_supplement: str = ""
     self_profile_id: str = ""
@@ -400,7 +393,7 @@ def resolve_skill_label(skill_id: str) -> str | None:
     if sid in _SKILL_LABEL_CACHE:
         return _SKILL_LABEL_CACHE[sid]
     label: str | None = None
-    path = find_meeting_skill_file(sid)
+    path = _find_external_skill_file(sid)
     if path is not None:
         try:
             from synapse.skills.parser import skill_parser
@@ -583,7 +576,7 @@ _WORKER_HIDE_SECTION = re.compile(
 
 
 def trim_skill_for_role(skill_body: str, role: Role) -> str:
-    """按角色裁剪 SKILL：host 隐藏 Worker 视角，worker 隐藏 Host 视角。"""
+    """按角色裁剪通用规范正文：host 隐藏 Worker 视角，worker 隐藏 Host 视角。"""
     if role == "host":
         return _HOST_HIDE_SECTION.sub("", skill_body)
     if role == "worker":
@@ -592,7 +585,7 @@ def trim_skill_for_role(skill_body: str, role: Role) -> str:
 
 
 def render_skill(skill_body: str, variables: dict[str, str]) -> str:
-    """填充 SKILL 占位符；``DYNAMIC_MEETING_CONTEXT`` 最后注入，避免污染四段式正文。"""
+    """填充规范正文中的占位符；``DYNAMIC_MEETING_CONTEXT`` 最后注入，避免污染四段式正文。"""
     dynamic = variables.get("DYNAMIC_MEETING_CONTEXT")
     procedural = {k: v for k, v in variables.items() if k != "DYNAMIC_MEETING_CONTEXT"}
     rendered = skill_body
@@ -662,6 +655,7 @@ def build_meeting_runtime_header(
     lines.append("")
     lines.append(f"- **当前角色**：{role_label}")
     lines.append(f"- **会议工单**:[`{context.scope_id}`]-{context.ticket_title}")
+    lines.append(f"- **工单描述**：")
     lines.append(f"- **涉及产品**：{product_label}")
     lines.append(f"- **会议任务**：{context.stage_name}阶段的{context.node_name}任务")
     lines.append(f"- **会议目标**：{context.node_intent}")
@@ -737,10 +731,13 @@ def build_room_skill_prompt(
     binding: dict[str, Any] | None = None,
     sop_node_display: str = "",
 ) -> str:
-    """生成会议室完整 system prompt：运行时头 + SKILL 规范 + 四段式 ``{DYNAMIC_MEETING_CONTEXT}``。"""
+    """生成会议室完整 system prompt：运行时头 + 通用规范 + 四段式 ``{DYNAMIC_MEETING_CONTEXT}``。
+
+    `skill_body` 仅供测试/缓存等场景覆盖；正常调用走内置 `_MEETING_ROOM_RULES`。
+    """
     from synapse.rd_meeting.dynamic_prompt import build_dynamic_meeting_context
 
-    body = skill_body if skill_body is not None else load_meeting_skill_body(context.meeting_skill_id)
+    body = skill_body if skill_body is not None else get_meeting_room_rules()
     body = trim_skill_for_role(body, context.role)
 
     bind = dict(binding) if binding else {
@@ -753,7 +750,6 @@ def build_room_skill_prompt(
         "worker_profile_ids": context.worker_profile_ids,
         "host_llm_endpoint_key": context.host_llm_endpoint,
         "worker_llm_endpoint_key": context.worker_llm_endpoint,
-        "meeting_skill_id": context.meeting_skill_id,
         "prompt_supplement": context.prompt_supplement,
         "human_confirm": False,
     }
@@ -823,32 +819,9 @@ def make_context(
         host_llm_endpoint=str(binding.get("host_llm_endpoint_key") or DEFAULT_LLM_ENDPOINT_KEY),
         worker_llm_endpoint=str(binding.get("worker_llm_endpoint_key") or DEFAULT_LLM_ENDPOINT_KEY),
         worker_profile_ids=[str(w) for w in worker_ids if str(w).strip()],
-        meeting_skill_id=str(binding.get("meeting_skill_id") or DEFAULT_MEETING_SKILL_ID),
         archive_dir=str(archive_dir or ""),
         prompt_supplement=str(binding.get("prompt_supplement") or ""),
         self_profile_id=str(self_profile_id or "").strip(),
     )
 
 
-def meeting_skill_preview(skill_id: str = DEFAULT_MEETING_SKILL_ID, limit: int = 280) -> dict[str, Any]:
-    """供前端配置抽屉展示的会议室通用规范元信息（不渲染变量）。
-
-    规范已内嵌为 ``_MEETING_SKILL_BODY``，``exists`` 恒为 True、``path`` 为 ``None``。
-    """
-    body = load_meeting_skill_body(skill_id)
-    summary = ""
-    for line in body.splitlines():
-        text = line.strip()
-        if not text or text.startswith("#") or text.startswith("---") or text.startswith(">"):
-            continue
-        summary = text
-        break
-    return {
-        "skill_id": skill_id or DEFAULT_MEETING_SKILL_ID,
-        "exists": True,
-        "path": None,
-        "title": "研发会议室通用规范（内嵌）",
-        "summary": summary[:limit],
-        "length": len(body),
-        "source": "builtin",
-    }

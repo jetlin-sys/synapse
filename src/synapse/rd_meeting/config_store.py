@@ -2,10 +2,12 @@
 
 `meeting_room_config.json` 现在承载两类配置：
 
-- **会议室全局**：host_llm_endpoint_key、worker_llm_endpoint_key、meeting_skill_id。
+- **会议室全局**：host_llm_endpoint_key、worker_llm_endpoint_key。
   小鲸独立配端点（能力优先），所有协作智能体共享另一端点。
 - **节点级覆盖**：`node_overrides[<node_id>]` 可覆盖 prompt_supplement / host /
   worker / llm_endpoint_key（节点级 llm_endpoint_key 仅覆盖 worker）。业务技能由 Profile 配置，不在此持久化。
+
+历史字段 `meeting_skill_id` 已废弃（规范内嵌于代码），读取时静默忽略、写入时不再保存。
 """
 
 from __future__ import annotations
@@ -23,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 CONFIG_VERSION = "2"
 DEFAULT_LLM_ENDPOINT_KEY = "default"
-DEFAULT_MEETING_SKILL_ID = "whalecloud-dev-tool-meeting-room"
 
 
 def rd_meeting_config_dir() -> Path:
@@ -43,7 +44,6 @@ def default_meeting_room_config() -> dict[str, Any]:
         "version": CONFIG_VERSION,
         "host_llm_endpoint_key": DEFAULT_LLM_ENDPOINT_KEY,
         "worker_llm_endpoint_key": DEFAULT_LLM_ENDPOINT_KEY,
-        "meeting_skill_id": DEFAULT_MEETING_SKILL_ID,
         "node_overrides": {},
     }
 
@@ -78,9 +78,7 @@ def load_meeting_room_config() -> dict[str, Any]:
     merged["worker_llm_endpoint_key"] = _coerce_str(
         data.get("worker_llm_endpoint_key"), DEFAULT_LLM_ENDPOINT_KEY
     )
-    merged["meeting_skill_id"] = _coerce_str(
-        data.get("meeting_skill_id"), DEFAULT_MEETING_SKILL_ID
-    )
+    # 老版本 meeting_skill_id 字段已废弃（规范内嵌于代码），静默忽略
     overrides = data.get("node_overrides")
     merged["node_overrides"] = (
         _strip_legacy_override_fields(overrides) if isinstance(overrides, dict) else {}
@@ -151,11 +149,8 @@ def save_meeting_room_config(payload: dict[str, Any]) -> dict[str, Any]:
                 payload.get("worker_llm_endpoint_key"),
                 str(existing.get("worker_llm_endpoint_key") or DEFAULT_LLM_ENDPOINT_KEY),
             )
-        if "meeting_skill_id" in payload:
-            merged["meeting_skill_id"] = _coerce_str(
-                payload.get("meeting_skill_id"),
-                str(existing.get("meeting_skill_id") or DEFAULT_MEETING_SKILL_ID),
-            )
+        # 老版本 meeting_skill_id 已废弃；忽略 payload 中的该字段
+        merged.pop("meeting_skill_id", None)
         if "node_overrides" in payload:
             merged["node_overrides"] = _normalize_overrides(payload.get("node_overrides"))
 
