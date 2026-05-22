@@ -813,10 +813,14 @@ export type ProductKnowledgeGenerateBody = {
   prod_name: string;
   /** 与 docs_initialize 的 doc_type 一致 */
   doc_type: string;
+  /** 主仓库名（兜底；完整列表见 repo_info） */
   repo_name: string;
   repo_url?: string;
+  /** 产品关联的全部仓库，与统一服务 get_prod_info.repo_info 结构一致 */
+  repo_info?: RdRepoInfo[];
   gitnexus_url: string;
   product_desc: string;
+  /** 主仓库代码路径（兜底；各仓路径见 repo_info[].code_path） */
   code_path: string;
   core_features: string;
   /** 研发工具技能 id 列表（多选，动态白名单，服务端过滤） */

@@ -4,40 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from synapse.agents.profile import AgentProfile
 from synapse.rd_meeting.init_context import build_node_init_log_data, normalize_node_init_log_data
 from synapse.rd_meeting.paths import archive_root
-from synapse.rd_meeting.room_skill import (
-    DEFAULT_LLM_ENDPOINT_KEY,
-    format_skill_entries,
-    resolve_agent_profile,
-)
 from synapse.rd_sop.nodes import node_display_name
 
 ScopeType = Literal["demand", "task"]
-
-
-def _format_worker_block(
-    profile: AgentProfile,
-    *,
-    llm_endpoint: str,
-) -> str:
-    name = profile.get_display_name() or profile.name or profile.id
-    lines = [f"**{name}**（`{profile.id}`）"]
-    lines.append(f"- 端点：`{llm_endpoint or DEFAULT_LLM_ENDPOINT_KEY}`")
-    desc = (profile.description or "").strip()
-    if desc:
-        lines.append(f"- 简介：{desc}")
-    skills = format_skill_entries(profile.skills or [])
-    if skills:
-        lines.append(f"- 技能：{', '.join(skills)}")
-    custom = (profile.custom_prompt or "").strip()
-    if custom:
-        short = custom.replace("\n", " ").strip()
-        if len(short) > 240:
-            short = short[:240] + "…"
-        lines.append(f"- 主张：{short}")
-    return "\n".join(lines)
 
 
 def _human_confirm_line(binding: dict[str, Any]) -> str:
@@ -136,18 +107,19 @@ def build_dynamic_meeting_context(
     intent = str(binding.get("node_intent") or binding.get("intent") or "").strip() or "（未配置 node_intent）"
 
     host_id = str(binding.get("host_profile_id") or "default").strip()
-    worker_endpoint = str(binding.get("worker_llm_endpoint_key") or DEFAULT_LLM_ENDPOINT_KEY)
-    worker_lines: list[str] = []
-    for wid in binding.get("worker_profile_ids") or []:
-        w = str(wid).strip()
-        if not w or w == host_id:
-            continue
-        profile = resolve_agent_profile(w)
-        if profile is None:
-            worker_lines.append(f"**{w}**\n- 简介：未在 Profile 库中找到")
-        else:
-            worker_lines.append(_format_worker_block(profile, llm_endpoint=worker_endpoint))
-    workers_body = "\n\n".join(worker_lines) if worker_lines else "（本节点未配置协作智能体）"
+    worker_ids = [
+        str(w).strip()
+        for w in (binding.get("worker_profile_ids") or [])
+        if str(w).strip() and str(w).strip() != host_id
+    ]
+    if worker_ids:
+        workers_summary = (
+            f"本节点配置了 {len(worker_ids)} 位协作智能体："
+            + "、".join(f"`{w}`" for w in worker_ids)
+            + "。**能力边界与端点详见 system prompt 上方「参会能力卡片」段**，本块不再重复列出。"
+        )
+    else:
+        workers_summary = "（本节点未配置协作智能体；小鲸需在自身能力范围内完成本节点。）"
 
     supplement = str(binding.get("prompt_supplement") or "").strip()
     supplement_block = f"\n\n**运营补充**：{supplement}" if supplement else ""
@@ -165,7 +137,7 @@ def build_dynamic_meeting_context(
         f"(3) **人工确认（human_confirm）**：{_human_confirm_line(binding)}",
         "",
         "(4) **协作智能体**：",
-        workers_body,
+        workers_summary,
         supplement_block,
         "",
         "## 二、工单信息（继承节点初始化）",

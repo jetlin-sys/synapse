@@ -82,6 +82,61 @@ def _repo_name_from_git_url(url: str | None) -> str | None:
     return part or None
 
 
+class ProductKnowledgeRepoRow(BaseModel):
+    """与研发统一服务 get_prod_info.repo_info / get_repo_info 单项结构对齐。"""
+
+    repo_url: str = Field(default="", description="Git 仓库 URL")
+    repo_branch: str = Field(default="", description="仓库分支 repositoryId|destBranchName")
+    prod_branch: str = Field(default="", description="产品分支 branchVersionId|branchName")
+    repo_module: str = Field(default="", description="应用模块 productModuleId|moduleChName")
+    code_path: str = Field(default="", description="仓库代码路径")
+    repo_func: str = Field(default="", description="仓库职责/用途")
+    repo_master: str = Field(default="N", description="主仓库 Y/N")
+
+
+def _repo_names_from_repo_info(rows: list[ProductKnowledgeRepoRow]) -> list[str]:
+    """从 repo_info 解析去重后的 GitNexus 仓库名列表（顺序与请求体一致）。"""
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        name = _repo_name_from_git_url(row.repo_url)
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _resolve_main_repo_from_info(
+    rows: list[ProductKnowledgeRepoRow],
+    *,
+    fallback_name: str,
+    fallback_url: str | None,
+) -> tuple[str, ProductKnowledgeRepoRow | None]:
+    """返回 (主仓库 GitNexus 名, 主仓库行)；无 repo_info 时回退到请求体单仓字段。"""
+    if rows:
+        main_rows = [r for r in rows if (r.repo_master or "").strip().upper() == "Y"]
+        main_row = main_rows[0] if main_rows else rows[0]
+        name = _repo_name_from_git_url(main_row.repo_url)
+        if name:
+            return name, main_row
+    name = _repo_name_from_git_url(fallback_url) or fallback_name
+    return name, None
+
+
+def _format_repo_info_for_prompt(rows: list[ProductKnowledgeRepoRow]) -> str:
+    if not rows:
+        return ""
+    lines: list[str] = []
+    for i, row in enumerate(rows, 1):
+        name = _repo_name_from_git_url(row.repo_url) or "(未解析)"
+        master = "主仓库" if (row.repo_master or "").strip().upper() == "Y" else "从仓库"
+        lines.append(
+            f"{i}. **{name}**（{master}） url=`{row.repo_url}` code_path=`{row.code_path}` "
+            f"职责=`{row.repo_func}` branch=`{row.repo_branch}`"
+        )
+    return "\n".join(lines)
+
+
 class ProductKnowledgeGenerateRequest(BaseModel):
     task_id: str = Field(
         ...,
@@ -117,6 +172,10 @@ class ProductKnowledgeGenerateRequest(BaseModel):
         description="文档类型：与统一服务一致；内置任务区分「产品架构」（FUNCTIONAL/TECH）与「产品手册」（PRODUCT_DEV.md）等",
         min_length=1,
         max_length=256,
+    )
+    repo_info: list[ProductKnowledgeRepoRow] = Field(
+        default_factory=list,
+        description="产品关联的全部仓库（与统一服务 repo_info 一致）；技能须按 GNX_REPO_LIST 全量 materialize",
     )
 
 
@@ -545,14 +604,23 @@ async def _run_knowledge_generation_task(
         pool.invalidate_profile(prof_id)
         agent = await pool.get_or_create(session_id, test_profile)
 
-        # repo_url 优先解析真实仓库名，前端未传时 fallback 到 repo_name
-        repo_name = _repo_name_from_git_url(req.repo_url) or req.repo_name
+        repo_name, main_row = _resolve_main_repo_from_info(
+            req.repo_info,
+            fallback_name=req.repo_name,
+            fallback_url=req.repo_url,
+        )
+        gnx_repo_list = _repo_names_from_repo_info(req.repo_info)
+        if not gnx_repo_list and repo_name:
+            gnx_repo_list = [repo_name]
         doc_type = req.doc_type
         prod_name = req.prod_name
+        code_path = (main_row.code_path if main_row else "") or req.code_path
+        repo_info_detail = _format_repo_info_for_prompt(req.repo_info)
 
         # GitNexus 本地数据与架构产出分离：前者 tmp/gitnexus/<repo>，后者 tmp/docs/<prod>/<doc_type>
         local_data_path = _gitnexus_local_data_path(repo_name)
-        local_data_path.mkdir(parents=True, exist_ok=True)
+        for rn in gnx_repo_list:
+            _gitnexus_local_data_path(rn).mkdir(parents=True, exist_ok=True)
         output_dir = _knowledge_docs_root(doc_type, prod_name)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -571,13 +639,15 @@ async def _run_knowledge_generation_task(
         prompt = build_knowledge_generation_user_prompt(
             gitnexus_url=req.gitnexus_url,
             repo_name=repo_name,
+            gnx_repo_list=gnx_repo_list,
+            repo_info_detail=repo_info_detail,
             local_data_path=local_data_path,
             output_dir=output_dir,
             prod_name=prod_name,
             doc_type=doc_type,
             request_repo_name=req.repo_name,
             product_desc=req.product_desc,
-            code_path=req.code_path,
+            code_path=code_path,
             core_features=req.core_features,
         )
 
@@ -716,19 +786,28 @@ def register_product_knowledge_routes(router: APIRouter) -> None:
                 _knowledge_tasks[task_id] = existing
             return success_response({"task_id": task_id}, "任务已在执行中")
 
-        repo_resolved = _repo_name_from_git_url(body.repo_url) or body.repo_name
+        repo_resolved, _ = _resolve_main_repo_from_info(
+            body.repo_info,
+            fallback_name=body.repo_name,
+            fallback_url=body.repo_url,
+        )
+        gnx_repo_list = _repo_names_from_repo_info(body.repo_info)
+        if not gnx_repo_list and repo_resolved:
+            gnx_repo_list = [repo_resolved]
         _knowledge_tasks[task_id] = {
             "status": "pending",
             "created_at": time.time(),
             "repo_name": repo_resolved,
+            "gnx_repo_list": gnx_repo_list,
             "prod_name": body.prod_name,
             "doc_type": body.doc_type,
         }
         _persist_task(task_id)
         ep = (body.preferred_endpoint or "").strip() or None
         logger.info(
-            "Product knowledge generation task %s, rd_skill_ids=%s, preferred_endpoint=%s",
+            "Product knowledge generation task %s, gnx_repo_list=%s, rd_skill_ids=%s, preferred_endpoint=%s",
             task_id,
+            gnx_repo_list,
             body.rd_skill_ids,
             ep or "(auto)",
         )

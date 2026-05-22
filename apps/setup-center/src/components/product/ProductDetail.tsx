@@ -34,6 +34,7 @@ import {
   PRODUCT_KNOWLEDGE_KEYS,
   knowledgeFromDocProcess,
   productKnowledgeCategoryFromDocTypeWire,
+  productRepositoriesToRdRepoInfo,
 } from "./types";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import {
@@ -1003,6 +1004,7 @@ export function ProductDetail({
         doc_type: docTypeParam,
         repo_name: repoNameFromUrl,
         repo_url: mainRepo.url || undefined,
+        repo_info: productRepositoriesToRdRepoInfo(product),
         gitnexus_url: gitnexusUrl,
         product_desc: product.description || "",
         code_path: mainRepo.codePath || "",

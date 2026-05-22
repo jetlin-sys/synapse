@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from synapse.agents.profile import AgentProfile, AgentType, SkillsMode
 from synapse.rd_meeting.dynamic_prompt import build_dynamic_meeting_context
 
 
@@ -60,8 +59,9 @@ def test_four_section_structure(host_binding, monkeypatch):
     assert "synapse_url" in md.lower() or "127.0.0.1:10001" in md
 
 
-def test_worker_skills_show_label(host_binding, monkeypatch):
-    """协作智能体技能行应带 SKILL frontmatter label。"""
+def test_dynamic_context_workers_summary_avoids_capability_card_duplication(host_binding, monkeypatch):
+    """§0 一、(4) 协作智能体段仅给清单 + 指向能力卡片，不再重复 label/技能详情，避免与
+    system prompt 顶部「参会能力卡片」冲突。"""
     monkeypatch.setattr(
         "synapse.rd_meeting.init_context.resolve_product_for_meeting",
         lambda *_a, **_k: (
@@ -78,29 +78,37 @@ def test_worker_skills_show_label(host_binding, monkeypatch):
         lambda *_a, **_k: {"demand_no": "D1", "demand_title": "T", "prod": "p1"},
     )
 
-    def _fake_profile(pid: str) -> AgentProfile | None:
-        if pid != "whalecloud-requirement-expert":
-            return None
-        return AgentProfile(
-            id=pid,
-            name="需求专家",
-            type=AgentType.SYSTEM,
-            skills=[
-                "whalecloud-dev-tool-code-access",
-                "whalecloud-dev-tool-base-scripts",
-            ],
-            skills_mode=SkillsMode.INCLUSIVE,
-        )
-
-    monkeypatch.setattr(
-        "synapse.rd_meeting.dynamic_prompt.resolve_agent_profile",
-        _fake_profile,
-    )
     md = build_dynamic_meeting_context(
         binding=host_binding,
         scope_type="demand",
         scope_id="D1",
         sop_node_display="需求澄清",
     )
-    assert "whalecloud-dev-tool-code-access（代码访问）" in md
-    assert "whalecloud-dev-tool-base-scripts（研发工具共享脚本）" in md
+    assert "(4) **协作智能体**" in md
+    assert "whalecloud-requirement-expert" in md, "应列出参与本节点的 worker id"
+    assert "参会能力卡片" in md, "应指向能力卡片以避免重复"
+    # 不应再渲染单个 worker 的技能详表（这些已收敛到能力卡片）
+    assert "- 技能：" not in md
+    assert "- 主张：" not in md
+    # 也不应再展示单 worker 的端点行（端点信息只在能力卡片上）
+    assert md.count("worker-default") == 0
+
+
+def test_capability_cards_render_skill_label():
+    """技能 label（来自 SKILL frontmatter）应出现在能力卡片，不再在动态上下文里。"""
+    from synapse.rd_meeting.room_skill import _resolve_profile, build_capability_cards
+
+    # 若 profile 不存在则跳过（依赖 SYSTEM_PRESETS）
+    if _resolve_profile("whalecloud-requirement-expert") is None:
+        pytest.skip("whalecloud-requirement-expert preset missing")
+
+    cards = build_capability_cards(
+        host_profile_id="default",
+        worker_profile_ids=["whalecloud-requirement-expert"],
+        host_llm_endpoint="reasoning-heavy",
+        worker_llm_endpoint="worker-default",
+        include_host=False,
+    )
+    assert "whalecloud-requirement-expert" in cards
+    # 至少有一个技能 label（带括号的中文描述）出现在能力卡片中
+    assert "（" in cards and "）" in cards

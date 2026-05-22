@@ -125,6 +125,8 @@ def build_knowledge_generation_user_prompt(
     *,
     gitnexus_url: str,
     repo_name: str,
+    gnx_repo_list: list[str],
+    repo_info_detail: str,
     local_data_path: Path | str,
     output_dir: Path | str,
     prod_name: str,
@@ -135,42 +137,61 @@ def build_knowledge_generation_user_prompt(
     core_features: str,
 ) -> str:
     """产品知识生成：架构（FUNCTIONAL/TECH）或产品手册（PRODUCT_DEV.md），由 doc_type 决定。"""
+    gnx_list_str = ", ".join(gnx_repo_list) if gnx_repo_list else repo_name
+    repo_list_section = ""
+    if repo_info_detail.strip():
+        repo_list_section = f"""
+## 产品关联仓库（请求体 repo_info，须全量覆盖）
+{repo_info_detail}
+"""
+    elif gnx_repo_list:
+        repo_list_section = f"""
+## 产品关联仓库（GNX_REPO_LIST）
+{", ".join(f"`{n}`" for n in gnx_repo_list)}
+"""
+    gnx_repo_list_line = (
+        f"- **GNX_REPO_LIST**（本任务已从请求体传入，**须逐项 materialize/read/grep，不得遗漏任一仓库**）：`{gnx_list_str}`"
+        if gnx_repo_list
+        else f"- **GNX_REPO_LIST**：当前仅 `{repo_name}`；若产品为多仓库，须调用 `get_repo_info.py --prod={prod_name}` 补全后再 materialize"
+    )
     if is_product_manual_knowledge_doc_type(doc_type):
         return f"""gitnexus服务部署在[{gitnexus_url}]上。当前 **doc_type** 为产品手册，请使用产品开发手册生成技能（**whalecloud-dev-tool-development-manual**）的完整工作流，在本任务目录生成**唯一主交付物** **`PRODUCT_DEV.md`**（文件名必须一致，写入 **OUTPUT_DIR** 根下，不要改名为「产品研发手册.md」）。
 
 ## 路径与参数约定（脚本见 whalecloud-dev-tool-base-scripts；九段章节、模板变量与源码核验规则见 whalecloud-dev-tool-development-manual，勿改写目录语义）
 - **SYNAPSE_URL**：SynapseService 地址（`IP:PORT`）。按该技能 Phase 1：可用 `get_doc.py` 拉取产品手册/产品架构等输入文档到临时目录；若本 HTTP 任务未显式传入，由你在执行中从运维上下文或必要步骤中解析，**不得臆造**服务地址。
 - **GITNEXUS_URL**：`{gitnexus_url}`（`gnx-tools.js` 的 `--url`）。
-- **REPO_NAME**（本任务当前主仓库，须与 GitNexus 一致）：`{repo_name}`（来自 `repo_url` 解析或请求体 `repo_name` 兜底）。若技能要求列举产品关联的**多仓库**，须按 `get_repo_info.py --prod` 结果为准扩展 materialize，不得以单仓库冒充全量。
-- **GNX_CACHE_DIR**（本 **REPO_NAME** 对应缓存根，等同 `_gitnexus_local_data_path`）：`{local_data_path}`。多仓库时为**每个仓库**各自缓存目录（见技能内 TMP_DIR/.gnx-cache 约定），本任务至少保证当前仓库缓存可用。
+- **REPO_NAME**（本任务主仓库，须与 GitNexus 一致）：`{repo_name}`（来自 `repo_info` 中 `repo_master=Y` 或列表首项；请求体 `repo_url`/`repo_name` 为兜底）。
+{gnx_repo_list_line}
+- **GNX_CACHE_DIR**（按仓库名分目录，等同 `synapse_home/tmp/gitnexus/<repo_name>/`）：主仓当前为 `{local_data_path}`；**GNX_REPO_LIST 中每个仓库均须各自 materialize 到对应缓存目录**。
 - **OUTPUT_DIR**（手册落盘目录，与 Agent `default_cwd` 一致）：`{output_dir}`
 - **OUTPUT**：固定为 **`PRODUCT_DEV.md`**（相对 **OUTPUT_DIR**）。**不要**生成功能/技术架构拆分文件（无 FUNCTIONAL_ARCH.md / TECH_ARCH.md 要求）；**不要**生成 `.excalidraw`（分层与依赖请用手册正文内 **Mermaid** 表达，与技能 Phase 3 一致）。
 - **模板**：章节结构、占位符覆盖率与 `[待补充]`/`[待代码确认]` 等约束以技能内 `templates/产品研发手册.md` 与 Workflow 为准，但**落盘文件名**始终为 `PRODUCT_DEV.md`。
-
+{repo_list_section}
 ## 任务上下文
 产品标识（prod_name）：[{prod_name}]
 文档类型（doc_type）：[{doc_type}]
-请求体仓库名字段（可能与 REPO_NAME 不同，以技能多仓库逻辑及已解析 REPO_NAME 为准）：[{request_repo_name}]
+请求体仓库名字段（主仓兜底，以 GNX_REPO_LIST 为准）：[{request_repo_name}]
 产品描述：[{product_desc}]
-代码路径：[{code_path}]
+主仓代码路径（code_path）：[{code_path}]
 主要功能：[{core_features}]"""
 
     return f"""gitnexus服务部署在[{gitnexus_url}]上，请使用产品架构文档生成工具生成产品的系统架构和功能架构文档。
 
 ## 路径与参数约定（GitNexus / Synapse 脚本见技能 whalecloud-dev-tool-base-scripts；工作流与模板见 whalecloud-dev-tool-arch-create，勿改写目录语义）
-- **SYNAPSE_URL**：SynapseService 地址（`IP:PORT`）。若需按产品名调用 `scripts/get_repo_info.py` 拉取**全部**关联仓库列表，由对话或运维提供；本 HTTP 任务未单独传该字段时可为空（此时以下方已解析的 **REPO_NAME** 为准）。
+- **SYNAPSE_URL**：SynapseService 地址（`IP:PORT`）。若需校验仓库列表，可用 `scripts/get_repo_info.py --prod={prod_name}` 对照 **GNX_REPO_LIST**；**以本任务已传入的 GNX_REPO_LIST 为执行依据**，不得只 materialize 主仓。
 - **GITNEXUS_URL**：`{gitnexus_url}`（`gnx-tools.js` / `fetch-arch-data.js` 的 `--url`）。
-- **REPO_NAME**（本任务已解析，须与 GitNexus 图谱一致）：`{repo_name}`（来自 `repo_url` 解析或请求体 `repo_name` 兜底，**禁止**臆造其它仓库名）。
-- **GNX_CACHE_DIR**（当前 **REPO_NAME** 的 materialize/read/grep 缓存根，等同 `_gitnexus_local_data_path`）：`{local_data_path}`
+- **REPO_NAME**（本任务主仓库，须与 GitNexus 图谱一致）：`{repo_name}`（来自 `repo_info` 中 `repo_master=Y` 或列表首项；请求体 `repo_url`/`repo_name` 为兜底，**禁止**臆造其它仓库名）。
+{gnx_repo_list_line}
+- **GNX_CACHE_DIR**（按仓库名分目录，等同 `synapse_home/tmp/gitnexus/<repo_name>/`）：主仓当前为 `{local_data_path}`；**GNX_REPO_LIST 中每个仓库均须各自 materialize 到对应缓存目录**。
 - **OUTPUT_DIR**（架构交付物唯一落盘目录，与 Agent `default_cwd` 一致，等同 `_knowledge_docs_root`）：`{output_dir}`
 - **OUTPUT**（须全部写入 **OUTPUT_DIR**）：`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md` 为必选。另：**仅当**本任务已挂载技能 `whalecloud-dev-tool-excalidraw`（system 提示「研发工具技能指引」中含该技能块）时，还须写入 `sys-arch-layers.excalidraw`、`tech-stack.excalidraw`；**未挂载**时**不要**创建上述 `.excalidraw` 文件，技术栈与分层示意须在 `TECH_ARCH.md` 内用 **Mermaid** 代码块（见 `whalecloud-dev-tool-arch-create` Phase 3）
-
+{repo_list_section}
 ## 任务上下文
 产品标识（prod_name）：[{prod_name}]
 文档类型（doc_type）：[{doc_type}]
-请求体仓库名字段（可能与 REPO_NAME 不同，以已解析 REPO_NAME 为准）：[{request_repo_name}]
+请求体仓库名字段（主仓兜底，以 GNX_REPO_LIST 为准）：[{request_repo_name}]
 产品描述：[{product_desc}]
-代码路径：[{code_path}]
+主仓代码路径（code_path）：[{code_path}]
 主要功能：[{core_features}]"""
 
 
