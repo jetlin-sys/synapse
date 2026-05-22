@@ -138,9 +138,9 @@ def is_human_only_node(node_id: str) -> bool:
 # 节点产出文档（只读展示；归档路径 archive/<stage_id>/<node_id>/）
 NODE_OUTPUTS: dict[str, list[str]] = {
     "pending": ["（系统节点，无归档产出）"],
-    "req_clarify": ["需求澄清记录.md", "01-需求澄清.md"],
+    "req_clarify": ["需求澄清.md"],
     "boundary": ["边界确认说明.md"],
-    "module_func": ["模块功能拆分.md", "03-模块功能.md"],
+    "module_func": ["模块功能.md"],
     "acceptance": ["验收标准.md"],
     "req_risk": ["需求风险评估.md"],
     "func_assign": ["功能点分派清单.md"],

@@ -285,6 +285,8 @@ export interface MeetingRoomLivePayload {
   participants?: MeetingRoomParticipantWire[];
   intervention_kind?: string;
   hitl_form_schema?: HitlFormSchema;
+  hitl_locked?: boolean;
+  hitl_submission?: { values?: Record<string, unknown>; submitted_at?: string; locked?: boolean };
   pending_delivery?: { report_body?: string; await_confirm?: boolean };
 }
 

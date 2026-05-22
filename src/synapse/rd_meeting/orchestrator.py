@@ -613,6 +613,8 @@ class MeetingRoomOrchestrator:
         room_state["status"] = "human_intervention"
         room_state["current_node_id"] = node_id
         room_state["intervention_kind"] = intervention_kind
+        room_state.pop("hitl_locked", None)
+        room_state.pop("hitl_submission", None)
         if hitl_form_schema:
             room_state["hitl_form_schema"] = hitl_form_schema
         if pending_delivery:
@@ -724,6 +726,8 @@ class MeetingRoomOrchestrator:
         rs = dict(rs)
         rs.pop("pending_delivery", None)
         rs.pop("hitl_form_schema", None)
+        rs.pop("hitl_locked", None)
+        rs.pop("hitl_submission", None)
         set_phase(sid, "completed")
         save_room_state(sid, rs)
 

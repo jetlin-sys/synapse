@@ -102,6 +102,8 @@ interface MeetingRoom {
   runInProgress?: boolean;
   hitlFormSchema?: HitlFormSchema | null;
   hitlPendingSummary?: string | null;
+  hitlLocked?: boolean;
+  hitlSubmission?: { values?: Record<string, unknown>; submitted_at?: string } | null;
   participants?: MeetingRoomParticipantWire[];
 }
 
@@ -258,6 +260,9 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
     tokenBudget: live.tokenBudget ?? room.tokenBudget,
     stageDuration: live.stageDuration || room.stageDuration,
     hitlFormSchema: (live.hitl_form_schema as HitlFormSchema | undefined) ?? room.hitlFormSchema,
+    hitlLocked: live.hitl_locked ?? room.hitlLocked,
+    hitlSubmission:
+      (live.hitl_submission as MeetingRoom['hitlSubmission']) ?? room.hitlSubmission ?? null,
     hitlPendingSummary:
       live.pending_delivery?.report_body ?? room.hitlPendingSummary ?? null,
     brief: live.phase
@@ -319,6 +324,9 @@ function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
     logs,
     brief: `${item.local_process_state} · ${item.current_node_name || item.current_node_id}`,
     hitlFormSchema: (item.room_state?.hitl_form_schema as HitlFormSchema | undefined) ?? null,
+    hitlLocked: Boolean(item.room_state?.hitl_locked),
+    hitlSubmission:
+      (item.room_state?.hitl_submission as MeetingRoom['hitlSubmission']) ?? null,
     hitlPendingSummary:
       (item.room_state?.pending_delivery as { report_body?: string } | undefined)?.report_body ?? null,
     participants: item.participants,
@@ -830,7 +838,11 @@ const InterventionDialog = ({
   const logsEndRef = useRef<HTMLDivElement>(null);
   const lastLogKeyRef = useRef('');
 
-  const hitlAvailable = !!(room && room.status === 'human_intervention' && room.hitlFormSchema);
+  const hitlLocked = Boolean(room?.hitlLocked);
+  const hitlAvailable = !!(
+    room?.hitlFormSchema &&
+    (room.status === 'human_intervention' || hitlLocked)
+  );
   const hitlKind = (room?.hitlFormSchema as { summary_kind?: string; intervention_kind?: string } | undefined);
   const hitlBadgeText = useMemo(() => {
     const k = (hitlKind?.summary_kind || hitlKind?.intervention_kind || '').toLowerCase();
@@ -1097,14 +1109,27 @@ const InterventionDialog = ({
                 <div className="max-w-[920px] mx-auto">
                   <MeetingHitlForm
                     schema={room.hitlFormSchema}
-                    summaryMarkdown={room.hitlPendingSummary ?? undefined}
-                    submitLabel={room.hitlPendingSummary ? '确认总结并归档推进' : '提交确认并推进'}
-                    onSubmit={(values) => {
-                      const summary = Object.entries(values)
-                        .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(',') : String(v)}`)
-                        .join('\n');
-                      onIntervene(`[人工确认表单]\n${summary}`, { resumeRun: true });
-                    }}
+                    locked={hitlLocked}
+                    initialValues={
+                      (room.hitlSubmission?.values as Record<string, string | string[] | boolean>) ??
+                      undefined
+                    }
+                    submitLabel={
+                      hitlKind?.summary_kind === 'result_confirm' ||
+                      hitlKind?.intervention_kind === 'result_confirm'
+                        ? '确认并归档推进'
+                        : '提交并继续处理'
+                    }
+                    onSubmit={
+                      hitlLocked
+                        ? undefined
+                        : (values) => {
+                            const summary = Object.entries(values)
+                              .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(',') : String(v)}`)
+                              .join('\n');
+                            onIntervene(`[人工确认表单]\n${summary}`, { resumeRun: true });
+                          }
+                    }
                   />
                 </div>
               </div>
@@ -1488,9 +1513,15 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
     })
       .then((detail) => {
         const updatedRoom = mapDetailToRoom(detail);
-        updatedRoom.brief = '人类专家已介入并下发指令，正在重新评估状态...';
+        const locked = Boolean(detail.room_state?.hitl_locked);
+        updatedRoom.brief = locked
+          ? '表单已提交并锁定，系统正在继续处理…'
+          : '人类专家已介入并下发指令，正在重新评估状态...';
         setActiveRoom(updatedRoom);
         setRooms((prev) => prev.map((r) => (r.id === updatedRoom.id ? updatedRoom : r)));
+        if ((detail as { resume_run_started?: boolean }).resume_run_started) {
+          toast.success('已提交，后台已继续执行当前节点');
+        }
       })
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);

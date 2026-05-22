@@ -4,8 +4,8 @@
  */
 import React, { useCallback, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { AlertTriangle, CheckCircle2, ChevronRight, ListChecks, Sparkles } from 'lucide-react';
-import { Button, Form, Input, Progress } from 'antd';
+import { AlertTriangle, CheckCircle2, ChevronRight, Sparkles } from 'lucide-react';
+import { Button, Input, Progress } from 'antd';
 
 const { TextArea } = Input;
 
@@ -140,21 +140,39 @@ const HitlQuestionnaireForm: React.FC<{
   const stepped = schema.render?.layout === 'stepped';
   const accent = accentClasses(schema.render?.accent);
   const [step, setStep] = useState(0);
-  const [selections, setSelections] = useState<Record<string, Set<string>>>(() => {
-    const init: Record<string, Set<string>> = {};
+  const hydrateFromInitial = (vals?: HitlFormValues) => {
+    const selInit: Record<string, Set<string>> = {};
+    const customInit: Record<string, string> = {};
+    const showInit: Record<string, boolean> = {};
     questions.forEach((q) => {
-      init[q.id] = new Set();
+      selInit[q.id] = new Set();
+      customInit[q.id] = '';
+      const raw = vals?.[q.id];
+      if (raw === undefined || raw === null) return;
+      if (q.type === 'textarea' || q.type === 'text') {
+        customInit[q.id] = String(raw);
+        return;
+      }
+      const items = Array.isArray(raw) ? raw.map(String) : [String(raw)];
+      const opts = new Set<string>();
+      items.forEach((item) => {
+        if (item.startsWith('OTHER:')) {
+          customInit[q.id] = item.slice(6).trim();
+          showInit[q.id] = true;
+        } else {
+          opts.add(item);
+        }
+      });
+      selInit[q.id] = opts;
+      if (customInit[q.id]) showInit[q.id] = true;
     });
-    return init;
-  });
-  const [customTexts, setCustomTexts] = useState<Record<string, string>>(() => {
-    const init: Record<string, string> = {};
-    questions.forEach((q) => {
-      init[q.id] = '';
-    });
-    return init;
-  });
-  const [showCustom, setShowCustom] = useState<Record<string, boolean>>({});
+    return { selInit, customInit, showInit };
+  };
+
+  const seeded = useMemo(() => hydrateFromInitial(initialValues), [initialValues, questions]);
+  const [selections, setSelections] = useState<Record<string, Set<string>>>(seeded.selInit);
+  const [customTexts, setCustomTexts] = useState<Record<string, string>>(seeded.customInit);
+  const [showCustom, setShowCustom] = useState<Record<string, boolean>>(seeded.showInit);
 
   const currentQ = questions[step];
   const totalSteps = questions.length;
@@ -167,8 +185,14 @@ const HitlQuestionnaireForm: React.FC<{
     }).length;
   }, [questions, selections, customTexts]);
 
+  const clearCustomForQuestion = useCallback((qid: string) => {
+    setCustomTexts((p) => ({ ...p, [qid]: '' }));
+    setShowCustom((p) => ({ ...p, [qid]: false }));
+  }, []);
+
   const toggleOption = useCallback((q: HitlQuestion, value: string) => {
     if (preview) return;
+    clearCustomForQuestion(q.id);
     const multi = q.type === 'multiple' || q.render?.optionStyle === 'checkbox';
     setSelections((prev) => {
       const next = new Set(prev[q.id]);
@@ -183,6 +207,15 @@ const HitlQuestionnaireForm: React.FC<{
       }
       return { ...prev, [q.id]: next };
     });
+  }, [preview, clearCustomForQuestion]);
+
+  const setCustomForQuestion = useCallback((q: HitlQuestion, text: string) => {
+    if (preview) return;
+    setCustomTexts((p) => ({ ...p, [q.id]: text }));
+    if (text.trim()) {
+      setSelections((prev) => ({ ...prev, [q.id]: new Set() }));
+      setShowCustom((p) => ({ ...p, [q.id]: true }));
+    }
   }, [preview]);
 
   const questionAnswered = (q: HitlQuestion): boolean => {
@@ -337,25 +370,24 @@ const HitlQuestionnaireForm: React.FC<{
       )}
       {optsLength(q) > 0 ? renderOptions(q) : null}
       {q.inputEnabled && q.type !== 'textarea' && q.type !== 'text' ? (
-        showCustom[q.id] ? (
+        <div
+          className={`mt-3 rounded-xl border-2 p-0.5 transition-all ${
+            (customTexts[q.id] || '').trim()
+              ? 'border-amber-400/70 bg-amber-500/10 shadow-[0_0_16px_rgba(245,158,11,0.18)] ring-1 ring-amber-400/30'
+              : 'border-dashed border-border/50 bg-muted/15'
+          }`}
+        >
+          <div className="px-2.5 pt-1.5 text-[10px] font-medium text-amber-300/90">
+            自定义回答（与上方选项互斥）
+          </div>
           <Input
-            autoFocus
             disabled={preview}
             value={customTexts[q.id] || ''}
-            onChange={(e) => setCustomTexts((p) => ({ ...p, [q.id]: e.target.value }))}
-            placeholder={q.inputPlaceholder || '或者你的答案：'}
-            className="mt-2 bg-background/50 border-dashed border-border/60 text-xs"
+            onChange={(e) => setCustomForQuestion(q, e.target.value)}
+            placeholder={q.inputPlaceholder || '输入后将清空已选选项…'}
+            className="border-0 bg-transparent text-xs text-foreground shadow-none focus:shadow-none"
           />
-        ) : (
-          <button
-            type="button"
-            disabled={preview}
-            onClick={() => setShowCustom((p) => ({ ...p, [q.id]: true }))}
-            className="mt-2 text-[11px] text-muted-foreground hover:text-foreground border border-dashed border-border/50 rounded-lg px-3 py-1.5 w-full text-left transition-colors"
-          >
-            {q.inputPlaceholder || '或者你的答案…'}
-          </button>
-        )
+        </div>
       ) : null}
     </div>
   );
@@ -384,67 +416,21 @@ const HitlQuestionnaireForm: React.FC<{
       ) : null}
 
       {(() => {
-        if (preview) return null;
         const kind: HitlSummaryKind | undefined =
           schema.summary_kind ?? schema.intervention_kind;
+        if (kind !== 'exception') return null;
         const reason = (schema.summary_reason || '').trim();
-        const fromSchema = (schema.summary_markdown || '').trim();
-        const fromProp = (summaryMarkdown || '').trim();
-        const body = fromSchema || fromProp;
-        if (!body && !reason) return null;
-        const isException = kind === 'exception';
-        const isResult = kind === 'result_confirm';
-        const palette = isException
-          ? {
-              card: 'border-violet-500/40 bg-violet-500/10 ring-1 ring-violet-500/25',
-              chip: 'bg-violet-500/20 text-violet-200 border border-violet-500/40',
-              label: 'text-violet-200/90',
-              Icon: AlertTriangle,
-              title: '异常摘要',
-              hint: '系统在主控未通过结构化方式提交问卷时进入异常门控；请审阅以下原因后选择处置方式。',
-            }
-          : isResult
-          ? {
-              card: 'border-blue-500/40 bg-blue-500/10 ring-1 ring-blue-500/25',
-              chip: 'bg-blue-500/20 text-blue-200 border border-blue-500/40',
-              label: 'text-blue-200/90',
-              Icon: CheckCircle2,
-              title: '待确认总结',
-              hint: '请审阅以下待确认要点；填写表单后系统将归档并推进下一节点。',
-            }
-          : {
-              card: 'border-emerald-500/40 bg-emerald-500/10 ring-1 ring-emerald-500/25',
-              chip: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40',
-              label: 'text-emerald-200/90',
-              Icon: ListChecks,
-              title: '澄清要点',
-              hint: '主控已收集到以下澄清要点，请逐题填写后提交。',
-            };
-        const Icon = palette.Icon;
+        if (!reason) return null;
         return (
-          <div className={`rounded-xl border p-3.5 backdrop-blur-sm ${palette.card}`}>
-            <div className="flex items-center justify-between mb-2">
-              <div className={`text-[11px] font-semibold flex items-center gap-1.5 ${palette.label}`}>
-                <Icon className="w-3.5 h-3.5" />
-                {palette.title}
-              </div>
-              {kind ? (
-                <span className={`text-[10px] px-1.5 py-0.5 rounded-md ${palette.chip}`}>
-                  {kind}
-                </span>
-              ) : null}
+          <div className="rounded-xl border border-violet-500/40 bg-violet-500/10 ring-1 ring-violet-500/25 p-3.5 backdrop-blur-sm">
+            <div className="text-[11px] font-semibold flex items-center gap-1.5 text-violet-200/90 mb-2">
+              <AlertTriangle className="w-3.5 h-3.5" />
+              异常说明
             </div>
-            {reason ? (
-              <div className="text-[12px] font-medium text-foreground/95 mb-2 leading-relaxed">
-                {reason}
-              </div>
-            ) : null}
-            {body ? (
-              <pre className="text-[11px] text-foreground/85 whitespace-pre-wrap font-sans leading-relaxed m-0 max-h-52 overflow-y-auto custom-scrollbar">
-                {body}
-              </pre>
-            ) : null}
-            <p className="text-[10px] text-muted-foreground mt-2 leading-relaxed">{palette.hint}</p>
+            <p className="text-[12px] text-foreground/95 leading-relaxed m-0">{reason}</p>
+            <p className="text-[10px] text-muted-foreground mt-2 leading-relaxed">
+              请选择处置方式后提交；interactive / 结果确认场景不展示长文「待确认总结」，避免与表单题目重复或误导。
+            </p>
           </div>
         );
       })()}
@@ -511,6 +497,7 @@ export const MeetingHitlForm: React.FC<{
   schema: HitlFormSchema;
   summaryMarkdown?: string;
   preview?: boolean;
+  locked?: boolean;
   initialValues?: HitlFormValues;
   onSubmit?: (values: HitlFormValues) => void;
   submitLabel?: string;
@@ -519,6 +506,7 @@ export const MeetingHitlForm: React.FC<{
   schema,
   summaryMarkdown,
   preview = false,
+  locked = false,
   initialValues,
   onSubmit,
   submitLabel = '提交确认',
@@ -526,12 +514,19 @@ export const MeetingHitlForm: React.FC<{
 }) => {
   const questionnaire = isQuestionnaire(schema);
   const accent = accentClasses(schema.render?.accent);
+  const readOnly = preview || locked;
 
   return (
     <div
       className={`rd-meeting-hitl-form overflow-hidden rounded-xl border border-border/60 bg-gradient-to-br ${accent.bg} ${className}`}
     >
       <div className="p-4 space-y-3">
+        {locked ? (
+          <div className="flex items-center gap-2 text-[11px] text-emerald-300/95 bg-emerald-500/10 border border-emerald-500/35 rounded-lg px-3 py-2">
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+            已提交并锁定，不可再修改；系统正在根据您的答案继续处理。
+          </div>
+        ) : null}
         {schema.title ? (
           <div className="flex items-center gap-2">
             <div className={`w-1 h-5 rounded-full ${accent.bar}`} />
@@ -546,9 +541,9 @@ export const MeetingHitlForm: React.FC<{
           <HitlQuestionnaireForm
             schema={schema}
             summaryMarkdown={summaryMarkdown}
-            preview={preview}
+            preview={readOnly}
             initialValues={initialValues}
-            onSubmit={onSubmit}
+            onSubmit={readOnly ? undefined : onSubmit}
             submitLabel={submitLabel}
           />
         ) : (

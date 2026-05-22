@@ -21,8 +21,8 @@ label: 文档生成工具
 
 | 模板文件 | 典型 OUTPUT | 说明 |
 |----------|-------------|------|
-| `templates/01-需求澄清.md` | `01-需求澄清.md` | 需求澄清交付文档 |
-| `templates/03-模块功能.md` | `03-模块功能.md` | 模块功能清单 |
+| `templates/需求澄清.md` | `需求澄清.md` | 需求澄清交付文档 |
+| `templates/模块功能.md` | `模块功能.md` | 模块功能清单 |
 
 新增模板：在 `templates/` 下放置 `{文件名}.md`，调用时设 `OUTPUT` 与文件名一致即可。
 
@@ -33,7 +33,7 @@ label: 文档生成工具
 | Parameter | 必填 | 说明 / 示例 |
 |-----------|------|----------------|
 | `OUTPUT_DIR` | 是 | 输出目录，如 `./requirements/` |
-| `OUTPUT` | 是 | 输出文件名，须与 `templates/` 下某模板文件名一致，如 `01-需求澄清.md` |
+| `OUTPUT` | 是 | 输出文件名，须与 `templates/` 下某模板文件名一致，如 `需求澄清.md` |
 | `TEMPLATE` | 否 | 显式指定模板文件名（相对 `templates/`），默认等于 `OUTPUT` |
 | `CONTEXT_JSON` | 否 | 模板变量 JSON（字符串或 `.json` 文件路径） |
 | `CONTEXT_FILES` | 否 | 逗号分隔的上下文文件路径（Markdown / JSON），用于抽取或补充变量 |
@@ -109,7 +109,7 @@ Step 4 — 落盘与输出
 
 ```
 OUTPUT_DIR: ./requirements/
-OUTPUT: 03-模块功能.md
+OUTPUT: 模块功能.md
 CONTEXT_JSON: ./requirements/.tmp/module_context.json
 PROD: XXX系统
 STATUS: confirmed
@@ -120,7 +120,7 @@ OUTPUT_MODE: file
 
 ```
 OUTPUT_DIR: ./requirements/
-OUTPUT: 01-需求澄清.md
+OUTPUT: 需求澄清.md
 CONTEXT_JSON: { "REQUIREMENT_NAME": "索引优先级在线变更", "scenarios": [...], ... }
 OUTPUT_MODE: content
 ```
@@ -130,7 +130,7 @@ OUTPUT_MODE: content
 ```
 OUTPUT_DIR: ./requirements/
 OUTPUT: clarify-final.md
-TEMPLATE: 01-需求澄清.md
+TEMPLATE: 需求澄清.md
 CONTEXT_JSON: ./requirements/.tmp/clarify_context.json
 ```
 

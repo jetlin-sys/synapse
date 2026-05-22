@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Any, Literal
 
@@ -41,10 +42,17 @@ from synapse.rd_meeting.room_runtime import (
     sync_room_state_from_dev,
 )
 from synapse.rd_meeting.room_skill import meeting_skill_preview
+from synapse.rd_meeting.hitl_submission import (
+    format_hitl_form_instruction,
+    load_archive_delivery_body,
+    parse_hitl_form_text,
+    record_hitl_submission_locked,
+)
 from synapse.rd_meeting.user_context import (
     append_user_context_pending,
     is_hitl_form_submission,
 )
+from synapse.rd_meeting.validation import validate_node_output
 from synapse.rd_meeting.userwork_sync import build_title_index, patch_userwork_summary
 from synapse.rd_sop.manifest import list_manifest_stages
 from synapse.rd_sop.nodes import (
@@ -273,6 +281,8 @@ class MeetingRoomService:
             "recent_chat": history_to_chat_logs(history),
             "intervention_kind": room_state.get("intervention_kind"),
             "hitl_form_schema": room_state.get("hitl_form_schema"),
+            "hitl_locked": bool(room_state.get("hitl_locked")),
+            "hitl_submission": room_state.get("hitl_submission"),
             "pending_delivery": room_state.get("pending_delivery"),
         }
 
@@ -432,45 +442,25 @@ class MeetingRoomService:
         scope_type = str(detail.get("scope_type") or "demand")
         ticket_title = str(detail.get("ticket_title") or "")
 
-        room_state = load_room_state(scope_id)
-        append_user_context_pending(scope_id, text)
+        room_state = load_room_state(scope_id) or {}
+        rs = dict(room_state) if isinstance(room_state, dict) else {}
 
-        pending = (
-            room_state.get("pending_delivery")
-            if isinstance(room_state, dict)
-            else None
-        )
-        is_result_confirm_gate = (
-            isinstance(pending, dict)
-            and pending.get("report_body")
-            and pending.get("await_confirm", True)
-            and message_type == "instruction"
-            and is_hitl_form_submission(text)
-        )
-        if is_result_confirm_gate:
-            approved, comment = self._parse_hitl_decision(text, resume_run=resume_run)
-            orch = MeetingRoomOrchestrator()
-            orch.confirm_node_delivery(
-                scope_type=scope_type,  # type: ignore[arg-type]
+        if is_hitl_form_submission(text) and rs.get("hitl_locked"):
+            raise ValueError("hitl_form_already_locked")
+
+        if is_hitl_form_submission(text) and message_type == "instruction":
+            return self._handle_hitl_form_submission(
+                rid,
+                scope_type=scope_type,
                 scope_id=scope_id,
-                room_id=rid,
-                approved=approved,
-                comment=comment,
+                text=text,
                 ticket_title=ticket_title,
+                room_state=rs,
+                detail=detail,
+                agent_pool=agent_pool,
             )
-            append_history_event(
-                scope_id,
-                {
-                    "event": "human_intervene",
-                    "room_id": rid,
-                    "text": text,
-                    "message_type": message_type,
-                    "log_type": "user",
-                    "agent_id": "user",
-                    "id": uuid.uuid4().hex[:12],
-                },
-            )
-            return self.get_room_detail(rid) or detail
+
+        append_user_context_pending(scope_id, text)
 
         append_history_event(
             scope_id,
@@ -487,16 +477,9 @@ class MeetingRoomService:
 
         effective_resume = resume_run
         if message_type == "instruction":
-            rs = dict(room_state) if isinstance(room_state, dict) else {}
-            if is_hitl_form_submission(text) or str(rs.get("status") or "") == "human_intervention":
+            if str(rs.get("status") or "") == "human_intervention":
                 effective_resume = True
                 rs["status"] = "processing"
-                if not (
-                    isinstance(pending, dict)
-                    and pending.get("report_body")
-                    and pending.get("await_confirm", True)
-                ):
-                    rs.pop("hitl_form_schema", None)
                 save_room_state(scope_id, rs)
         elif message_type == "chat":
             effective_resume = False
@@ -513,8 +496,154 @@ class MeetingRoomService:
             out["resume_run_started"] = True
         return out
 
-    @staticmethod
-    def _parse_hitl_decision(text: str, *, resume_run: bool = False) -> tuple[bool, str]:
+    def _handle_hitl_form_submission(
+        self,
+        room_id: str,
+        *,
+        scope_type: str,
+        scope_id: str,
+        text: str,
+        ticket_title: str,
+        room_state: dict[str, Any],
+        detail: dict[str, Any],
+        agent_pool: Any | None = None,
+    ) -> dict[str, Any]:
+        """问卷提交：落地锁定 → 按 intervention_kind 分支继续处理。"""
+        rid = room_id.strip()
+        sid = scope_id.strip()
+        form_values, comment, parsed_decision = parse_hitl_form_text(text)
+        record_hitl_submission_locked(sid, raw_text=text, values=form_values)
+
+        instruction_text = format_hitl_form_instruction(form_values, comment=comment)
+        append_user_context_pending(sid, instruction_text)
+
+        kind = str(room_state.get("intervention_kind") or "interactive").strip().lower()
+        pending = room_state.get("pending_delivery")
+        if not isinstance(pending, dict):
+            pending = {}
+
+        append_history_event(
+            sid,
+            {
+                "event": "hitl_form_submitted",
+                "room_id": rid,
+                "text": text,
+                "message_type": "instruction",
+                "log_type": "user",
+                "agent_id": "user",
+                "intervention_kind": kind,
+                "id": uuid.uuid4().hex[:12],
+            },
+        )
+
+        orch = MeetingRoomOrchestrator()
+        resume_started = False
+
+        if kind == "result_confirm":
+            approved, dec_comment = self._parse_hitl_decision(
+                text, resume_run=True, explicit_decision=parsed_decision
+            )
+            if dec_comment and not comment:
+                comment = dec_comment
+            if not approved:
+                rs2 = dict(load_room_state(sid) or {})
+                rs2["status"] = "processing"
+                save_room_state(sid, rs2)
+                orch.confirm_node_delivery(
+                    scope_type=scope_type,  # type: ignore[arg-type]
+                    scope_id=sid,
+                    room_id=rid,
+                    approved=False,
+                    comment=comment,
+                    ticket_title=ticket_title,
+                )
+                out = self.get_room_detail(rid) or detail
+                out["resume_run_started"] = True
+                return out
+
+            node_id = str(pending.get("node_id") or room_state.get("current_node_id") or "")
+            report_body = str(pending.get("report_body") or "").strip()
+            if not validate_node_output(node_id, report_body).ok:
+                archive_body = load_archive_delivery_body(sid, node_id)
+                if archive_body:
+                    rs_fix = dict(load_room_state(sid) or {})
+                    pend = dict(rs_fix.get("pending_delivery") or pending)
+                    pend["report_body"] = archive_body
+                    rs_fix["pending_delivery"] = pend
+                    save_room_state(sid, rs_fix)
+
+            rs_proc = dict(load_room_state(sid) or {})
+            rs_proc["status"] = "processing"
+            save_room_state(sid, rs_proc)
+            orch.confirm_node_delivery(
+                scope_type=scope_type,  # type: ignore[arg-type]
+                scope_id=sid,
+                room_id=rid,
+                approved=True,
+                comment=comment,
+                ticket_title=ticket_title,
+            )
+            out = self.get_room_detail(rid) or detail
+            out["hitl_locked"] = True
+            return out
+
+        if kind == "exception":
+            decision = (parsed_decision or str(form_values.get("decision") or "")).lower()
+            rs2 = dict(load_room_state(sid) or {})
+            rs2["status"] = "processing"
+            save_room_state(sid, rs2)
+            if decision in ("abort", "reject"):
+                rs2 = dict(load_room_state(sid) or {})
+                rs2["status"] = "failed"
+                rs2.pop("hitl_form_schema", None)
+                save_room_state(sid, rs2)
+                append_history_event(
+                    sid,
+                    {
+                        "event": "hitl_exception_abort",
+                        "room_id": rid,
+                        "comment": comment,
+                        "log_type": "warning",
+                        "agent_id": "user",
+                    },
+                )
+            else:
+                schedule_run_node(
+                    scope_type=scope_type,  # type: ignore[arg-type]
+                    scope_id=sid,
+                    room_id=rid,
+                    ticket_title=ticket_title,
+                    agent_pool=agent_pool,
+                )
+                resume_started = True
+            out = self.get_room_detail(rid) or detail
+            out["resume_run_started"] = resume_started
+            out["hitl_locked"] = True
+            return out
+
+        # interactive / 会中澄清：注入答案后继续跑本节点
+        rs2 = dict(load_room_state(sid) or {})
+        rs2["status"] = "processing"
+        save_room_state(sid, rs2)
+        schedule_run_node(
+            scope_type=scope_type,  # type: ignore[arg-type]
+            scope_id=sid,
+            room_id=rid,
+            ticket_title=ticket_title,
+            agent_pool=agent_pool,
+        )
+        out = self.get_room_detail(rid) or detail
+        out["resume_run_started"] = True
+        out["hitl_locked"] = True
+        return out
+
+    def _parse_hitl_decision(
+        self,
+        text: str,
+        *,
+        resume_run: bool = False,
+        explicit_decision: str | None = None,
+    ) -> tuple[bool, str]:
         """解析人工确认表单或一键通过指令，返回 (是否通过, 补充说明)。"""
         lower = text.lower()
         comment = ""
@@ -523,11 +652,19 @@ class MeetingRoomService:
             if stripped.lower().startswith("comment:") or stripped.startswith("补充说明:"):
                 comment = stripped.split(":", 1)[-1].strip()
 
+        dec = (explicit_decision or "").strip().lower()
+        if dec in ("reject", "abort", "no"):
+            return False, comment or text
+        if dec in ("approve", "retry", "ok", "yes"):
+            return True, comment
+
         if "decision: reject" in lower or "decision:reject" in lower:
             return False, comment or text
         if "decision: approve" in lower or "decision:approve" in lower:
             return True, comment
-        if "不通过" in text or "需返工" in text or "reject" in lower:
+        if "不通过" in text or "需返工" in text:
+            return False, comment or text
+        if re.search(r"\breject\b", lower) and "approve" not in lower:
             return False, comment or text
         if resume_run or "人工确认通过" in text or "approve" in lower:
             return True, comment

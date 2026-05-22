@@ -190,7 +190,7 @@ def test_resolve_hitl_schema_interactive_stays_none():
 def test_coerce_rejects_under_granular_questionnaire():
     """summary 列了 14 个 P0 问题，questions 只给 2 道 → 必须拒绝。"""
     summary = (
-        "## 需求澄清交付结论\n"
+        "## 需求澄清\n"
         "14个P0问题均附有可默认结论（含2个待确认项），请确认：\n"
         "1. 备份方式：全量\n2. 备份粒度：按节点\n3. 触发机制：定时\n"
         "4. 备份范围：全量内存\n5. 存储格式：二进制\n6. 保留策略：最近3份\n"
