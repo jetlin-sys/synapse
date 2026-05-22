@@ -21,6 +21,10 @@ OptionStyle = Literal["radio", "checkbox", "boolean"]
 QUESTIONNAIRE_TYPE = "questionnaire"
 QUESTIONNAIRE_VERSION = "1.0"
 
+# 所有人机问卷末尾追加的自由补充题（不覆盖上方选项/填空答案）
+HUMAN_SUPPLEMENT_QUESTION_ID = "human_supplement"
+HUMAN_SUPPLEMENT_TITLE = "请问您还有什么需要补充的吗？"
+
 # 智能体输出中的 HITL 问卷标记（与技能 whalecloud-dev-tool-ask-user 对齐）
 HITL_MARKER_BEGIN = "<!-- hitl-questionnaire"
 HITL_MARKER_END = "<!-- /hitl-questionnaire -->"
@@ -216,11 +220,13 @@ def resolve_hitl_schema_for_gate(
         # 此处不兜底，避免给用户看到无意义的占位题目。
         return None
     if kind == "exception":
-        return default_exception_hitl_schema(node_id, reason=reason)
+        return normalize_hitl_schema(
+            default_exception_hitl_schema(node_id, reason=reason)
+        )
     if kind == "result_confirm" and node_id and binding.get("human_confirm"):
-        return default_hitl_form_schema(node_id)
+        return normalize_hitl_schema(default_hitl_form_schema(node_id))
     if node_id and binding.get("human_confirm"):
-        return default_hitl_form_schema(node_id)
+        return normalize_hitl_schema(default_hitl_form_schema(node_id))
     return None
 
 
@@ -466,6 +472,29 @@ def build_question(
     }
 
 
+def build_human_supplement_question() -> dict[str, Any]:
+    """所有人机场景末尾的选填补充题（长文本输入，独立于上方各题答案）。"""
+    return build_question(
+        qid=HUMAN_SUPPLEMENT_QUESTION_ID,
+        qtype="textarea",
+        title=HUMAN_SUPPLEMENT_TITLE,
+        context="选填。此处为自由补充说明，不会覆盖您在上方各题中的选择；无补充可留空直接提交。",
+        required=False,
+        show_progress=False,
+    )
+
+
+def append_human_supplement_question(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """在题目列表末尾追加统一补充题（已存在同 id/标题则跳过）。"""
+    out = [dict(q) for q in questions if isinstance(q, dict)]
+    if any(str(q.get("id") or "").strip() == HUMAN_SUPPLEMENT_QUESTION_ID for q in out):
+        return out
+    if any(HUMAN_SUPPLEMENT_TITLE in str(q.get("title") or "") for q in out):
+        return out
+    out.append(build_human_supplement_question())
+    return out
+
+
 def attach_question_progress(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """为题目列表写入统一的 progress.current / progress.total。"""
     total = len(questions)
@@ -665,7 +694,8 @@ def normalize_hitl_schema(schema: dict[str, Any] | None) -> dict[str, Any] | Non
         out["type"] = QUESTIONNAIRE_TYPE
     if not out.get("version"):
         out["version"] = QUESTIONNAIRE_VERSION
-    out["questions"] = attach_question_progress(list(questions))
+    merged = append_human_supplement_question(list(questions))
+    out["questions"] = attach_question_progress(merged)
     return out
 
 

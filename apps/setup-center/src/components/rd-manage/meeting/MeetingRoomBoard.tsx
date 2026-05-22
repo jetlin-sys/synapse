@@ -611,36 +611,53 @@ const AgentStatusIcon = ({ status }: { status: RoomAgent['status'] }) => {
   }
 };
 
-const AgentAvatar = ({ agent, size = 'normal' }: { agent: RoomAgent, size?: 'small' | 'normal' | 'large' }) => {
+const AgentAvatar = ({
+  agent,
+  size = 'normal',
+  showStatusBadge = true,
+}: {
+  agent: RoomAgent;
+  size?: 'small' | 'normal' | 'large';
+  /** 右上角状态角标（协作流对话框内默认关闭，避免与主头像叠两层图标） */
+  showStatusBadge?: boolean;
+}) => {
   const isLarge = size === 'large';
   const sizeClasses = isLarge ? 'w-10 h-10' : size === 'small' ? 'w-6 h-6' : 'w-8 h-8';
-  
+
   return (
     <div className="relative group/avatar">
-      <div className={`${sizeClasses} rounded-full flex items-center justify-center text-white ${agent.avatarColor} border-2 border-background shadow-lg relative z-10 overflow-hidden`}>
+      <div
+        className={`${sizeClasses} rounded-full flex items-center justify-center text-white ${agent.avatarColor} border-2 border-background shadow-lg relative z-10 overflow-hidden`}
+      >
         {agent.status === 'processing' && (
-          <motion.div 
+          <motion.div
             className="absolute inset-0 bg-white/20"
             animate={{ y: ['100%', '-100%'] }}
-            transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
+            transition={{ repeat: Infinity, duration: 2, ease: 'linear' }}
           />
         )}
         {agent.icon}
       </div>
-      
-      {/* Status Badge Fixed to Top Right */}
-      <div className={`absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border-2 border-background z-20 ${
-        agent.status === 'processing' ? 'bg-blue-900' : 
-        agent.status === 'error' ? 'bg-red-900' : 'bg-muted'
-      }`}>
-        <AgentStatusIcon status={agent.status} />
-        {agent.status === 'processing' && (
-          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-50"></span>
-        )}
-        {agent.status === 'error' && (
-          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-40"></span>
-        )}
-      </div>
+
+      {showStatusBadge ? (
+        <div
+          className={`absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border-2 border-background z-20 ${
+            agent.status === 'processing'
+              ? 'bg-blue-900'
+              : agent.status === 'error'
+                ? 'bg-red-900'
+                : 'bg-muted'
+          }`}
+        >
+          <AgentStatusIcon status={agent.status} />
+          {agent.status === 'processing' && (
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-50" />
+          )}
+          {agent.status === 'error' && (
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-40" />
+          )}
+        </div>
+      ) : null}
     </div>
   );
 };
@@ -1221,11 +1238,10 @@ const InterventionDialog = ({
                  <span className="mx-1 text-muted-foreground/70">|</span>
                  {room.agents.map(a => (
                    <Tooltip key={a.id} title={`${a.name} · ${a.role}`}>
-                     <div className="relative">
-                       <div className={`w-6 h-6 rounded-full flex items-center justify-center text-white text-[10px] ${a.avatarColor} ring-2 ring-background`}>
-                         {a.icon}
-                       </div>
-                       <div className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full border border-background ${a.status === 'error' ? 'bg-red-500' : a.status === 'processing' ? 'bg-blue-500' : 'bg-muted-foreground'}`} />
+                     <div
+                       className={`w-6 h-6 rounded-full flex items-center justify-center text-white text-[10px] ${a.avatarColor} ring-2 ring-background`}
+                     >
+                       {a.icon}
                      </div>
                    </Tooltip>
                  ))}
@@ -1247,7 +1263,7 @@ const InterventionDialog = ({
                 >
                   {!isUser && agent && (
                     <div className="shrink-0 mt-0.5">
-                      <AgentAvatar agent={agent} size="small" />
+                      <AgentAvatar agent={agent} size="small" showStatusBadge={false} />
                     </div>
                   )}
                   <div className={`flex flex-col max-w-[85%] ${isUser ? 'items-end' : 'items-start'}`}>
@@ -1283,7 +1299,7 @@ const InterventionDialog = ({
                   className="flex gap-2.5 flex-row items-center"
                 >
                   <div className="shrink-0">
-                    <AgentAvatar agent={room.agents[0]} size="small" />
+                    <AgentAvatar agent={room.agents[0]} size="small" showStatusBadge={false} />
                   </div>
                   <div className="bg-muted border border-border/50 rounded-xl rounded-tl-sm px-3 py-2.5 text-muted-foreground text-xs flex items-center gap-2">
                     <BrainCircuit className="w-3.5 h-3.5 animate-pulse text-blue-400" />

@@ -177,7 +177,7 @@ def test_hitl_schema_prompt_text():
     schema = default_hitl_form_schema("boundary")
     text = format_hitl_schema_for_prompt(schema)
     assert "确认结论" in text
-    assert "共 4 题" in text
+    assert "共 5 题" in text
     assert "decision" in text or "approve" in text
 
 

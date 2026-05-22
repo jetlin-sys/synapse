@@ -7,8 +7,10 @@ import json
 import pytest
 
 from synapse.rd_meeting.hitl_form import (
+    HUMAN_SUPPLEMENT_QUESTION_ID,
     coerce_questionnaire_schema,
     default_exception_hitl_schema,
+    normalize_hitl_schema,
     resolve_hitl_schema_for_gate,
 )
 from synapse.rd_meeting.hitl_submit import (
@@ -94,7 +96,24 @@ def test_coerce_schema_validates_questions():
     assert schema["intervention_kind"] == "result_confirm"
     assert schema["summary_markdown"] == "待确认要点"
     assert schema["render"]["accent"] == "blue"
-    assert schema["questions"][0]["render"]["progress"]["total"] == 1
+    assert schema["questions"][-1]["id"] == HUMAN_SUPPLEMENT_QUESTION_ID
+    assert schema["questions"][-1]["type"] == "textarea"
+    assert schema["questions"][0]["render"]["progress"]["total"] == 2
+
+
+def test_normalize_appends_human_supplement_question():
+    schema = normalize_hitl_schema(
+        {
+            "type": "questionnaire",
+            "questions": [
+                {"id": "q1", "type": "single", "title": "是否通过", "options": [{"value": "y", "label": "是"}]},
+            ],
+        }
+    )
+    assert schema is not None
+    assert schema["questions"][-1]["id"] == HUMAN_SUPPLEMENT_QUESTION_ID
+    assert schema["questions"][-1]["required"] is False
+    assert schema["questions"][-1]["type"] == "textarea"
 
 
 def test_submit_questionnaire_writes_room_state(meeting_scope):
@@ -221,7 +240,8 @@ def test_coerce_allows_sufficient_granularity():
         questions=questions,
         summary=summary,
     )
-    assert len(schema["questions"]) == 3
+    assert len(schema["questions"]) == 4
+    assert schema["questions"][-1]["id"] == HUMAN_SUPPLEMENT_QUESTION_ID
 
 
 def test_coerce_granularity_skipped_for_exception():
