@@ -252,6 +252,7 @@ class MeetingRoomOrchestrator:
             archive_dir=str(
                 archive_root(scope_id) / str(binding.get("stage_id") or 0) / str(binding.get("node_id") or "")
             ),
+            self_profile_id=str(self_profile_id or "").strip(),
         )
         if self_profile_id:
             ctx.worker_profile_ids = [self_profile_id] + [
@@ -278,13 +279,16 @@ class MeetingRoomOrchestrator:
                 binding=binding,
                 sop_node_display=sop_display,
             )
-        agent._custom_prompt_suffix = suffix
+        # 会议室提示词直接作为 system prompt（绕过 Identity/Catalogs/Memory 等通用编译段），
+        # 通过 _org_context=True 阻止 _build_system_prompt_compiled* 重新拼装覆盖。
+        agent._custom_prompt_suffix = ""
         agent_ctx = getattr(agent, "_context", None)
-        if agent_ctx is not None and hasattr(agent, "_build_system_prompt"):
-            try:
-                agent_ctx.system = agent._build_system_prompt()
-            except Exception as exc:
-                logger.debug("rebuild system prompt failed for role=%s: %s", role, exc)
+        if agent_ctx is not None:
+            agent_ctx.system = suffix
+        try:
+            agent._org_context = True  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.debug("set _org_context failed for role=%s: %s", role, exc)
         return reused_host_prompt
 
     def on_node_complete(

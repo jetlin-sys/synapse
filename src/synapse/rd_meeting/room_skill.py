@@ -166,6 +166,7 @@ class MeetingRoomContext:
     meeting_skill_id: str
     archive_dir: str
     prompt_supplement: str = ""
+    self_profile_id: str = ""
 
     def template_vars(self) -> dict[str, str]:
         """仅流程/路径类占位符；议程与工单数据只在 ``DYNAMIC_MEETING_CONTEXT``。"""
@@ -384,6 +385,91 @@ def render_skill(skill_body: str, variables: dict[str, str]) -> str:
     return rendered
 
 
+def build_meeting_runtime_header(
+    context: MeetingRoomContext,
+    *,
+    now_iso: str | None = None,
+) -> str:
+    """生成"运行时头"——替代原 Identity/Catalogs/Multi-Agent 段。
+
+    Host 与 Worker 各加一段角色专属说明；末尾附参会能力卡片。
+    Worker 视角时排除自己的卡片，避免自我介绍冗余。
+    """
+    from datetime import datetime as _dt
+
+    role = context.role
+    self_pid = (context.self_profile_id or "").strip()
+    if not self_pid:
+        if role == "host":
+            self_pid = context.host_profile_id
+        elif context.worker_profile_ids:
+            self_pid = context.worker_profile_ids[0]
+    self_profile = _resolve_profile(self_pid) if self_pid else None
+    self_name = (
+        self_profile.get_display_name() if self_profile is not None
+        else (context.host_profile_name if role == "host" else self_pid)
+    ) or self_pid or "(unknown)"
+
+    role_label = "host=小鲸主持人" if role == "host" else "worker=协作专家"
+    endpoint = (
+        context.host_llm_endpoint if role == "host"
+        else context.worker_llm_endpoint
+    ) or DEFAULT_LLM_ENDPOINT_KEY
+    now = (now_iso or _dt.now().isoformat(timespec="seconds")).strip()
+
+    lines: list[str] = []
+    lines.append("# 你是 Synapse 研发会议室参会智能体")
+    lines.append("")
+    lines.append(f"- **当前角色**：{role}（{role_label}）")
+    lines.append(f"- **当前 Profile**：`{self_pid or 'default'}` —— {self_name}")
+    lines.append(f"- **会议工单**：{context.ticket_title or '(未命名)'} · scope=`{context.scope_id}`")
+    lines.append(
+        f"- **当前节点**：{context.stage_name or 'stage-' + str(context.stage_id)} / "
+        f"{context.node_name}（`{context.node_id}`）"
+    )
+    if context.archive_dir:
+        lines.append(f"- **工作目录**：`{context.archive_dir}`（相对路径以此为根，归档物写入此处）")
+    lines.append(f"- **LLM 端点**：`{endpoint}`")
+    lines.append(f"- **当前时间**：{now}")
+    lines.append("- **回复语言**：中文")
+    lines.append("")
+    lines.append("## 工具调用通则")
+    lines.append("- 你拥有 shell / read_file / write_file / list_directory / web_search 等工具，通过函数调用方式触发，禁止伪造工具输出。")
+    lines.append("- 涉及破坏性操作（rm / 大批量写入 / 网络副作用）需在产物中显式标注理由。")
+    lines.append("- 任何结论必须可由源码、文档或工单证据回溯；严禁虚构。")
+    lines.append("")
+
+    if role == "host":
+        lines.append("## 主持人额外职责")
+        lines.append("- 你可以调用 `delegate_to_agent` 向单个 worker 派单，或 `delegate_parallel` 并行派发多个子任务；委派后等待 worker 返回再继续。")
+        lines.append("- 节点目标完成且通过自检后，按 SKILL 第 5 节要求归档并报告结论。")
+        lines.append("- 当达到 SKILL 第 1.2 节描述的 `human_confirm` 触发条件时，按 ask-user 流程发起问卷，禁止伪造用户答复。")
+        lines.append("- 可用 worker 名单见下方「参会能力卡片」。")
+    else:
+        lines.append("## 协作专家额外职责")
+        lines.append("- 你是子 Agent，**禁止再发起委派**（不要调用 delegate_to_agent / delegate_parallel）。")
+        lines.append("- 仅在你的能力卡片描述的边界内执行任务；超出边界时返回 host 并在内容里说明边界外原因。")
+        lines.append("- 输出必须自给自足：含结论、证据、产物路径；遵循 SKILL 第 4 节「Worker 协作规范」。")
+
+    cards = build_capability_cards(
+        host_profile_id=context.host_profile_id,
+        worker_profile_ids=context.worker_profile_ids,
+        host_llm_endpoint=context.host_llm_endpoint,
+        worker_llm_endpoint=context.worker_llm_endpoint,
+        exclude_self_id=self_pid if role == "worker" else None,
+    )
+    lines.append("")
+    lines.append("## 参会能力卡片")
+    lines.append("")
+    lines.append(cards)
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("（以下为会议室通用规范 SKILL，本场会议必须严格遵守。）")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_room_skill_prompt(
     context: MeetingRoomContext,
     *,
@@ -392,7 +478,7 @@ def build_room_skill_prompt(
     binding: dict[str, Any] | None = None,
     sop_node_display: str = "",
 ) -> str:
-    """生成会议室唯一动态注入：SKILL 规范 + 四段式 ``{DYNAMIC_MEETING_CONTEXT}``。"""
+    """生成会议室完整 system prompt：运行时头 + SKILL 规范 + 四段式 ``{DYNAMIC_MEETING_CONTEXT}``。"""
     from synapse.rd_meeting.dynamic_prompt import build_dynamic_meeting_context
 
     body = skill_body if skill_body is not None else load_meeting_skill_body(context.meeting_skill_id)
@@ -423,7 +509,9 @@ def build_room_skill_prompt(
 
     variables = context.template_vars()
     variables["DYNAMIC_MEETING_CONTEXT"] = dynamic
-    return render_skill(body, variables)
+    rendered = render_skill(body, variables)
+    header = build_meeting_runtime_header(context)
+    return f"{header}\n{rendered}"
 
 
 def _self_profile_id_for_context(context: MeetingRoomContext) -> str | None:
@@ -446,6 +534,7 @@ def make_context(
     scope_id: str,
     ticket_title: str,
     archive_dir: str,
+    self_profile_id: str = "",
 ) -> MeetingRoomContext:
     """从 binding（resolve_node_binding 输出）+ scope 信息组装上下文。"""
     host_id = str(binding.get("host_profile_id") or "default").strip() or "default"
@@ -474,6 +563,7 @@ def make_context(
         meeting_skill_id=str(binding.get("meeting_skill_id") or DEFAULT_MEETING_SKILL_ID),
         archive_dir=str(archive_dir or ""),
         prompt_supplement=str(binding.get("prompt_supplement") or ""),
+        self_profile_id=str(self_profile_id or "").strip(),
     )
 
 

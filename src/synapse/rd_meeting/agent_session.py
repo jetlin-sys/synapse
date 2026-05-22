@@ -41,7 +41,11 @@ def bind_meeting_agent_session(agent: Any, session: Session) -> None:
 
 
 def clear_meeting_agent_session(agent: Any) -> None:
-    """任务结束后清理，避免池化 Agent 残留会话指针。"""
+    """任务结束后清理，避免池化 Agent 残留会话指针 / 会议室提示词短路标记。"""
     agent._current_session = None
     if getattr(agent, "agent_state", None) is not None:
         agent.agent_state.current_session = None
+    try:
+        agent._org_context = False  # 复位会议室短路开关，允许复用时回到通用编译管线
+    except Exception:
+        pass
