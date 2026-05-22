@@ -72,6 +72,8 @@ def _sample_questions():
                 {"value": "ok", "label": "同意"},
                 {"value": "no", "label": "拒绝"},
             ],
+            "inputEnabled": True,
+            "inputPlaceholder": "或者你的答案：",
         }
     ]
 
@@ -106,7 +108,13 @@ def test_normalize_appends_human_supplement_question():
         {
             "type": "questionnaire",
             "questions": [
-                {"id": "q1", "type": "single", "title": "是否通过", "options": [{"value": "y", "label": "是"}]},
+                {
+                    "id": "q1",
+                    "type": "single",
+                    "title": "是否通过",
+                    "options": [{"value": "y", "label": "是"}],
+                    "inputEnabled": True,
+                },
             ],
         }
     )
@@ -218,8 +226,8 @@ def test_coerce_rejects_under_granular_questionnaire():
         "12. 多节点协调：独立\n13. 监控告警：复用\n14. 失败恢复：自动重试\n"
     )
     questions = [
-        {"id": "q1", "type": "single", "title": "整体确认"},
-        {"id": "q2", "type": "single", "title": "触发周期"},
+        {"id": "q1", "type": "single", "title": "整体确认", "inputEnabled": True},
+        {"id": "q2", "type": "single", "title": "触发周期", "inputEnabled": True},
     ]
     with pytest.raises(ValueError) as excinfo:
         coerce_questionnaire_schema(
@@ -233,7 +241,8 @@ def test_coerce_rejects_under_granular_questionnaire():
 def test_coerce_allows_sufficient_granularity():
     summary = "## 待澄清问题\n1. A\n2. B\n3. C\n"
     questions = [
-        {"id": f"q{i}", "type": "single", "title": f"题目 {i}"} for i in range(1, 4)
+        {"id": f"q{i}", "type": "single", "title": f"题目 {i}", "inputEnabled": True}
+        for i in range(1, 4)
     ]
     schema = coerce_questionnaire_schema(
         kind="result_confirm",
@@ -249,7 +258,9 @@ def test_coerce_granularity_skipped_for_exception():
     summary = "节点产物未通过 14 项校验"
     schema = coerce_questionnaire_schema(
         kind="exception",
-        questions=[{"id": "q1", "type": "single", "title": "处置"}],
+        questions=[
+            {"id": "q1", "type": "single", "title": "处置", "inputEnabled": True}
+        ],
         summary=summary,
     )
     assert schema["intervention_kind"] == "exception"
@@ -269,6 +280,7 @@ def test_coerce_normalizes_option_value_from_id():
                     {"id": "reject", "label": "拒绝"},
                     {"label": "仅有 label 也要拿到稳定 value"},
                 ],
+                "inputEnabled": True,
             }
         ],
     )
@@ -289,7 +301,9 @@ def test_coerce_rejects_roadmap_in_summary():
     with pytest.raises(ValueError) as excinfo:
         coerce_questionnaire_schema(
             kind="result_confirm",
-            questions=[{"id": "q1", "type": "single", "title": "Q1"}],
+            questions=[
+                {"id": "q1", "type": "single", "title": "Q1", "inputEnabled": True}
+            ],
             summary=summary,
         )
     assert "summary" in str(excinfo.value).lower() or "路线图" in str(excinfo.value)
@@ -298,7 +312,14 @@ def test_coerce_rejects_roadmap_in_summary():
 def test_coerce_allows_clean_summary():
     coerce_questionnaire_schema(
         kind="result_confirm",
-        questions=[{"id": "q1", "type": "single", "title": "Q1 备份方式"}],
+        questions=[
+            {
+                "id": "q1",
+                "type": "single",
+                "title": "Q1 备份方式",
+                "inputEnabled": True,
+            }
+        ],
         summary="## 本节点待确认\n- Q1 备份方式：推荐全量（✅）\n",
     )
 
@@ -308,10 +329,85 @@ def test_coerce_granularity_can_be_disabled():
     summary = "10 个待确认项："
     coerce_questionnaire_schema(
         kind="result_confirm",
-        questions=[{"id": "q1", "type": "single", "title": "整体"}],
+        questions=[
+            {"id": "q1", "type": "single", "title": "整体", "inputEnabled": True}
+        ],
         summary=summary,
         enforce_granularity=False,
     )
+
+
+def test_coerce_rejects_single_without_input_enabled():
+    """选项题（single / multiple）必须 ``inputEnabled: true``，否则拒绝。"""
+    with pytest.raises(ValueError) as excinfo:
+        coerce_questionnaire_schema(
+            kind="interactive",
+            questions=[
+                {
+                    "id": "decision",
+                    "type": "single",
+                    "title": "请选择",
+                    "options": [
+                        {"value": "ok", "label": "同意"},
+                        {"value": "no", "label": "拒绝"},
+                    ],
+                }
+            ],
+        )
+    assert "inputEnabled" in str(excinfo.value)
+
+
+def test_coerce_rejects_multiple_without_input_enabled():
+    with pytest.raises(ValueError) as excinfo:
+        coerce_questionnaire_schema(
+            kind="interactive",
+            questions=[
+                {
+                    "id": "tags",
+                    "type": "multiple",
+                    "title": "影响范围（可多选）",
+                    "options": [
+                        {"value": "a", "label": "A 模块"},
+                        {"value": "b", "label": "B 模块"},
+                    ],
+                }
+            ],
+        )
+    assert "inputEnabled" in str(excinfo.value)
+
+
+def test_coerce_allows_multiple_choice_with_input():
+    schema = coerce_questionnaire_schema(
+        kind="interactive",
+        questions=[
+            {
+                "id": "tags",
+                "type": "multiple",
+                "title": "影响范围（可多选）",
+                "options": [
+                    {"value": "a", "label": "A 模块"},
+                    {"value": "b", "label": "B 模块"},
+                ],
+                "inputEnabled": True,
+                "inputPlaceholder": "其他模块：",
+            }
+        ],
+    )
+    assert schema["questions"][0]["type"] == "multiple"
+    assert schema["questions"][0]["inputEnabled"] is True
+
+
+def test_coerce_boolean_and_text_do_not_require_input_enabled():
+    """``boolean`` / ``text`` / ``textarea`` 不强制 inputEnabled。"""
+    schema = coerce_questionnaire_schema(
+        kind="interactive",
+        questions=[
+            {"id": "ack", "type": "boolean", "title": "是否知悉"},
+            {"id": "note", "type": "textarea", "title": "备注"},
+            {"id": "name", "type": "text", "title": "联系人"},
+        ],
+    )
+    assert len(schema["questions"]) == 4  # 含系统追加补充题
 
 
 def test_default_exception_schema_shape():

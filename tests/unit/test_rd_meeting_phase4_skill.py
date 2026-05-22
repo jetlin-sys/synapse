@@ -36,24 +36,23 @@ def host_binding() -> dict:
 
 
 def test_meeting_room_rules_is_builtin_no_external_file():
-    """会议室通用规范内嵌在 room_skill.py，与 SKILL 加载机制无关。"""
+    """会议室流程规则内嵌在 room_skill.py，与 SKILL 加载机制无关。"""
     body = get_meeting_room_rules()
-    assert body, "内置规范正文不应为空"
-    assert "## 1. 节点成功标准" in body
-    assert "## 6. 不变量" in body
+    assert body, "内置规则正文不应为空"
+    assert "## 会议室流程与规则" in body
+    assert "### 1. 节点成功标准" in body
+    assert "### 7. 不变量" in body
     assert "name: whalecloud-dev-tool-meeting-room" not in body, "不应再含 front-matter"
 
 
-def test_trim_skill_for_role_hides_other_perspective():
+def test_trim_skill_for_role_keeps_host_and_strips_worker():
+    """精简后：流程规则仅 host 看到；worker 视角下规则段为空。"""
     body = get_meeting_room_rules()
     host_view = trim_skill_for_role(body, "host")
     worker_view = trim_skill_for_role(body, "worker")
 
-    assert "## 3. 小鲸（Host）的工作循环" in host_view
-    assert "## 4. 协作智能体（Worker）的协作规范" not in host_view
-
-    assert "## 4. 协作智能体（Worker）的协作规范" in worker_view
-    assert "## 3. 小鲸（Host）的工作循环" not in worker_view
+    assert "### 3. 工作循环" in host_view
+    assert worker_view == "", "worker 视角不应再追加任何流程规则正文"
 
 
 def test_build_capability_cards_lists_host_and_workers(host_binding):
@@ -133,13 +132,18 @@ def test_build_room_skill_prompt_renders_context_vars(host_binding, monkeypatch)
     # host 视角下不渲染 host 自己的能力卡片，所以 host 端点不应出现；worker 端点仍在 worker 卡片里
     assert "reasoning-heavy" not in rendered, "host 视角下不应再次出现自己的端点（避免自我介绍）"
     assert "worker-default" in rendered
-    assert "## 1. 节点成功标准" in rendered
-    assert "## 3. 小鲸（Host）的工作循环" in rendered
+    # 精简后：只在 host 段出现「会议室流程与规则」，且无四段式 §0/§3/§4 标题
+    assert "## 会议室流程与规则" in rendered
+    assert "### 3. 工作循环" in rendered
+    assert "## 3. 小鲸（Host）的工作循环" not in rendered, "旧版四段式标题不应再出现"
     assert "## 4. 协作智能体（Worker）的协作规范" not in rendered
-    assert "本产品为账务中心" in rendered, "运营补充应出现在四段式第一节"
-    assert "## 一、本 SOP 环节工作信息" in rendered
+    # 「一、本 SOP 环节工作信息」已在运行时头展示，不再注入到「系统信息」中
+    assert "## 一、本 SOP 环节工作信息" not in rendered, "运行时头已覆盖，避免重复"
+    assert "本产品为账务中心" in rendered, "运营补充应在运行时头展示"
     assert "{DYNAMIC_MEETING_CONTEXT}" not in rendered
-    assert rendered.count("## 二、工单信息") == 1, "工单段不应在通用规范正文中重复出现"
+    assert rendered.count("## 二、工单信息") == 1
+    assert "## 三、产品信息" in rendered
+    assert "## 四、系统信息" in rendered
     # 能力卡片应排除自己（host 视角时不渲染 host 自己卡）
     assert "## 参会能力卡片" in rendered
     # 会议任务展示为「阶段名 + 节点名」格式
@@ -158,15 +162,18 @@ def test_build_room_skill_prompt_worker_view(host_binding):
         archive_dir="/tmp/work/21878317/archive/1/boundary",
     )
     rendered = build_room_skill_prompt(ctx)
-    assert "## 4. 协作智能体（Worker）的协作规范" in rendered
-    assert "## 3. 小鲸（Host）的工作循环" not in rendered
+    # 精简后：worker 视角不再追加任何流程规则正文
+    assert "## 会议室流程与规则" not in rendered, "worker 视角不应再看到 host 专属规则段"
+    assert "### 3. 工作循环" not in rendered
     # Worker 视角下不再渲染「参会能力卡片」，改为渲染当前 worker 自己的「能力档案」
     assert "## 参会能力卡片" not in rendered, "worker 不允许委派，不应再看到他人能力卡片"
     assert "## 你的能力档案" in rendered
     # 自己的 worker id 应出现在能力档案中
     assert "whalecloud-requirement-expert" in rendered
-    # 不应再有 §4.6 worker↔worker 段
-    assert "Worker ↔ Worker 协作" not in rendered, "worker 之间不能直接协作，§4.6 应被移除"
+    # 工单 / 产品 / 系统三段都应在
+    assert "## 二、工单信息" in rendered
+    assert "## 三、产品信息" in rendered
+    assert "## 四、系统信息" in rendered
 
 
 def test_no_legacy_meeting_skill_api():

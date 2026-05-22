@@ -336,6 +336,22 @@ def coerce_questionnaire_schema(
         qtitle = str(q.get("title") or "").strip()
         if not qtitle:
             raise ValueError(f"questions[{idx}].title 不能为空")
+        # 选项题（single / multiple）必须显式允许用户在选项之外手动输入，
+        # 避免 HITL 流程被有限选项卡死（详见 meeting-room 规则 §5.1(c)）。
+        # boolean / text / textarea 不强制：boolean 二选一即明确；text/textarea 本身是输入框。
+        # 系统自动追加的补充题（human_supplement）由后续 append_human_supplement_question 处理，
+        # 跳过此校验。
+        if (
+            qtype in ("single", "multiple")
+            and qid != HUMAN_SUPPLEMENT_QUESTION_ID
+            and not bool(q.get("inputEnabled"))
+        ):
+            raise ValueError(
+                f"questions[{idx}] (id={qid!r}, type={qtype}) 必须设置 "
+                "``inputEnabled: true`` 与 ``inputPlaceholder``，"
+                "以便用户在给定选项都不满意时手动填写答复"
+                "（见 whalecloud-dev-tool-meeting-room 规则 §5.1(c)）。"
+            )
         entry = dict(q)
         entry["id"] = qid
         entry["type"] = qtype

@@ -117,103 +117,75 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-# ─── 内置会议室通用规范 ────────────────────────────────────────────────
+# ─── 内置主持人流程规则 ────────────────────────────────────────────────
 #
-# 这是会议室 system 上下文的"规则"部分，与 SKILL 加载机制无关——之前它曾经
-# 是一份外部 `skills/whalecloud-dev-tool-meeting-room/SKILL.md`，现在直接内嵌。
-# 仅保留**规范性**内容；议程 / 工单 / 产品 / 系统等数据由
-# `build_dynamic_meeting_context` 注入 `{DYNAMIC_MEETING_CONTEXT}`；角色身份、
-# 参会能力卡片由 `build_meeting_runtime_header` 渲染，**不在本规范正文中重复**。
-_MEETING_ROOM_RULES = """# 研发会议室通用规范
+# 仅 Host（小鲸）会在 system prompt 中加载这段「会议室流程与规则」。
+# Worker 的边界与协作要点已经在 `build_meeting_runtime_header` 的「协作专家职责」
+# 与「你的能力档案」中说清楚，不再追加任何长文规范。
+#
+# 与运行时头、与「系统信息」（工单/产品/系统）之间**不允许重复**：
+# 身份/工单/产品/会议目标/人工确认开关/能力卡片都已展示，本文只讲流程与判定规则。
+_MEETING_ROOM_RULES = """## 会议室流程与规则（主持人专属）
 
-> 本规范是研发会议室的「桌签」。任何参会智能体——主持人 **小鲸** 或协作智能体（需求 / 设计 / 研发 / 测试 / 质量 等专家）——进入会议室后都会在 system prompt 中加载这份规范，作为本场议程的协作宪法。
->
-> 议程、工单、产品、系统参数**仅**出现在下方 §0 四段式动态上下文中；本规范正文**只**描述流程规则，不重复数据。
-> 参会角色与能力清单见 system prompt 上方「参会能力卡片」段。
+### 1. 节点成功标准
 
----
+- 交付物归档到 system 信息「四、系统信息 · 本节点归档目录」指定路径，且通过你自己的契合度 / 真实性 / 准确性检查。
+- 关闭节点（`enabled: false`）由编排器跳过并自动推进；你只需对当前节点负责。
 
-## 0. 本场会议动态上下文（四段式 · 唯一数据注入点）
+### 2. 人工确认（`human_confirm`）语义
 
-```text
-{DYNAMIC_MEETING_CONTEXT}
-```
-
-**不变量**：分派任务、核对能力边界、引用事实前**必须先读 §0**；不得臆造 §0 未出现的 URL、路径或 prod。
-
----
-
-## 1. 节点成功标准与人工确认
-
-会议成功的判定：交付物归档到 `archive/{STAGE_ID}/{NODE_ID}/`（路径见 §0 四 · `{ARCHIVE_DIR}`），且通过小鲸契合度 / 真实性 / 准确性检查。节点关闭（`enabled: false`）时跳过智能体并自动推进。
-
-### 1.2 人工确认（`human_confirm`）语义
-
-**SOP 节点类型 `human` / `human_start` 等**：表示该议程**人工参与度高、适合多轮人机交互**，**不等于**「仅人工处理、不跑智能体」。小鲸与 Worker 仍按 §3 协作；是否向用户请示、结果是否需确认，由 **`human_confirm` 开关**决定（开关取值见 system prompt 顶部「人工确认」字段）。
+「人工确认」开关取值见运行时头的「人工确认」字段。SOP 节点类型 `human` / `human_start` 等，表示**人工参与度高**，**不等于**「仅人工处理、不跑智能体」。
 
 | 场景 | `human_confirm: true` | `human_confirm: false` | 例外 |
 |------|----------------------|------------------------|------|
-| **会议期间** | 可将 Worker 关键中间产物（如需求澄清问题列表）整理后主动提交用户审阅，支持多轮交互 | 小鲸自主决策，不必为常规中间产物逐条请示 | — |
+| **会议期间** | **每次收到 Worker 响应、每次需要做下一步决策前**，都必须先生成 HITL 问卷（`submit_hitl_questionnaire(kind="interactive")`）交人工裁决，**不得**自行替用户做选择 | 自主决策，不必为常规中间产物逐条请示 | — |
 | **会议结果** | 输出「待确认总结」→ 用户表单确认 → **才**写入归档并推进下一节点 | 自主收敛后直接归档并自动推进下一节点 | — |
 | **异常** | 同左 | 同左 | **无论开关**：超时、质量/真实度不达标、风险不可控等，**必须**主动请求人工介入 |
 
-推进下一节点时**不**根据下一节点是否为「人工型」额外挂门控；仅当**当前节点**开启结果确认且用户尚未确认时，节点流转才被阻塞。
+**`human_confirm: true` 时的硬约束**：
 
----
+- **每条决策点 = 一次 HITL**：你**不能**根据 Worker 返回结果直接「拍板」「自动通过」「自动重派」「自动收敛」。在每一个决策分叉（要不要重派、改派给谁、要不要追加 Worker、是否进入收敛、是否归档等），都必须先调 `submit_hitl_questionnaire(kind="interactive")` 拿到用户答复后再继续。
+- **调用即停**：提交后立刻停止本轮所有正文 / 工具调用；待用户答复回到下一轮再继续推进。
+- 仅当**当前节点**开启结果确认且用户尚未确认时，节点流转才被阻塞；推进下一节点不挂额外门控。
 
-## 3. 小鲸（Host）的工作循环
+### 3. 工作循环：拆分 → 派单 → 校验 → 收敛
 
-> 仅对 `{ROLE}=host` 生效。Worker 视角请跳到 §4。
+1. **拆分**：复读运行时头的「会议目标」与「工单」中的硬约束，按「参会能力卡片」的技能列表把目标拆分成可由具体 Worker 完成的子任务。
+2. **派单**：**必须先**调用 `submit_meeting_work_plan` 提交结构化计划（每项含 `agent_id` / `task` / `reason`），再 `delegate_to_agent` 或 `delegate_parallel`；可并行的只读 / 调研任务优先 `delegate_parallel`（建议带 `plan_item_id` 关联计划条目）。
+3. **校验**：Worker 返回结果后，按三项逐条核对：
+   - **契合度**：是否针对你下发的子任务，是否回答了关键问题。
+   - **真实性**：引用的代码 / 文档 / 工单是否真实存在，能否复核。
+   - **准确性**：结论是否经得起源码 / 数据验证，是否存在臆造。
+   不通过则**明确**指出缺项；**`human_confirm: true` 时**按 §2 硬约束先发 HITL 与用户共同决定「重派 / 换人 / 收敛」，**严禁**私下直接重 delegate；`human_confirm: false` 时可重新 delegate 给同一个 Worker（保留上下文，附纠偏指令）。
+4. **收敛**：必要时换人重派或要求 Worker 互助；`human_confirm: true` 时进入收敛前也必须先发 HITL 取得用户同意；目标达成后把多个产出综合为节点的最终交付物。
 
-小鲸是本会议室的**协调者**，按「拆分 → 派单 → 校验 → 收敛」循环推进。可用 Worker 名单及其能力边界见 system prompt 上方「参会能力卡片」段。
+### 4. 自主加载产品上下文（按需）
 
-### 3.1 目标拆分与派单
-
-- 复读 **§0 一、(2) 会议目标** 与 **§0 二、工单信息** 中的硬约束。
-- 参考「参会能力卡片」中 worker 的技能列表，把节点目标拆分为可由具体 Worker 完成的子任务。
-- **必须先**调用 `submit_meeting_work_plan` 提交结构化计划（每项含 `agent_id` / `task` / `reason`），再 `delegate_to_agent` 或 `delegate_parallel`（研发会议室强制）。
-- 优先 `delegate_parallel` 启动可并行的只读 / 调研任务（建议带 `plan_item_id` 关联计划条目）。
-
-### 3.2 检查反馈
-
-Worker 返回结果后，逐项核对：
-
-- **契合度**：是否针对你下发的子任务，是否回答了关键问题。
-- **真实性**：引用的代码 / 文档 / 工单是否真实存在，能否复核。
-- **准确性**：结论是否经得起源码 / 数据验证，是否存在臆造。
-
-不通过则**明确**指出缺项并**重新 delegate** 给同一个 Worker（保留上下文，添加纠偏指令）。
-
-### 3.3 多轮迭代
-
-节点目标未达成前，按「拆分 → 检查」循环；必要时换人重派或要求 Worker 之间互助。收敛后，把多个 Worker 的产出综合成节点的最终交付物。
-
-### 3.4 加载产品上下文（按需）
-
-小鲸可主动调用以下能力（任一可用即可）：
+当且仅当现有 Worker 不具备相关能力时，你可以直接调用：
 
 - `whalecloud-dev-tool-base-scripts` → `gnx-tools.js` 检索源码 / 仓库
 - `get_doc.py` 获取产品架构 / 需求 / 方案文档
 - 工单只读 API（`owner_order_snapshot`、`meeting-summary`）查看历史
 - `search_memory` / `add_memory` 同步个人记忆与团队记忆
 
-服务地址与目录约定见 **§0 四、系统信息**；**不得臆造**未在 §0 出现的 URL 或路径。
+服务地址与目录约定**只能**取自上方「四、系统信息」；**不得臆造**未出现的 URL 或路径。
 
-### 3.5 对用户汇报
+### 5. 对用户汇报与 HITL 三场景（强约束）
 
-- 不暴露内部多轮扯皮；进展（启动了谁）与结论（最终方案）分层呈现。
-- 需要人工填写表单的三种场景（**强约束**）：
+不暴露内部多轮扯皮；进展（启动了谁）与结论（最终方案）分层呈现。需要人工填写表单的三种场景：
 
-  | 场景 | `kind` | 推荐方式 |
-  |------|--------|----------|
-  | 会议期间澄清 / 选项收集 | `interactive` | **首选** `submit_hitl_questionnaire` 工具；兼容 ask-user 标记块 |
-  | 节点终稿确认（`human_confirm: true`） | `result_confirm` | **必须** `submit_hitl_questionnaire(kind="result_confirm")`，`summary` 仅写本节点待确认简表（见 §3.5.2） |
-  | 异常 / 风险不可控 / 质量不达标 | `exception` | **必须** `submit_hitl_questionnaire(kind="exception")`，在 `summary` 字段写明异常原因 |
+| 场景 | `kind` | 推荐方式 |
+|------|--------|----------|
+| 会议期间澄清 / 选项收集 | `interactive` | **首选** `submit_hitl_questionnaire` 工具；兼容 ask-user 标记块 |
+| 节点终稿确认（`human_confirm: true`） | `result_confirm` | **必须** `submit_hitl_questionnaire(kind="result_confirm")`，`summary` 仅写本节点待确认简表（见下） |
+| 异常 / 风险不可控 / 质量不达标 | `exception` | **必须** `submit_hitl_questionnaire(kind="exception")`，在 `summary` 字段写明异常原因 |
 
-- **调用 `submit_hitl_questionnaire` 后立即停止**：不要再继续写正文、不要重复总结、不要再调任何工具。系统在工具返回后会自动锁定 `human_intervention`，模型继续产出的内容会被忽略。
+- **调用 `submit_hitl_questionnaire` 后立即停止**：不要继续写正文、不要重复总结、不要再调任何工具。系统在工具返回后会自动锁定 `human_intervention`，模型继续产出的内容会被忽略。
 - **`human_confirm: false` 时**：自主收敛并输出最终结论，由系统自动归档推进；除非进入异常，否则**不要**调用 HITL 工具。
 
-#### 3.5.1 问卷题目颗粒度（强约束 · 易错点）
+#### 5.1 问卷题目颗粒度与题型（强约束）
+
+**(a) 颗粒度 · 一个决策点 = 一道独立题**
 
 | 违规做法 | 正确做法 |
 |----------|---------|
@@ -223,83 +195,68 @@ Worker 返回结果后，逐项核对：
 
 **判定原则**：交付文档 / `result.md` / Worker 产出中每条「带可选项的决策点」「带『可默认结论 X / 是否同意』的问题」，都必须落到 `questions[]` 里成为一道独立题，**不允许打包**。题量较多（>10）时可使用 `render.layout="stepped"` 让前端分步引导，但 `questions` 数组本身必须把每个决策点拆开。
 
-#### 3.5.2 `summary` 字段（待确认总结 · 强约束）
+**(b) 题型选择 · 必须支持多选**
 
-`submit_hitl_questionnaire` 的 `summary` 会渲染为桌面端表单上方的**「待确认总结」**卡片。它**只**用于帮助用户快速扫一眼「本节点要确认什么」，**不是**交付结论全文，**不是**项目路线图，**不是** SOP 流程预告。
+| 决策点形态 | 推荐 `type` |
+|------------|-------------|
+| 二元判断（是 / 否、通过 / 不通过） | `boolean` |
+| 互斥结论（只能选一个） | `single` |
+| **可同时成立的多项（任选若干、可全选）**，如「该问题涉及哪些产品 / 模块 / 风险类别」 | **必须** `multiple` |
+| 短输入（编号、名称） | `text` |
+| 长输入（描述、原因、备注） | `textarea` |
+
+只要决策语义允许「同时选中多个」，就**必须**用 `multiple`，**禁止**强行拆成多个 `boolean` 或 `single` 互相覆盖。
+
+**(c) 每题必须支持人工输入（`inputEnabled: true`）**
+
+除「补充题（系统自动追加）」与纯文本输入题（`text` / `textarea`，本身就是输入框）外，**所有** `boolean` / `single` / `multiple` 题都必须显式设置：
+
+```json
+{ "id": "...", "type": "single", "title": "...", "options": [...],
+  "inputEnabled": true,
+  "inputPlaceholder": "或者你的答案：" }
+```
+
+这是为了保证用户在「给定选项都不满意」时仍可手动填写答复，避免 HITL 流程被有限选项卡死。**禁止**为了「答复更标准化」而把 `inputEnabled` 关掉。
+
+#### 5.2 `summary` 字段约束
+
+`submit_hitl_questionnaire` 的 `summary` 渲染为桌面端表单上方的「待确认总结」卡片。它**只**用于让用户快速扫一眼「本节点要确认什么」，**不是**交付结论全文、**不是**项目路线图、**不是** SOP 流程预告。
 
 | 禁止写入 `summary` | 说明 |
 |--------------------|------|
-| ❌ `### 下一步`、`确认后 → …`、`进入某某阶段` | 用户提交问卷后由系统归档并推进；**无需**在 summary 里写「确认后去哪」 |
-| ❌ Worker 归档里的 **Phase 1～N**、改造路线图、排期表、可行性计划 | 这些属于交付文档正文；用户通过 `questions` 逐题确认，不要抄进 summary |
-| ❌ 把 SOP **下一节点**名写进 summary 当流程预告 | 下一节点以 §0 一、(1) 与编排器为准 |
+| ❌ `### 下一步`、`确认后 → …`、`进入某某阶段` | 用户提交问卷后由系统归档并推进；**无需**写「确认后去哪」 |
+| ❌ Worker 归档里的 **Phase 1～N**、改造路线图、排期表、可行性计划 | 属于交付文档正文，不要抄进 summary |
+| ❌ 把 SOP **下一节点**名写进 summary 当流程预告 | 下一节点由编排器决定 |
 | ❌ 整段复制交付结论的「下一步行动」章节 | 只保留与 `questions[]` **题号一一对应**的待确认简表 |
 
-**`summary` 建议结构（宜短，约一屏内）**：
+**建议结构（宜短，约一屏内）**：
 
 1. 本节点名 + 工单/产品一行概要（可选）
 2. 本节点已产出文件列表（可选，文件名即可）
 3. **待确认简表**：列与 `questions` 相同的编号（如 Q1～Q14），每行「维度 / 要点 / 推荐默认（✅）」
 
-> **严禁**：跳过 SOP 节点依赖；在未做检查的情况下把 Worker 的结果当作最终结论；把简单文件读 / 计算这类小事再 delegate 出去；在结果确认 / 异常门控应触发时只口头宣称「问卷已提交」而不调用工具；在结果确认门控开启时自行写入归档或推进节点；在异常场景下私下「假装通过」。
-
----
-
-## 4. 协作智能体（Worker）的协作规范
-
-> 仅对 `{ROLE}=worker` 生效。
-
-### 4.1 自给自足的输入
-
-你看不到主会话的历史。所有需要的上下文都在小鲸（或上一个 Worker）发给你的 prompt 中。如果信息不足，**主动反问**或使用工具自查，**不要臆造**。
-
-### 4.2 守住能力边界
-
-你的角色、技能与主张已在 system prompt 上方「你的能力档案」段明确给出。若小鲸下发的任务超出你的能力边界，**坦诚向小鲸说明**并建议「请考虑改派更合适的同事」，**不要勉强执行也不要伪造结果**；具体改派谁由小鲸决定（你看不到其他同事的卡片）。
-
-### 4.3 结论必须可校验
-
-涉及代码 / 接口 / 模块名等结论必须给出源码或文档证据；无法验证的项标注 `[待代码确认]`，禁止虚构。
-
-### 4.4 结构化产出
-
-- 输出 Markdown，开头一级标题（`# ...`），结尾包含「结论」「完成」或「交付」。
-- 长度建议 ≥ 80 字符；必要时按 §5 的产物要求填充。
-
-### 4.5 闭环反馈
-
-完成后明确告诉小鲸：
-
-- 完成了什么子任务
-- 用到了哪些证据
-- 还有哪些 `[待代码确认]` / 风险项尚未解决
-- 是否触达能力边界、是否建议改派
-
----
-
-## 5. 输出物与人机交互要求
+### 6. 输出物与归档
 
 | 项 | 要求 |
 |----|------|
-| 归档位置 | `archive/{STAGE_ID}/{NODE_ID}/` 下的 Markdown / JSON 等结构化文件 |
+| 归档位置 | 上方「四、系统信息 · 本节点归档目录」下的 Markdown / JSON 等结构化文件 |
 | 命名 | `result.md`（默认），多产物时用语义化文件名 |
 | 一级标题 | 必含，描述节点产物（如 `# 需求澄清`） |
 | 验收字样 | 包含「结论」「完成」或「交付」之一，便于 `validation.py` 校验 |
-| 人工确认 | 见 §1.2：期间交互 + 结果确认 + 异常介入 |
 | 用户可见性 | 仅最终结论与必要进展对用户可见；Worker 之间的扯皮、调试日志归档不外发 |
 
-**异常介入**（与 `human_confirm` 无关）：协作超时、产物质量/真实度无法达标、风险不可控时，**必须**调用 `submit_hitl_questionnaire(kind="exception", summary="异常原因…")`；系统会立刻进入 `human_intervention` 并渲染表单；**严禁**只口头宣称问卷已提交而不实际调用工具。
+**异常介入**（与 `human_confirm` 无关）：协作超时、产物质量/真实度无法达标、风险不可控时，**必须**调用 `submit_hitl_questionnaire(kind="exception", summary="异常原因…")`；**严禁**只口头宣称问卷已提交而不实际调用工具。
 
----
+### 7. 不变量
 
-## 6. 不变量（Invariants）
-
-1. **会议室 = SOP 节点**：当前节点以外的产物不要写入本次归档（节点 id 见 §0 一、(1)）。
-2. **能力边界先行**：小鲸分派前必须先读 system prompt 上方「参会能力卡片」；Worker 接到任务后必须先比对 system prompt 上方「你的能力档案」，超界即向小鲸申请改派。
-3. **真实可核验**：任何结论必须能从源码、文档、工单中找到证据。
-4. **小鲸主持**：所有 Worker 的产出最终由小鲸综合、校验后才算节点完成。
-5. **双端点解耦**：小鲸（host）端点与 Worker 端点独立配置，互不污染。
-6. **结果确认先于归档**：`human_confirm: true` 时，用户表单确认是写入归档与推进节点的**前置条件**（仅阻塞当前节点结束，不依赖下一节点类型）。
-7. **异常必介入**：异常场景下必须请求人工，不受 `human_confirm` 开关限制。
+1. **会议室 = SOP 节点**：当前节点以外的产物不要写入本次归档。
+2. **能力边界先行**：分派前必须先读「参会能力卡片」；Worker 超界时**应**申请改派。
+3. **真实可核验**：任何结论必须能从源码、文档、工单中找到证据；不得臆造。
+4. **小鲸主持**：所有 Worker 的产出最终由你综合、校验后才算节点完成。
+5. **结果确认先于归档**：`human_confirm: true` 时，用户表单确认是写入归档与推进节点的前置条件。
+6. **异常必介入**：异常场景下必须请求人工，不受 `human_confirm` 开关限制。
+7. **不暗箱**：不得跳过 SOP 节点依赖、不得把 Worker 的结果未经检查直接当作最终结论、不得在结果确认 / 异常门控应触发时只口头宣称「问卷已提交」而不调用工具、不得在结果确认门控开启时自行写入归档或推进节点。
 
 > 违反任一不变量视为节点未完成，归档校验会拒绝该产物。
 """
@@ -331,7 +288,11 @@ class MeetingRoomContext:
     self_profile_id: str = ""
 
     def template_vars(self) -> dict[str, str]:
-        """仅流程/路径类占位符；议程与工单数据只在 ``DYNAMIC_MEETING_CONTEXT``。"""
+        """流程 / 路径类占位符。
+
+        新版规则段已不依赖这些变量（运行时头与「系统信息」段直接展示具体值），
+        但保留映射以便测试 / 自定义 `skill_body` 时仍能渲染。
+        """
         return {
             "ROLE": self.role,
             "HOST_PROFILE_ID": self.host_profile_id,
@@ -341,7 +302,6 @@ class MeetingRoomContext:
             "ARCHIVE_DIR": self.archive_dir,
             "STAGE_ID": str(self.stage_id),
             "NODE_ID": self.node_id,
-            "DYNAMIC_MEETING_CONTEXT": "{DYNAMIC_MEETING_CONTEXT}",
         }
 
 
@@ -565,34 +525,27 @@ def build_capability_cards(
 # ─── 角色裁剪 + 渲染 ────────────────────────────────────────────────────
 
 
-_HOST_HIDE_SECTION = re.compile(
-    r"^## 4\. 协作智能体（Worker）的协作规范.*?(?=^## 5\. )",
-    re.MULTILINE | re.DOTALL,
-)
-_WORKER_HIDE_SECTION = re.compile(
-    r"^## 3\. 小鲸（Host）的工作循环.*?(?=^## 4\. )",
-    re.MULTILINE | re.DOTALL,
-)
-
-
 def trim_skill_for_role(skill_body: str, role: Role) -> str:
-    """按角色裁剪通用规范正文：host 隐藏 Worker 视角，worker 隐藏 Host 视角。"""
-    if role == "host":
-        return _HOST_HIDE_SECTION.sub("", skill_body)
+    """按角色返回流程规则正文。
+
+    - ``host``：原样返回（规则段仅给 host 看）。
+    - ``worker``：返回空字符串——worker 的边界与协作要点已在运行时头的
+      「协作专家职责」+「你的能力档案」中说清楚，不再追加任何长文规范。
+    """
     if role == "worker":
-        return _WORKER_HIDE_SECTION.sub("", skill_body)
+        return ""
     return skill_body
 
 
 def render_skill(skill_body: str, variables: dict[str, str]) -> str:
-    """填充规范正文中的占位符；``DYNAMIC_MEETING_CONTEXT`` 最后注入，避免污染四段式正文。"""
-    dynamic = variables.get("DYNAMIC_MEETING_CONTEXT")
-    procedural = {k: v for k, v in variables.items() if k != "DYNAMIC_MEETING_CONTEXT"}
+    """填充规范正文中的占位符。
+
+    新版规则段已不含 ``{ROLE}`` / ``{ARCHIVE_DIR}`` / ``{DYNAMIC_MEETING_CONTEXT}`` 等占位
+    （这些信息全部在运行时头与「系统信息」段直接展示），本函数仅作为兼容入口保留。
+    """
     rendered = skill_body
-    for key, value in procedural.items():
+    for key, value in variables.items():
         rendered = rendered.replace("{" + key + "}", str(value))
-    if dynamic is not None:
-        rendered = rendered.replace("{DYNAMIC_MEETING_CONTEXT}", str(dynamic), 1)
     return rendered
 
 
@@ -649,11 +602,16 @@ def build_meeting_runtime_header(
     now = (now_iso or _dt.now().isoformat(timespec="seconds")).strip()
     product_label = _extract_product_label(init_context)
     confirm_label = _human_confirm_label(binding)
+    supplement = ""
+    if isinstance(binding, dict):
+        supplement = str(binding.get("prompt_supplement") or "").strip()
+    if not supplement:
+        supplement = (context.prompt_supplement or "").strip()
 
     lines: list[str] = []
     lines.append("# 你是 Synapse 研发会议室参会智能体")
     lines.append("")
-    lines.append(f"- **当前角色**：{role_label}")
+    lines.append(f"- **当前角色**：{role_label}（`role={role}`）")
     lines.append(f"- **会议工单**:[`{context.scope_id}`]-{context.ticket_title}")
     lines.append(f"- **工单描述**：")
     lines.append(f"- **涉及产品**：{product_label}")
@@ -662,6 +620,8 @@ def build_meeting_runtime_header(
     lines.append(f"- **人工确认**：{confirm_label}")
     lines.append(f"- **当前时间**：{now}")
     lines.append("- **回复语言**：中文")
+    if supplement:
+        lines.append(f"- **运营补充**：{supplement}")
     lines.append("")
 
     if role == "host":
@@ -716,10 +676,6 @@ def build_meeting_runtime_header(
         lines.append("")
         lines.append(self_block)
     lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("（以下为会议室通用规范，本场会议必须严格遵守。）")
-    lines.append("")
     return "\n".join(lines)
 
 
@@ -731,14 +687,22 @@ def build_room_skill_prompt(
     binding: dict[str, Any] | None = None,
     sop_node_display: str = "",
 ) -> str:
-    """生成会议室完整 system prompt：运行时头 + 通用规范 + 四段式 ``{DYNAMIC_MEETING_CONTEXT}``。
+    """生成会议室完整 system prompt。
 
-    `skill_body` 仅供测试/缓存等场景覆盖；正常调用走内置 `_MEETING_ROOM_RULES`。
+    结构（精简后，参见 docs `多智能体研发会议室实现方案.md` §9）：
+
+    1. **运行时头**（`build_meeting_runtime_header`）—— Host / Worker 都看：
+       身份、工单、会议任务/目标、人工确认、时间、角色职责、工具通则、能力卡片或能力档案。
+    2. **系统信息**（`build_dynamic_meeting_context(include_overview=False)`）—— 都看：
+       仅工单 / 产品 / 系统三段；运行时头已展示的「会议节点/会议目标/人工确认/协作智能体」
+       不再重复。
+    3. **会议室流程与规则**（`_MEETING_ROOM_RULES`）—— **仅 Host** 追加：
+       节点成功标准、HITL 语义、工作循环、产品上下文加载、HITL 三场景与 summary 约束、
+       归档要求、不变量。
+
+    `skill_body` 仅供测试 / 缓存等场景覆盖。
     """
     from synapse.rd_meeting.dynamic_prompt import build_dynamic_meeting_context
-
-    body = skill_body if skill_body is not None else get_meeting_room_rules()
-    body = trim_skill_for_role(body, context.role)
 
     bind = dict(binding) if binding else {
         "node_id": context.node_id,
@@ -754,23 +718,29 @@ def build_room_skill_prompt(
         "human_confirm": False,
     }
 
-    dynamic = build_dynamic_meeting_context(
-        binding=bind,
-        init_data=init_context,
-        scope_type=context.scope_type,  # type: ignore[arg-type]
-        scope_id=context.scope_id,
-        sop_node_display=sop_node_display or context.node_name,
-    )
-
-    variables = context.template_vars()
-    variables["DYNAMIC_MEETING_CONTEXT"] = dynamic
-    rendered = render_skill(body, variables)
     header = build_meeting_runtime_header(
         context,
         binding=bind,
         init_context=init_context,
     )
-    return f"{header}\n{rendered}"
+
+    system_info = build_dynamic_meeting_context(
+        binding=bind,
+        init_data=init_context,
+        scope_type=context.scope_type,  # type: ignore[arg-type]
+        scope_id=context.scope_id,
+        sop_node_display=sop_node_display or context.node_name,
+        include_overview=False,
+    )
+
+    body = skill_body if skill_body is not None else get_meeting_room_rules()
+    body = trim_skill_for_role(body, context.role)
+    rules_block = render_skill(body, context.template_vars()).strip() if body else ""
+
+    parts = [header.rstrip(), "", system_info.strip()]
+    if rules_block:
+        parts.extend(["", "---", "", rules_block])
+    return "\n".join(parts)
 
 
 def _self_profile_id_for_context(context: MeetingRoomContext) -> str | None:

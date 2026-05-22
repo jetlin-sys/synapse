@@ -86,8 +86,17 @@ def build_dynamic_meeting_context(
     scope_type: ScopeType = "demand",
     scope_id: str = "",
     sop_node_display: str = "",
+    include_overview: bool = True,
 ) -> str:
-    """四段式动态上下文 Markdown（注入 SKILL `{DYNAMIC_MEETING_CONTEXT}`）。"""
+    """会议室动态上下文 Markdown。
+
+    - ``include_overview=True``（默认）：四段式，含「一、本 SOP 环节工作信息 / 二、工单 / 三、产品 / 四、系统」。
+    - ``include_overview=False``：仅「工单 / 产品 / 系统」三段。
+
+      新版会议室 system prompt 中，「会议节点 / 会议目标 / 人工确认 / 协作智能体」
+      已由 ``build_meeting_runtime_header`` 输出，第一段会与之重复，
+      因此 ``room_skill.build_room_skill_prompt`` 会传 ``False``。
+    """
     sid = (scope_id or "").strip()
     nid = str(binding.get("node_id") or "").strip()
     data = normalize_node_init_log_data(
@@ -124,7 +133,7 @@ def build_dynamic_meeting_context(
     supplement = str(binding.get("prompt_supplement") or "").strip()
     supplement_block = f"\n\n**运营补充**：{supplement}" if supplement else ""
 
-    parts = [
+    sections_overview = [
         "## 一、本 SOP 环节工作信息（最重要）",
         "",
         f"(1) **会议节点**：阶段 `{stage_id}`"
@@ -140,6 +149,8 @@ def build_dynamic_meeting_context(
         workers_summary,
         supplement_block,
         "",
+    ]
+    sections_data = [
         "## 二、工单信息（继承节点初始化）",
         "",
         _format_section_order(order),
@@ -152,6 +163,7 @@ def build_dynamic_meeting_context(
         "",
         _format_section_system(system),
     ]
+    parts = (sections_overview + sections_data) if include_overview else sections_data
     return "\n".join(parts).strip()
 
 
