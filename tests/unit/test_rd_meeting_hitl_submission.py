@@ -65,7 +65,8 @@ def test_record_hitl_submission_locked(scope_work):
     state = json.loads((work / "room_state.json").read_text(encoding="utf-8"))
     assert state["hitl_locked"] is True
     assert state["hitl_submission"]["values"]["q1"] == "答案A"
-    assert state["hitl_form_schema"]  # schema 保留供只读展示
+    assert state.get("hitl_form_schema") is None
+    assert state["hitl_submission"]["schema_snapshot"]["questions"]
 
 
 def test_format_hitl_form_instruction():

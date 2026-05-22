@@ -61,7 +61,13 @@ def _format_section_product(product: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else "（无产品字段）"
 
 
-def _format_section_system(system: dict[str, Any]) -> str:
+def _format_section_system(
+    system: dict[str, Any],
+    *,
+    stage_name: str = "",
+    node_name: str = "",
+    node_outputs: list[str] | None = None,
+) -> str:
     if not system:
         return "（无系统参数）"
     lines: list[str] = []
@@ -71,11 +77,26 @@ def _format_section_system(system: dict[str, Any]) -> str:
         ("gnx_cache_base_dir", "GNX 缓存根目录"),
         ("gnx_cache_dir", "GNX 缓存目录（本仓库）"),
         ("work_order_dir", "工单工作目录"),
-        ("archive_dir", "本节点归档目录"),
     ):
         val = str(system.get(key) or "").strip()
         if val:
             lines.append(f"- {label}：`{val}`")
+    archive_val = str(system.get("archive_dir") or "").strip()
+    if archive_val:
+        friendly = " · ".join(s for s in (stage_name, node_name) if s)
+        if friendly:
+            lines.append(f"- 本节点归档目录（{friendly}）：`{archive_val}`")
+        else:
+            lines.append(f"- 本节点归档目录：`{archive_val}`")
+    outs = [
+        str(n).strip()
+        for n in (node_outputs or [])
+        if str(n).strip() and not str(n).strip().startswith("（")
+    ]
+    if outs:
+        lines.append("- **会议产出**（与运行时头「会议产出」一致；归档文件名必须逐字匹配以下清单）：")
+        for n in outs:
+            lines.append(f"  - `{n}`")
     return "\n".join(lines) if lines else "（无系统字段）"
 
 
@@ -161,7 +182,12 @@ def build_dynamic_meeting_context(
         "",
         "## 四、系统信息（继承节点初始化）",
         "",
-        _format_section_system(system),
+        _format_section_system(
+            system,
+            stage_name=stage_name,
+            node_name=node_name,
+            node_outputs=list(binding.get("node_outputs") or []),
+        ),
     ]
     parts = (sections_overview + sections_data) if include_overview else sections_data
     return "\n".join(parts).strip()

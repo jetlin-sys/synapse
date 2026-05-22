@@ -95,6 +95,7 @@ def record_hitl_submission_locked(
     }
     rs["hitl_submission"] = submission
     rs["hitl_locked"] = True
+    rs.pop("hitl_form_schema", None)
     rs.pop("pending_questionnaire", None)
     save_room_state(sid, rs)
     return submission

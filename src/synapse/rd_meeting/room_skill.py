@@ -159,6 +159,33 @@ _MEETING_ROOM_RULES = """## 会议室流程与规则（主持人专属）
    不通过则**明确**指出缺项；**`human_confirm: true` 时**按 §2 硬约束先发 HITL 与用户共同决定「重派 / 换人 / 收敛」，**严禁**私下直接重 delegate；`human_confirm: false` 时可重新 delegate 给同一个 Worker（保留上下文，附纠偏指令）。
 4. **收敛**：必要时换人重派或要求 Worker 互助；`human_confirm: true` 时进入收敛前也必须先发 HITL 取得用户同意；目标达成后把多个产出综合为节点的最终交付物。
 
+#### 3.1 多轮迭代：基于上一轮结果继续推演（强约束）
+
+会议室通常需要多轮迭代才能收敛。**两种场景下都禁止**「推倒重来、丢弃已确认内容、循环重复追问已通过项」；区别只在"由谁来确认"。
+
+**A) `human_confirm: true` —— 由用户通过 HITL 表单确认（人工裁决）**
+
+- **继承已确认项**：上一轮用户勾选为正确 / 明确肯定的结论，下一轮**直接视为既成事实**，不再复核、不再追问。
+- **吸收纠正与补充**：用户指正的内容按其最新口径覆盖原结论；用户新增的想法作为本轮新输入纳入推演。
+- **只推进未决项**：本轮 Worker 派单与 HITL `questions[]` **仅针对**「尚未确认 / 新增 / 被指正后需重做」的部分，**禁止**把上一轮已通过项再次入题。
+- **终止条件**：当用户既无新想法、也无新指正（仅追问、确认或表示满意）时，视为本轮收敛，按 §6 归档；不要为「再确认一次」无限循环。
+
+**B) `human_confirm: false` —— 由你自评，自主决定是否再迭代一轮（无 HITL 表单）**
+
+此场景下你**不会**发表单给用户，因此**收敛质量完全由你负责**。不能 Worker 一轮交付就直接归档，也不能为了"显得严谨"无限自我对话。判断要不要再迭代一轮，按以下规则：
+
+- **何时必须再迭代**（满足任一即继续）：
+  - Worker 产出未通过 §3 第 3 步「契合度 / 真实性 / 准确性」三项中任意一项；
+  - 关键结论缺乏可核验证据（源码 / 文档 / 工单引用缺失或对不上）；
+  - 多个 Worker 产出之间相互矛盾，或与系统信息段中工单 / 产品事实冲突；
+  - 节点目标涉及高影响 / 不可逆决策（如方案评审、风险评估、自动拆单），需更高置信度。
+- **何时允许收敛归档**（全部满足才可）：
+  - 三项校验全部通过且证据可回溯；
+  - 产出覆盖了「会议产出」清单中的全部文件，无遗漏；
+  - 再迭代一轮的新增收益预期较低（边际产出趋零）。
+- **每一轮继承上一轮的"自评通过"结论**：已经被你校验通过的部分作为既成事实，**只把发现的缺项**作为下一轮派单 / 自查的输入，**禁止**对已通过项重复审问。
+- **迭代上限保护**：原则上不超过 **3** 轮自主迭代；仍未收敛说明已超出 `human_confirm: false` 的自主决策边界，**必须**升级为异常 HITL：`submit_hitl_questionnaire(kind="exception", summary="自主迭代 N 轮仍未收敛，原因…")` 请求人工介入。
+
 ### 4. 自主加载产品上下文（按需）
 
 当且仅当现有 Worker 不具备相关能力时，你可以直接调用：
@@ -240,10 +267,12 @@ _MEETING_ROOM_RULES = """## 会议室流程与规则（主持人专属）
 
 | 项 | 要求 |
 |----|------|
-| 归档位置 | 上方「四、系统信息 · 本节点归档目录」下的 Markdown / JSON 等结构化文件 |
-| 命名 | `result.md`（默认），多产物时用语义化文件名 |
-| 一级标题 | 必含，描述节点产物（如 `# 需求澄清`） |
-| 验收字样 | 包含「结论」「完成」或「交付」之一，便于 `validation.py` 校验 |
+| 归档位置 | 上方「四、系统信息 · 本节点归档目录（阶段名 · 节点名）」展示的完整路径下；按友好名识别即可，无需手算路径 |
+| **命名（强约束）** | **必须**与运行时头「会议产出」（= 系统信息段同名清单）**逐字一致**（如 `需求澄清.md`、`模块功能.md`）；**禁止**改名、加前后缀，**禁止**用 `result.md` 替代清单中的语义化文件名 |
+| **生成方式（强约束）** | **必须**调用 `whalecloud-dev-tool-doc-generate`：①`get_skill_info` 读 SKILL.md → ②确认 `templates/` 下有与预期产出物**同名**的模板 → ③`run_skill_script` 传入 `OUTPUT_DIR`（归档目录）/`OUTPUT`（产出物文件名）/`CONTEXT_JSON`（已核验上下文）落盘 |
+| **模板缺失** | 若 `templates/` 下找不到与预期产出物同名的模板，或模板字段无法满足本节点需求，**立即** `submit_hitl_questionnaire(kind="exception", summary="doc-generate 缺少 <文件名> 模板…")` 请求人工补齐模板 / 调整清单；**禁止**自行手写 Markdown 绕过模板 |
+| 一级标题 | 由模板提供并描述节点产物（如 `# 需求澄清`） |
+| 验收字样 | 产物末尾包含「结论」「完成」或「交付」之一，便于 `validation.py` 校验（模板已内置） |
 | 用户可见性 | 仅最终结论与必要进展对用户可见；Worker 之间的扯皮、调试日志归档不外发 |
 
 **异常介入**（与 `human_confirm` 无关）：协作超时、产物质量/真实度无法达标、风险不可控时，**必须**调用 `submit_hitl_questionnaire(kind="exception", summary="异常原因…")`；**严禁**只口头宣称问卷已提交而不实际调用工具。
@@ -257,6 +286,7 @@ _MEETING_ROOM_RULES = """## 会议室流程与规则（主持人专属）
 5. **结果确认先于归档**：`human_confirm: true` 时，用户表单确认是写入归档与推进节点的前置条件。
 6. **异常必介入**：异常场景下必须请求人工，不受 `human_confirm` 开关限制。
 7. **不暗箱**：不得跳过 SOP 节点依赖、不得把 Worker 的结果未经检查直接当作最终结论、不得在结果确认 / 异常门控应触发时只口头宣称「问卷已提交」而不调用工具、不得在结果确认门控开启时自行写入归档或推进节点。
+8. **产出物模板化**：归档文件名必须与运行时头「会议产出」清单逐字一致，且必须经 `whalecloud-dev-tool-doc-generate` 模板生成；模板缺失或不匹配时只能走异常 HITL，不得手写绕过。
 
 > 违反任一不变量视为节点未完成，归档校验会拒绝该产物。
 """
@@ -576,6 +606,39 @@ def _human_confirm_label(binding: dict[str, Any] | None) -> str:
         return "**开启**（结果需用户表单确认后才能归档/推进）"
     return "关闭（自主收敛后自动归档推进）"
 
+
+def _extract_ticket_description(init_context: dict[str, Any] | None) -> str:
+    """从 init_context.order 中提取工单描述（含影响范围，若存在）。"""
+    if not isinstance(init_context, dict):
+        return "（未提供工单描述）"
+    order = init_context.get("order")
+    if not isinstance(order, dict):
+        return "（未提供工单描述）"
+    desc = str(order.get("description") or "").strip()
+    impact = str(order.get("impact") or "").strip()
+    parts: list[str] = []
+    if desc:
+        parts.append(desc)
+    if impact:
+        parts.append(f"影响范围：{impact}")
+    if not parts:
+        return "（未提供工单描述）"
+    return " ｜ ".join(parts)
+
+
+def _format_meeting_outputs(binding: dict[str, Any] | None) -> str:
+    """从 binding.node_outputs 渲染「会议产出」展示串（与归档强约束一一对应）。"""
+    if not isinstance(binding, dict):
+        return "（未配置会议产出，可能为系统节点或配置缺失）"
+    outs = [
+        str(n).strip()
+        for n in (binding.get("node_outputs") or [])
+        if str(n).strip() and not str(n).strip().startswith("（")
+    ]
+    if not outs:
+        return "（未配置会议产出，可能为系统节点或配置缺失）"
+    return "、".join(f"`{n}`" for n in outs)
+
 def build_meeting_runtime_header(
     context: MeetingRoomContext,
     *,
@@ -602,6 +665,8 @@ def build_meeting_runtime_header(
     now = (now_iso or _dt.now().isoformat(timespec="seconds")).strip()
     product_label = _extract_product_label(init_context)
     confirm_label = _human_confirm_label(binding)
+    ticket_desc = _extract_ticket_description(init_context)
+    meeting_outputs_label = _format_meeting_outputs(binding)
     supplement = ""
     if isinstance(binding, dict):
         supplement = str(binding.get("prompt_supplement") or "").strip()
@@ -613,9 +678,10 @@ def build_meeting_runtime_header(
     lines.append("")
     lines.append(f"- **当前角色**：{role_label}（`role={role}`）")
     lines.append(f"- **会议工单**:[`{context.scope_id}`]-{context.ticket_title}")
-    lines.append(f"- **工单描述**：")
+    lines.append(f"- **工单描述**：{ticket_desc}")
     lines.append(f"- **涉及产品**：{product_label}")
     lines.append(f"- **会议任务**：{context.stage_name}阶段的{context.node_name}任务")
+    lines.append(f"- **会议产出**：{meeting_outputs_label}（最终归档文件名必须**完全等于**这里列出的名字；详见下方归档约束）")
     lines.append(f"- **会议目标**：{context.node_intent}")
     lines.append(f"- **人工确认**：{confirm_label}")
     lines.append(f"- **当前时间**：{now}")
@@ -631,7 +697,12 @@ def build_meeting_runtime_header(
         lines.append("- 基于产品事实，**专注于上方「会议目标」中要做的具体事情**，不进行超出本节点目标的决策。")
         lines.append("- 通过 `submit_meeting_work_plan` 提交结构化计划后，再调用 `delegate_to_agent` 或 `delegate_parallel` 派单；委派后等待 worker 返回再继续。")
         lines.append("- 收到 worker 产出后，按「契合度 / 真实性 / 准确性」三项逐条校验；不通过则**重新派单**给同一 worker 并指出缺项。")
-        lines.append("- 节点目标完成且通过自检后，按下方规范第 5 节要求归档（`archive/{STAGE_ID}/{NODE_ID}/`）并报告结论。")
+        lines.append("- **多轮迭代继承上一轮结果**（共性原则）：上一轮已被认可 / 校验通过的结论**直接视为既成事实**，已被指正的按最新口径覆盖、新增想法纳入推演；下一轮**只**推进未决 / 新增 / 需重做的部分，**禁止**推倒重来或重复审问已通过项；详见下方规范 §3.1。")
+        lines.append("- **`human_confirm: true` 时**：每轮决策都通过 HITL 表单交由用户裁决；当用户无新想法亦无新指正时即视为本轮收敛。")
+        lines.append("- **`human_confirm: false` 时**：不发表单，由你自评收敛质量——若三项校验（契合度 / 真实性 / 准确性）有任一不通过、证据缺失、Worker 产出相互矛盾、或决策高影响，则**必须再迭代一轮**；三项全过且产出已覆盖「会议产出」清单时才能归档；自主迭代原则上**不超过 3 轮**，仍未收敛时升级为 `submit_hitl_questionnaire(kind=\"exception\", ...)` 请求人工介入。")
+        lines.append("- 节点目标完成且通过自检后，按下方规范第 6 节归档到「本节点归档目录」（系统信息段已展示完整路径，并带阶段名 · 节点名便于识别）并报告结论。")
+        lines.append("- **会议产出 = 归档文件名（硬约束）**：上方「会议产出」列出的就是本节点必须落盘的文件，归档文件名必须与之**逐字一致**（如 `需求澄清.md`、`模块功能.md`），**禁止**改名 / 加前后缀 / 用 `result.md` 替代；多文件时每一项都要落盘，且不能多出清单之外的文件。")
+        lines.append('- **必须走 `whalecloud-dev-tool-doc-generate` 生成产出物**：先 `get_skill_info(whalecloud-dev-tool-doc-generate)` 读 SKILL.md、确认 `templates/` 下存在与预期产出物**同名**的模板，再 `run_skill_script` 填模板落盘；若模板缺失或与本节点产出物不匹配，**立即** `submit_hitl_questionnaire(kind="exception", summary="doc-generate 缺少 <文件名> 模板，需人工补齐模板或调整产出物清单")` 请求人工介入，**禁止**自行手写 Markdown 兜底。')
         lines.append("- `human_confirm` 开启或出现异常 / 风险不可控时，必须调用 `submit_hitl_questionnaire`，**禁止伪造用户答复**，**禁止只口头宣称问卷已提交**。")
         lines.append("- 可用 worker 名单与能力边界见下方「参会能力卡片」（已排除你自己）；派单时 task 描述应指向卡片上的具体 skill / 能力，便于 Worker 加载对应 SKILL。")
         lines.append("- 若你（Host）自身 Profile 也配置了技能且必须自行执行（Worker 不具备时），同样须先 `get_skill_info(skill_id)` 读取 SKILL.md，再 `run_skill_script` 或按 SKILL 指引用 shell / 读写工具执行，**禁止**跳过 SKILL 硬猜流程。")

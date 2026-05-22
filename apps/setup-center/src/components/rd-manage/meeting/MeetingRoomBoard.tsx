@@ -291,7 +291,10 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
     tokenConsumed: live.tokenConsumed ?? room.tokenConsumed,
     tokenBudget: live.tokenBudget ?? room.tokenBudget,
     stageDuration: live.stageDuration || room.stageDuration,
-    hitlFormSchema: (live.hitl_form_schema as HitlFormSchema | undefined) ?? room.hitlFormSchema,
+    hitlFormSchema:
+      live.hitl_form_schema !== undefined
+        ? ((live.hitl_form_schema as HitlFormSchema | null) ?? null)
+        : room.hitlFormSchema,
     hitlLocked: live.hitl_locked ?? room.hitlLocked,
     hitlSubmission:
       (live.hitl_submission as MeetingRoom['hitlSubmission']) ?? room.hitlSubmission ?? null,
@@ -926,7 +929,8 @@ const InterventionDialog = ({
   const hitlLocked = Boolean(room?.hitlLocked);
   const hitlAvailable = !!(
     room?.hitlFormSchema &&
-    (room.status === 'human_intervention' || hitlLocked)
+    room.status === 'human_intervention' &&
+    !hitlLocked
   );
   const hitlKind = (room?.hitlFormSchema as { summary_kind?: string; intervention_kind?: string } | undefined);
   const hitlBadgeText = useMemo(() => {
@@ -1189,28 +1193,21 @@ const InterventionDialog = ({
               <div className="h-full overflow-y-auto custom-scrollbar p-6 bg-[color:var(--panel)]">
                 <div className="max-w-[920px] mx-auto">
                   <MeetingHitlForm
+                    key={`hitl-${room.id}-${room.hitlFormSchema.title ?? ''}-${room.hitlFormSchema.questions?.length ?? 0}`}
                     schema={room.hitlFormSchema}
-                    locked={hitlLocked}
-                    initialValues={
-                      (room.hitlSubmission?.values as Record<string, string | string[] | boolean>) ??
-                      undefined
-                    }
                     submitLabel={
                       hitlKind?.summary_kind === 'result_confirm' ||
                       hitlKind?.intervention_kind === 'result_confirm'
                         ? '确认并归档推进'
                         : '提交并继续处理'
                     }
-                    onSubmit={
-                      hitlLocked
-                        ? undefined
-                        : (values) => {
-                            const summary = Object.entries(values)
-                              .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(',') : String(v)}`)
-                              .join('\n');
-                            onIntervene(`[人工确认表单]\n${summary}`, { resumeRun: true });
-                          }
-                    }
+                    onSubmit={(values) => {
+                      setCenterTab('detail');
+                      const summary = Object.entries(values)
+                        .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(',') : String(v)}`)
+                        .join('\n');
+                      onIntervene(`[人工确认表单]\n${summary}`, { resumeRun: true });
+                    }}
                   />
                 </div>
               </div>
