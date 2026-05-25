@@ -1,5 +1,5 @@
 ---
-name: whalecloud-dev-tool-code-access
+name: whalecloud-dev-tool-c-code-access
 description: "研发会议室 C++ 代码精读。执行前必须从上下文确认三要素：USER_REQUEST（用户诉求）、ENTRY_MODULE 与 REPO_NAME（二者须从产品架构/功能文档提取，禁止臆造）。在工单路径上读代码，并通过 GitNexus 图检索辅助。"
 label: C++ 代码阅读
 ---
