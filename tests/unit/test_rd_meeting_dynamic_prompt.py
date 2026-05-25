@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from synapse.rd_meeting.dynamic_prompt import build_dynamic_meeting_context
+from synapse.rd_meeting.dynamic_prompt import (
+    _format_section_system,
+    build_dynamic_meeting_context,
+)
 
 
 @pytest.fixture
@@ -92,6 +95,20 @@ def test_dynamic_context_workers_summary_avoids_capability_card_duplication(host
     assert "- 主张：" not in md
     # 也不应再展示单 worker 的端点行（端点信息只在能力卡片上）
     assert md.count("worker-default") == 0
+
+
+def test_format_section_system_includes_current_os(monkeypatch):
+    monkeypatch.setattr(
+        "synapse.rd_meeting.dynamic_prompt._detect_current_os_type",
+        lambda: "WINDOWS",
+    )
+    md = _format_section_system({})
+    assert "- CURRENT_OS：`WINDOWS`" in md
+
+
+def test_format_section_system_current_os_override():
+    md = _format_section_system({"current_os": "linux"})
+    assert "- CURRENT_OS：`LINUX`" in md
 
 
 def test_product_section_includes_prod_feature(host_binding):

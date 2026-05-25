@@ -392,6 +392,7 @@ def coerce_questionnaire_schema(
         schema["render"] = {
             "layout": "stepped",
             "showOverallProgress": True,
+            "progressBasis": "step",
             "accent": accent_map[kind_norm],
             "animate": True,
         }
@@ -554,7 +555,7 @@ def append_human_supplement_question(questions: list[dict[str, Any]]) -> list[di
 
 
 def attach_question_progress(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """为题目列表写入统一的 progress.current / progress.total。"""
+    """为题目列表写入题序 progress（current=第几题，total=总题数；非已填题数）。"""
     total = len(questions)
     out: list[dict[str, Any]] = []
     for idx, q in enumerate(questions, start=1):
@@ -644,6 +645,7 @@ def default_hitl_form_schema(node_id: str) -> dict[str, Any]:
         "render": {
             "layout": "stepped",
             "showOverallProgress": True,
+            "progressBasis": "step",
             "accent": "blue",
             "animate": True,
         },
@@ -731,6 +733,7 @@ def default_exception_hitl_schema(
         "render": {
             "layout": "stepped",
             "showOverallProgress": True,
+            "progressBasis": "step",
             "accent": "violet",
             "animate": True,
         },

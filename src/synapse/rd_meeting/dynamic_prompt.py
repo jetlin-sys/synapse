@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Literal
 
 from synapse.rd_meeting.devservice import (
@@ -69,10 +70,26 @@ def _format_section_product(product: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else "（无产品字段）"
 
 
+def _detect_current_os_type() -> Literal["WINDOWS", "LINUX", "MACOS"]:
+    """识别当前操作系统，供本地脚本/命令选择对应平台指令。"""
+    if sys.platform == "win32":
+        return "WINDOWS"
+    if sys.platform == "darwin":
+        return "MACOS"
+    if sys.platform.startswith("linux"):
+        return "LINUX"
+    return "LINUX"
+
+
 def _format_section_system(system: dict[str, Any]) -> str:
-    """系统段：服务 URL 与路径；URL 优先读 system，缺失时按 devservice.ip 拼接。"""
+    """系统段：服务 URL、当前 OS 与路径；URL 优先读 system，缺失时按 devservice.ip 拼接。"""
     sys = system if isinstance(system, dict) else {}
     lines: list[str] = []
+
+    current_os = str(sys.get("current_os") or _detect_current_os_type()).strip().upper()
+    if current_os not in {"WINDOWS", "LINUX", "MACOS"}:
+        current_os = _detect_current_os_type()
+    lines.append(f"- CURRENT_OS：`{current_os}`")
 
     synapse_url = str(sys.get("synapse_url") or unified_service_base_url() or "").strip()
     if synapse_url:

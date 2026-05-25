@@ -142,6 +142,8 @@ export interface HitlFormSchema {
   render?: {
     layout?: 'stepped' | 'flat';
     showOverallProgress?: boolean;
+    /** stepped 下总进度按当前题序（非已填题数）；默认 step */
+    progressBasis?: 'step' | 'answered';
     accent?: 'blue' | 'violet' | 'emerald';
     animate?: boolean;
   };
@@ -260,6 +262,9 @@ const HitlQuestionnaireForm: React.FC<{
       return (sel && sel.size > 0) || !!custom;
     }).length;
   }, [questions, selections, customTexts]);
+
+  const progressBasis = schema.render?.progressBasis ?? (stepped ? 'step' : 'answered');
+  const progressCurrent = progressBasis === 'step' ? step + 1 : answeredCount;
 
   const toggleOption = useCallback((q: HitlQuestion, value: string) => {
     if (preview) return;
@@ -435,16 +440,21 @@ const HitlQuestionnaireForm: React.FC<{
     );
   };
 
-  const renderQuestionBody = (q: HitlQuestion) => (
+  const renderQuestionBody = (q: HitlQuestion) => {
+    const qProgress =
+      progressBasis === 'step'
+        ? { current: step + 1, total: totalSteps }
+        : q.render?.progress;
+    return (
     <div className="space-y-1">
       <div className="flex items-start justify-between gap-2">
         <h4 className="text-sm font-semibold text-foreground leading-snug">
           {q.title}
           {q.required ? <span className="text-rose-400 ml-1">*</span> : null}
         </h4>
-        {q.render?.showProgress !== false && q.render?.progress ? (
+        {q.render?.showProgress !== false && qProgress ? (
           <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground bg-muted/40 px-2 py-0.5 rounded-full">
-            {q.render.progress.current}/{q.render.progress.total}
+            {qProgress.current}/{qProgress.total}
           </span>
         ) : null}
       </div>
@@ -466,7 +476,8 @@ const HitlQuestionnaireForm: React.FC<{
       {optsLength(q) > 0 ? renderOptions(q) : null}
       {renderPerQuestionInput(q)}
     </div>
-  );
+    );
+  };
 
   const visibleQuestions = stepped ? (currentQ ? [currentQ] : []) : questions;
 
@@ -479,10 +490,13 @@ const HitlQuestionnaireForm: React.FC<{
               <Sparkles className={`w-3 h-3 ${accent.text}`} />
               确认进度
             </span>
-            <span>{answeredCount}/{totalSteps} 已答</span>
+            <span>
+              {progressCurrent}/{totalSteps}
+              {progressBasis === 'answered' ? ' 已答' : ''}
+            </span>
           </div>
           <Progress
-            percent={Math.round((answeredCount / totalSteps) * 100)}
+            percent={Math.round((progressCurrent / totalSteps) * 100)}
             showInfo={false}
             strokeColor={{ from: '#3b82f6', to: '#8b5cf6' }}
             trailColor="rgba(128,128,128,0.15)"
