@@ -82,24 +82,6 @@ def _format_section_system(system: dict[str, Any]) -> str:
     if gitnexus_url:
         lines.append(f"- GITNEXUS_URL：`{gitnexus_url}`")
 
-    for key, label in (
-        ("archive_dir", "ARCHIVE_DIR"),
-        ("work_order_dir", "WORK_ORDER_DIR"),
-        ("product_code_root", "PRODUCT_CODE_ROOT"),
-        ("product_doc_root", "PRODUCT_DOC_ROOT"),
-    ):
-        val = str(sys.get(key) or "").strip()
-        if val:
-            lines.append(f"- {label}：`{val}`")
-
-    gnx_base = str(sys.get("gnx_cache_base_dir") or gnx_cache_base_dir() or "").strip()
-    if gnx_base:
-        lines.append(f"- GNX_CACHE_BASE_DIR：`{gnx_base}`")
-
-    gnx_cache_dir = str(sys.get("gnx_cache_dir") or "").strip()
-    if gnx_cache_dir:
-        lines.append(f"- GNX_CACHE_DIR：`{gnx_cache_dir}`")
-
     return "\n".join(lines) if lines else "（无系统字段）"
 
 
