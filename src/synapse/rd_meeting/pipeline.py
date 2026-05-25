@@ -405,6 +405,21 @@ def _step_open_meeting(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
 
         save_prod_catalog_to_pipeline(sid, catalog_rows, selected_prod=prod)
 
+        from synapse.rd_meeting.product_assets import (
+            bootstrap_product_assets,
+            save_product_assets_to_pipeline,
+        )
+        from synapse.rd_meeting.product_context import match_prod_row_by_prod
+
+        wire_hit = match_prod_row_by_prod(catalog_rows, prod)
+        assets = bootstrap_product_assets(sid, prod, wire_row=wire_hit, catalog_rows=catalog_rows)
+        save_product_assets_to_pipeline(sid, assets)
+        pctx = pipe._data.get("context")
+        if not isinstance(pctx, dict):
+            pctx = {}
+        pctx["product_assets"] = assets
+        pipe._data["context"] = pctx
+
     open_binding = resolve_node_binding(
         node_id,
         scope_type=scope_type,
@@ -412,21 +427,22 @@ def _step_open_meeting(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     )
     host_id = str(open_binding.get("host_profile_id") or "default").strip() or "default"
 
-    append_history_event(
-        sid,
-        {
-            "event": "room_opened",
-            "room_id": room_id,
-            "scope_id": sid,
-            "current_node_id": node_id,
-            "sop_display": sop_display,
-            "userwork_updates": userwork_updates,
-            "chat_text": format_room_opened_chat(),
-            "flow_stage": "开启会议室",
-            "log_type": "info",
-            "agent_id": host_id,
-        },
-    )
+    room_opened_payload: dict[str, Any] = {
+        "event": "room_opened",
+        "room_id": room_id,
+        "scope_id": sid,
+        "current_node_id": node_id,
+        "sop_display": sop_display,
+        "userwork_updates": userwork_updates,
+        "chat_text": format_room_opened_chat(),
+        "flow_stage": "开启会议室",
+        "log_type": "info",
+        "agent_id": host_id,
+    }
+    pctx_open = pipe._data.get("context")
+    if isinstance(pctx_open, dict) and isinstance(pctx_open.get("product_assets"), dict):
+        room_opened_payload["product_assets"] = pctx_open["product_assets"]
+    append_history_event(sid, room_opened_payload)
 
     pipe._data["room_id"] = room_id
     pipe._data["current_node_id"] = node_id

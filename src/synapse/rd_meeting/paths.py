@@ -69,6 +69,28 @@ def archive_root(scope_id: str) -> Path:
     return scope_dir(scope_id) / "archive"
 
 
+def product_code_root(scope_id: str) -> Path:
+    """产品仓库代码根目录：``work/<scope>/code/``。"""
+    return scope_dir(scope_id) / "code"
+
+
+def product_code_dir(scope_id: str, repo_name: str) -> Path:
+    """单仓库代码目录：``work/<scope>/code/<repo_name>/``。"""
+    seg = sanitize_work_order_segment(repo_name or "default")
+    return product_code_root(scope_id) / seg
+
+
+def product_doc_root(scope_id: str) -> Path:
+    """产品文档根目录：``work/<scope>/doc/``。"""
+    return scope_dir(scope_id) / "doc"
+
+
+def product_doc_dir(scope_id: str, doc_type: str) -> Path:
+    """单类文档目录：``work/<scope>/doc/<doc_type>/``。"""
+    seg = sanitize_work_order_segment(doc_type or "default")
+    return product_doc_root(scope_id) / seg
+
+
 def agents_root(scope_id: str) -> Path:
     """工单维度的智能体沉淀根目录：``work/<scope>/agents/``。"""
     return scope_dir(scope_id) / "agents"

@@ -41,23 +41,47 @@ def _format_section_product(product: dict[str, Any]) -> str:
     if not product:
         return "（无产品数据）"
     lines: list[str] = []
-    code = str(product.get("locator_code") or "").strip()
-    msg = str(product.get("locator_message") or "").strip()
     if product.get("prod"):
         lines.append(f"- PROD：`{product['prod']}`")
     if product.get("prod_feature"):
         lines.append(f"- PROD_FEATURE：{product['prod_feature']}")
     if product.get("version"):
         lines.append(f"- version：`{product['version']}`")
+    if product.get("code_root"):
+        lines.append(f"- **产品代码根目录**：`{product['code_root']}`")
+    if product.get("doc_root"):
+        lines.append(f"- **产品文档根目录**：`{product['doc_root']}`")
+    assets_status = str(product.get("assets_status") or "").strip()
+    if assets_status:
+        lines.append(f"- 资产落盘状态：`{assets_status}`")
     repos = product.get("repos")
     if isinstance(repos, list) and repos:
         lines.append(f"- 关联仓库（{len(repos)}）：")
         for r in repos:
             if isinstance(r, dict):
-                lines.append(f"  - `{r.get('repo_name') or r.get('repo_url') or '?'}`")
+                name = r.get("repo_name") or r.get("repo_url") or "?"
+                local = str(r.get("local_path") or "").strip()
+                st = str(r.get("materialize_status") or "").strip()
+                suffix = f" → `{local}`" if local else ""
+                if st and st != "ok":
+                    suffix += f"（{st}）"
+                lines.append(f"  - `{name}`{suffix}")
     docs = product.get("docs")
     if isinstance(docs, list) and docs:
-        lines.append(f"- 文档槽位：{len(docs)}")
+        lines.append(f"- 文档槽位（{len(docs)}）：")
+        for d in docs:
+            if isinstance(d, dict):
+                dtype = d.get("doc_type") or "?"
+                local = str(d.get("local_path") or "").strip()
+                st = str(d.get("materialize_status") or "").strip()
+                files = d.get("files")
+                file_hint = ""
+                if isinstance(files, list) and files:
+                    file_hint = f"（{len(files)} 个文件）"
+                suffix = f" → `{local}`{file_hint}" if local else ""
+                if st and st != "ok":
+                    suffix += f"（{st}）"
+                lines.append(f"  - `{dtype}`{suffix}")
     return "\n".join(lines) if lines else "（无产品字段）"
 
 
@@ -76,6 +100,8 @@ def _format_section_system(
         ("gitnexus_url", "GITNEXUS_URL"),
         ("gnx_cache_base_dir", "TMP_DIR"),
         ("work_order_dir", "工单工作目录"),
+        ("product_code_root", "产品代码根目录"),
+        ("product_doc_root", "产品文档根目录"),
     ):
         val = str(system.get(key) or "").strip()
         if val:

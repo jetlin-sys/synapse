@@ -410,4 +410,14 @@ def resolve_product_for_meeting(
         **normalized,
     }
     save_product_session_cache(sid, cache_payload)
+
+    from synapse.rd_meeting.product_assets import (
+        assets_system_fields,
+        enrich_product_with_assets,
+        load_product_assets_from_pipeline,
+    )
+
+    assets = load_product_assets_from_pipeline(sid)
+    product = enrich_product_with_assets(product, assets)
+    system = {**system, **assets_system_fields(assets)}
     return product, system

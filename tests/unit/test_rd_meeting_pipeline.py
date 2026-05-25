@@ -63,6 +63,17 @@ def test_pipeline_file_created_on_open_flow(monkeypatch, tmp_path):
         lambda p: ([{"prod": p, "version": "v", "repo_info": [], "doc_process": []}], ""),
     )
     monkeypatch.setattr(
+        "synapse.rd_meeting.product_assets.bootstrap_product_assets",
+        lambda *_a, **_k: {
+            "status": "ok",
+            "repos": [],
+            "docs": [],
+            "code_root": str(work / "code"),
+            "doc_root": str(work / "doc"),
+            "work_order_dir": str(work),
+        },
+    )
+    monkeypatch.setattr(
         "synapse.rd_meeting.init_context.resolve_product_for_meeting",
         lambda *_a, **_k: (
             {"locator_code": "ok", "prod": "myprod", "repos": [], "docs": []},

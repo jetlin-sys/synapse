@@ -1,0 +1,128 @@
+"""room_opened 产品代码 / 文档落盘。"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from synapse.rd_meeting.paths import product_code_dir, product_doc_dir
+from synapse.rd_meeting.product_assets import (
+    bootstrap_product_assets,
+    enrich_product_with_assets,
+    fetch_prod_doc,
+    save_product_assets_to_pipeline,
+)
+from synapse.rd_meeting.room_skill import build_product_workspace_paths_section
+
+
+def test_bootstrap_writes_code_and_doc(monkeypatch, tmp_path):
+    scope_id = "asset-scope-1"
+    monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
+
+    wire = {
+        "prod": "myprod",
+        "repo_info": [
+            {
+                "repo_url": "https://github.com/example/demo.git",
+                "repo_branch": "1|main",
+            }
+        ],
+        "doc_process": [
+            {"doc_type": "产品架构", "doc_process_state": "D"},
+            {"doc_type": "产品需求", "doc_process_state": "I"},
+        ],
+    }
+
+    monkeypatch.setattr(
+        "synapse.rd_meeting.product_assets._materialize_repo",
+        lambda sid, repo: {
+            "repo_name": "demo",
+            "local_path": str(product_code_dir(sid, "demo")),
+            "status": "ok",
+            "error": "",
+        },
+    )
+    monkeypatch.setattr(
+        "synapse.rd_meeting.product_assets._materialize_doc",
+        lambda sid, prod, doc: {
+            "doc_type": doc["doc_type"],
+            "local_path": str(product_doc_dir(sid, doc["doc_type"])),
+            "files": ["a.md"],
+            "status": "ok" if doc["doc_type"] == "产品架构" else "skipped",
+            "error": "",
+        },
+    )
+
+    assets = bootstrap_product_assets(scope_id, "myprod", wire_row=wire)
+    assert assets["status"] in ("ok", "partial")
+    assert len(assets["repos"]) == 1
+    assert assets["repos"][0]["status"] == "ok"
+    assert len(assets["docs"]) == 2
+
+    product = enrich_product_with_assets({"prod": "myprod", "repos": [], "docs": []}, assets)
+    assert product["code_root"]
+    assert product["doc_root"]
+    assert product["repos"][0]["local_path"]
+
+    init_ctx = {
+        "product": product,
+        "system": {"product_code_root": product["code_root"], "product_doc_root": product["doc_root"]},
+    }
+    block = build_product_workspace_paths_section(init_ctx)
+    assert "产品工作区路径" in block
+    assert "code" in block
+    assert "doc" in block
+
+
+def test_fetch_prod_doc_parses_response(monkeypatch):
+    class FakeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "code": 0,
+                "message": "ok",
+                "data": {"doc_content": [{"doc_name": "x.md", "content": "# hi"}]},
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, json=None):
+            return FakeResp()
+
+    monkeypatch.setattr(
+        "synapse.rd_meeting.product_assets.unified_service_base_url",
+        lambda: "http://127.0.0.1:10001",
+    )
+    monkeypatch.setattr("synapse.rd_meeting.product_assets.httpx.Client", FakeClient)
+
+    docs, err = fetch_prod_doc("p", "产品架构")
+    assert not err
+    assert docs[0]["doc_name"] == "x.md"
+    assert docs[0]["content"] == "# hi"
+
+
+def test_save_product_assets_to_pipeline(monkeypatch, tmp_path):
+    scope_id = "asset-pipe-1"
+    monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
+    work = tmp_path / "work" / scope_id
+    work.mkdir(parents=True)
+    from synapse.rd_meeting.paths import meeting_pipeline_path
+
+    meeting_pipeline_path(scope_id).write_text(
+        json.dumps({"schema_version": 1, "context": {}}),
+        encoding="utf-8",
+    )
+    save_product_assets_to_pipeline(scope_id, {"prod": "p", "status": "ok"})
+    raw = json.loads(meeting_pipeline_path(scope_id).read_text(encoding="utf-8"))
+    assert raw["context"]["product_assets"]["prod"] == "p"

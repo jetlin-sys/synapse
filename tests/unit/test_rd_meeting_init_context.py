@@ -116,6 +116,17 @@ def test_open_meeting_step1_userwork_and_init_log(monkeypatch, tmp_path):
         "synapse.rd_meeting.product_context.ensure_prod_in_catalog",
         lambda p: ([{"prod": p, "version": "v", "repo_info": [], "doc_process": []}], ""),
     )
+    monkeypatch.setattr(
+        "synapse.rd_meeting.product_assets.bootstrap_product_assets",
+        lambda *_a, **_k: {
+            "status": "ok",
+            "repos": [],
+            "docs": [],
+            "code_root": str(work / "code"),
+            "doc_root": str(work / "doc"),
+            "work_order_dir": str(work),
+        },
+    )
 
     monkeypatch.setattr(
         "synapse.rd_meeting.orchestrator.schedule_run_node",
@@ -155,6 +166,8 @@ def test_open_meeting_step1_userwork_and_init_log(monkeypatch, tmp_path):
     assert init_data["product"].get("locator_code") == "ok"
     assert init_data["product"].get("prod") == "p"
     assert "gnx_cache_base_dir" in init_data.get("system", {})
-    assert "work_order_dir" not in init_data.get("system", {})
+    assert init_data.get("system", {}).get("work_order_dir")
+    assert init_data.get("system", {}).get("product_code_root")
+    assert init_data.get("system", {}).get("product_doc_root")
     assert "小鲸" not in init_row["text"]
     assert "payload" not in init_row

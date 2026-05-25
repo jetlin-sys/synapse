@@ -14,33 +14,33 @@ from synapse.rd_meeting.flow_log import flow_log_to_text
 # --- 步骤完成说明（流程层，不含工单/产品等实例字段）---
 
 STEP_OPEN_SUMMARY = (
-    "【步骤 1/3】开启会议室\n\n"
+    "开启会议室\n\n"
     "已为当前工单创建研发会议室并同步流程状态，下一步将进行节点初始化。"
 )
 
 STEP_NODE_INIT_SUMMARY = (
-    "【步骤 2/3】节点初始化\n\n"
+    "节点初始化\n\n"
     "已解析本节点绑定关系，并加载工单 / 产品 / 系统上下文，供后续主控提示词注入。"
 )
 
 STEP_HOST_PROMPT_SUMMARY = (
-    "【步骤 3/3】主控提示词组装\n\n"
+    "主控提示词组装\n\n"
     "已将会诊室 SKILL 与四段式动态上下文写入小鲸系统提示；"
     "将立即调度小鲸执行当前 SOP 节点。"
 )
 
 PHASE_WAITING_SUMMARY = (
-    "【流程待机】\n\n"
+    "流程待机\n\n"
     "会议室准备流程已完成，等待执行当前 SOP 节点或人工触发。"
 )
 
 STEP_HOST_FIRST_CALL_SUMMARY = (
-    "【步骤 4/4】主控首次调用\n\n"
+    "主控首次调用\n\n"
     "小鲸开始执行本 SOP 节点：使用已组装的会议室提示词进行推理，并按 SKILL 提交工作安排与委派协作智能体。"
 )
 
 STEP_HOST_FIRST_CALL_REUSED_SUMMARY = (
-    "【步骤 4/4】主控首次调用\n\n"
+    "主控首次调用\n\n"
     "小鲸开始执行本 SOP 节点：复用步骤 3 已组装的会议室提示词（未重新渲染 SKILL）。"
 )
 

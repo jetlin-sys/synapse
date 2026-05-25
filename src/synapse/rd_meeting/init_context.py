@@ -68,6 +68,17 @@ def build_node_init_log_data(
     _ = node_id
     order = _collect_order_section(scope_type, scope_id)
     product, system = resolve_product_for_meeting(scope_type, scope_id)
+    sid = (scope_id or "").strip()
+    if sid:
+        from synapse.rd_meeting.product_assets import (
+            assets_system_fields,
+            enrich_product_with_assets,
+            load_product_assets_from_pipeline,
+        )
+
+        assets = load_product_assets_from_pipeline(sid)
+        product = enrich_product_with_assets(product, assets)
+        system = {**system, **assets_system_fields(assets)}
     return {
         "order": order,
         "product": product,

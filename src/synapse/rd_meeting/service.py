@@ -481,6 +481,52 @@ class MeetingRoomService:
                 return
 
             save_prod_catalog_to_pipeline(sid, catalog_rows, selected_prod=prod_key)
+
+            from synapse.rd_meeting.product_assets import (
+                bootstrap_product_assets,
+                save_product_assets_to_pipeline,
+            )
+            from synapse.rd_meeting.product_context import match_prod_row_by_prod
+            from synapse.rd_meeting.pipeline import MeetingPipeline
+
+            wire_hit = match_prod_row_by_prod(catalog_rows, prod_key)
+            assets = bootstrap_product_assets(
+                sid, prod_key, wire_row=wire_hit, catalog_rows=catalog_rows
+            )
+            save_product_assets_to_pipeline(sid, assets)
+            pipe = MeetingPipeline.load(sid)
+            if pipe is not None:
+                pctx = pipe.data.get("context")
+                if not isinstance(pctx, dict):
+                    pctx = {}
+                pctx["product_assets"] = assets
+                pipe.data["context"] = pctx
+                pipe.save()
+
+            try:
+                from synapse.rd_meeting.host_prompt import assemble_host_prompt_bundle
+                from synapse.rd_meeting.host_prompt_cache import save_host_prompt_cache
+                from synapse.rd_meeting.binding import resolve_node_binding
+
+                run_node = str(dev.get("current_node_id") or "pending")
+                ticket_title = str(dev.get("ticket_title") or dev.get("demand_title") or "")
+                run_binding = resolve_node_binding(
+                    run_node,
+                    scope_type=scope_type,
+                    scope_id=sid,
+                    ticket_title=ticket_title,
+                )
+                bundle = assemble_host_prompt_bundle(
+                    scope_type=scope_type,
+                    scope_id=sid,
+                    node_id=run_node,
+                    binding=run_binding,
+                    ticket_title=ticket_title,
+                )
+                save_host_prompt_cache(sid, bundle)
+            except Exception as exc:
+                logger.warning("refresh host prompt after product assets failed: %s", exc)
+
             if sync_userwork:
                 patch_userwork_summary(
                     scope_type=scope_type,  # type: ignore[arg-type]

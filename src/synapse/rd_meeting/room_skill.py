@@ -487,6 +487,61 @@ def render_skill(skill_body: str, variables: dict[str, str]) -> str:
     return rendered
 
 
+def build_product_workspace_paths_section(init_context: dict[str, Any] | None) -> str:
+    """渲染 room_opened 落盘后的产品代码 / 文档路径（Host / Worker 必读）。"""
+    if not isinstance(init_context, dict):
+        return ""
+    product = init_context.get("product")
+    system = init_context.get("system")
+    prod = product if isinstance(product, dict) else {}
+    sys_map = system if isinstance(system, dict) else {}
+
+    code_root = str(prod.get("code_root") or sys_map.get("product_code_root") or "").strip()
+    doc_root = str(prod.get("doc_root") or sys_map.get("product_doc_root") or "").strip()
+    work_dir = str(prod.get("work_order_dir") or sys_map.get("work_order_dir") or "").strip()
+    if not code_root and not doc_root and not work_dir:
+        return ""
+
+    lines: list[str] = ["## 产品工作区路径（room_opened 已落盘，必读）", ""]
+    lines.append(
+        "- **约定**：产品源码在 `work/<scope>/code/<repo_name>/`；"
+        "产品文档在 `work/<scope>/doc/<doc_type>/`。"
+        "读代码 / 文档时**必须**使用下列路径，**禁止**臆造目录。"
+    )
+    if work_dir:
+        lines.append(f"- **工单工作目录**：`{work_dir}`")
+    if code_root:
+        lines.append(f"- **产品代码根目录**：`{code_root}`")
+    repos = prod.get("repos")
+    if isinstance(repos, list):
+        for r in repos:
+            if not isinstance(r, dict):
+                continue
+            local = str(r.get("local_path") or "").strip()
+            if not local:
+                continue
+            name = str(r.get("repo_name") or "仓库").strip()
+            st = str(r.get("materialize_status") or "").strip()
+            note = f"（{st}）" if st and st != "ok" else ""
+            lines.append(f"  - 代码 `{name}`：`{local}`{note}")
+    if doc_root:
+        lines.append(f"- **产品文档根目录**：`{doc_root}`")
+    docs = prod.get("docs")
+    if isinstance(docs, list):
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            local = str(d.get("local_path") or "").strip()
+            if not local:
+                continue
+            dtype = str(d.get("doc_type") or "文档").strip()
+            st = str(d.get("materialize_status") or "").strip()
+            note = f"（{st}）" if st and st != "ok" else ""
+            lines.append(f"  - 文档 `{dtype}`：`{local}`{note}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _extract_product_label(init_context: dict[str, Any] | None) -> str:
     """从 init_context 中提取『涉及产品』展示值。"""
     if not isinstance(init_context, dict):
@@ -574,6 +629,10 @@ def build_meeting_runtime_header(
     lines.append("- **回复语言**：中文")
     if supplement:
         lines.append(f"- **运营补充**：{supplement}")
+    paths_block = build_product_workspace_paths_section(init_context)
+    if paths_block:
+        lines.append("")
+        lines.append(paths_block.rstrip())
     lines.append("")
 
     if role == "host":
