@@ -305,6 +305,39 @@ def _host_profile_id_for_scope(
         return "default"
 
 
+def _canonical_node_id(node_id: str) -> str:
+    return (node_id or "").strip()
+
+
+def _is_valid_run_node(node_id: str) -> bool:
+    nid = _canonical_node_id(node_id)
+    return bool(nid) and nid != "pending"
+
+
+def _resolve_run_node_id(
+    pipe: MeetingPipeline,
+    data: dict[str, Any] | None,
+    *,
+    sync_pipe: bool = True,
+) -> str:
+    """解析 pipeline 当前应运行的 SOP 节点。
+
+    ``on_node_complete(advance=True)`` 会先更新 dev.status，而 meeting_pipeline 在
+    NodeReview 等待期间可能仍停留在上一节点；因此以 dev.status 为准。
+    """
+    dev_node = _canonical_node_id(str((data or {}).get("current_node_id") or ""))
+    pipe_node = _canonical_node_id(pipe.current_node_id)
+    if _is_valid_run_node(dev_node):
+        run_node = dev_node
+    elif _is_valid_run_node(pipe_node):
+        run_node = pipe_node
+    else:
+        run_node = dev_node or pipe_node or "pending"
+    if sync_pipe and _is_valid_run_node(run_node):
+        pipe._data["current_node_id"] = run_node
+    return run_node
+
+
 def _resolve_open_node(
     scope_type: ScopeType,
     scope_id: str,
@@ -473,7 +506,7 @@ def _step_node_init(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     if not data:
         data = load_dev_status(sid) or {}
     room_id = pipe.room_id or str((data.get("meeting_room") or {}).get("room_id") or "")
-    run_node = pipe.current_node_id or str(data.get("current_node_id") or "")
+    run_node = _resolve_run_node_id(pipe, data)
     if run_node in ("pending", ""):
         pipe.mark_step_completed(STEP_NODE_INIT)
         pipe.set_flow_step(STEP_WAITING, reason="无有效节点，跳过初始化")
@@ -526,7 +559,7 @@ def _step_assemble_host_prompt(pipe: MeetingPipeline, ctx: PipelineRunContext) -
     if not data:
         data = load_dev_status(sid) or {}
     room_id = pipe.room_id or str((data.get("meeting_room") or {}).get("room_id") or "")
-    run_node = pipe.current_node_id or str(data.get("current_node_id") or "")
+    run_node = _resolve_run_node_id(pipe, data)
     scope_type = ctx.scope_type
     ticket_title = str(ctx.detail.get("ticket_title") or "")
 
@@ -760,9 +793,7 @@ def _step_node_finish(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     """
     sid = ctx.scope_id
     data = ctx.dev_status or load_dev_status(sid) or {}
-    next_node = pipe.current_node_id or str(data.get("current_node_id") or "")
-    pipe._data["current_node_id"] = next_node
-
+    next_node = _resolve_run_node_id(pipe, data)
     room_id = pipe.room_id or str((data.get("meeting_room") or {}).get("room_id") or "")
 
     # 解析"刚完成的节点"以及对应 binding，用于 dump trace
@@ -878,19 +909,20 @@ def schedule_node_finish(
     def _do_advance() -> None:
         try:
             pipe = MeetingPipeline.load_or_create(sid, scope_type=scope_type)
+            dev = load_dev_status(sid) or {}
             if last_node_id:
                 pctx = pipe._data.get("context")
                 if not isinstance(pctx, dict):
                     pctx = {}
                 pctx["last_finished_node_id"] = last_node_id.strip()
                 pipe._data["context"] = pctx
+            _resolve_run_node_id(pipe, dev)
             pipe.set_flow_step(STEP_NODE_FINISH, reason="节点完成，自动推进至下一节点")
             pipe.save()
 
             from synapse.rd_meeting.service import MeetingRoomService
 
             svc = MeetingRoomService()
-            dev = load_dev_status(sid) or {}
             titles = build_title_index()
             detail = svc._room_detail_payload(dev, sid, titles)
 
