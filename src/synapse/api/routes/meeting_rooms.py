@@ -9,6 +9,17 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from synapse.api.schemas import error_response, success_response
+from synapse.rd_meeting.dev_status import load_dev_status
+from synapse.rd_meeting.live import scope_id_for_room_id
+from synapse.rd_meeting.node_review import (
+    build_node_review_payload,
+    load_node_review,
+    read_artifact_file,
+    save_node_review,
+)
+from synapse.rd_meeting.orchestrator import MeetingRoomOrchestrator
+from synapse.rd_meeting.paths import agent_dir, agent_node_dir
+from synapse.rd_meeting.room_runtime import load_room_state
 from synapse.rd_meeting.service import MeetingRoomService
 
 logger = logging.getLogger(__name__)
@@ -218,4 +229,214 @@ async def put_meeting_room_config(body: PutMeetingRoomConfigBody) -> dict:
 @router.get("/api/dev/meeting-room-config/bindings/{node_id}")
 async def get_node_binding(node_id: str) -> dict:
     return success_response(_service.resolve_binding(node_id))
+
+
+# ─── PR3：NodeReviewPanel 配套路由 ───────────────────────────────────
+
+
+class ReviewDecisionBody(BaseModel):
+    mode: Literal["approve", "reject", "escalate"] = Field(
+        ..., description="人工裁决：通过 / 打回返工 / 异常介入"
+    )
+    comment: str = Field("", description="人工备注（打回原因、异常说明等）")
+
+
+def _resolve_scope_for_room(room_id: str) -> tuple[str, str] | None:
+    """room_id → (scope_id, scope_type)；找不到返回 ``None``。"""
+    sid = scope_id_for_room_id(room_id)
+    if not sid:
+        return None
+    dev = load_dev_status(sid) or {}
+    scope_type = str(dev.get("scope_type") or "demand").strip() or "demand"
+    if scope_type not in ("demand", "task"):
+        scope_type = "demand"
+    return sid, scope_type
+
+
+@router.get("/api/dev/meeting-rooms/{room_id}/node-review")
+async def get_node_review(
+    room_id: str,
+    request: Request,
+    node_id: str | None = None,
+    refresh: bool = False,
+) -> dict:
+    """读取节点确认总结 payload（PR2 NODE_REVIEW 步骤的结果）。
+
+    - 默认从 ``meeting_pipeline.json.context.node_review[node_id]`` 拿；
+    - ``refresh=true`` 时基于当前 pending_delivery + agent_pool 重新装配（不走 LLM 摘要，
+      仅刷新 metrics / artifacts，便于前端在审阅期间手动刷新统计数据）。
+    """
+    resolved = _resolve_scope_for_room(room_id)
+    if resolved is None:
+        return error_response(404, "meeting_room_not_found")
+    sid, scope_type = resolved
+
+    room_state = load_room_state(sid) or {}
+    pending = room_state.get("pending_delivery") if isinstance(room_state.get("pending_delivery"), dict) else {}
+    target_node = (node_id or "").strip() or str(pending.get("node_id") or room_state.get("current_node_id") or "")
+    if not target_node:
+        return error_response(400, "node_id_required")
+
+    if not refresh:
+        payload = load_node_review(sid, target_node)
+        if payload is not None:
+            return success_response(payload)
+        # 回退：pending_delivery.review_payload 也可能就是 payload
+        inline = pending.get("review_payload") if isinstance(pending, dict) else None
+        if isinstance(inline, dict):
+            return success_response(inline)
+
+    # refresh=true 或缓存缺失：用 binding 重新装配（不走 LLM）
+    try:
+        from synapse.rd_meeting.binding import resolve_node_binding
+        from synapse.rd_sop.nodes import stage_id_for_node_id
+
+        binding = resolve_node_binding(target_node, scope_type=scope_type, scope_id=sid)  # type: ignore[arg-type]
+        binding["node_id"] = target_node
+        pool = getattr(request.app.state, "agent_pool", None)
+        payload = await build_node_review_payload(
+            scope_type=scope_type,  # type: ignore[arg-type]
+            scope_id=sid,
+            room_id=room_id,
+            node_id=target_node,
+            binding=binding,
+            report_body=str(pending.get("report_body") or "") if isinstance(pending, dict) else "",
+            tokens_used=int(pending.get("tokens_used") or 0) if isinstance(pending, dict) else 0,
+            duration_seconds=int(pending.get("duration_seconds") or 0) if isinstance(pending, dict) else 0,
+            stage_id=int(pending.get("stage_id") or stage_id_for_node_id(target_node)) if isinstance(pending, dict) else stage_id_for_node_id(target_node),
+            agent_pool=pool,
+            orchestrator=getattr(pool, "orchestrator", None) if pool is not None else None,
+            use_llm_summary=False,  # refresh 仅刷新 metrics，不再二次跑 LLM
+        )
+        save_node_review(sid, target_node, payload)
+        return success_response(payload)
+    except Exception as exc:
+        logger.exception("refresh node_review failed: %s", exc)
+        return error_response(500, "node_review_refresh_failed", str(exc))
+
+
+@router.get("/api/dev/meeting-rooms/{room_id}/agent-trace")
+async def get_agent_trace(
+    room_id: str,
+    profile_id: str,
+    node_id: str,
+    tail_messages: int = 200,
+) -> dict:
+    """读取智能体节点级 trace（PR1 落盘的 conversation/tools/skills/usage/events）。
+
+    返回结构：
+    ``{ meta, conversation: [...], tools: {...}, skills: {...}, usage: {...}, events: [...] }``
+    """
+    resolved = _resolve_scope_for_room(room_id)
+    if resolved is None:
+        return error_response(404, "meeting_room_not_found")
+    sid, _ = resolved
+
+    pid = (profile_id or "").strip()
+    nid = (node_id or "").strip()
+    if not pid or not nid:
+        return error_response(400, "profile_id_and_node_id_required")
+
+    import json as _json
+
+    base = agent_node_dir(sid, pid, nid)
+    meta_path = agent_dir(sid, pid) / "meta.json"
+
+    def _read_json(path) -> Any:
+        if not path.is_file():
+            return None
+        try:
+            return _json.loads(path.read_text("utf-8"))
+        except (OSError, _json.JSONDecodeError):
+            return None
+
+    def _read_jsonl(path, *, limit: int = 0) -> list[dict[str, Any]]:
+        if not path.is_file():
+            return []
+        try:
+            lines = path.read_text("utf-8").splitlines()
+        except OSError:
+            return []
+        if limit and len(lines) > limit:
+            lines = lines[-limit:]
+        out: list[dict[str, Any]] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                out.append(row)
+        return out
+
+    payload = {
+        "scope_id": sid,
+        "room_id": room_id,
+        "profile_id": pid,
+        "node_id": nid,
+        "meta": _read_json(meta_path),
+        "conversation": _read_jsonl(base / "conversation.jsonl", limit=max(0, int(tail_messages or 0))),
+        "tools": _read_json(base / "tools.json"),
+        "skills": _read_json(base / "skills.json"),
+        "usage": _read_json(base / "usage.json"),
+        "events": _read_jsonl(base / "events.jsonl"),
+    }
+    return success_response(payload)
+
+
+@router.get("/api/dev/meeting-rooms/{room_id}/artifact-file")
+async def get_artifact_file(room_id: str, path: str) -> dict:
+    """读取归档文件原文（前端 .md 内联展开用）。
+
+    ``path`` 必须是 scope_dir 下的相对路径（如
+    ``archive/2/req_clarify/需求澄清.md``），含 ``..`` 越权访问会被拒绝。
+    """
+    resolved = _resolve_scope_for_room(room_id)
+    if resolved is None:
+        return error_response(404, "meeting_room_not_found")
+    sid, _ = resolved
+    res = read_artifact_file(sid, path)
+    if res is None:
+        return error_response(404, "artifact_not_found_or_forbidden")
+    content, ext = res
+    return success_response({"path": path, "ext": ext, "content": content, "size": len(content)})
+
+
+@router.post("/api/dev/meeting-rooms/{room_id}/review-decision")
+async def submit_review_decision(
+    room_id: str,
+    body: ReviewDecisionBody,
+    request: Request,
+) -> dict:
+    """NodeReviewPanel 三按钮入口：approve / reject / escalate。"""
+    resolved = _resolve_scope_for_room(room_id)
+    if resolved is None:
+        return error_response(404, "meeting_room_not_found")
+    sid, scope_type = resolved
+
+    pool = getattr(request.app.state, "agent_pool", None)
+    detail = _service.get_room_detail(room_id) or {}
+    ticket_title = str(detail.get("ticket_title") or "")
+
+    orch = MeetingRoomOrchestrator()
+    try:
+        result = orch.confirm_node_delivery(
+            scope_type=scope_type,
+            scope_id=sid,
+            room_id=room_id,
+            approved=body.mode == "approve",
+            comment=body.comment or "",
+            ticket_title=ticket_title,
+            agent_pool=pool,
+            mode=body.mode,
+        )
+    except ValueError as exc:
+        return error_response(400, str(exc))
+    except Exception as exc:
+        logger.exception("submit_review_decision failed: %s", exc)
+        return error_response(500, "review_decision_failed", str(exc))
+    return success_response(result)
 

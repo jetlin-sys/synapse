@@ -464,6 +464,173 @@ export async function putMeetingRoomConfig(
   return apiPut<MeetingRoomConfigPayload>(base, '/api/dev/meeting-room-config', body);
 }
 
+// ─── PR4：NodeReviewPanel 配套 API ──────────────────────────────────────
+
+export interface NodeReviewAgentRow {
+  profile_id: string;
+  display_name: string;
+  role: 'host' | 'worker' | string;
+  delegations: number;
+  tool_calls: number;
+  skill_calls: number;
+  tokens: number;
+  tools: { name: string; count: number }[];
+  skills: { skill: string; count: number }[];
+}
+
+export interface NodeReviewMetrics {
+  node_token_total: number;
+  node_duration_seconds: number;
+  delegation_total: number;
+  tool_call_total: number;
+  skill_call_total: number;
+  host: NodeReviewAgentRow | null;
+  workers: NodeReviewAgentRow[];
+}
+
+export interface NodeReviewArtifactFile {
+  name: string;
+  relative_path: string;
+  size: number;
+  mtime: string;
+  ext: string;
+}
+
+export interface NodeReviewSummary {
+  profile_id: string;
+  display_name: string;
+  role: 'host' | 'worker' | string;
+  summary_markdown: string;
+  source: 'llm' | 'rule' | 'fallback' | string;
+  conversation_path?: string;
+}
+
+export interface NodeReviewPayload {
+  schema_version: number;
+  scope_type: MeetingRoomScopeType;
+  scope_id: string;
+  room_id: string;
+  node_id: string;
+  node_name: string;
+  node_intent?: string;
+  stage_id: number;
+  metrics: NodeReviewMetrics;
+  summaries: NodeReviewSummary[];
+  artifacts: NodeReviewArtifactFile[];
+  report_body: string;
+  generated_at?: string;
+}
+
+export async function fetchNodeReview(
+  synapseApiBase: string,
+  roomId: string,
+  options?: { nodeId?: string; refresh?: boolean },
+): Promise<NodeReviewPayload> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  const params = new URLSearchParams();
+  if (options?.nodeId) params.set('node_id', options.nodeId);
+  if (options?.refresh) params.set('refresh', 'true');
+  const qs = params.toString();
+  const path = `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/node-review${qs ? `?${qs}` : ''}`;
+  return apiGet<NodeReviewPayload>(base, path);
+}
+
+export interface AgentTraceMessageSpeaker {
+  kind: 'user' | 'host' | 'coworker' | 'system' | 'tool' | 'unknown';
+  profile_id?: string;
+  display_name?: string;
+}
+
+export interface AgentTraceMessage {
+  index: number;
+  role: string;
+  speaker: AgentTraceMessageSpeaker;
+  text: string;
+  tool_uses?: { id: string; name: string; input?: unknown }[];
+  tool_results?: { tool_use_id: string; content?: unknown }[];
+}
+
+export interface AgentTracePayload {
+  scope_id: string;
+  room_id: string;
+  profile_id: string;
+  node_id: string;
+  meta: {
+    profile_id: string;
+    role: string;
+    display_name: string;
+    llm_endpoint?: string;
+    capabilities?: Record<string, unknown>;
+    updated_at?: string;
+  } | null;
+  conversation: AgentTraceMessage[];
+  tools: { tools_executed: string[]; updated_at?: string } | null;
+  skills: { skills_executed: unknown[]; updated_at?: string } | null;
+  usage: { last_usage: Record<string, unknown>; updated_at?: string } | null;
+  events: { ts: string; event: string; node_id?: string; detail?: unknown }[];
+}
+
+export async function fetchAgentTrace(
+  synapseApiBase: string,
+  roomId: string,
+  options: { profileId: string; nodeId: string; tailMessages?: number },
+): Promise<AgentTracePayload> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  const params = new URLSearchParams({
+    profile_id: options.profileId,
+    node_id: options.nodeId,
+  });
+  if (options.tailMessages != null) params.set('tail_messages', String(options.tailMessages));
+  return apiGet<AgentTracePayload>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/agent-trace?${params.toString()}`,
+  );
+}
+
+export interface ArtifactFileContent {
+  path: string;
+  ext: string;
+  content: string;
+  size: number;
+}
+
+export async function fetchArtifactFile(
+  synapseApiBase: string,
+  roomId: string,
+  path: string,
+): Promise<ArtifactFileContent> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  const params = new URLSearchParams({ path });
+  return apiGet<ArtifactFileContent>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/artifact-file?${params.toString()}`,
+  );
+}
+
+export type ReviewDecisionMode = 'approve' | 'reject' | 'escalate';
+
+export interface ReviewDecisionResult {
+  status: 'approved' | 'rework' | 'escalated' | string;
+  node_id?: string;
+  room_state?: Record<string, unknown>;
+  next_node_id?: string | null;
+}
+
+export async function submitReviewDecision(
+  synapseApiBase: string,
+  roomId: string,
+  mode: ReviewDecisionMode,
+  comment = '',
+): Promise<ReviewDecisionResult> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  return apiPost<ReviewDecisionResult>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/review-decision`,
+    { mode, comment },
+  );
+}
+
+
 export async function putDevStatus(
   synapseApiBase: string,
   scopeType: MeetingRoomScopeType,

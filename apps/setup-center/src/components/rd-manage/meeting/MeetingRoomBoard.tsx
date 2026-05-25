@@ -15,6 +15,8 @@ import {
 import { consumeMeetingRoomFocus } from '../../../rd-meeting/focus';
 import { MeetingRoomConfigDrawer } from './MeetingRoomConfigDrawer';
 import { MeetingHitlForm, type HitlFormSchema } from './MeetingHitlForm';
+import { NodeReviewPanel } from './NodeReviewPanel';
+import type { NodeReviewPayload } from '../../../api/meetingRoomService';
 import {
   MeetingAgentContextDrawer,
   type AgentContextTarget,
@@ -105,6 +107,7 @@ interface MeetingRoom {
   runInProgress?: boolean;
   hitlFormSchema?: HitlFormSchema | null;
   hitlPendingSummary?: string | null;
+  reviewPayload?: NodeReviewPayload | null;
   hitlLocked?: boolean;
   hitlSubmission?: { values?: Record<string, unknown>; submitted_at?: string } | null;
   participants?: MeetingRoomParticipantWire[];
@@ -300,6 +303,9 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
       (live.hitl_submission as MeetingRoom['hitlSubmission']) ?? room.hitlSubmission ?? null,
     hitlPendingSummary:
       live.pending_delivery?.report_body ?? room.hitlPendingSummary ?? null,
+    reviewPayload:
+      ((live.pending_delivery as { review_payload?: NodeReviewPayload } | undefined)
+        ?.review_payload as NodeReviewPayload | undefined) ?? room.reviewPayload ?? null,
     brief: live.phase
       ? `${room.brief.split(' · ')[0] || room.brief} · ${live.phase}`
       : room.brief,
@@ -364,6 +370,9 @@ function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
       (item.room_state?.hitl_submission as MeetingRoom['hitlSubmission']) ?? null,
     hitlPendingSummary:
       (item.room_state?.pending_delivery as { report_body?: string } | undefined)?.report_body ?? null,
+    reviewPayload:
+      ((item.room_state?.pending_delivery as { review_payload?: NodeReviewPayload } | undefined)
+        ?.review_payload as NodeReviewPayload | undefined) ?? null,
     participants: item.participants,
   };
 }
@@ -927,12 +936,14 @@ const InterventionDialog = ({
   const lastLogKeyRef = useRef('');
 
   const hitlLocked = Boolean(room?.hitlLocked);
+  const hasReviewPayload = !!(room?.reviewPayload && room.status === 'human_intervention' && !hitlLocked);
   const hitlAvailable = !!(
-    room?.hitlFormSchema &&
-    room.status === 'human_intervention' &&
+    (room?.hitlFormSchema || hasReviewPayload) &&
+    room?.status === 'human_intervention' &&
     !hitlLocked
   );
-  const hitlKind = (room?.hitlFormSchema as { summary_kind?: string; intervention_kind?: string } | undefined);
+  const hitlKind = (room?.hitlFormSchema as { summary_kind?: string; intervention_kind?: string } | undefined)
+    ?? (hasReviewPayload ? { intervention_kind: 'result_confirm' as const } : undefined);
   const hitlBadgeText = useMemo(() => {
     const k = (hitlKind?.summary_kind || hitlKind?.intervention_kind || '').toLowerCase();
     if (k === 'exception') return '异常待裁决';
@@ -1189,7 +1200,15 @@ const InterventionDialog = ({
 
           {/* Tab Body */}
           <div className="flex-1 overflow-hidden">
-            {centerTab === 'hitl' && hitlAvailable && room.hitlFormSchema ? (
+            {centerTab === 'hitl' && hitlAvailable && (hitlKind?.intervention_kind === 'result_confirm' || (hasReviewPayload && !room.hitlFormSchema)) ? (
+              <NodeReviewPanel
+                synapseApiBase={synapseApiBase || ''}
+                roomId={room.id}
+                nodeId={room.currentNode}
+                initialPayload={room.reviewPayload ?? null}
+                onDecided={() => setCenterTab('detail')}
+              />
+            ) : centerTab === 'hitl' && hitlAvailable && room.hitlFormSchema ? (
               <div className="h-full overflow-y-auto custom-scrollbar p-6 bg-[color:var(--panel)]">
                 <div className="max-w-[920px] mx-auto">
                   <MeetingHitlForm

@@ -45,6 +45,7 @@ interface Props {
 }
 
 type MsgRole = 'system' | 'user' | 'assistant' | 'tool' | 'unknown';
+type SpeakerKind = 'user' | 'host' | 'coworker' | 'system' | 'tool' | 'unknown';
 
 interface NormalizedMessage {
   index: number;
@@ -53,6 +54,8 @@ interface NormalizedMessage {
   toolName?: string;
   isToolResult?: boolean;
   hasToolUse?: boolean;
+  speakerKind?: SpeakerKind;
+  speakerName?: string;
 }
 
 function detectRole(raw: unknown): MsgRole {
@@ -61,8 +64,22 @@ function detectRole(raw: unknown): MsgRole {
   return 'unknown';
 }
 
+function extractSpeaker(msg: Record<string, unknown>): { kind?: SpeakerKind; name?: string } {
+  // 兼容 agent_trace.py 输出的 conversation.jsonl 结构：
+  //   { role: 'assistant'|..., speaker: { kind: 'host'|'coworker'|..., display_name, profile_id }, content: ... }
+  const sp = msg.speaker;
+  if (!sp || typeof sp !== 'object') return {};
+  const obj = sp as Record<string, unknown>;
+  const k = String(obj.kind || '').toLowerCase();
+  const valid: SpeakerKind[] = ['user', 'host', 'coworker', 'system', 'tool', 'unknown'];
+  const kind = (valid as string[]).includes(k) ? (k as SpeakerKind) : undefined;
+  const name = typeof obj.display_name === 'string' ? obj.display_name : undefined;
+  return { kind, name };
+}
+
 function normalizeMessage(msg: Record<string, unknown>, index: number): NormalizedMessage {
   const role = detectRole(msg.role);
+  const { kind: speakerKind, name: speakerName } = extractSpeaker(msg);
   const content = msg.content;
   let text = '';
   let toolName: string | undefined;
@@ -119,8 +136,44 @@ function normalizeMessage(msg: Record<string, unknown>, index: number): Normaliz
     }
   }
 
-  return { index, role, text, toolName, isToolResult, hasToolUse };
+  return { index, role, text, toolName, isToolResult, hasToolUse, speakerKind, speakerName };
 }
+
+const SPEAKER_META: Record<
+  SpeakerKind,
+  { label: string; chip: string; bar: string }
+> = {
+  user: {
+    label: '用户',
+    chip: 'bg-sky-500/15 text-sky-300 border border-sky-500/30',
+    bar: 'bg-sky-500/70',
+  },
+  host: {
+    label: '主持人',
+    chip: 'bg-amber-500/15 text-amber-300 border border-amber-500/30',
+    bar: 'bg-amber-500/70',
+  },
+  coworker: {
+    label: '协作智能体',
+    chip: 'bg-violet-500/15 text-violet-300 border border-violet-500/30',
+    bar: 'bg-violet-500/70',
+  },
+  system: {
+    label: '系统',
+    chip: 'bg-slate-500/15 text-slate-300 border border-slate-500/30',
+    bar: 'bg-slate-500/70',
+  },
+  tool: {
+    label: '工具',
+    chip: 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30',
+    bar: 'bg-emerald-500/70',
+  },
+  unknown: {
+    label: '其它',
+    chip: 'bg-muted text-muted-foreground border border-border/60',
+    bar: 'bg-muted',
+  },
+};
 
 const ROLE_META: Record<
   MsgRole,
@@ -237,7 +290,11 @@ function CollapsibleBlock({
 }
 
 function MessageCard({ msg }: { msg: NormalizedMessage }) {
-  const meta = ROLE_META[msg.role];
+  const speakerMeta = msg.speakerKind ? SPEAKER_META[msg.speakerKind] : null;
+  const roleMeta = ROLE_META[msg.role];
+  const meta = speakerMeta
+    ? { ...roleMeta, label: msg.speakerName || speakerMeta.label, chip: speakerMeta.chip, bar: speakerMeta.bar }
+    : roleMeta;
   const [expanded, setExpanded] = useState(msg.text.length < 1500);
   const preview =
     expanded || msg.text.length < 1500
