@@ -21,9 +21,19 @@ label: 产品架构文档生成工具
 > 6. **多仓库协同（与研发手册思路一致）**：当 `|GNX_REPO_LIST| > 1` 时，**每个仓库**独立 `materialize` / `GNX_CACHE_DIR`；凡结论涉及路径、API、配置、执行流，须在对应仓缓存上 **read/grep** 留证。**跨仓库**须写清集成证据（URL、proto、客户端、消息、DB 等）与**术语/接口前缀一致性**；证据不足标 `[待源码确认]`，禁止单仓推断他仓行为。
 > 7. **遗漏功能分析为必选章节**：只要生成功能架构主文档，**§4「遗漏功能与清单外能力分析」**须按 `func-arch-template.md` 填满；用于暴露源码中已存在但未列入 `CORE_FEATURES` 的能力，并给出**产品管理人员待办**。未传 `CORE_FEATURES` 时该节改为「候选核心能力清单（待产品确认）」。
 
-## 共享脚本目录（BASE_SCRIPTS_DIR）
+## 共享脚本（run_skill_script）
 
-凡调用 `get_repo_info.py`、`get_doc.py`、`gnx-tools.js`、`fetch-arch-data.js`、`detect-project-kind.js`，一律使用 **`<BASE_SCRIPTS_DIR>/scripts/<文件名>`**。**BASE_SCRIPTS_DIR** 为技能 **`whalecloud-dev-tool-base-scripts`** 的根目录（与系统提示中该技能块内 `**技能路径**:` 一致；本仓库内为 `skills/whalecloud-dev-tool-base-scripts`）。本技能（arch-create）目录下**不再**提供上述脚本的副本。
+凡调用 `get_repo_info.py`、`get_doc.py`、`gnx-tools.js`、`fetch-arch-data.js`、`detect-project-kind.js`，一律通过：
+
+```text
+run_skill_script(
+  skill_name="whalecloud-dev-tool-base-scripts",
+  script_name="<文件名>",
+  args=[...]
+)
+```
+
+详见 `whalecloud-dev-tool-base-scripts` 技能 SKILL.md。本技能（arch-create）目录下**不再**提供上述脚本的副本。
 
 ## Parameters
 
@@ -34,7 +44,7 @@ label: 产品架构文档生成工具
 | `GITNEXUS_URL` | 是 | GitNexus 服务根地址（`gitnexus serve`），如 `http://127.0.0.1:11011` |
 | `SYNAPSE_URL` | 条件 | SynapseService 地址（`IP:PORT`，**无 `http://` 前缀**）。当需要通过脚本按产品拉取关联仓库列表时**必填**；若调用方已显式给出唯一 `REPO_NAME`（如 HTTP 任务注入），可省略 |
 | `PROD` | 条件 | 产品名称。与 `SYNAPSE_URL` 同时出现时，用于 `get_repo_info.py`，**不得手填 `REPO_NAME` 替代接口结果** |
-| `REPO_NAME` | 条件 | GitNexus 图谱中的仓库名。**优先**由 `{PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_repo_info.py --server-url={SYNAPSE_URL} --prod={PROD}` 解析输出得到列表 `GNX_REPO_LIST`（多仓时逐项处理）；若用户/请求体已给出确定仓库名且无产品拉仓需求，可视为单元素列表 |
+| `REPO_NAME` | 条件 | GitNexus 图谱中的仓库名。**优先**由 `run_skill_script(..., script_name="get_repo_info.py", args=["--server-url", "{SYNAPSE_URL}", "--prod", "{PROD}"])` 解析得到列表 `GNX_REPO_LIST`（多仓时逐项处理）；若用户/请求体已给出确定仓库名且无产品拉仓需求，可视为单元素列表 |
 | `OUTPUT_DIR` | 否 | 架构文档产出目录（`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`、`.excalidraw` 等）。**Synapse 内置任务**下等价于 `_knowledge_docs_root(doc_type, prod_name)`，即 `{SYNAPSE_HOME}/tmp/docs/<prod_name>/<doc_type>/`；Cursor 独立执行时由用户指定或使用团队约定目录 |
 | `OUTPUT` | 否 | **必选文件**：`FUNCTIONAL_ARCH.md`、`TECH_ARCH.md`。**条件文件**：仅当 **`DIAGRAM_MODE=excalidraw`**（已挂载 `whalecloud-dev-tool-excalidraw`）时，还须写入 `sys-arch-layers.excalidraw`、`tech-stack.excalidraw`（与 `dev_iwhalecloud_knowledge.py` 读取逻辑一致）。**`DIAGRAM_MODE=mermaid` 时不创建**上述 `.excalidraw`，图示仅写入 `TECH_ARCH.md` 的 Mermaid 代码块 |
 | `GNX_CACHE_DIR` | 是（每仓） | 该仓库的 materialize 根；**read/grep 仅访问其下 `files/`**。`gnx-tools.js` 的 `--cache` 必须指向此目录。**Synapse 内置任务**下为 `{SYNAPSE_HOME}/tmp/gitnexus/<REPO_NAME>/`（`_gitnexus_local_data_path`）。**独立 Cursor / 研发手册式流程**下由调用方显式给定目录（常见：工作区下 `.gnx-cache/<REPO_NAME>/` 或团队约定的绝对路径），不要求再套一层「临时根」变量名 |
@@ -44,7 +54,11 @@ label: 产品架构文档生成工具
 ### 仓库列表获取（禁止拍脑袋写 `REPO_NAME`）
 
 ```text
-{PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_repo_info.py --server-url=<SYNAPSE_URL> --prod=<PROD>
+run_skill_script(
+  skill_name="whalecloud-dev-tool-base-scripts",
+  script_name="get_repo_info.py",
+  args=["--server-url", "<SYNAPSE_URL>", "--prod", "<PROD>"]
+)
 ```
 
 - 解析标准输出中 `一共有N个仓库：REPO1,REPO2,...`，得到 `GNX_REPO_LIST`。
@@ -58,7 +72,7 @@ label: 产品架构文档生成工具
 **推荐自动化（Cursor 终端）**：
 
 ```text
-node <BASE_SCRIPTS_DIR>/scripts/detect-project-kind.js --cache <GNX_CACHE_DIR> [--overview <GNX_CACHE_DIR>/overview.json]
+run_skill_script(skill_name="whalecloud-dev-tool-base-scripts", script_name="detect-project-kind.js", args=["--cache", "<GNX_CACHE_DIR>", "--overview", "<GNX_CACHE_DIR>/overview.json"])
 ```
 
 脚本输出 JSON 字段 `projectKind`、`confidence`、`signals`、`extHistogramTop`。将其映射为内部变量：
@@ -84,7 +98,7 @@ node <BASE_SCRIPTS_DIR>/scripts/detect-project-kind.js --cache <GNX_CACHE_DIR> [
 
 ### GitNexus 取数标准流程（与 Nexus / gitnexus-web Backend 对齐）
 
-本技能**不再**以 PowerShell 拼 `Invoke-WebRequest` 或 MCP 流式接口作为默认取数方式。一律使用 **`<BASE_SCRIPTS_DIR>/scripts/gnx-tools.js`**（七子命令 + `materialize`），底层与 Nexus 一致：
+本技能**不再**以 PowerShell 拼 `Invoke-WebRequest` 或 MCP 流式接口作为默认取数方式。一律使用 **`run_skill_script(..., script_name="gnx-tools.js", args=[子命令, ...])`**（七子命令 + `materialize`），底层与 Nexus 一致：
 
 | 子命令 | REST / 行为 | 说明 |
 |--------|----------------|------|
@@ -105,7 +119,7 @@ node <BASE_SCRIPTS_DIR>/scripts/detect-project-kind.js --cache <GNX_CACHE_DIR> [
 
 **参数约定**：`--url` 为 `gitnexus serve` 根（如 `http://127.0.0.1:11011`），`--repo` 与代码图谱嵌入参数一致（**须与 `get_repo_info.py` 或请求体解析结果一致**，不得手编）；`--cache` 即本技能的 **`GNX_CACHE_DIR`**（每仓库一个 materialize 根，与 **`OUTPUT_DIR`** 分离）。
 
-**完整用法与 Cursor 验证步骤**：见 `<BASE_SCRIPTS_DIR>/references/README-GNX-TOOLS.md`。
+**完整用法**：`get_skill_info("whalecloud-dev-tool-base-scripts")` 内 `references/README-GNX-TOOLS.md`。
 
 ## 多仓库协同（产品关联性 · 一致性）
 
@@ -236,7 +250,7 @@ Phase 0 — 用户传入信息整理（必选，首先执行）
       - PROD、SYNAPSE_URL、GITNEXUS_URL、OUTPUT_DIR、OUTPUT、各仓 **GNX_CACHE_DIR**（若用户/系统提示已给出则记录；未给出时按「Parameters」表或 Synapse 注入路径推导）
   0b. **仓库名解析（禁止手写猜测）**：
       - 若同时有 **PROD + SYNAPSE_URL**：必须执行
-        `{PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_repo_info.py --server-url=<SYNAPSE_URL> --prod=<PROD>`
+        `run_skill_script(skill_name="whalecloud-dev-tool-base-scripts", script_name="get_repo_info.py", args=["--server-url", "<SYNAPSE_URL>", "--prod", "<PROD>"])`
         → 得到 `GNX_REPO_LIST`；后续每个仓库使用各自的 `GNX_CACHE_DIR`。
       - 若仅有单仓上下文（如 API 已注入 **REPO_NAME**）：`GNX_REPO_LIST = [该 REPO_NAME]`，仍须与 GitNexus `--list` 或接口结果核对拼写。
   0c. 将 CORE_FEATURES 展开为追踪表格，用于 Phase 1b 逐项打勾：
@@ -249,22 +263,24 @@ Phase 0 — 用户传入信息整理（必选，首先执行）
 
 Phase 0.1 — 工程类型判定（必选，可与 0.5b 顺序微调）
   0.1a. 若尚未有缓存：先执行下方 Phase 0.5b `materialize`（至少需要 `cache/files` 才能跑检测脚本）。
-  0.1b. `node <BASE_SCRIPTS_DIR>/scripts/detect-project-kind.js --cache <GNX_CACHE_DIR> [--overview <GNX_CACHE_DIR>/overview.json]`
+  0.1b. `run_skill_script(skill_name="whalecloud-dev-tool-base-scripts", script_name="detect-project-kind.js", args=["--cache", "<GNX_CACHE_DIR>", "--overview", "<GNX_CACHE_DIR>/overview.json"])`
         → 解析 JSON，写入内部变量 `PROJECT_KIND`、`KIND_CONFIDENCE`、`KIND_SIGNALS`。
   0.1c. 将 `PROJECT_KIND` 与用户 **`CODE_PATH` / 产品说明** 及 README（若存在）对照；冲突时以**用户明确说明**为准，并在文档中注明依据。
   0.1d. 若 `PROJECT_KIND` 为 `cpp_native` 或 `cpp_mixed`：在后续 Phase 1b **必须执行附录 A**；其他语言按上表「主策略摘要」执行，不得套用 C++ 头文件猜测规则。
 
 Phase 0.5 — GitNexus 缓存与 Nexus 对齐取数（有索引且要写技术/功能架构时 **必选**）
-  0.5a. 为 `GNX_REPO_LIST` 中**每个** `REPO_NAME` 确定 **`GNX_CACHE_DIR`**（Synapse 下即 `tmp/gitnexus/<REPO_NAME>/`；独立执行时为调用方指定的 materialize 根）；**禁止**把架构产出写到 `GNX_CACHE_DIR`（架构只进 **OUTPUT_DIR**）。
-  0.5b. **按仓库循环**：`node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js materialize --url <GITNEXUS_URL> --repo <REPO_NAME> --cache <GNX_CACHE_DIR> --concurrency 8`
+  0.5a. 为 `GNX_REPO_LIST` 中**每个** `REPO_NAME` 确定 **`GNX_CACHE_DIR`**（Synapse 内置任务下即 `tmp/gitnexus/<REPO_NAME>/`；独立 Cursor / 研发手册式流程下由调用方显式给定，常见 `.gnx-cache/<REPO_NAME>/`）。**禁止**把架构产出写到 `GNX_CACHE_DIR`（架构只进 **OUTPUT_DIR**）。
+  0.5b. **按仓库循环**：
+        `run_skill_script(skill_name="whalecloud-dev-tool-base-scripts", script_name="gnx-tools.js", args=["materialize", "--url", "<GITNEXUS_URL>", "--repo", "<REPO_NAME>", "--cache", "<GNX_CACHE_DIR>", "--concurrency", "8"])`
         → 本地 `<GNX_CACHE_DIR>/files/**` 与 `manifest.json`（后续 **read/grep 只走本地**）。
         ⚠ **不要加 `--max-files` 限制**：默认不限文件数量，确保缓存覆盖仓库全量源文件，避免后续 `read: not in cache` 错误。仅在网络极慢或磁盘空间受限时才临时加上 `--max-files N`。
-  0.5c. 结构化总览（可选但推荐，**每仓**）：`node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js overview --url ... --repo <REPO_NAME> --out <GNX_CACHE_DIR>/overview.json`（**必须加 `--out`**，不要依赖 PowerShell `>` 重定向，`>` 默认 UTF-16 编码会导致下游脚本解析失败）
-  0.5d. 按需检索（**每仓**）：`node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js search ...`、`node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js explore ...`、`node <BASE_SCRIPTS_DIR>/scripts/gnx-tools.js impact ...`，或直接用 `cypher` 子命令。
+  0.5c. 结构化总览（可选，**每仓**，须 `--out`）：
+        `run_skill_script(..., script_name="gnx-tools.js", args=["overview", "--url", "...", "--repo", "<REPO_NAME>", "--out", "<GNX_CACHE_DIR>/overview.json"])`
+  0.5d. 按需：`search` / `explore` / `impact` / `cypher`（均通过 `gnx-tools.js` + `args` 数组调用）。
 
 Phase 1 — 结构化信号采集（可选，与 Phase 0.5 互补，run fetch-arch-data.js）
   1. **按仓库循环**（或选定主仓后再单跑），示例：
-        node <BASE_SCRIPTS_DIR>/scripts/fetch-arch-data.js --url <GITNEXUS_URL> --repo <REPO_NAME> --out <OUTPUT_DIR>/arch-data-<REPO_NAME>.json --with-snippets [--debug-dump <GNX_CACHE_DIR>/debug-fetch] [--merge-overview <path>] [--no-auto-overview]
+        run_skill_script(skill_name="whalecloud-dev-tool-base-scripts", script_name="fetch-arch-data.js", args=["--url", "<GITNEXUS_URL>", "--repo", "<REPO_NAME>", "--out", "<OUTPUT_DIR>/arch-data-<REPO_NAME>.json", "--with-snippets", ...])
      （⚠ 使用绝对路径；Windows 下不支持 && 链式命令，须用绝对路径或 working_directory 参数）
      → arch-data.json（clusters/processes/query 命中路径；--with-snippets 含符号正文片段）
      → 若 **`GET /api/clusters`/`processes` 为空** 且 **`--out` 同目录存在 `overview.json`**（一般由 Phase 0.5c 的 `gnx-tools overview --out` 生成），**自动合并**聚类与流程列表到 `rawClusters`/`rawProcesses`（`meta.overviewMerge` 记录来源）
@@ -351,13 +367,12 @@ Phase 5 — 迭代
 
 ## Phase 1: 结构化信号采集
 
-```powershell
-# 始终使用 --with-snippets 以获取符号正文片段（用于验证索引聚类是否准确）
-# 注意：使用 BASE_SCRIPTS_DIR（whalecloud-dev-tool-base-scripts 技能根目录）下的绝对路径，勿写相对路径 scripts/fetch-arch-data.js
-node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url <GITNEXUS_URL> --repo <REPO_NAME> --with-snippets
-
-# 示例（Windows PowerShell，不支持 && 链式命令，须分开执行或用 ; 分隔）：
-node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url http://10.x.x.x:11011 --repo ZMDB --with-snippets
+```text
+run_skill_script(
+  skill_name="whalecloud-dev-tool-base-scripts",
+  script_name="fetch-arch-data.js",
+  args=["--url", "<GITNEXUS_URL>", "--repo", "<REPO_NAME>", "--with-snippets"]
+)
 ```
 
 > ⚠ **Windows PowerShell 注意**：不支持 `&&` 链式命令，`cd <dir> && node ...` 会报 `InvalidEndOfLine` 错误。应使用绝对路径直接调用脚本，或用 `;` 分隔两条命令（前者失败时后者仍执行），或在 `working_directory` 参数中设置工作目录。
@@ -620,7 +635,7 @@ node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url http://10.x.x.x:11011
 | `ECONNREFUSED` | 检查 URL；跳过 Phase 1，直接从 Phase 1b 开始（仅源码路径） |
 | `Repo not found` | 用脚本绝对路径加 `--list` 参数列出可用仓库名 |
 | 索引过期 | 提示在索引所在环境执行 `npx gitnexus analyze --embeddings` 后重新导出 |
-| 找不到脚本 `fetch-arch-data.js` | 使用 `node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" ...`（**BASE_SCRIPTS_DIR** 为技能 `whalecloud-dev-tool-base-scripts` 根目录） |
+| 找不到脚本 `fetch-arch-data.js` | 使用 `run_skill_script(skill_name="whalecloud-dev-tool-base-scripts", script_name="fetch-arch-data.js", args=[...])` |
 | PowerShell `&&` 报 InvalidEndOfLine | 不要用 `&&`，改用绝对路径直接调用，或用 `working_directory` 参数 |
 | `overview.json` / `arch-data` 解析失败、`overview:parse-failed` | PowerShell `>` 默认 **UTF-16**；**必须改用** `gnx-tools overview --out path.json`（`--out` 写 UTF-8，无此参数时控制台会打印警告提示）；或依赖已增强的 `detect-project-kind.js`（可读 UTF-16） |
 | REST 与 `arch-data` 内容对不上 | 使用 `fetch-arch-data.js --debug-dump <dir>` 对照原始响应与 MCP SSE |
@@ -656,6 +671,3 @@ node "<BASE_SCRIPTS_DIR>\scripts\fetch-arch-data.js" --url http://10.x.x.x:11011
 
 - [func-arch-template.md](func-arch-template.md) — 功能架构文档模板（主文档）
 - [tech-arch-template.md](tech-arch-template.md) — 技术架构文档模板（补充文档）
-- [../whalecloud-dev-tool-base-scripts/references/get_repo_info_readme.md](../whalecloud-dev-tool-base-scripts/references/get_repo_info_readme.md) — `get_repo_info.py` 用法（与 `whalecloud-dev-tool-development-manual` 同源接口）
-- **图示技能（仅 `DIAGRAM_MODE=excalidraw` 时必读）**：`../whalecloud-dev-tool-excalidraw/SKILL.md` — 用于生成 `tech-stack.excalidraw` / `sys-arch-layers.excalidraw`；未挂载该技能时走 Mermaid 分支，勿读此文件
-- 代码探索：[gitnexus-exploring](../gitnexus-exploring/SKILL.md)（在需要 MCP 深入某符号时）

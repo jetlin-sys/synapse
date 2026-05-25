@@ -259,7 +259,7 @@
 - **结构化索引服务**：`{{GITNEXUS_URL}}`（仅团队内部部署时使用）
 - **索引中的仓库名**：`{{PROJECT_NAME}}`
 - **原始采集文件**：`arch-data.json`（与本文档同目录时可附）
-- **采集命令**：`node <BASE_SCRIPTS_DIR>/scripts/fetch-arch-data.js --url <URL> --repo <NAME>`（`BASE_SCRIPTS_DIR` = 技能 `whalecloud-dev-tool-base-scripts` 根目录）；需要符号正文片段时加 `--with-snippets`
+- **采集命令**：`run_skill_script(skill_name="whalecloud-dev-tool-base-scripts", script_name="fetch-arch-data.js", args=["--url", "<URL>", "--repo", "<NAME>", "--with-snippets"])`
 
 ---
 
