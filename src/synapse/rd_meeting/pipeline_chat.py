@@ -36,12 +36,12 @@ PHASE_WAITING_SUMMARY = (
 
 STEP_HOST_FIRST_CALL_SUMMARY = (
     "主控触发执行\n\n"
-    "小鲸开始执行本 SOP 节点：使用已组装的会议室提示词进行推理，并按 SKILL 提交工作安排与委派协作智能体。"
+    "触发小鲸继续执行sop工作。"
 )
 
 STEP_HOST_FIRST_CALL_REUSED_SUMMARY = (
     "主控触发执行\n\n"
-    "小鲸开始执行本 SOP 节点：复用步骤 3 已组装的会议室提示词（未重新渲染 SKILL）。"
+    "触发小鲸继续执行sop工作。"
 )
 
 
