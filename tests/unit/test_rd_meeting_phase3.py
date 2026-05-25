@@ -93,12 +93,13 @@ def test_validate_node_archive_artifacts_checks_file_content(tmp_path, monkeypat
 
     scope_id = "21883304"
     node_id = "boundary"
+    stage_name = "需求分析"
     monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
-    dest = scope_dir(scope_id) / "archive" / "1" / node_id
+    dest = scope_dir(scope_id) / "archive" / stage_name / node_id
     dest.mkdir(parents=True)
 
     (dest / "边界确认说明.md").write_text("too short", encoding="utf-8")
-    bad = validate_node_archive_artifacts(scope_id, 1, node_id)
+    bad = validate_node_archive_artifacts(scope_id, stage_name, node_id)
     assert not bad.ok
     assert any("边界确认说明.md" in e for e in bad.errors)
 
@@ -107,7 +108,7 @@ def test_validate_node_archive_artifacts_checks_file_content(tmp_path, monkeypat
         "本节点已完成交付，结论如下：模块边界清晰，无跨产品影响。\n" * 3
     )
     (dest / "边界确认说明.md").write_text(good_body, encoding="utf-8")
-    good = validate_node_archive_artifacts(scope_id, 1, node_id)
+    good = validate_node_archive_artifacts(scope_id, stage_name, node_id)
     assert good.ok
 
 
@@ -137,8 +138,9 @@ def test_resolve_delivery_body_prefers_archive_md(tmp_path, monkeypatch):
 
     scope_id = "21883303"
     node_id = "req_clarify"
+    stage_name = "需求分析"
     monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
-    dest = scope_dir(scope_id) / "archive" / "1" / node_id
+    dest = scope_dir(scope_id) / "archive" / stage_name / node_id
     dest.mkdir(parents=True)
     archive_text = (
         "# 需求澄清\n\n"
@@ -152,7 +154,7 @@ def test_resolve_delivery_body_prefers_archive_md(tmp_path, monkeypatch):
         "这是没有一级标题的 pending 摘要，" + "内容较短。" * 5,
     )
     assert resolved.startswith("# 需求澄清")
-    assert validate_node_archive_artifacts(scope_id, 1, node_id).ok
+    assert validate_node_archive_artifacts(scope_id, stage_name, node_id).ok
 
 
 @pytest.mark.asyncio

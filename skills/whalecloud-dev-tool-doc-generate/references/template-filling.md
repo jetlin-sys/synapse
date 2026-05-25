@@ -40,4 +40,18 @@
 ## 输出
 
 - 填充完成后得到纯 Markdown 字符串，不含 Handlebars 未解析残留（不应出现 `{{#each` 等）。
-- 写入 `{OUTPUT_DIR}/{OUTPUT}`，UTF-8，换行符 `\n`。
+- 写入 `{OUTPUT_DIR}/{OUTPUT}`：**必须** `write_file`，UTF-8（无 BOM），换行符 `\n`。
+- 文档中含中文时，变量值与正文均须为合法 Unicode 字符；**禁止**以 GBK/GB2312/GB18030/UTF-16 等编码写入后再按 UTF-8 误读。
+
+### 写盘与字符编码（强制）
+
+| 操作 | 要求 |
+|------|------|
+| 读模板、CONTEXT_FILES、CONTEXT_JSON 文件 | UTF-8 |
+| 写交付物 `{OUTPUT_DIR}/{OUTPUT}` | **必须**调用 `write_file`（UTF-8，无 BOM） |
+| 写后验证 | **必须**用 `read_file` 读回；含中文时检查无乱码 |
+| 内存中的填充结果 | Unicode 字符串，落盘前不做非 UTF-8 转码 |
+
+**禁止**通过 shell 重定向、Python/Node/PowerShell 脚本等方式写盘；`OUTPUT_MODE=file` 或 `both` 时落盘步骤不可省略或替代。
+
+**写后验证**：若出现 U+FFFD 替换字符、`Ã`、`ï¿½` 等乱码特征，视为编码错误，**不得交付**，须确认使用了 `write_file` 后重试。

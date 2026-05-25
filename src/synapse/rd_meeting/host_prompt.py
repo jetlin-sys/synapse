@@ -8,10 +8,10 @@ from synapse.rd_meeting.binding import resolve_node_binding
 from synapse.rd_meeting.dev_status import load_dev_status
 from synapse.rd_meeting.dynamic_prompt import build_dynamic_meeting_context, build_meeting_user_turn_prompt
 from synapse.rd_meeting.init_context import build_node_init_log_data
-from synapse.rd_meeting.paths import archive_root, scope_dir
+from synapse.rd_meeting.paths import archive_node_dir, scope_dir
 from synapse.rd_meeting.pipeline_chat import format_host_prompt_step_chat
 from synapse.rd_meeting.room_skill import build_room_skill_prompt, get_meeting_room_rules, make_context
-from synapse.rd_sop.nodes import node_display_name, stage_id_for_node_id
+from synapse.rd_sop.nodes import node_display_name, stage_id_for_node_id, stage_name_for_id
 
 ScopeType = Literal["demand", "task"]
 
@@ -34,7 +34,7 @@ def assemble_host_prompt_bundle(
         ticket_title=ticket_title,
     )
     bind["node_id"] = nid
-    stg = int(bind.get("stage_id") or stage_id_for_node_id(nid))
+    stg_name = str(bind.get("stage_name") or stage_name_for_id(int(bind.get("stage_id") or stage_id_for_node_id(nid))))
 
     dev = load_dev_status(sid)
     sop_display = str(dev.get("sop_node_display") or "") if dev else ""
@@ -55,7 +55,7 @@ def assemble_host_prompt_bundle(
         scope_type=scope_type,
         scope_id=sid,
         ticket_title=ticket_title,
-        archive_dir=str(archive_root(sid) / str(stg) / nid) if sid and nid else "",
+        archive_dir=str(archive_node_dir(sid, stg_name, nid)) if sid and nid else "",
     )
     meeting_prompt = build_room_skill_prompt(
         ctx,

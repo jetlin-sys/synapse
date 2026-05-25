@@ -189,19 +189,19 @@ def test_aggregate_worker_tools_from_pool_with_host_session_fallback(tmp_path):
 
 def test_collect_artifact_files_lists_md_and_others(tmp_path):
     scope = "scope-B"
-    stage_id = 2
+    stage_name = "需求设计"
     node_id = "req_clarify"
-    base = archive_root(scope) / str(stage_id) / node_id
+    base = archive_root(scope) / stage_name / node_id
     base.mkdir(parents=True)
     (base / "需求澄清.md").write_text("# Hello", encoding="utf-8")
     (base / "data.json").write_text('{"k": 1}', encoding="utf-8")
 
-    files = collect_artifact_files(scope, stage_id, node_id)
+    files = collect_artifact_files(scope, stage_name, node_id)
     names = sorted(f.name for f in files)
     assert names == ["data.json", "需求澄清.md"]
     md = next(f for f in files if f.name == "需求澄清.md")
     assert md.ext == ".md"
-    assert md.relative_path.endswith(f"archive/{stage_id}/{node_id}/需求澄清.md")
+    assert md.relative_path.endswith(f"archive/{stage_name}/{node_id}/需求澄清.md")
     assert md.size > 0
 
 
@@ -216,10 +216,10 @@ def test_read_artifact_file_blocks_path_escape(tmp_path):
 
 def test_read_artifact_file_reads_md(tmp_path):
     scope = "scope-D"
-    base = archive_root(scope) / "2" / "req_clarify"
+    base = archive_root(scope) / "需求设计" / "req_clarify"
     base.mkdir(parents=True)
     (base / "x.md").write_text("# X", encoding="utf-8")
-    res = read_artifact_file(scope, "archive/2/req_clarify/x.md")
+    res = read_artifact_file(scope, "archive/需求设计/req_clarify/x.md")
     assert res is not None
     content, ext = res
     assert content == "# X"
@@ -248,7 +248,7 @@ async def test_build_and_save_payload_without_llm(tmp_path):
     )
 
     # 2) 归档文件
-    base = archive_root(scope) / str(stage_id) / node_id
+    base = archive_root(scope) / "需求设计" / node_id
     base.mkdir(parents=True)
     (base / "需求澄清.md").write_text("# 交付结论\nOK", encoding="utf-8")
 

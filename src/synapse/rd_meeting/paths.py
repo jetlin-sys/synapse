@@ -88,6 +88,18 @@ def archive_root(scope_id: str) -> Path:
     return scope_dir(scope_id) / "archive"
 
 
+def archive_stage_segment(stage_name: str) -> str:
+    """归档路径阶段段：``archive/<stage_name>/``（保留中文阶段名）。"""
+    return sanitize_fs_segment(stage_name or "待处理", fallback="待处理")
+
+
+def archive_node_dir(scope_id: str, stage_name: str, node_id: str) -> Path:
+    """节点归档目录：``work/<scope>/archive/<stage_name>/<node_id>/``。"""
+    stg = archive_stage_segment(stage_name)
+    nid = (node_id or "pending").strip() or "pending"
+    return archive_root(scope_id) / stg / nid
+
+
 def product_code_root(scope_id: str) -> Path:
     """产品仓库代码根目录：``work/<scope>/code/``。"""
     return scope_dir(scope_id) / "code"

@@ -82,27 +82,28 @@ def validate_node_output(node_id: str, content: str) -> NodeOutputValidation:
 
 def validate_node_archive_artifacts(
     scope_id: str,
-    stage_id: int,
+    stage_name: str,
     node_id: str,
 ) -> NodeOutputValidation:
     """校验归档目录下 NODE_OUTPUTS 约定的 Markdown 产出物（存在性 + 内容）。"""
-    from synapse.rd_meeting.paths import scope_dir
+    from synapse.rd_meeting.paths import archive_node_dir, archive_stage_segment
 
     names = _artifact_md_names(node_id)
     if not names:
         return NodeOutputValidation(ok=True, errors=[])
 
-    dest = scope_dir(scope_id) / "archive" / str(stage_id) / node_id
+    stg = archive_stage_segment(stage_name)
+    dest = archive_node_dir(scope_id, stage_name, node_id)
     if not dest.is_dir():
         return NodeOutputValidation(
             ok=False,
-            errors=[f"归档目录不存在：archive/{stage_id}/{node_id}/"],
+            errors=[f"归档目录不存在：archive/{stg}/{node_id}/"],
         )
 
     errors: list[str] = []
     for name in names:
         path = dest / name
-        rel = f"archive/{stage_id}/{node_id}/{name}"
+        rel = f"archive/{stg}/{node_id}/{name}"
         if not path.is_file():
             errors.append(f"缺少约定产出物：{name}（{rel}）")
             continue
@@ -118,14 +119,14 @@ def validate_node_archive_artifacts(
 
 def validate_node_archive_files(
     scope_id: str,
-    stage_id: int,
+    stage_name: str,
     node_id: str,
 ) -> NodeOutputValidation:
     """P3：仅校验约定 Markdown 文件是否存在于归档目录（不含内容）。"""
-    from synapse.rd_meeting.paths import scope_dir
+    from synapse.rd_meeting.paths import archive_node_dir
 
     errors: list[str] = []
-    dest = scope_dir(scope_id) / "archive" / str(stage_id) / node_id
+    dest = archive_node_dir(scope_id, stage_name, node_id)
     if not dest.is_dir():
         return NodeOutputValidation(ok=False, errors=["归档目录不存在"])
     for name in _artifact_md_names(node_id):

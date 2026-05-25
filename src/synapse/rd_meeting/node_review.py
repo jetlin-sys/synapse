@@ -30,14 +30,14 @@ from synapse.rd_meeting.agent_session import (
     clear_meeting_agent_session,
     ensure_host_session,
 )
-from synapse.rd_meeting.paths import agent_node_dir, archive_root, meeting_pipeline_path
+from synapse.rd_meeting.paths import agent_node_dir, archive_node_dir, meeting_pipeline_path
 from synapse.rd_meeting.room_runtime import (
     load_room_state,
     read_json_file,
     save_room_state,
     write_json_file,
 )
-from synapse.rd_sop.nodes import node_display_name
+from synapse.rd_sop.nodes import node_display_name, stage_name_for_id
 
 logger = logging.getLogger(__name__)
 
@@ -358,12 +358,12 @@ def aggregate_node_metrics(
 # ─── 产出物 ───────────────────────────────────────────────────────────
 
 
-def collect_artifact_files(scope_id: str, stage_id: int, node_id: str) -> list[ArtifactFile]:
-    """扫 ``archive/<stage_id>/<node_id>/`` 下所有文件（递归一层即可，归档很少嵌套）。"""
+def collect_artifact_files(scope_id: str, stage_name: str, node_id: str) -> list[ArtifactFile]:
+    """扫 ``archive/<stage_name>/<node_id>/`` 下所有文件（递归一层即可，归档很少嵌套）。"""
     sid = (scope_id or "").strip()
     if not sid:
         return []
-    base = archive_root(sid) / str(stage_id) / node_id
+    base = archive_node_dir(sid, stage_name, node_id)
     if not base.is_dir():
         return []
     from synapse.rd_meeting.paths import scope_dir
@@ -618,7 +618,11 @@ async def build_node_review_payload(
         use_llm=use_llm_summary,
     )
 
-    artifacts = collect_artifact_files(scope_id, stage_id, node_id)
+    artifacts = collect_artifact_files(
+        scope_id,
+        str(binding.get("stage_name") or stage_name_for_id(stage_id)),
+        node_id,
+    )
 
     return {
         "schema_version": REVIEW_SCHEMA_VERSION,

@@ -16,7 +16,7 @@ from synapse.rd_meeting.paths import (
     room_state_lock_path,
     room_state_path,
 )
-from synapse.rd_sop.nodes import ALL_NODES, node_display_name
+from synapse.rd_sop.nodes import ALL_NODES, node_display_name, stage_id_for_name
 
 logger = logging.getLogger(__name__)
 
@@ -195,10 +195,8 @@ def list_archive_index(scope_id: str) -> list[dict[str, Any]]:
     for stage_dir in sorted(root.iterdir(), key=lambda p: p.name):
         if not stage_dir.is_dir():
             continue
-        try:
-            stage_id = int(stage_dir.name)
-        except ValueError:
-            continue
+        stage_name = stage_dir.name
+        stage_id = stage_id_for_name(stage_name)
         for node_dir in sorted(stage_dir.iterdir(), key=lambda p: p.name):
             if not node_dir.is_dir():
                 continue

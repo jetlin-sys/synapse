@@ -135,7 +135,7 @@ def is_human_only_node(node_id: str) -> bool:
     return NODE_TYPES.get(node_id, "") == "human"
 
 
-# 节点产出文档（只读展示；归档路径 archive/<stage_id>/<node_id>/）
+# 节点产出文档（只读展示；归档路径 archive/<stage_name>/<node_id>/）
 NODE_OUTPUTS: dict[str, list[str]] = {
     "pending": ["（系统节点，无归档产出）"],
     "req_clarify": ["需求澄清.md"],
@@ -171,4 +171,4 @@ def node_output_artifacts(node_id: str) -> list[str]:
     items = NODE_OUTPUTS.get(node_id)
     if items:
         return list(items)
-    return [f"archive/<stage_id>/{node_id}/ 目录下的节点交付 Markdown"]
+    return [f"archive/<stage_name>/{node_id}/ 目录下的节点交付 Markdown"]

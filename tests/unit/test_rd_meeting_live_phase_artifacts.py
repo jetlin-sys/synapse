@@ -72,9 +72,9 @@ def test_write_node_deliverables_and_validate(tmp_path: Path, monkeypatch: pytes
         lambda s: tmp_path / s,
     )
     body = "# 需求澄清\n\n## 结论\n交付完成，结论已确认。\n" + ("x" * 80)
-    artifacts = write_node_deliverables(sid, 1, "req_clarify", body)
+    artifacts = write_node_deliverables(sid, "需求分析", "req_clarify", body)
     assert artifacts
-    ok, errors = validate_archive_outputs(sid, 1, "req_clarify")
+    ok, errors = validate_archive_outputs(sid, "需求分析", "req_clarify")
     assert ok, errors
 
 

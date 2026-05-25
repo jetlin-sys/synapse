@@ -100,6 +100,14 @@ def stage_name_for_id(stage_id: int) -> str:
     return ""
 
 
+def stage_id_for_name(stage_name: str) -> int:
+    name = (stage_name or "").strip()
+    for s in STAGES:
+        if str(s["name"]) == name:
+            return int(s["id"])
+    return 0
+
+
 def node_display_name(node_id: str) -> str:
     for n in _ALL_NODES:
         if n["id"] == node_id:

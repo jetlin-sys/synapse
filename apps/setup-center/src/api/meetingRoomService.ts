@@ -319,13 +319,17 @@ export interface MeetingAgentDelegationRun {
   status?: string;
   reason?: string;
   from_agent?: string;
+  task_preview?: string;
+  result_summary?: string;
+  plan_item_id?: string;
   elapsed_s?: number;
   iteration?: number;
   tools_total?: number;
   tools_executed?: string[];
   skills_total?: number;
   current_tool_summary?: string;
-  started_at?: number;
+  started_at?: number | string;
+  finished_at?: string;
 }
 
 export interface ProcessingHistoryEntry {

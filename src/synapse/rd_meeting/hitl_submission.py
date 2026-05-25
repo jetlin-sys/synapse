@@ -8,7 +8,6 @@ from typing import Any
 
 from synapse.rd_meeting.room_runtime import load_room_state, save_room_state
 from synapse.rd_meeting.user_context import is_hitl_form_submission
-from synapse.rd_sop.nodes import stage_id_for_node_id
 
 _HITL_FORM_PREFIX = "[人工确认表单]"
 
@@ -112,15 +111,16 @@ def record_hitl_submission_locked(
 
 def load_archive_delivery_body(scope_id: str, node_id: str) -> str:
     """读取归档目录下主交付 Markdown（供 result_confirm 归档校验）。"""
-    from synapse.rd_meeting.paths import scope_dir
+    from synapse.rd_meeting.paths import archive_node_dir
     from synapse.rd_sop.manifest import node_output_artifacts
+    from synapse.rd_sop.nodes import stage_id_for_node_id, stage_name_for_id
 
     sid = (scope_id or "").strip()
     nid = (node_id or "").strip()
     if not sid or not nid:
         return ""
-    stage_id = stage_id_for_node_id(nid)
-    dest = scope_dir(sid) / "archive" / str(stage_id) / nid
+    stage_name = stage_name_for_id(stage_id_for_node_id(nid))
+    dest = archive_node_dir(sid, stage_name, nid)
     if not dest.is_dir():
         return ""
 

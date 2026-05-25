@@ -93,19 +93,21 @@ def record_delegation_started(
     preview = (task_preview or "").strip().replace("\n", " ")
     preview_txt = f"\n任务：{preview[:280]}" if preview else ""
     plan_txt = f"\n计划项：{plan_item_id}" if (plan_item_id or "").strip() else ""
+    body = f"小鲸 → {to_label}：已委派协作{reason_txt}{preview_txt}{plan_txt}"
     append_meeting_live_event(
         scope_id,
         room_id=parsed["room_id"],
         event="delegation_started",
-        text=f"小鲸 → {to_label}：已委派协作{reason_txt}{preview_txt}{plan_txt}",
+        text=body,
         agent_id=from_agent or "host",
         log_type="info",
         extra={
             "to_agent": to_agent,
             "from_agent": from_agent,
             "reason": reason,
-            "task_preview": preview[:500],
+            "task_preview": preview[:2000],
             "plan_item_id": (plan_item_id or "").strip(),
+            "chat_text": body,
         },
     )
     _touch_agents_active(scope_id, parsed["room_id"], to_agent, "worker", "delegating")
@@ -130,14 +132,23 @@ def record_delegation_finished(
     preview = (summary or "")[:240].replace("\n", " ")
     elapsed = f" · {elapsed_s:.0f}s" if elapsed_s is not None else ""
     to_label = _meeting_agent_label(to_agent)
+    body = f"{to_label} {status}{elapsed}" + (f"：{preview}" if preview else "")
     append_meeting_live_event(
         scope_id,
         room_id=parsed["room_id"],
         event="delegation_finished",
-        text=f"{to_label} {status}{elapsed}" + (f"：{preview}" if preview else ""),
+        text=body,
         agent_id=to_agent,
         log_type="info" if ok else "warning",
-        extra={"to_agent": to_agent, "ok": ok, "status": status},
+        extra={
+            "to_agent": to_agent,
+            "from_agent": from_agent,
+            "ok": ok,
+            "status": status,
+            "result_summary": (summary or "")[:2000],
+            "elapsed_s": elapsed_s,
+            "chat_text": body,
+        },
     )
     _touch_agents_active(scope_id, parsed["room_id"], to_agent, "worker", status)
 

@@ -71,7 +71,7 @@
 当且仅当现有 Worker 不具备相关能力时，你可以直接调用：
 
 - 工单目录 `PRODUCT_CODE_ROOT/<repo_name>/` 读取源码（`read_file` / `list_directory` / 检索）
-- 工单目录 `PRODUCT_DOC_ROOT/<doc_type>/` 读取产品文档；仅缺失时再用 `get_doc.py` 回退
+- 工单目录 `PRODUCT_DOC_ROOT/<doc_type>/` 读取产品文档
 - 工单只读 API（`owner_order_snapshot`、`meeting-summary`）查看历史
 - `search_memory` / `add_memory` 同步个人记忆与团队记忆
 

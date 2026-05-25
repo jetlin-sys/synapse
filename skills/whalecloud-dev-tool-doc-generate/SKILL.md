@@ -51,7 +51,7 @@ label: 文档生成工具
 
 ### A. 职责边界
 
-- **做**：匹配模板、读上下文、填充占位符、校验可靠性标记、写入 `{OUTPUT_DIR}/{OUTPUT}`。
+- **做**：匹配模板、读上下文、填充占位符、校验可靠性标记、通过 `write_file` 写入 `{OUTPUT_DIR}/{OUTPUT}`。
 - **不做**：生成澄清问题、GitNexus 检索、业务规则推导（由上游技能完成后再调用本技能）。
 
 ### B. 内容可靠性（强制）
@@ -60,7 +60,35 @@ label: 文档生成工具
 - 无法确认：`[待确认]`；缺资料：`[待补充]`；缺某仓证据：`[待补充-{REPO}仓库未获取]`。
 - 填充后文档中**不得残留**未解析的 `{{` 占位符或 `{{#each` 块标记。
 
-### C. 输出模式
+### C. 字符编码（强制）
+
+本技能产出与读取的 Markdown / JSON **一律使用 UTF-8**（无 BOM）。含中文的模板、上下文与交付物**禁止**以 GBK、GB2312、GB18030、Big5 或 UTF-16 等编码读写。
+
+| 环节 | 要求 |
+|------|------|
+| 读模板 `templates/*.md` | UTF-8 |
+| 读 `CONTEXT_JSON` / `CONTEXT_FILES` | UTF-8；非法 JSON 或解码失败 → **中止** |
+| 写 `{OUTPUT_DIR}/{OUTPUT}` | **必须** `write_file`（UTF-8，无 BOM），换行 `\n` |
+| `OUTPUT_MODE=content` / `both` | 通道输出的 Markdown 正文须为 UTF-8 字符串，不得经错误编码转码 |
+
+**写盘方式（强制）**：
+
+- **必须**使用 Synapse `write_file` 工具写入 `{OUTPUT_DIR}/{OUTPUT}`（内置 UTF-8，自动创建父目录）。
+- **禁止**通过 `run_shell`、Python `open()`、Node `fs.writeFileSync`、PowerShell `Set-Content`/`Out-File`/`>` 重定向等方式写盘（Windows 下易产出 UTF-16 或 GBK 乱码）。
+
+```json
+{
+  "path": "{OUTPUT_DIR}/{OUTPUT}",
+  "content": "<填充后的 Markdown 正文>"
+}
+```
+
+**写后自检（含中文时必做）**：
+
+- 用 `read_file` 读回 `{OUTPUT_DIR}/{OUTPUT}`，确认中文可读、无 U+FFFD 替换字符或典型乱码（如 `Ã©`、`ï¿½`）。
+- 自检失败 → **中止**，不得交付乱码文件；检查是否误用了非 `write_file` 的写盘方式后重试。
+
+### D. 输出模式
 
 | OUTPUT_MODE | 行为 |
 |-------------|------|
@@ -82,12 +110,13 @@ Step 0 — 参数校验
 Step 1 — 读取模板
   1a. 模板路径 = 本技能目录 templates/{TEMPLATE}
   1b. 文件不存在 → 中止，列出 templates/ 下现有 .md 文件名
+  1c. 以 UTF-8 读取模板正文；解码失败 → **中止**，提示检查模板文件编码
 
 Step 2 — 收集变量
   2a. 设置 TIMESTAMP（ISO 8601）。
   2b. 合并 Parameters 中与模板同名的标量字段。
-  2c. 按序读取 CONTEXT_FILES（JSON 解析为对象；Markdown 可由调用方预先结构化到 CONTEXT_JSON）。
-  2d. 解析 CONTEXT_JSON（字符串或文件），覆盖/补充变量表。
+  2c. 按序以 UTF-8 读取 CONTEXT_FILES（JSON 解析为对象；Markdown 可由调用方预先结构化到 CONTEXT_JSON）；解码失败 → **中止**。
+  2d. 解析 CONTEXT_JSON（内联 UTF-8 字符串或 UTF-8 编码的 `.json` 文件），覆盖/补充变量表。
   2e. 扫描模板占位符；STRICT=true 且必填项缺失 → 中止并列出缺失项。
 
 Step 3 — 填充模板
@@ -96,9 +125,10 @@ Step 3 — 填充模板
   3c. 自检：无未解析占位符、无空标题下完全空白的关键表格（除非上下文明确为空）。
 
 Step 4 — 落盘与输出
-  4a. mkdir -p {OUTPUT_DIR}
-  4b. 将结果写入 {OUTPUT_DIR}/{OUTPUT}（UTF-8）
-  4c. 按 OUTPUT_MODE 决定是否向调用通道输出 Markdown 正文
+  4a. 确认 OUTPUT_DIR 可写（write_file 会自动创建父目录）
+  4b. **必须**调用 write_file 写入 {OUTPUT_DIR}/{OUTPUT}（见 §C）
+  4c. 含中文时用 read_file 执行 §C 写后自检；乱码 → **中止**
+  4d. 按 OUTPUT_MODE 决定是否向调用通道输出 Markdown 正文
 ```
 
 ---
@@ -145,6 +175,9 @@ CONTEXT_JSON: ./requirements/.tmp/clarify_context.json
 | STRICT=true 且必填占位符缺失 | **中止**，列出缺失变量名 |
 | OUTPUT_DIR 不可写 | **中止** |
 | CONTEXT_JSON 非法 JSON | **中止**，说明解析错误 |
+| 模板 / 上下文 / 输出文件 UTF-8 解码失败 | **中止**，指明路径与环节 |
+| 写后自检发现中文乱码 | **中止**，确认是否使用了 `write_file` 后重试 |
+| 未使用 `write_file` 写盘 | **中止**，改用 `write_file` 重写 |
 
 ---
 

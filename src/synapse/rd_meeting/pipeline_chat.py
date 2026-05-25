@@ -35,12 +35,12 @@ PHASE_WAITING_SUMMARY = (
 )
 
 STEP_HOST_FIRST_CALL_SUMMARY = (
-    "主控首次调用\n\n"
+    "主控触发执行\n\n"
     "小鲸开始执行本 SOP 节点：使用已组装的会议室提示词进行推理，并按 SKILL 提交工作安排与委派协作智能体。"
 )
 
 STEP_HOST_FIRST_CALL_REUSED_SUMMARY = (
-    "主控首次调用\n\n"
+    "主控触发执行\n\n"
     "小鲸开始执行本 SOP 节点：复用步骤 3 已组装的会议室提示词（未重新渲染 SKILL）。"
 )
 
@@ -93,6 +93,24 @@ def format_event_chat_display(event: dict[str, Any]) -> str:
     if et == "host_llm_begin":
         reused = bool(event.get("reused_host_prompt_cache"))
         return format_host_first_call_chat(reused_prompt=reused)
+    if et == "delegation_started":
+        preview = str(event.get("task_preview") or "").strip()
+        plan = str(event.get("plan_item_id") or "").strip()
+        reason = str(event.get("reason") or "").strip()
+        lines = [str(event.get("text") or "小鲸已委派协作智能体").strip()]
+        if plan:
+            lines.append(f"计划项：{plan}")
+        if reason:
+            lines.append(f"原因：{reason}")
+        if preview:
+            lines.append(f"委派内容：\n{preview}")
+        return "\n".join(lines)
+    if et == "delegation_finished":
+        summary = str(event.get("result_summary") or "").strip()
+        lines = [str(event.get("text") or "协作智能体已返回").strip()]
+        if summary and summary not in lines[0]:
+            lines.append(f"返回摘要：\n{summary[:2000]}")
+        return "\n".join(lines)
 
     text = str(event.get("text") or event.get("message") or "").strip()
     if text and not text.startswith("{"):

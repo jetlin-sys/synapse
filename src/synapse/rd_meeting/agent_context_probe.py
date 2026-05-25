@@ -315,40 +315,104 @@ def _merge_task_with_sub_agents(
 
 
 def _delegation_runs_from_sub_rows(sub_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-
     runs: list[dict[str, Any]] = []
-
     for row in sub_rows:
-
         runs.append(
-
             {
-
                 "status": row.get("status"),
-
                 "reason": row.get("reason") or "",
-
                 "from_agent": row.get("from_agent") or "",
-
                 "elapsed_s": row.get("elapsed_s"),
-
                 "iteration": row.get("iteration"),
-
                 "tools_total": row.get("tools_total"),
-
                 "tools_executed": list(row.get("tools_executed") or []),
-
                 "skills_total": row.get("skills_total"),
-
                 "current_tool_summary": row.get("current_tool_summary") or "",
-
                 "started_at": row.get("started_at"),
-
+                "task_preview": row.get("task_preview") or "",
+                "result_summary": row.get("result_summary") or "",
+                "plan_item_id": row.get("plan_item_id") or "",
             }
-
         )
-
     return runs
+
+
+def _delegation_runs_from_history(
+    scope_id: str | None,
+    profile_id: str,
+) -> list[dict[str, Any]]:
+    """从 room_history 还原委派记录（任务结束后 sub_agent_states 会清理，历史为持久来源）。"""
+    sid = (scope_id or "").strip()
+    pid = (profile_id or "").strip()
+    if not sid or not pid:
+        return []
+    from synapse.rd_meeting.room_runtime import read_history
+
+    pending: list[dict[str, Any]] = []
+    runs: list[dict[str, Any]] = []
+    for ev in read_history(sid, limit=500):
+        if not isinstance(ev, dict):
+            continue
+        et = str(ev.get("event") or "").strip()
+        to_agent = str(ev.get("to_agent") or "").strip()
+        if to_agent != pid:
+            continue
+        if et == "delegation_started":
+            pending.append(ev)
+        elif et == "delegation_finished":
+            started = pending.pop(0) if pending else None
+            ok = ev.get("ok")
+            if ok is None:
+                ok = str(ev.get("status") or "").strip().lower() == "completed"
+            runs.append(
+                {
+                    "status": "completed" if ok else "failed",
+                    "reason": str((started or {}).get("reason") or ""),
+                    "from_agent": str((started or {}).get("from_agent") or ""),
+                    "task_preview": str((started or {}).get("task_preview") or ""),
+                    "plan_item_id": str((started or {}).get("plan_item_id") or ""),
+                    "result_summary": str(ev.get("text") or "").strip(),
+                    "elapsed_s": ev.get("elapsed_s"),
+                    "started_at": (started or {}).get("ts"),
+                    "finished_at": ev.get("ts"),
+                }
+            )
+    for started in pending:
+        runs.append(
+            {
+                "status": "delegating",
+                "reason": str(started.get("reason") or ""),
+                "from_agent": str(started.get("from_agent") or ""),
+                "task_preview": str(started.get("task_preview") or ""),
+                "plan_item_id": str(started.get("plan_item_id") or ""),
+                "started_at": started.get("ts"),
+            }
+        )
+    return runs
+
+
+def _delegation_runs_for_profile(
+    scope_id: str | None,
+    profile_id: str,
+    sub_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """历史委派为主；进行中任务用 live sub_agent 状态覆盖指标。"""
+    hist = _delegation_runs_from_history(scope_id, profile_id)
+    live = _delegation_runs_from_sub_rows(sub_rows)
+    if not live:
+        return hist
+    if not hist:
+        return live
+    out = list(hist)
+    live_by_status = {str(r.get("status") or ""): r for r in live}
+    for i, run in enumerate(out):
+        st = str(run.get("status") or "")
+        if st in ("delegating", "starting", "running") and live:
+            out[i] = {**run, **live[-1]}
+            return out
+    if live[-1].get("status") in ("running", "starting", "delegating"):
+        out.append(live[-1])
+    return out
 
 
 
@@ -519,7 +583,7 @@ def probe_pooled_agent(
 
         "task": task,
 
-        "delegation_runs": _delegation_runs_from_sub_rows(sub_rows),
+        "delegation_runs": _delegation_runs_for_profile(scope_id, profile_id, sub_rows),
 
         "last_usage": getattr(agent, "last_usage", None),
 
@@ -554,7 +618,24 @@ def _sub_rows_for_profile(sub_agents: list[dict[str, Any]], profile_id: str) -> 
     return out
 
 
+def _worker_profile_ids_from_delegation_history(scope_id: str | None) -> list[str]:
+    sid = (scope_id or "").strip()
+    if not sid:
+        return []
+    from synapse.rd_meeting.room_runtime import read_history
 
+    ids: list[str] = []
+    seen: set[str] = set()
+    for ev in read_history(sid, limit=500):
+        if not isinstance(ev, dict):
+            continue
+        if str(ev.get("event") or "") not in ("delegation_started", "delegation_finished"):
+            continue
+        to_agent = str(ev.get("to_agent") or "").strip()
+        if to_agent and to_agent not in seen:
+            seen.add(to_agent)
+            ids.append(to_agent)
+    return ids
 
 
 def collect_meeting_agent_contexts(
@@ -707,14 +788,36 @@ def collect_meeting_agent_contexts(
                     "processing_history": processing_history,
                     "processing_history_count": len(processing_history),
                     "task": task,
-                    "delegation_runs": _delegation_runs_from_sub_rows(
-                        _sub_rows_for_profile(sub_agents, pid)
+                    "delegation_runs": _delegation_runs_for_profile(
+                        scope_id,
+                        pid,
+                        _sub_rows_for_profile(sub_agents, pid),
                     ),
                     "offline_from_disk": True,
                 }
             )
 
-
+    for pid in _worker_profile_ids_from_delegation_history(scope_id):
+        if pid in seen_profiles:
+            continue
+        runs = _delegation_runs_for_profile(
+            scope_id, pid, _sub_rows_for_profile(sub_agents, pid)
+        )
+        if not runs:
+            continue
+        agents.append(
+            {
+                "session_id": f"{prefix}{pid}",
+                "profile_id": pid,
+                "role": "worker",
+                "current_node_id": current_node_id,
+                "system_prompt": "",
+                "messages": [],
+                "messages_count": 0,
+                "delegation_runs": runs,
+                "offline_from_history": True,
+            }
+        )
 
     return {
 

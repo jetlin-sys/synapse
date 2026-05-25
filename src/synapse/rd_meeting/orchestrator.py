@@ -56,7 +56,7 @@ from synapse.rd_meeting.host_prompt_cache import (
 from synapse.rd_meeting.init_context import build_node_init_log_data
 from synapse.rd_meeting.notifications import schedule_human_intervention_notify
 from synapse.rd_meeting.participants import build_meeting_participants
-from synapse.rd_meeting.paths import archive_root, scope_dir
+from synapse.rd_meeting.paths import archive_node_dir, archive_root, scope_dir
 from synapse.rd_meeting.phase import set_phase
 from synapse.rd_meeting.pipeline_chat import format_host_first_call_chat
 from synapse.rd_meeting.room_runtime import (
@@ -80,7 +80,7 @@ from synapse.rd_meeting.validation import (
 from synapse.rd_sop.manifest import (
     next_node_id,
 )
-from synapse.rd_sop.nodes import ALL_NODES, node_display_name, stage_id_for_node_id
+from synapse.rd_sop.nodes import ALL_NODES, node_display_name, stage_id_for_node_id, stage_name_for_id
 
 _MAX_SKIP_CHAIN = len(ALL_NODES) + 2
 
@@ -144,13 +144,13 @@ def _skip_node_report_body(node_id: str) -> str:
 
 def write_archive_artifact(
     scope_id: str,
-    stage_id: int,
+    stage_name: str,
     node_id: str,
     *,
     filename: str,
     content: str,
 ) -> Path:
-    dest_dir = archive_root(scope_id) / str(stage_id) / node_id
+    dest_dir = archive_node_dir(scope_id, stage_name, node_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / filename
     path.write_text(content, encoding="utf-8")
@@ -258,7 +258,11 @@ class MeetingRoomOrchestrator:
             scope_id=scope_id,
             ticket_title=ticket_title,
             archive_dir=str(
-                archive_root(scope_id) / str(binding.get("stage_id") or 0) / str(binding.get("node_id") or "")
+                archive_node_dir(
+                    scope_id,
+                    str(binding.get("stage_name") or stage_name_for_id(int(binding.get("stage_id") or 0))),
+                    str(binding.get("node_id") or ""),
+                )
             ),
             self_profile_id=str(self_profile_id or "").strip(),
         )
@@ -474,10 +478,10 @@ class MeetingRoomOrchestrator:
         """配置关闭的节点：不写 LLM，归档跳过说明并立即推进。"""
         sid = scope_id.strip()
         body = _skip_node_report_body(node_id)
-        stage_id = stage_id_for_node_id(node_id)
+        stage_name = stage_name_for_id(stage_id_for_node_id(node_id))
         artifact_path = write_archive_artifact(
             sid,
-            stage_id,
+            stage_name,
             node_id,
             filename="skipped.md",
             content=body,
@@ -1088,9 +1092,10 @@ class MeetingRoomOrchestrator:
         )
 
         stage_id = int(pending.get("stage_id") or stage_id_for_node_id(node_id))
+        stage_name = stage_name_for_id(stage_id)
         set_phase(sid, "document")
-        artifacts = write_node_deliverables(sid, stage_id, node_id, report_body)
-        validation = validate_node_archive_artifacts(sid, stage_id, node_id)
+        artifacts = write_node_deliverables(sid, stage_name, node_id, report_body)
+        validation = validate_node_archive_artifacts(sid, stage_name, node_id)
         if not validation.ok:
             raise ValueError("node_archive_validation_failed: " + "; ".join(validation.errors))
         tokens_used = int(pending.get("tokens_used") or 0)
@@ -1457,12 +1462,14 @@ class MeetingRoomOrchestrator:
 
                 # E：human_confirm 节点的「自动重跑一次」
                 # 触发：未通过工具提交问卷 + 终稿无标记块 + 产出物文档校验失败
-                _retry_stage = int(dev.get("stage_id") or stage_id_for_node_id(node_id))
+                _retry_stage_name = stage_name_for_id(
+                    int(dev.get("stage_id") or stage_id_for_node_id(node_id))
+                )
                 if (
                     bool(binding.get("human_confirm"))
                     and tool_questionnaire is None
                     and not extract_hitl_from_agent_output(report_body).explicit
-                    and not validate_node_archive_artifacts(sid, _retry_stage, node_id).ok
+                    and not validate_node_archive_artifacts(sid, _retry_stage_name, node_id).ok
                 ):
                     append_history_event(
                         sid,
@@ -1515,6 +1522,7 @@ class MeetingRoomOrchestrator:
                 host_run_profile_id = host_profile_id
 
         stage_id = int(dev.get("stage_id") or stage_id_for_node_id(node_id))
+        stage_name = stage_name_for_id(stage_id)
         duration = max(1, int(time.monotonic() - started))
 
         need_human_confirm = bool(binding.get("human_confirm"))
@@ -1591,7 +1599,7 @@ class MeetingRoomOrchestrator:
             report_body = hitl_gate.clean_body
 
         if need_human_confirm:
-            validation = validate_node_archive_artifacts(sid, stage_id, node_id)
+            validation = validate_node_archive_artifacts(sid, stage_name, node_id)
             if not validation.ok:
                 append_history_event(
                     sid,
@@ -1689,8 +1697,8 @@ class MeetingRoomOrchestrator:
                 "skipped_nodes": skipped_nodes or None,
             }
 
-        artifacts = write_node_deliverables(sid, stage_id, node_id, report_body)
-        validation = validate_node_archive_artifacts(sid, stage_id, node_id)
+        artifacts = write_node_deliverables(sid, stage_name, node_id, report_body)
+        validation = validate_node_archive_artifacts(sid, stage_name, node_id)
         if not validation.ok:
             append_history_event(
                 sid,

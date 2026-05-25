@@ -15,9 +15,11 @@ label: 模块功能技能
 | 用途 | 路径约定 | 说明 |
 |------|----------|------|
 | 工单根目录 | `{WORK_ORDER_DIR}` | 系统提示「产品工作区路径」或委派参数，形如 `work/<scope_id>/` |
+| 需求澄清文档 | **固定路径（勿传参）** | `{WORK_ORDER_DIR}/archive/需求分析/req_clarify/需求澄清.md` |
 | 产品代码 | `{PRODUCT_CODE_ROOT}/<repo_name>/` | 默认 `{WORK_ORDER_DIR}/code/<repo_name>/` |
 | 产品文档 | `{PRODUCT_DOC_ROOT}/<doc_type>/` | 默认 `{WORK_ORDER_DIR}/doc/<doc_type>/`；架构文档在 `产品架构/` |
 
+- **需求澄清**：只读上表固定路径；研发会议室若系统信息已注入 `ARCHIVE_DIR`（当前节点归档目录），可先尝试同阶段上一节点 `{WORK_ORDER_DIR}/archive/需求分析/req_clarify/需求澄清.md`（阶段名与 `ARCHIVE_DIR` 中段一致）
 - **FUNCTIONAL_ARCH / TECH_ARCH**：优先读 `{PRODUCT_DOC_ROOT}/产品架构/`
 - **代码确认**（Step 3）：在 `{PRODUCT_CODE_ROOT}` 各仓库目录内检索，路径标注为 `<repo_name>/相对路径`
 
@@ -27,14 +29,13 @@ label: 模块功能技能
 
 | Parameter | 必填 | 说明 / 示例 |
 |-----------|------|----------------|
-| `CLARIFY_DOC` | 是 | 需求澄清文档路径（通常为工单 `archive/` 下 `需求澄清.md`），须为可读绝对/相对路径 |
 | `PROD` | 是 | 产品名称 |
-| `WORK_ORDER_DIR` | 否 | 工单工作目录（研发会议室注入），如 `work/21881451`。提供时**必须**从此目录读代码/文档 |
+| `WORK_ORDER_DIR` | 否 | 工单工作目录（研发会议室注入），如 `work/21881451`。提供时**必须**从此目录读代码/文档与固定需求澄清路径 |
 | `PRODUCT_CODE_ROOT` | 否 | 产品代码根目录，默认 `{WORK_ORDER_DIR}/code` |
 | `PRODUCT_DOC_ROOT` | 否 | 产品文档根目录，默认 `{WORK_ORDER_DIR}/doc` |
 | `DEBUG` | 否 | 调试模式开关。如果显式传入 `true`，需将每一步的执行日志输出到调试文件中。默认 `false` |
 
-> **知识来源**：分析仅以实际存在的内容为依据，包括：代码（项目文件）、文档（FUNCTIONAL_ARCH、TECH_ARCH）、需求澄清文档（CLARIFY_DOC）。任何无法从上述来源验证的结论必须标注 `[待确认]`，严禁臆断想象。
+> **知识来源**：分析仅以实际存在的内容为依据，包括：代码（项目文件）、文档（FUNCTIONAL_ARCH、TECH_ARCH）、需求澄清文档（固定路径见上表）。任何无法从上述来源验证的结论必须标注 `[待确认]`，严禁臆断想象。
 
 ---
 
@@ -53,7 +54,7 @@ label: 模块功能技能
 - 模块识别**必须严格依赖**以下三类事实来源，不得凭空臆断或想象：
   | 事实来源 | 说明 |
   |---------|------|
-  | **需求澄清文档** | `CLARIFY_DOC`（01-需求澄清.md）— 包含范围定义、功能要点、澄清结论、约束与依赖 |
+  | **需求澄清文档** | `{WORK_ORDER_DIR}/archive/需求分析/req_clarify/需求澄清.md` — 包含范围定义、功能要点、澄清结论、约束与依赖 |
   | **文档** | `{PRODUCT_DOC_ROOT}/产品架构/`（FUNCTIONAL_ARCH、TECH_ARCH） |
   | **代码** | 优先 `{PRODUCT_CODE_ROOT}/<repo_name>/`；通过文件系统或检索工具读取，禁止臆造路径 |
 - 模块识别中凡涉及**文件路径、接口、类名**等结论，必须在代码或文档中有对应支撑依据，并标注来源。
@@ -81,18 +82,21 @@ label: 模块功能技能
 
 ```
 Step 0 — 参数校验与环境准备
-  0a. 校验必填参数：CLARIFY_DOC, PROD
+  0a. 校验必填参数：PROD；若提供 `WORK_ORDER_DIR` 则解析固定需求澄清路径：
+      `CLARIFY_DOC_PATH = {WORK_ORDER_DIR}/archive/需求分析/req_clarify/需求澄清.md`
+      （勿由调用方传入 `CLARIFY_DOC`；未提供 `WORK_ORDER_DIR` 时无法解析该路径）
   0b. **解析工单目录**：`CODE_ROOT = PRODUCT_CODE_ROOT`（缺省 `{WORK_ORDER_DIR}/code`），`DOC_ROOT = PRODUCT_DOC_ROOT`（缺省 `{WORK_ORDER_DIR}/doc`）
   0c. *(DEBUG)* 若 DEBUG=true，在 `{WORK_ORDER_DIR}` 下写 `module_function_debug.log`
 
 Step 1 — 获取项目资料
-  1a. 读取 CLARIFY_DOC，不存在则**中止**
+  1a. 读取 `CLARIFY_DOC_PATH`；若不存在，且系统信息含 `ARCHIVE_DIR`，再尝试
+      `{WORK_ORDER_DIR}/archive/需求分析/req_clarify/需求澄清.md`（阶段名取自 `ARCHIVE_DIR` 路径段）；仍不存在则**中止**
   1b. 在 `{DOC_ROOT}/产品架构/` 读取 FUNCTIONAL_ARCH、TECH_ARCH 相关 `.md`；FUNCTIONAL_ARCH 缺失则**中止**
   1c. *(DEBUG)* 记录已读文档路径
 
 Step 2 — 提取功能模块列表与需求拆分
   2a. 读取 FUNCTIONAL_ARCH.md，提取"核心功能详解"章节中的**功能模块列表**（每个模块的名称、功能描述、涉及的源代码文件），记为 ARCH_MODULE_LIST
-  2b. 读取 CLARIFY_DOC（需求澄清文档），提取以下结构化信息：
+  2b. 读取需求澄清文档（`CLARIFY_DOC_PATH`），提取以下结构化信息：
       - **范围定义**：IN（涉及范围）和 OUT（排除范围）
       - **功能要点**：需求涉及的功能点列表
       - **澄清结论**：关键确认点的总结
@@ -102,13 +106,13 @@ Step 2 — 提取功能模块列表与需求拆分
       - 若功能要点按服务粒度划分（如"后台服务-用户管理"），保持服务级别
       - 若功能要点粒度与 ARCH_MODULE_LIST 不对齐，按 ARCH_MODULE_LIST 的粒度重新拆分
       - OUT 范围内的功能点排除，不纳入 FEATURE_POINTS
-  2d. *(DEBUG)* 若 DEBUG=true，将 ARCH_MODULE_LIST（模块名称+描述+源代码文件）、CLARIFY_DOC 提取的结构化信息、FEATURE_POINTS（功能点列表+拆分推理）写入调试日志
+  2d. *(DEBUG)* 若 DEBUG=true，将 ARCH_MODULE_LIST（模块名称+描述+源代码文件）、需求澄清文档提取的结构化信息、FEATURE_POINTS（功能点列表+拆分推理）写入调试日志
 
 Step 3 — 功能点匹配与代码确认
   对 FEATURE_POINTS 中的每个功能点，依次执行以下匹配流程：
 
   3a. **匹配功能模块**：将该功能点与 ARCH_MODULE_LIST 中的模块逐一比对，找到最匹配的功能模块
-      - 匹配依据：功能描述的语义相似度、业务领域归属、CLARIFY_DOC 中的范围定义和约束与依赖
+      - 匹配依据：功能描述的语义相似度、业务领域归属、需求澄清文档中的范围定义和约束与依赖
       - 一个功能点可能匹配到多个功能模块（如前台页面+后台服务都需改造）
       - 若无法匹配到任何已有模块 → 标记为"未匹配"，进入 **3d** 处理
 
@@ -143,8 +147,8 @@ Step 4 — 生成模块功能文档
 
 | 情况 | 处理 |
 |------|------|
-| 缺少必填参数（CLARIFY_DOC/PROD） | **中止**，列出缺失参数 |
-| CLARIFY_DOC 文件不存在 | **中止** |
+| 缺少必填参数（PROD）或未提供 `WORK_ORDER_DIR` | **中止**，列出缺失项 |
+| 需求澄清文档（固定路径及 `archive/需求分析/req_clarify/` 回退）均不存在 | **中止**，注明已尝试路径 |
 | `{DOC_ROOT}/产品架构/` 无 FUNCTIONAL_ARCH | **中止** |
 | TECH_ARCH 缺失 | 继续，仅以 FUNCTIONAL_ARCH 为准 |
 | 代码检索无结果 | 标注 `[待确认]`，不得虚构内容 |
@@ -205,8 +209,9 @@ Step 4 — 生成模块功能文档
 ### 示例调用
 
 ```
-CLARIFY_DOC: ./archive/需求澄清.md,
 PROD: XXX系统,
 WORK_ORDER_DIR: work/21881451,
 DEBUG: false
 ```
+
+需求澄清文档由技能按固定路径读取，无需传入：`work/21881451/archive/需求分析/req_clarify/需求澄清.md`

@@ -792,8 +792,21 @@ function DelegationRunsCard({ runs }: { runs: MeetingAgentDelegationRun[] }) {
                 <span className="text-muted-foreground">tools={run.tools_total}</span>
               ) : null}
             </div>
+            {run.plan_item_id ? (
+              <p className="text-muted-foreground/80 font-mono">计划项: {run.plan_item_id}</p>
+            ) : null}
             {run.reason ? (
-              <p className="text-muted-foreground/90">{run.reason}</p>
+              <p className="text-muted-foreground/90">原因: {run.reason}</p>
+            ) : null}
+            {run.task_preview ? (
+              <p className="text-foreground/90 whitespace-pre-wrap break-words leading-relaxed">
+                委派内容: {run.task_preview}
+              </p>
+            ) : null}
+            {run.result_summary ? (
+              <p className="text-emerald-200/90 whitespace-pre-wrap break-words leading-relaxed">
+                返回: {run.result_summary}
+              </p>
             ) : null}
             {run.current_tool_summary ? (
               <p className="text-amber-300/90 font-mono truncate">末次工具: {run.current_tool_summary}</p>
@@ -1046,17 +1059,23 @@ export function MeetingAgentContextDrawer({
               </div>
             }
           >
-            {subEntries.length ? (
+            {(delegationRuns.length > 0 || subEntries.length > 0) ? (
               <div className="mt-4 mx-auto max-w-md text-left space-y-3">
-                <DelegationRunsCard runs={subEntries.map((s) => ({
-                  status: s.status,
-                  reason: s.reason,
-                  elapsed_s: s.elapsed_s,
-                  iteration: s.iteration,
-                  tools_total: s.tools_total,
-                  tools_executed: s.tools_executed,
-                  current_tool_summary: s.current_tool_summary,
-                }))} />
+                <DelegationRunsCard
+                  runs={
+                    delegationRuns.length > 0
+                      ? delegationRuns
+                      : subEntries.map((s) => ({
+                          status: s.status,
+                          reason: s.reason,
+                          elapsed_s: s.elapsed_s,
+                          iteration: s.iteration,
+                          tools_total: s.tools_total,
+                          tools_executed: s.tools_executed,
+                          current_tool_summary: s.current_tool_summary,
+                        }))
+                  }
+                />
                 <ToolUsageCard tools={collectToolsFromSubEntries(subEntries)} />
                 {(() => {
                   const merged: SkillExecutionEntry[] = [];

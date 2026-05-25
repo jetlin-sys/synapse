@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from synapse.rd_meeting.paths import scope_dir
+from synapse.rd_meeting.paths import archive_node_dir, scope_dir
 from synapse.rd_sop.manifest import node_output_artifacts
 
 
 def write_node_deliverables(
     scope_id: str,
-    stage_id: int,
+    stage_name: str,
     node_id: str,
     content: str,
     *,
@@ -25,7 +25,7 @@ def write_node_deliverables(
 
     primary_path = write_archive_artifact(
         scope_id,
-        stage_id,
+        stage_name,
         node_id,
         filename=primary_filename,
         content=body,
@@ -47,7 +47,7 @@ def write_node_deliverables(
             continue
         path = write_archive_artifact(
             scope_id,
-            stage_id,
+            stage_name,
             node_id,
             filename=name,
             content=body,
@@ -65,12 +65,12 @@ def write_node_deliverables(
 
 def validate_archive_outputs(
     scope_id: str,
-    stage_id: int,
+    stage_name: str,
     node_id: str,
 ) -> tuple[bool, list[str]]:
     """P3：校验 NODE_OUTPUTS 中 Markdown 文件是否存在于归档目录。"""
     errors: list[str] = []
-    dest = scope_dir(scope_id) / "archive" / str(stage_id) / node_id
+    dest = archive_node_dir(scope_id, stage_name, node_id)
     if not dest.is_dir():
         return False, ["归档目录不存在"]
 

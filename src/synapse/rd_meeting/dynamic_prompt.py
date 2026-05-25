@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from synapse.rd_meeting.devservice import (
+    gitnexus_service_base_url,
+    gnx_cache_base_dir,
+    gnx_cache_dir_for_repo,
+    unified_service_base_url,
+)
 from synapse.rd_meeting.init_context import build_node_init_log_data, normalize_node_init_log_data
-from synapse.rd_meeting.paths import archive_root
-from synapse.rd_sop.nodes import node_display_name
+from synapse.rd_meeting.paths import archive_node_dir
+from synapse.rd_sop.nodes import node_display_name, stage_name_for_id
 
 ScopeType = Literal["demand", "task"]
 
@@ -47,15 +53,6 @@ def _format_section_product(product: dict[str, Any]) -> str:
         lines.append(f"- PROD_FEATURE：{product['prod_feature']}")
     if product.get("version"):
         lines.append(f"- version：`{product['version']}`")
-    if product.get("work_order_dir"):
-        lines.append(f"- **工单工作目录**：`{product['work_order_dir']}`")
-    if product.get("code_root"):
-        lines.append(f"- **产品代码根目录**：`{product['code_root']}`")
-    if product.get("doc_root"):
-        lines.append(f"- **产品文档根目录**：`{product['doc_root']}`")
-    assets_status = str(product.get("assets_status") or "").strip()
-    if assets_status:
-        lines.append(f"- 资产落盘状态：`{assets_status}`")
     repos = product.get("repos")
     if isinstance(repos, list) and repos:
         lines.append(f"- 关联仓库（{len(repos)}）：")
@@ -68,57 +65,41 @@ def _format_section_product(product: dict[str, Any]) -> str:
                 if st and st != "ok":
                     suffix += f"（{st}）"
                 lines.append(f"  - `{name}`{suffix}")
-    docs = product.get("docs")
-    if isinstance(docs, list) and docs:
-        lines.append(f"- 文档槽位（{len(docs)}）：")
-        for d in docs:
-            if isinstance(d, dict):
-                dtype = d.get("doc_type") or "?"
-                local = str(d.get("local_path") or "").strip()
-                st = str(d.get("materialize_status") or "").strip()
-                files = d.get("files")
-                file_hint = ""
-                if isinstance(files, list) and files:
-                    file_hint = f"（{len(files)} 个文件）"
-                suffix = f" → `{local}`{file_hint}" if local else ""
-                if st and st != "ok":
-                    suffix += f"（{st}）"
-                lines.append(f"  - `{dtype}`{suffix}")
+  
     return "\n".join(lines) if lines else "（无产品字段）"
 
 
-def _format_section_system(
-    system: dict[str, Any],
-    *,
-    stage_name: str = "",
-    node_name: str = "",
-    node_outputs: list[str] | None = None,
-) -> str:
-    if not system:
-        return "（无系统参数）"
+def _format_section_system(system: dict[str, Any]) -> str:
+    """系统段：服务 URL 与路径；URL 优先读 system，缺失时按 devservice.ip 拼接。"""
+    sys = system if isinstance(system, dict) else {}
     lines: list[str] = []
+
+    synapse_url = str(sys.get("synapse_url") or unified_service_base_url() or "").strip()
+    if synapse_url:
+        lines.append(f"- SYNAPSE_URL：`{synapse_url}`")
+
+    gitnexus_url = str(sys.get("gitnexus_url") or gitnexus_service_base_url() or "").strip()
+    if gitnexus_url:
+        lines.append(f"- GITNEXUS_URL：`{gitnexus_url}`")
+
     for key, label in (
-        ("synapse_url", "SYNAPSE_URL"),
-        ("work_order_dir", "工单工作目录"),
-        ("product_code_root", "产品代码根目录"),
-        ("product_doc_root", "产品文档根目录"),
+        ("archive_dir", "ARCHIVE_DIR"),
+        ("work_order_dir", "WORK_ORDER_DIR"),
+        ("product_code_root", "PRODUCT_CODE_ROOT"),
+        ("product_doc_root", "PRODUCT_DOC_ROOT"),
     ):
-        val = str(system.get(key) or "").strip()
+        val = str(sys.get(key) or "").strip()
         if val:
             lines.append(f"- {label}：`{val}`")
-    archive_val = str(system.get("archive_dir") or "").strip()
-    if archive_val:
-        friendly = " · ".join(s for s in (stage_name, node_name) if s)
-        if friendly:
-            lines.append(f"- 本节点归档目录（{friendly}）：`{archive_val}`")
-        else:
-            lines.append(f"- 本节点归档目录：`{archive_val}`")
-    outs = [
-        str(n).strip()
-        for n in (node_outputs or [])
-        if str(n).strip() and not str(n).strip().startswith("（")
-    ]
-    
+
+    gnx_base = str(sys.get("gnx_cache_base_dir") or gnx_cache_base_dir() or "").strip()
+    if gnx_base:
+        lines.append(f"- GNX_CACHE_BASE_DIR：`{gnx_base}`")
+
+    gnx_cache_dir = str(sys.get("gnx_cache_dir") or "").strip()
+    if gnx_cache_dir:
+        lines.append(f"- GNX_CACHE_DIR：`{gnx_cache_dir}`")
+
     return "\n".join(lines) if lines else "（无系统字段）"
 
 
@@ -151,9 +132,20 @@ def build_dynamic_meeting_context(
     product = data.get("product") if isinstance(data.get("product"), dict) else {}
     system = dict(data.get("system")) if isinstance(data.get("system"), dict) else {}
     stage_id = int(binding.get("stage_id") or 0)
+    stage_name = str(binding.get("stage_name") or stage_name_for_id(stage_id)).strip()
     if sid and nid and not system.get("archive_dir"):
-        system["archive_dir"] = str(archive_root(sid) / str(stage_id) / nid)
-    stage_name = str(binding.get("stage_name") or "").strip()
+        system["archive_dir"] = str(archive_node_dir(sid, stage_name, nid))
+    repos = product.get("repos") if isinstance(product.get("repos"), list) else []
+    for repo in repos:
+        if not isinstance(repo, dict):
+            continue
+        repo_name = str(repo.get("repo_name") or "").strip()
+        if not repo_name:
+            continue
+        gnx_dir = gnx_cache_dir_for_repo(repo_name)
+        if gnx_dir:
+            system["gnx_cache_dir"] = gnx_dir
+        break
     node_name = str(binding.get("node_name") or node_display_name(nid))
     sop_node = (sop_node_display or node_name or nid or "—").strip()
     intent = str(binding.get("node_intent") or binding.get("intent") or "").strip() or "（未配置 node_intent）"
@@ -194,22 +186,17 @@ def build_dynamic_meeting_context(
         "",
     ]
     sections_data = [
-        "## 二、工单信息",
+        "## 一、工单信息",
         "",
         _format_section_order(order),
         "",
-        "## 三、产品信息",
+        "## 二、产品信息",
         "",
         _format_section_product(product),
         "",
-        "## 四、系统信息",
+        "## 三、系统信息",
         "",
-        _format_section_system(
-            system,
-            stage_name=stage_name,
-            node_name=node_name,
-            node_outputs=list(binding.get("node_outputs") or []),
-        ),
+        _format_section_system(system),
     ]
     parts = (sections_overview + sections_data) if include_overview else sections_data
     return "\n".join(parts).strip()
