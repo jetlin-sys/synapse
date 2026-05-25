@@ -8,23 +8,18 @@ label: 需求澄清技能
 
 通过分析原始需求信息，严格依赖产品知识体系事实（代码、架构文档、需求文档、需求单上下文、历史相似工单方案），逐轮向用户确认关键点，确保需求清晰可理解。**严禁臆断想象**，所有分析结论必须有实际存在的内容作为依据，需要用户确认的内容必须具体可靠。
 
-## 共享系统脚本（BASE_SCRIPTS_DIR）
+## 研发会议室：工单目录读代码 / 文档
 
-与 SynapseService 交互的脚本位于技能 **`whalecloud-dev-tool-base-scripts`**（`skills/whalecloud-dev-tool-base-scripts/`）。**BASE_SCRIPTS_DIR** 为其根目录（系统提示中「研发技能：whalecloud-dev-tool-base-scripts」的 `**技能路径**:`）。`get_doc.py` 等须用 `<BASE_SCRIPTS_DIR>/scripts/...` 调用。
-
-## 研发会议室：工单目录读代码 / 文档（优先）
-
-在研发会议室中，`room_opened` 已将产品资产落盘到工单目录。**凡需读取代码或产品文档，必须优先使用下列路径，禁止臆造目录，也不要重复调用 `get_doc.py` 拉取已在工单目录中的文档。**
+`room_opened` 已将产品资产落盘到工单目录。**凡需读取代码或产品文档，只使用下列路径，禁止臆造目录。**
 
 | 用途 | 路径约定 | 说明 |
 |------|----------|------|
-| 工单根目录 | `{WORK_ORDER_DIR}` | 系统提示「产品工作区路径」或委派参数中的工单工作目录，形如 `work/<scope_id>/` |
-| 产品代码 | `{PRODUCT_CODE_ROOT}/<repo_name>/` | 默认 `{WORK_ORDER_DIR}/code/<repo_name>/`，多仓库时按 `repo_name` 分别检索 |
+| 工单根目录 | `{WORK_ORDER_DIR}` | 系统提示「产品工作区路径」或委派参数，形如 `work/<scope_id>/` |
+| 产品代码 | `{PRODUCT_CODE_ROOT}/<repo_name>/` | 默认 `{WORK_ORDER_DIR}/code/<repo_name>/` |
 | 产品文档 | `{PRODUCT_DOC_ROOT}/<doc_type>/` | 默认 `{WORK_ORDER_DIR}/doc/<doc_type>/`，如 `产品架构`、`产品需求`、`产品方案` |
 
-- **代码检索**（Phase 1 / 3 / 4）：在 `{PRODUCT_CODE_ROOT}` 下对应仓库目录内用 `read_file` / `list_directory` / 检索工具查找，结论标注**相对该仓库根**的文件路径。
-- **架构 / 需求文档**：优先读取 `{PRODUCT_DOC_ROOT}/产品架构/` 下的 `TECH_ARCH.md`、`FUNCTIONAL_ARCH.md` 等；`产品需求`、`产品方案` 等同理。
-- **仅当**工单目录未提供对应文档、且 `SYNAPSE_URL` 可用时，才回退 Phase 0 的 `get_doc.py` 下载到 `{TMP_DIR}/docs/`。
+- **代码检索**（Phase 1 / 3 / 4）：在 `{PRODUCT_CODE_ROOT}` 下用 `read_file` / `list_directory` / 检索工具；结论标注**相对该仓库根**的路径。
+- **架构 / 需求文档**：读取 `{PRODUCT_DOC_ROOT}/产品架构/` 下的 `TECH_ARCH.md`、`FUNCTIONAL_ARCH.md` 等；其他 `doc_type` 目录同理。
 
 ---
 
@@ -51,13 +46,11 @@ label: 需求澄清技能
 | `WORK_ORDER_DIR` | 否 | 工单工作目录（研发会议室注入），如 `work/21881451`。提供时**必须**从此目录读代码/文档 |
 | `PRODUCT_CODE_ROOT` | 否 | 产品代码根目录，默认 `{WORK_ORDER_DIR}/code` |
 | `PRODUCT_DOC_ROOT` | 否 | 产品文档根目录，默认 `{WORK_ORDER_DIR}/doc` |
-| `SYNAPSE_URL` | 否 | SynapseService 服务地址。仅当工单目录无文档时，用于 `get_doc.py` 回退下载 |
-| `TMP_DIR` | 否 | 临时目录（回退下载用），默认 `./.tmp/`，其下 `docs/` |
-| `SIMILAR_DEMAND_DOC` | 否 | 相似历史工单方案文档内容。若用户提供则直接使用；未提供则调用历史相似工单搜索能力自动检索 |
+| `SIMILAR_DEMAND_DOC` | 否 | 相似历史工单方案文档正文。若已提供则直接使用；未提供则通过历史相似工单搜索能力获取 |
 
 > **注意**：用户回复内容存放在系统提示词上下文中，智能体需自行从上下文中提取。
 
-> **知识来源**：分析仅以实际存在的内容为依据，包括：代码、架构文档、需求文档、需求单上下文（DEMAND_DESC、DEMAND_IMPACT、PROD_FEATURE）、历史相似工单方案文档（若提供 `{SIMILAR_DEMAND_DOC}` 则直接使用；否则通过 `hybrid_query` 搜索历史相似工单后用 `get_doc` 获取方案文档）。任何无法从上述来源验证的结论必须标注 `[待确认]`，严禁臆断想象。
+> **知识来源**：代码（`{PRODUCT_CODE_ROOT}`）、文档（`{PRODUCT_DOC_ROOT}`）、需求单上下文（DEMAND_DESC、DEMAND_IMPACT、PROD_FEATURE）、历史相似工单方案（`SIMILAR_DEMAND_DOC` 或搜索能力）。无法验证的结论标注 `[待确认]`，严禁臆断想象。
 
 ---
 
@@ -84,8 +77,8 @@ label: 需求澄清技能
   | 事实来源 | 说明 |
   |---------|------|
   | **需求单上下文** | `DEMAND_DESC`、`DEMAND_IMPACT`、`PROD_FEATURE` — 从需求单中提取的原始信息 |
-  | **文档** | 优先 `{PRODUCT_DOC_ROOT}/<doc_type>/`（研发会议室已落盘）；否则 SynapseService / `{TMP_DIR}/docs/` |
-  | **代码** | 优先 `{PRODUCT_CODE_ROOT}/<repo_name>/`（研发会议室已 clone）；否则不得臆造路径 |
+  | **文档** | `{PRODUCT_DOC_ROOT}/<doc_type>/`（如 `产品架构/`） |
+  | **代码** | `{PRODUCT_CODE_ROOT}/<repo_name>/` |
 - 需求分析中凡涉及**模块路径、接口、依赖关系、关键符号**等结论，必须在代码或文档中有对应支撑依据，并标注来源。
 - 无法通过上述事实来源验证的条目必须标注 **`[待确认]`**，不得虚构。
 - 若某文档源未获取成功，涉及该文档的分析标注 `[待补充-文档未获取]`。
@@ -167,7 +160,7 @@ label: 需求澄清技能
 阶段之间形成依赖链：Phase 1 的产出是 Phase 2 的输入，Phase 2 的产出是 Phase 3 的输入，以此类推。
 
 【阶段概览】
-Phase 0 — 环境准备：参数校验 + 目录创建 + 文档获取（仅首次执行）
+Phase 0 — 环境准备：参数校验 + 工单目录确认（仅首次执行）
 Phase 1 — 代码范围圈定：文档分析 + 模块定位 + 范围确认问题
 Phase 2 — 需求背景挖掘：三层动机追问 + 背景分析（触发场景 → 痛点 → 期望收益）
 Phase 3 — 用户故事：示例映射四色卡片 + 规则确认（蓝卡 → 绿卡 → 红卡）
@@ -184,24 +177,20 @@ Phase 4 — 深度澄清：三视角问题澄清（最终交付）
 
   0a. 校验必填参数：对照 Parameters 章节，校验所有标记为"是"的参数均已提供
 
-  0b. Python 命令适配：优先使用 `python3`，若不可用则尝试 `py`（Windows），均不可用则尝试 `python`。以下用 `{PYTHON}` 指代实际可用的 Python 命令。
+  0b. **解析工单目录**（从系统提示「产品工作区路径」或参数）：
+        - `CODE_ROOT = PRODUCT_CODE_ROOT`（缺省 `{WORK_ORDER_DIR}/code`）
+        - `DOC_ROOT = PRODUCT_DOC_ROOT`（缺省 `{WORK_ORDER_DIR}/doc`）
+        - 无法解析时标注 `[待补充-工单目录未就绪]`，继续但不得臆造路径
 
-  0c. **解析工单目录**（研发会议室优先）：
-        - 若提供 `WORK_ORDER_DIR`：设 `CODE_ROOT = PRODUCT_CODE_ROOT`（缺省则 `{WORK_ORDER_DIR}/code`），`DOC_ROOT = PRODUCT_DOC_ROOT`（缺省则 `{WORK_ORDER_DIR}/doc`）
-        - 否则：`DOC_ROOT` 回退为 `{TMP_DIR}/docs`，并 `mkdir -p {TMP_DIR} {TMP_DIR}/docs`
+  0c. **确认产品架构文档可读**：
+        - 在 `{DOC_ROOT}/产品架构/` 下查找 `TECH_ARCH`、`FUNCTIONAL_ARCH` 相关 `.md` 并读取
+        - 目录为空或文件缺失 → 标注 `[待补充-架构文档未获取]`，继续执行
 
-  0d. **获取产品架构文档**（优先读工单目录，禁止重复下载已有文件）：
-        - 若 `{DOC_ROOT}/产品架构/` 下已有 `TECH_ARCH` / `FUNCTIONAL_ARCH` 相关 `.md` → **直接读取**，跳过 `get_doc.py`
-        - 否则且 `SYNAPSE_URL` 已提供 → 下载到 `{DOC_ROOT}/产品架构/`（有 `WORK_ORDER_DIR` 时）或 `{TMP_DIR}/docs/`：
-          `{PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_doc.py --doc_type=产品架构 --server_url {SYNAPSE_URL} --prod {PROD} --doc_name=TECH_ARCH.md --output {DOC_ROOT}/产品架构`（`FUNCTIONAL_ARCH` 同理）
-        - 若仍失败，标注 `[待补充-架构文档未获取]`，继续执行。
+  0d. **历史相似工单方案**：
+        - 若 `SIMILAR_DEMAND_DOC` 已提供：直接使用其正文
+        - 否则调用历史相似工单搜索能力；无结果则标注 `[待补充-历史方案文档未获取]`，继续执行
 
-  0e. 获取历史相似工单方案文档：
-        - 若 `SIMILAR_DEMAND_DOC` 已提供：直接将文档内容保存到 `{TMP_DIR}/docs/` 目录下使用
-        - 若 `SIMILAR_DEMAND_DOC` 未提供且 `SYNAPSE_URL` 已提供：调用历史相似工单搜索能力自动检索
-        - 若 `SYNAPSE_URL` 未提供、搜索无结果或文档下载失败，标注 `[待补充-历史方案文档未获取]`，继续执行。
-
-**产出**：环境准备完成，架构文档及历史方案文档已获取（如可用）
+**产出**：环境准备完成；架构文档与历史方案（若可用）均来自工单目录或已给定正文
 
 **后续动作**：进入 Phase 1
 
@@ -389,46 +378,13 @@ Phase 4 — 深度澄清：三视角问题澄清（最终交付）
 
 ---
 
-## 使用脚本说明
-
-### get_doc.py（回退）
-
-脚本路径：`<BASE_SCRIPTS_DIR>/scripts/get_doc.py`（见技能 `whalecloud-dev-tool-base-scripts`）
-
-**仅当** `{PRODUCT_DOC_ROOT}/<doc_type>/` 或 `{TMP_DIR}/docs/` 中尚无所需文档时使用。研发会议室已落盘时**禁止**重复下载。
-
-用于从 SynapseService 获取产品文档：
-
-| 命令 | 说明 |
-|------|------|
-| `--doc_type=产品架构` | 获取产品架构文档 |
-| `--doc_type=产品需求` | 获取产品需求文档 |
-| `--doc_type=产品方案` | 获取产品方案文档 |
-| `--server_url XXX` | SynapseService 服务地址 |
-| `--prod XXX` | 产品名称 |
-| `--doc_name XXX` | 可选，指定文件名进行过滤（支持模糊匹配） |
-| `--demand_no XXX` | 可选，指定工单号，用于获取特定工单的方案文档 |
-| `--output XXX` | 可选，指定输出目录，文档将保存到此目录 |
-
-示例：
-```bash
-# 获取产品架构文档
-{PYTHON} <BASE_SCRIPTS_DIR>/scripts/get_doc.py --doc_type=产品架构 --server_url {SYNAPSE_URL} --prod {PROD} --doc_name=TECH_ARCH --output {TMP_DIR}/docs
-
----
-
 ## Error Handling
 
 | 情况 | 处理 |
 |------|------|
 | 缺少必填参数（DEMAND_DESC/DEMAND_IMPACT/PROD_FEATURE/PROD） | **中止**，列出缺失参数 |
-| 工单目录与 get_doc 均无架构文档 | 标注 `[待补充-架构文档未获取]`，继续执行 |
-| SYNAPSE_URL 未提供且工单目录无文档 | 同上 |
-| SIMILAR_DEMAND_DOC 未提供且搜索无结果或历史方案文档下载失败 | 标注 `[待补充-历史方案文档未获取]`，继续执行 |
-
----
-
-## Error Handling
+| `{DOC_ROOT}/产品架构/` 无架构文档 | 标注 `[待补充-架构文档未获取]`，继续执行 |
+| 无 `SIMILAR_DEMAND_DOC` 且搜索无历史方案 | 标注 `[待补充-历史方案文档未获取]`，继续执行 |
 
 ---
 
