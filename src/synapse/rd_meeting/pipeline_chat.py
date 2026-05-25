@@ -40,8 +40,8 @@ STEP_HOST_FIRST_CALL_SUMMARY = (
 )
 
 STEP_HOST_FIRST_CALL_REUSED_SUMMARY = (
-    "主控触发执行\n\n"
-    "触发小鲸继续执行sop工作。"
+    "主控触发总结\n\n"
+    "触发小鲸总结本阶段sop工作，并进入下一节点。"
 )
 
 

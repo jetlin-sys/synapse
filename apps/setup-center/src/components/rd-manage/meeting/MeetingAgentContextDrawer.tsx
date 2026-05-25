@@ -731,13 +731,7 @@ function SkillUsageCard({ entries }: { entries: SkillExecutionEntry[] }) {
                 style={{ width: `${pct}%` }}
               />
               <div className="relative flex items-center gap-2 flex-wrap">
-                <Terminal className="w-3 h-3 text-amber-400 shrink-0" />
-                <span
-                  className="font-mono text-[11.5px] text-foreground/95 truncate max-w-[260px]"
-                  title={row.skill}
-                >
-                  {row.skill}
-                </span>
+                <ActivityNameBadge name={row.skill} variant="skill" />
                 <span className="text-[10px] font-semibold text-amber-300/95 font-mono">
                   ×{row.count}
                 </span>
@@ -756,21 +750,27 @@ function SkillUsageCard({ entries }: { entries: SkillExecutionEntry[] }) {
                   </button>
                 </Tooltip>
               </div>
-              {(row.lastScript || row.scripts.length > 1 || row.tools.length > 1) && (
-                <div className="relative flex flex-col gap-1.5 mt-2">
+              {((row.lastScript && row.lastScript !== 'instruction-only') ||
+                row.scripts.length > 1 ||
+                row.tools.length > 0) && (
+                <div className="relative flex flex-col gap-1.5 mt-2 pl-0.5">
                   {row.lastScript && row.lastScript !== 'instruction-only' ? (
-                    <InvokeChainRow leader={row.skill} tail={row.lastScript} tailVariant="script" />
-                  ) : (
-                    <ActivityNameBadge name={row.skill} variant="skill" />
-                  )}
+                    <span className="inline-flex items-center gap-1 flex-wrap">
+                      <ChevronRight className="w-3.5 h-3.5 text-muted-foreground/60 shrink-0" />
+                      <ActivityNameBadge name={row.lastScript} variant="script" />
+                    </span>
+                  ) : null}
                   {row.scripts.length > 1 ? (
-                    <span className="text-[10px] text-muted-foreground/70 font-mono pl-0.5">
+                    <span className="text-[10px] text-muted-foreground/70 font-mono">
                       另有 {row.scripts.length - 1} 个脚本
                     </span>
                   ) : null}
                   {row.tools.length > 0 ? (
-                    <span className="text-[10px] text-muted-foreground/70 font-mono pl-0.5">
-                      via {row.tools.join(', ')}
+                    <span className="inline-flex items-center gap-1 flex-wrap text-[10px] text-muted-foreground/70">
+                      <span className="shrink-0">via</span>
+                      {row.tools.map((t) => (
+                        <ActivityNameBadge key={t} name={t} variant="tool" />
+                      ))}
                     </span>
                   ) : null}
                 </div>
