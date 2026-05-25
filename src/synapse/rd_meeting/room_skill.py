@@ -487,7 +487,48 @@ def render_skill(skill_body: str, variables: dict[str, str]) -> str:
     return rendered
 
 
-def build_product_workspace_paths_section(init_context: dict[str, Any] | None) -> str:
+def _resolve_archive_output_dir(
+    *,
+    work_dir: str,
+    scope_id: str = "",
+    stage_name: str = "",
+    node_id: str = "",
+    archive_dir: str = "",
+    system: dict[str, Any] | None = None,
+) -> str:
+    """解析本节点会议产出目录 ``work/<scope>/archive/<stage_name>/<node_id>/``。"""
+    sys_map = system if isinstance(system, dict) else {}
+    ad = (archive_dir or str(sys_map.get("archive_dir") or "")).strip()
+    if ad:
+        return ad
+
+    sid = (scope_id or str(sys_map.get("scope_id") or "")).strip()
+    nid = (node_id or str(sys_map.get("node_id") or "")).strip()
+    stg = (stage_name or str(sys_map.get("stage_name") or "")).strip()
+    if sid and nid:
+        from synapse.rd_meeting.paths import archive_node_dir
+        from synapse.rd_sop.nodes import stage_id_for_node_id, stage_name_for_id
+
+        if not stg:
+            stg = stage_name_for_id(stage_id_for_node_id(nid))
+        return str(archive_node_dir(sid, stg, nid))
+
+    wo = (work_dir or str(sys_map.get("work_order_dir") or "")).strip()
+    if wo and stg and nid:
+        from synapse.rd_meeting.paths import archive_stage_segment
+
+        return str(Path(wo) / "archive" / archive_stage_segment(stg) / nid)
+    return ""
+
+
+def build_product_workspace_paths_section(
+    init_context: dict[str, Any] | None,
+    *,
+    scope_id: str = "",
+    stage_name: str = "",
+    node_id: str = "",
+    archive_dir: str = "",
+) -> str:
     """渲染 room_opened 落盘后的产品代码 / 文档路径（Host / Worker 必读）。"""
     if not isinstance(init_context, dict):
         return ""
@@ -538,6 +579,17 @@ def build_product_workspace_paths_section(init_context: dict[str, Any] | None) -
             st = str(d.get("materialize_status") or "").strip()
             note = f"（{st}）" if st and st != "ok" else ""
             lines.append(f"  - 文档 `{dtype}`：`{local}`{note}")
+
+    archive_path = _resolve_archive_output_dir(
+        work_dir=work_dir,
+        scope_id=scope_id,
+        stage_name=stage_name,
+        node_id=node_id,
+        archive_dir=archive_dir,
+        system=sys_map,
+    )
+    if archive_path:
+        lines.append(f"- **会议产出路径（OUTPUT_DIR / ARCHIVE_DIR）**：`{archive_path}`")
     lines.append("")
     return "\n".join(lines)
 
@@ -629,7 +681,13 @@ def build_meeting_runtime_header(
     lines.append("- **回复语言**：中文")
     if supplement:
         lines.append(f"- **运营补充**：{supplement}")
-    paths_block = build_product_workspace_paths_section(init_context)
+    paths_block = build_product_workspace_paths_section(
+        init_context,
+        scope_id=context.scope_id,
+        stage_name=context.stage_name,
+        node_id=context.node_id,
+        archive_dir=context.archive_dir,
+    )
     if paths_block:
         lines.append("")
         lines.append(paths_block.rstrip())

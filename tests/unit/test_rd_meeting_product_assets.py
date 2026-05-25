@@ -117,7 +117,28 @@ def test_bootstrap_writes_code_and_doc(monkeypatch, tmp_path):
     assert "doc" in block
 
 
-def test_fetch_prod_doc_parses_response(monkeypatch):
+def test_build_product_workspace_paths_includes_archive_dir(monkeypatch, tmp_path):
+    scope_id = "21881451"
+    work = tmp_path / "work" / scope_id
+    work.mkdir(parents=True)
+    monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
+
+    init_ctx = {
+        "product": {"work_order_dir": str(work), "code_root": str(work / "code"), "doc_root": str(work / "doc")},
+        "system": {"work_order_dir": str(work)},
+    }
+    block = build_product_workspace_paths_section(
+        init_ctx,
+        scope_id=scope_id,
+        stage_name="需求分析",
+        node_id="req_clarify",
+    )
+    assert "会议产出路径(OUTPUT_DIR/ARCHIVE_DIR)" in block
+    assert "archive" in block
+    assert "req_clarify" in block
+    assert "需求分析" in block or "req_clarify" in block
+    assert "stage_name" not in block
+    assert "node_name" not in block
     class FakeResp:
         def raise_for_status(self):
             return None
