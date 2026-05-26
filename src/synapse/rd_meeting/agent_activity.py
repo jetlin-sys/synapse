@@ -4,7 +4,7 @@
 
     work/<scope>/agents/<node_id>/<profile_id>/activity.jsonl
 
-每条记录为 JSON 一行，``category`` 取 ``input`` | ``output`` | ``tool`` | ``skill_load`` | ``skill_load_blocked`` | ``skill_exec``
+每条记录为 JSON 一行，``category`` 取 ``input`` | ``output`` | ``tool`` | ``skill_load`` | ``skill_load_blocked`` | ``skill_exec`` | ``llm_usage``
 （旧数据可能仍为 ``skill``，读取时会按 ``skill_tool`` 归一化）。
 写入失败仅打 warning，不阻断主流程。
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -72,6 +73,7 @@ _CATEGORY_LABELS: dict[str, str] = {
     "skill_load_blocked": "技能加载被拦截",
     "skill_exec": "执行技能",
     "skill": "调用技能",  # 旧数据兼容
+    "llm_usage": "LLM 用量",
 }
 
 _TODO_BLOCK_MARKERS = ("建议先创建 Todo", "这是一个多步骤任务，建议先创建 Todo")
@@ -676,6 +678,134 @@ def try_record_output_from_agent(
         logger.debug("try_record_output_from_agent failed: %s", exc)
 
 
+def mark_llm_call_start(agent: Any) -> None:
+    """会议室 LLM 调用开始前打点，供 ``try_record_llm_usage_from_agent`` 计算耗时。"""
+    if not getattr(agent, "_org_context", False):
+        return
+    try:
+        agent._rd_meeting_llm_started_at = time.monotonic()  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.debug("mark_llm_call_start failed: %s", exc)
+
+
+def _pop_llm_duration_ms(agent: Any) -> int | None:
+    started = getattr(agent, "_rd_meeting_llm_started_at", None)
+    if started is None:
+        return None
+    try:
+        del agent._rd_meeting_llm_started_at  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    try:
+        return max(int((time.monotonic() - float(started)) * 1000), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def record_llm_usage(
+    binding: dict[str, str],
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    usage_scene: str = "",
+    model: str = "",
+    ts: str = "",
+    duration_ms: int | None = None,
+) -> dict[str, Any] | None:
+    """追加 LLM token 用量行（节点审阅摘要等后台场景可在外层过滤 usage_scene）。"""
+    inp = max(int(input_tokens or 0), 0)
+    out = max(int(output_tokens or 0), 0)
+    total = max(int(total_tokens or 0), 0) or (inp + out)
+    if total <= 0:
+        return None
+    scene = (usage_scene or "").strip()
+    row: dict[str, Any] = {
+        "category": "llm_usage",
+        "input_tokens": inp,
+        "output_tokens": out,
+        "total_tokens": total,
+        "usage_scene": scene[:200],
+        "model": (model or "").strip()[:120],
+        "display_title": (model or "").strip()[:120] or "LLM 推理",
+    }
+    if duration_ms is not None and int(duration_ms) > 0:
+        row["duration_ms"] = int(duration_ms)
+    if ts:
+        row["ts"] = ts
+    return _append_row(
+        binding["scope_id"],
+        binding["node_id"],
+        binding["profile_id"],
+        row,
+    )
+
+
+def try_record_llm_usage_from_agent(
+    agent: Any,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    usage_scene: str = "",
+    model: str = "",
+) -> None:
+    """会议室智能体每次 LLM 调用后写入 activity.jsonl（node_review 场景跳过）。"""
+    if not getattr(agent, "_org_context", False):
+        return
+    if "node_review" in (usage_scene or ""):
+        return
+    binding = resolve_agent_activity_binding(agent)
+    if not binding:
+        return
+    try:
+        duration_ms = _pop_llm_duration_ms(agent)
+        record_llm_usage(
+            binding,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            usage_scene=usage_scene,
+            model=model,
+            duration_ms=duration_ms,
+        )
+    except Exception as exc:
+        logger.debug("try_record_llm_usage_from_agent failed: %s", exc)
+
+
+def aggregate_llm_tokens(entries: list[dict[str, Any]], *, exclude_scenes: frozenset[str] | None = None) -> int:
+    """从 activity 行累计 token（默认排除 node_review 后台摘要）。"""
+    skip = exclude_scenes or frozenset({"node_review"})
+    total = 0
+    for row in entries:
+        if str(row.get("category") or "") != "llm_usage":
+            continue
+        scene = str(row.get("usage_scene") or "")
+        if any(tag in scene for tag in skip):
+            continue
+        row_total = int(row.get("total_tokens") or 0)
+        if row_total <= 0:
+            row_total = int(row.get("input_tokens") or 0) + int(row.get("output_tokens") or 0)
+        total += max(row_total, 0)
+    return total
+
+
+def compute_activity_duration_seconds(entries: list[dict[str, Any]]) -> int:
+    """根据 activity 行 ``ts`` 首尾差计算耗时（秒）。"""
+    times: list[datetime] = []
+    for row in entries:
+        ts = str(row.get("ts") or "").strip()
+        if not ts:
+            continue
+        try:
+            times.append(datetime.fromisoformat(ts))
+        except (TypeError, ValueError):
+            continue
+    if len(times) < 2:
+        return 0
+    return max(1, int((max(times) - min(times)).total_seconds()))
+
+
 def read_activity_log(
     scope_id: str,
     node_id: str,
@@ -796,6 +926,30 @@ def enrich_display(entry: dict[str, Any]) -> dict[str, Any]:
     if normalized == "input":
         src = str(row.get("source") or "")
         row.setdefault("source_label", _INPUT_SOURCE_LABELS.get(src, src))
+        row["presentation_tier"] = "primary"
+    elif normalized == "output":
+        row.setdefault("presentation_tier", "primary")
+    elif normalized == "llm_usage":
+        model = str(row.get("model") or "").strip()
+        inp = int(row.get("input_tokens") or 0)
+        out = int(row.get("output_tokens") or 0)
+        total = int(row.get("total_tokens") or 0) or (inp + out)
+        dur = row.get("duration_ms")
+        summary_parts = [f"输入 {inp:,} token", f"输出 {out:,} token", f"合计 {total:,} token"]
+        if dur is not None and int(dur) > 0:
+            ms = int(dur)
+            summary_parts.append(f"耗时 {ms}ms" if ms < 1000 else f"耗时 {ms / 1000:.1f}s")
+        scene = str(row.get("usage_scene") or "").strip()
+        if scene:
+            summary_parts.append(f"场景 {scene}")
+        row["summary"] = " · ".join(summary_parts)
+        if model:
+            row["display_title"] = model
+        else:
+            row["display_title"] = "LLM 推理"
+        row["presentation_tier"] = "primary"
+    elif normalized in ("tool", "skill_load", "skill_exec", "skill", "skill_load_blocked"):
+        row["presentation_tier"] = "secondary"
     # display_title 仅保留技能名或工具名，链式关系由前端用 executing_skill_id + tool_name 组合展示
     esid = str(row.get("executing_skill_id") or "").strip()
     if normalized == "tool":

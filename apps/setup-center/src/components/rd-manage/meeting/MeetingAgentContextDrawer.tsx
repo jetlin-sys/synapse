@@ -47,7 +47,7 @@ interface Props {
   agent: AgentContextTarget | null;
 }
 
-type ActivityCategory = 'all' | 'input' | 'output' | 'tool' | 'skill_load' | 'skill_load_blocked' | 'skill_exec' | 'skill';
+type ActivityCategory = 'all' | 'input' | 'output' | 'llm_usage' | 'tool' | 'skill_load' | 'skill_load_blocked' | 'skill_exec' | 'skill';
 
 const ACTIVITY_CATEGORY_META: Record<
   Exclude<ActivityCategory, 'all'>,
@@ -66,6 +66,13 @@ const ACTIVITY_CATEGORY_META: Record<
     chip: 'bg-emerald-500/12 text-emerald-200 border-emerald-500/35',
     dot: 'bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.55)]',
     glow: 'from-emerald-500/20 via-emerald-500/5 to-transparent',
+  },
+  llm_usage: {
+    label: 'LLM 推理',
+    icon: <BrainCircuit className="w-3.5 h-3.5" />,
+    chip: 'bg-violet-500/18 text-violet-100 border-violet-500/40',
+    dot: 'bg-violet-400 shadow-[0_0_14px_rgba(167,139,250,0.65)]',
+    glow: 'from-violet-500/25 via-violet-500/8 to-transparent',
   },
   tool: {
     label: '工具',
@@ -104,6 +111,15 @@ const ACTIVITY_CATEGORY_META: Record<
   },
 };
 
+function formatDurationMs(ms?: number): string {
+  if (ms == null || ms <= 0) return '';
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.round((ms % 60_000) / 1000);
+  return `${m}m${s}s`;
+}
+
 function formatActivityTime(ts?: string): string {
   if (!ts) return '';
   const d = new Date(ts);
@@ -116,10 +132,45 @@ function normalizeActivityCategory(category?: string): Exclude<ActivityCategory,
   if (c === 'skill') {
     return 'skill_load';
   }
+  if (c === 'llm_usage') {
+    return 'llm_usage';
+  }
   if (c in ACTIVITY_CATEGORY_META) {
     return c as Exclude<ActivityCategory, 'all'>;
   }
   return 'tool';
+}
+
+function isMutedActivityEntry(entry: ProcessingHistoryEntry, cat: Exclude<ActivityCategory, 'all'>): boolean {
+  if (entry.presentation_tier === 'secondary') return true;
+  if (entry.presentation_tier === 'primary') return false;
+  return cat === 'tool' || isSkillCategory(cat);
+}
+
+function LlmTokenBadges({ entry }: { entry: ProcessingHistoryEntry }) {
+  const inp = entry.input_tokens;
+  const out = entry.output_tokens;
+  const total = entry.total_tokens ?? (inp != null && out != null ? inp + out : undefined);
+  if (inp == null && out == null && total == null) return null;
+  return (
+    <span className="inline-flex items-center gap-1 flex-wrap">
+      {inp != null ? (
+        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-sky-500/30 bg-sky-500/10 text-sky-100/90">
+          入 {inp.toLocaleString()}
+        </span>
+      ) : null}
+      {out != null ? (
+        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-100/90">
+          出 {out.toLocaleString()}
+        </span>
+      ) : null}
+      {total != null ? (
+        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-violet-500/35 bg-violet-500/12 text-violet-100/95">
+          计 {total.toLocaleString()}
+        </span>
+      ) : null}
+    </span>
+  );
 }
 
 function ActivityNameBadge({
@@ -181,6 +232,7 @@ function resolveActivityPresentation(entry: ProcessingHistoryEntry) {
   const scriptName = (entry.script_name || '').trim();
   const isChainedTool = cat === 'tool' && Boolean(entry.executing_skill_id?.trim());
   const isSkillRow = isSkillCategory(cat);
+  const isLlmRow = cat === 'llm_usage';
 
   let chipLabel = entry.category_label || ACTIVITY_CATEGORY_META[cat]?.label || cat;
   let chipMeta = ACTIVITY_CATEGORY_META[cat] || ACTIVITY_CATEGORY_META.tool;
@@ -189,21 +241,34 @@ function resolveActivityPresentation(entry: ProcessingHistoryEntry) {
     chipMeta = ACTIVITY_CATEGORY_META.skill_exec;
   }
 
-  return { cat, skillTitle, toolName, scriptName, isChainedTool, isSkillRow, chipLabel, chipMeta };
+  return { cat, skillTitle, toolName, scriptName, isChainedTool, isSkillRow, isLlmRow, chipLabel, chipMeta };
 }
 
 function ProcessingHistoryCard({ entry, isLast }: { entry: ProcessingHistoryEntry; isLast?: boolean }) {
   const [expanded, setExpanded] = useState(false);
-  const { skillTitle, toolName, scriptName, isChainedTool, isSkillRow, chipLabel, chipMeta } =
+  const { cat, skillTitle, toolName, scriptName, isChainedTool, isSkillRow, isLlmRow, chipLabel, chipMeta } =
     resolveActivityPresentation(entry);
+  const isMuted = isMutedActivityEntry(entry, cat);
   const title = entry.display_title || entry.title || chipLabel;
   const summary = (entry.summary || entry.result_preview || '').trim();
+  const durationLabel = formatDurationMs(entry.duration_ms);
   const hasDetail =
     Boolean(summary) ||
     entry.tool_input != null ||
-    Boolean(entry.detail && Object.keys(entry.detail).length);
+    Boolean(entry.detail && Object.keys(entry.detail).length) ||
+    Boolean(entry.usage_scene?.trim());
 
   const renderTitle = () => {
+    if (isLlmRow) {
+      return (
+        <span className="inline-flex items-center gap-2 flex-wrap min-w-0">
+          <span className="text-xs font-semibold text-violet-100/95 truncate max-w-[220px]" title={title}>
+            {title}
+          </span>
+          <LlmTokenBadges entry={entry} />
+        </span>
+      );
+    }
     if (isChainedTool) {
       return <InvokeChainRow leader={skillTitle} tail={toolName} tailVariant="tool" />;
     }
@@ -217,15 +282,27 @@ function ProcessingHistoryCard({ entry, isLast }: { entry: ProcessingHistoryEntr
   };
 
   return (
-    <div className="relative flex gap-3 group">
+    <div className={`relative flex gap-3 group ${isMuted ? 'opacity-[0.52]' : ''}`}>
       <div className="flex flex-col items-center shrink-0 w-5 pt-1">
-        <div className={`w-2.5 h-2.5 rounded-full ring-2 ring-[color:var(--panel,#0f0f12)] ${chipMeta.dot}`} />
+        <div
+          className={`rounded-full ring-2 ring-[color:var(--panel,#0f0f12)] ${chipMeta.dot} ${
+            isMuted ? 'w-2 h-2 opacity-70' : 'w-2.5 h-2.5'
+          }`}
+        />
         {!isLast ? (
-          <div className="w-px flex-1 min-h-[12px] mt-1 bg-gradient-to-b from-border/80 to-border/20" />
+          <div
+            className={`w-px flex-1 min-h-[12px] mt-1 bg-gradient-to-b ${
+              isMuted ? 'from-border/40 to-border/10' : 'from-border/80 to-border/20'
+            }`}
+          />
         ) : null}
       </div>
       <div
-        className={`flex-1 min-w-0 mb-3 rounded-xl border border-border/50 overflow-hidden transition-all duration-200 hover:border-border/80 hover:shadow-lg hover:shadow-black/20 bg-gradient-to-br ${chipMeta.glow}`}
+        className={`flex-1 min-w-0 mb-3 rounded-xl border overflow-hidden transition-all duration-200 ${
+          isMuted
+            ? 'border-border/25 bg-black/10 shadow-none hover:opacity-80'
+            : `border-border/50 hover:border-border/80 hover:shadow-lg hover:shadow-black/20 bg-gradient-to-br ${chipMeta.glow}`
+        } ${isLlmRow ? 'ring-1 ring-violet-500/20' : ''}`}
       >
         <button
           type="button"
@@ -244,8 +321,11 @@ function ProcessingHistoryCard({ entry, isLast }: { entry: ProcessingHistoryEntr
               {entry.source_label ? (
                 <span className="text-[10px] text-muted-foreground/80">{entry.source_label}</span>
               ) : null}
-              {entry.duration_ms != null && entry.duration_ms > 0 ? (
-                <span className="text-[10px] font-mono text-muted-foreground/70">{entry.duration_ms}ms</span>
+              {durationLabel ? (
+                <span className="text-[10px] font-mono text-muted-foreground/80">{durationLabel}</span>
+              ) : null}
+              {isMuted ? (
+                <span className="text-[10px] text-muted-foreground/60 italic">LLM 执行细节</span>
               ) : null}
               {entry.success === false ? (
                 <Tag color="error" className="text-[10px] leading-none m-0 px-1 py-0">失败</Tag>
@@ -281,6 +361,11 @@ function ProcessingHistoryCard({ entry, isLast }: { entry: ProcessingHistoryEntr
                     ? entry.tool_input
                     : JSON.stringify(entry.tool_input, null, 2)}
                 </pre>
+              </div>
+            ) : null}
+            {entry.usage_scene ? (
+              <div className="text-[10px] text-muted-foreground/80 font-mono break-all">
+                场景：{entry.usage_scene}
               </div>
             ) : null}
           </div>
@@ -1281,7 +1366,7 @@ export function MeetingAgentContextDrawer({
                     {filteredHistory.length}/{processingHistory.length}
                   </span>
                   <div className="ml-auto flex items-center gap-1 flex-wrap">
-                    {(['all', 'input', 'output', 'tool', 'skill_load', 'skill_load_blocked', 'skill_exec'] as const).map((c) => {
+                    {(['all', 'input', 'output', 'llm_usage', 'tool', 'skill_load', 'skill_load_blocked', 'skill_exec'] as const).map((c) => {
                       const active = categoryFilter === c;
                       const count =
                         c === 'all'

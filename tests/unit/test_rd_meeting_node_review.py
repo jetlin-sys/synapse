@@ -76,112 +76,170 @@ class _FakeOrch:
         return list(self._states)
 
 
-def test_aggregate_metrics_counts_delegations_and_workers(tmp_path):
+def _write_activity(scope: str, node_id: str, profile_id: str, rows: list[dict]) -> None:
+    path = agent_node_dir(scope, profile_id, node_id) / "activity.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows),
+        encoding="utf-8",
+    )
+
+
+def test_aggregate_metrics_from_activity_jsonl(tmp_path):
     scope = "scope-A"
     room = "room-A"
-    host_messages = [
-        {"role": "user", "content": "请开始"},
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "tool_use", "name": "delegate_to_agent", "input": {"to": "doc-gen"}},
-                {"type": "tool_use", "name": "delegate_to_agent", "input": {"to": "code-explorer"}},
-                {
-                    "type": "tool_use",
-                    "name": "delegate_parallel",
-                    "input": {"tasks": [{"to": "doc-gen"}, {"to": "code-explorer"}]},
-                },
-            ],
-        },
-    ]
-    host_agent = _fake_host_agent(host_messages, tokens=500, tools=["shell", "shell", "read_file"])
-    pool = _FakePool({f"rd_meeting:{room}:host": host_agent})
-    orch = _FakeOrch(
+    node_id = "req_clarify"
+    _write_activity(
+        scope,
+        node_id,
+        "default",
         [
-            {"profile_id": "doc-gen", "tools_executed": ["run_skill_script"], "skills_executed": [{"skill": "doc-generate"}], "tokens_used": 800},
-            {"profile_id": "doc-gen", "tools_executed": ["shell"], "tokens_used": 200},
-            {"profile_id": "code-explorer", "tools_executed": ["grep", "read_file"], "tokens_used": 400},
-        ]
+            {"seq": 1, "ts": "2026-05-26T10:00:00", "category": "input", "source": "system", "input_kind": "node_task", "title": "开始"},
+            {
+                "seq": 2,
+                "ts": "2026-05-26T10:00:30",
+                "category": "tool",
+                "tool_name": "delegate_to_agent",
+                "tool_input": {"to": "doc-gen", "message": "整理文档"},
+                "success": True,
+            },
+            {
+                "seq": 3,
+                "ts": "2026-05-26T10:01:00",
+                "category": "tool",
+                "tool_name": "delegate_to_agent",
+                "tool_input": {"to": "code-explorer", "message": "查代码"},
+                "success": True,
+            },
+            {
+                "seq": 4,
+                "ts": "2026-05-26T10:01:30",
+                "category": "tool",
+                "tool_name": "delegate_parallel",
+                "tool_input": {"tasks": [{"to": "doc-gen"}, {"to": "code-explorer"}]},
+                "success": True,
+            },
+            {"seq": 5, "ts": "2026-05-26T10:02:00", "category": "tool", "tool_name": "shell", "success": True},
+            {"seq": 6, "ts": "2026-05-26T10:02:30", "category": "tool", "tool_name": "shell", "success": True},
+            {"seq": 7, "ts": "2026-05-26T10:03:00", "category": "tool", "tool_name": "read_file", "success": True},
+            {"seq": 8, "ts": "2026-05-26T10:03:30", "category": "llm_usage", "input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+        ],
+    )
+    _write_activity(
+        scope,
+        node_id,
+        "doc-gen",
+        [
+            {
+                "seq": 1,
+                "ts": "2026-05-26T10:04:00",
+                "category": "input",
+                "input_kind": "delegation",
+                "title": "收到委派",
+                "summary": "整理文档",
+            },
+            {
+                "seq": 2,
+                "ts": "2026-05-26T10:04:30",
+                "category": "input",
+                "input_kind": "delegation",
+                "title": "收到委派",
+                "summary": "再整理",
+            },
+            {"seq": 3, "ts": "2026-05-26T10:05:00", "category": "tool", "tool_name": "run_skill_script", "success": True},
+            {"seq": 4, "ts": "2026-05-26T10:05:30", "category": "tool", "tool_name": "shell", "success": True},
+            {"seq": 5, "ts": "2026-05-26T10:06:00", "category": "skill_exec", "skill_name": "doc-generate", "skill_tool": "run_skill_script", "success": True},
+            {"seq": 6, "ts": "2026-05-26T10:06:30", "category": "llm_usage", "input_tokens": 700, "output_tokens": 100, "total_tokens": 800},
+            {"seq": 7, "ts": "2026-05-26T10:07:00", "category": "llm_usage", "input_tokens": 150, "output_tokens": 50, "total_tokens": 200},
+        ],
+    )
+    _write_activity(
+        scope,
+        node_id,
+        "code-explorer",
+        [
+            {
+                "seq": 1,
+                "ts": "2026-05-26T10:08:00",
+                "category": "input",
+                "input_kind": "delegation",
+                "title": "收到委派",
+                "summary": "查代码",
+            },
+            {"seq": 2, "ts": "2026-05-26T10:08:30", "category": "tool", "tool_name": "grep", "success": True},
+            {"seq": 3, "ts": "2026-05-26T10:09:00", "category": "tool", "tool_name": "read_file", "success": True},
+            {"seq": 4, "ts": "2026-05-26T10:09:30", "category": "llm_usage", "input_tokens": 300, "output_tokens": 100, "total_tokens": 400},
+        ],
     )
 
     metrics = aggregate_node_metrics(
         scope_id=scope,
         room_id=room,
-        node_id="req_clarify",
+        node_id=node_id,
         binding={
             "host_profile_id": "default",
             "worker_profile_ids": ["doc-gen", "code-explorer"],
         },
-        agent_pool=pool,
-        orchestrator=orch,
-        tokens_used=1500,
+        agent_pool=None,
+        orchestrator=None,
         duration_seconds=45,
     )
 
+    assert metrics.host is not None
     assert metrics.host.profile_id == "default"
     assert metrics.host.display_name == "小鲸"
-    # 2 个 delegate_to_agent + 2 个 delegate_parallel.tasks
     assert metrics.host.delegations == 4
     assert metrics.host.tool_calls == 3
-    # tools 聚合并按降序
+    assert metrics.host.tokens == 150
     assert metrics.host.tools[0]["name"] == "shell"
     assert metrics.host.tools[0]["count"] == 2
+    assert metrics.node_duration_seconds == 210  # 10:00:00 -> 10:03:30
 
     pids = [w.profile_id for w in metrics.workers]
     assert pids == ["doc-gen", "code-explorer"]
     doc = metrics.workers[0]
-    assert doc.delegations == 2  # 两条 sub_agent_state
+    assert doc.delegations == 2
     assert doc.tokens == 1000
     assert doc.tool_calls == 2
+    assert doc.skill_calls == 1
 
     assert metrics.delegation_total == 4
     assert metrics.tool_call_total == metrics.host.tool_calls + sum(w.tool_calls for w in metrics.workers)
-    assert metrics.node_duration_seconds == 45
+    assert metrics.node_token_total == 150 + 1000 + 400
 
 
-def test_aggregate_worker_tools_from_pool_with_host_session_fallback(tmp_path):
-    """Worker 委派任务注册在 host session；sub_agent_states 截断时仍应从池化实例读全量 tools。"""
+def test_aggregate_metrics_worker_only_from_activity(tmp_path):
+    """Worker 指标完全来自 activity.jsonl，不依赖 agent_pool。"""
     scope = "scope-pool"
     room = "room-pool"
-    host_sid = f"rd_meeting:{room}:host"
-    worker_sid = f"rd_meeting:{room}:doc-gen"
-
-    # Task 挂在 host session（与 orchestrator._call_agent 一致）
-    worker_task = SimpleNamespace(
-        tools_executed=["grep", "read_file", "run_skill_script", "grep", "write_file"],
-        skills_executed=[{"skill": "doc-generate", "tool": "run_skill_script"}],
-        status=SimpleNamespace(value="completed"),
-        iteration=3,
-        session_id=host_sid,
-        task_id="abc12345",
-        description="",
-        usage_scene="",
-    )
-    worker_state = SimpleNamespace(
-        current_task=worker_task,
-        get_task_for_session=lambda sid: worker_task if sid == host_sid else None,
-    )
-    worker_agent = SimpleNamespace(
-        _context=SimpleNamespace(messages=[]),
-        agent_state=worker_state,
-        last_usage={"total_tokens": 1200},
-    )
-
-    pool = _FakePool({worker_sid: worker_agent})
-    # orchestrator 只有截断的 2 条工具名
-    orch = _FakeOrch(
-        [{"profile_id": "doc-gen", "tools_executed": ["write_file"], "tools_total": 5, "tokens_used": 100}]
+    node_id = "req_clarify"
+    _write_activity(
+        scope,
+        node_id,
+        "doc-gen",
+        [
+            {"seq": 1, "ts": "2026-05-26T11:00:00", "category": "input", "input_kind": "delegation", "title": "委派"},
+            {"seq": 2, "ts": "2026-05-26T11:00:10", "category": "tool", "tool_name": "grep", "success": True},
+            {"seq": 3, "ts": "2026-05-26T11:00:20", "category": "tool", "tool_name": "grep", "success": True},
+            {"seq": 4, "ts": "2026-05-26T11:00:30", "category": "tool", "tool_name": "read_file", "success": True},
+            {"seq": 5, "ts": "2026-05-26T11:00:40", "category": "tool", "tool_name": "run_skill_script", "success": True},
+            {"seq": 6, "ts": "2026-05-26T11:00:50", "category": "tool", "tool_name": "write_file", "success": True},
+            {"seq": 7, "ts": "2026-05-26T11:01:00", "category": "skill_exec", "skill_name": "doc-generate", "skill_tool": "run_skill_script", "success": True},
+            {"seq": 8, "ts": "2026-05-26T11:01:10", "category": "llm_usage", "total_tokens": 1200},
+        ],
     )
 
     metrics = aggregate_node_metrics(
         scope_id=scope,
         room_id=room,
-        node_id="req_clarify",
+        node_id=node_id,
         binding={"host_profile_id": "default", "worker_profile_ids": ["doc-gen"]},
-        agent_pool=pool,
-        orchestrator=orch,
+        agent_pool=None,
+        orchestrator=None,
     )
 
+    assert metrics.host is None
+    assert len(metrics.workers) == 1
     doc = metrics.workers[0]
     assert doc.tool_calls == 5
     assert doc.tokens == 1200
@@ -316,6 +374,7 @@ async def test_build_and_save_payload_without_llm(tmp_path):
     assert payload["node_name"] == "需求澄清"
     assert payload["stage_id"] == stage_id
     assert payload["metrics"]["host"]["delegations"] == 1
+    assert payload["metrics"]["host"]["tokens"] == 0  # 旧 activity 无 llm_usage 行
     assert payload["metrics"]["node_duration_seconds"] == 30
     assert len(payload["artifacts"]) == 1
     assert payload["artifacts"][0]["name"] == "需求澄清.md"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -372,3 +373,79 @@ def test_activity_jsonl_on_disk(activity_work):
     assert line["category"] == "tool"
     assert line["tool_name"] == "run_shell"
     assert line["seq"] == 1
+
+
+def test_record_llm_usage_and_aggregate(activity_work):
+    from synapse.rd_meeting.agent_activity import (
+        aggregate_llm_tokens,
+        compute_activity_duration_seconds,
+        record_llm_usage,
+        resolve_binding_for_profile,
+    )
+
+    binding = resolve_binding_for_profile("scope1", "node_a", "host_pid", host_profile_id="host_pid")
+    record_llm_usage(
+        binding,
+        input_tokens=100,
+        output_tokens=40,
+        usage_scene="rd_meeting_scope1_req",
+        ts="2026-05-26T10:00:00",
+    )
+    record_llm_usage(
+        binding,
+        input_tokens=50,
+        output_tokens=10,
+        usage_scene="rd_meeting_scope1_node_review",
+        ts="2026-05-26T10:05:00",
+    )
+    rows = read_activity_log("scope1", "node_a", "host_pid")
+    assert aggregate_llm_tokens(rows) == 140
+    assert compute_activity_duration_seconds(rows) == 300
+
+
+def test_mark_llm_call_start_records_duration(activity_work):
+    from synapse.rd_meeting.agent_activity import (
+        enrich_display,
+        mark_llm_call_start,
+        resolve_binding_for_profile,
+        try_record_llm_usage_from_agent,
+    )
+
+    agent = MagicMock()
+    agent._org_context = True
+    agent._rd_meeting_activity = {
+        "scope_id": "scope1",
+        "node_id": "node_a",
+        "profile_id": "host_pid",
+        "host_profile_id": "host_pid",
+        "role": "host",
+        "room_id": "room1",
+    }
+
+    mark_llm_call_start(agent)
+    time.sleep(0.02)
+    try_record_llm_usage_from_agent(
+        agent,
+        input_tokens=120,
+        output_tokens=30,
+        usage_scene="rd_meeting_scope1_req",
+        model="test-model",
+    )
+
+    row = enrich_display(read_activity_log("scope1", "node_a", "host_pid")[0])
+    assert row["category"] == "llm_usage"
+    assert row["input_tokens"] == 120
+    assert row["output_tokens"] == 30
+    assert row["total_tokens"] == 150
+    assert row.get("duration_ms", 0) >= 10
+    assert row["presentation_tier"] == "primary"
+    assert "输入 120 token" in row["summary"]
+
+    tool_row = enrich_display(
+        {
+            "category": "tool",
+            "tool_name": "grep",
+            "success": True,
+        }
+    )
+    assert tool_row["presentation_tier"] == "secondary"

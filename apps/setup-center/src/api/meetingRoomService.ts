@@ -341,6 +341,7 @@ export interface ProcessingHistoryEntry {
   category:
     | 'input'
     | 'output'
+    | 'llm_usage'
     | 'tool'
     | 'skill_load'
     | 'skill_load_blocked'
@@ -367,6 +368,12 @@ export interface ProcessingHistoryEntry {
   block_reason?: string;
   success?: boolean;
   duration_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  model?: string;
+  usage_scene?: string;
+  presentation_tier?: 'primary' | 'secondary';
   detail?: Record<string, unknown>;
   node_id?: string;
   profile_id?: string;

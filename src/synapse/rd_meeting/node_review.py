@@ -6,7 +6,7 @@
 LLM 跑完后组装并落盘到 ``meeting_pipeline.json.context.node_review[node_id]``
 同时写入 ``room_state.pending_delivery.review_payload`` 供前端拉取：
 
-1. **metrics**：节点 token / 时长 / 各 agent 委派 / 工具 / 技能 / token 聚合
+1. **metrics**：节点 token / 时长 / 各 agent 委派 / 工具 / 技能，**均从各智能体 activity.jsonl 汇总**
 2. **summaries**：主持人 + 各协作智能体的工作摘要（由 LLM 在 NODE_REVIEW 阶段
    基于 ``agents/<node_id>/<pid>/activity.jsonl`` 汇总后的结构化上下文生成；
    **无 activity.jsonl 的智能体视为本节点未参与，不生成摘要**）
@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -376,35 +375,6 @@ def _now_iso() -> str:
 # ─── 指标聚合 ─────────────────────────────────────────────────────────
 
 
-def _count_buckets(items: Iterable[str]) -> list[dict[str, Any]]:
-    counter: dict[str, int] = {}
-    for it in items:
-        key = str(it or "").strip()
-        if not key:
-            continue
-        counter[key] = counter.get(key, 0) + 1
-    return [
-        {"name": name, "count": count}
-        for name, count in sorted(counter.items(), key=lambda kv: -kv[1])
-    ]
-
-
-def _count_skill_buckets(items: Iterable[Any]) -> list[dict[str, Any]]:
-    counter: dict[str, int] = {}
-    for it in items:
-        if isinstance(it, dict):
-            key = str(it.get("skill") or it.get("script") or it.get("tool") or "").strip()
-        else:
-            key = str(it or "").strip()
-        if not key:
-            continue
-        counter[key] = counter.get(key, 0) + 1
-    return [
-        {"skill": name, "count": count}
-        for name, count in sorted(counter.items(), key=lambda kv: -kv[1])
-    ]
-
-
 def _resolve_display_name(profile_id: str, fallback: str = "") -> str:
     try:
         from synapse.rd_meeting.room_skill import resolve_agent_profile
@@ -417,27 +387,60 @@ def _resolve_display_name(profile_id: str, fallback: str = "") -> str:
     return fallback or profile_id
 
 
-def _count_delegations(host_messages: list[Any]) -> int:
-    """从 host messages 中数 ``delegate_to_agent`` / ``delegate_parallel`` 工具调用次数。"""
-    count = 0
-    for msg in host_messages or []:
-        content = getattr(msg, "content", None) if not isinstance(msg, dict) else msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
+def _counter_dict_to_tool_buckets(counter: dict[str, int]) -> list[dict[str, Any]]:
+    return [
+        {"name": name, "count": count}
+        for name, count in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+
+def _counter_dict_to_skill_buckets(counter: dict[str, int]) -> list[dict[str, Any]]:
+    return [
+        {"skill": name, "count": count}
+        for name, count in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+
+def _count_delegations_from_activity(rows: list[dict[str, Any]], *, role: str) -> int:
+    from synapse.rd_meeting.agent_activity import _normalize_category
+
+    if role == "host":
+        total = 0
+        for row in rows:
+            if _normalize_category(row) != "tool":
                 continue
-            if str(part.get("type") or "") != "tool_use":
-                continue
-            name = str(part.get("name") or "")
-            if name in ("delegate_to_agent", "delegate_parallel"):
-                # delegate_parallel 一次可派 N 个，input.tasks 是数组
-                if name == "delegate_parallel":
-                    tasks = part.get("input", {}).get("tasks") if isinstance(part.get("input"), dict) else None
-                    count += len(tasks) if isinstance(tasks, list) and tasks else 1
-                else:
-                    count += 1
-    return count
+            items = _extract_delegation_items_from_tool_row(row)
+            if items:
+                total += len(items)
+        return total
+    return sum(
+        1
+        for row in rows
+        if _normalize_category(row) == "input" and str(row.get("input_kind") or "") == "delegation"
+    )
+
+
+def _metrics_row_from_activity(
+    rows: list[dict[str, Any]],
+    *,
+    profile_id: str,
+    role: str,
+) -> AgentMetricsRow:
+    from synapse.rd_meeting.agent_activity import aggregate_llm_tokens
+
+    tool_counts = _aggregate_tool_counts(rows)
+    skill_counts = _aggregate_skill_counts(rows)
+    return AgentMetricsRow(
+        profile_id=profile_id,
+        display_name=_resolve_display_name(profile_id, fallback="小鲸" if role == "host" else profile_id),
+        role=role,
+        delegations=_count_delegations_from_activity(rows, role=role),
+        tool_calls=sum(tool_counts.values()),
+        skill_calls=sum(skill_counts.values()),
+        tokens=aggregate_llm_tokens(rows),
+        tools=_counter_dict_to_tool_buckets(tool_counts),
+        skills=_counter_dict_to_skill_buckets(skill_counts),
+    )
 
 
 def aggregate_node_metrics(
@@ -446,19 +449,19 @@ def aggregate_node_metrics(
     room_id: str,
     node_id: str,
     binding: dict[str, Any],
-    agent_pool: Any | None,
+    agent_pool: Any | None = None,
     orchestrator: Any | None = None,
     tokens_used: int = 0,
     duration_seconds: int = 0,
 ) -> NodeReviewMetrics:
-    """从 agent_pool + orchestrator.sub_agent_states 聚合节点级指标。
+    """从各智能体 ``activity.jsonl`` 汇总节点级指标（不再读 agent_pool / orchestrator 内存态）。"""
+    from synapse.rd_meeting.agent_activity import (
+        compute_activity_duration_seconds,
+        list_node_agent_profiles,
+        read_activity_log,
+    )
 
-    指标来源：
-    - **host**：从 pool 中的 host agent 取 ``_context.messages``、``last_usage``、``agent_state.current_task``
-    - **workers**：优先从 ``orchestrator.get_sub_agent_states`` 拿（覆盖了 tokens / tools_total / skills_total），
-      失败时回退到 pool 中 worker agent 的 task 快照
-    """
-    from synapse.rd_meeting.agent_session import host_session_id
+    _ = (room_id, agent_pool, orchestrator, tokens_used)  # 保留签名兼容，指标不再依赖运行时池
 
     host_pid = str(binding.get("host_profile_id") or "default").strip() or "default"
     worker_pids = [
@@ -466,151 +469,41 @@ def aggregate_node_metrics(
         for w in (binding.get("worker_profile_ids") or [])
         if str(w).strip() and str(w).strip() != host_pid
     ]
+    active_pids = list_node_agent_profiles(scope_id, node_id)
+
+    host_rows: list[dict[str, Any]] = []
+    if host_pid in active_pids:
+        host_rows = read_activity_log(scope_id, node_id, host_pid, limit=5000)
+
+    worker_order = [pid for pid in worker_pids if pid in active_pids]
+    worker_order.extend(sorted(pid for pid in active_pids if pid != host_pid and pid not in worker_order))
+
+    host_row = (
+        _metrics_row_from_activity(host_rows, profile_id=host_pid, role="host") if host_rows else None
+    )
+    worker_rows: list[AgentMetricsRow] = []
+    for pid in worker_order:
+        rows = read_activity_log(scope_id, node_id, pid, limit=5000)
+        if not rows:
+            continue
+        worker_rows.append(_metrics_row_from_activity(rows, profile_id=pid, role="worker"))
+
+    node_duration = compute_activity_duration_seconds(host_rows) or int(duration_seconds or 0)
+    node_tokens = (host_row.tokens if host_row else 0) + sum(w.tokens for w in worker_rows)
 
     metrics = NodeReviewMetrics(
-        node_token_total=int(tokens_used or 0),
-        node_duration_seconds=int(duration_seconds or 0),
+        node_token_total=node_tokens,
+        node_duration_seconds=node_duration,
+        host=host_row,
+        workers=worker_rows,
     )
-
-    if orchestrator is None:
-        from synapse.rd_meeting.agent_session import resolve_meeting_orchestrator
-
-        orchestrator = resolve_meeting_orchestrator(agent_pool)
-
-    host_sid = host_session_id(room_id) if room_id else ""
-
-    # ─── host ───
-    host_messages: list[Any] = []
-    host_tokens = 0
-    host_tools_executed: list[str] = []
-    host_skills_executed: list[Any] = []
-    if agent_pool is not None and room_id:
-        host_agent = None
-        try:
-            host_agent = agent_pool.get_existing(host_sid) if hasattr(agent_pool, "get_existing") else None
-        except Exception:
-            host_agent = None
-        if host_agent is not None:
-            ctx = getattr(host_agent, "_context", None)
-            host_messages = list(getattr(ctx, "messages", None) or [])
-            usage = getattr(host_agent, "last_usage", None) or {}
-            if isinstance(usage, dict):
-                host_tokens = int(usage.get("total_tokens") or usage.get("tokens") or 0)
-            state = getattr(host_agent, "agent_state", None)
-            if state is not None and hasattr(state, "get_task_for_session"):
-                from synapse.rd_meeting.agent_context_probe import _task_snapshot
-
-                snap = _task_snapshot(host_agent, host_sid)
-                if snap:
-                    host_tools_executed = list(snap.get("tools_executed") or [])
-                    host_skills_executed = list(snap.get("skills_executed") or [])
-            elif state is not None:
-                task = getattr(state, "current_task", None)
-                if task is not None:
-                    host_tools_executed = list(getattr(task, "tools_executed", None) or [])
-                    host_skills_executed = list(getattr(task, "skills_executed", None) or [])
-
-    host_tool_buckets = _count_buckets(host_tools_executed)
-    host_skill_buckets = _count_skill_buckets(host_skills_executed)
-    delegations = _count_delegations(host_messages)
-    metrics.host = AgentMetricsRow(
-        profile_id=host_pid,
-        display_name=_resolve_display_name(host_pid, fallback="小鲸"),
-        role="host",
-        delegations=delegations,
-        tool_calls=sum(b["count"] for b in host_tool_buckets),
-        skill_calls=sum(b["count"] for b in host_skill_buckets),
-        tokens=host_tokens,
-        tools=host_tool_buckets,
-        skills=host_skill_buckets,
+    metrics.delegation_total = host_row.delegations if host_row else 0
+    metrics.tool_call_total = (host_row.tool_calls if host_row else 0) + sum(
+        w.tool_calls for w in worker_rows
     )
-
-    # ─── workers ───
-    sub_rows_by_pid: dict[str, list[dict[str, Any]]] = {}
-    if orchestrator is not None:
-        try:
-            from synapse.rd_meeting.agent_session import host_session_id as _hs
-
-            host_sid = _hs(room_id)
-            sub_rows = orchestrator.get_sub_agent_states(host_sid) if hasattr(orchestrator, "get_sub_agent_states") else []
-            for row in sub_rows or []:
-                if not isinstance(row, dict):
-                    continue
-                pid = str(row.get("profile_id") or row.get("agent_id") or "").strip()
-                if not pid:
-                    continue
-                sub_rows_by_pid.setdefault(pid, []).append(row)
-        except Exception as exc:  # pragma: no cover
-            logger.debug("get_sub_agent_states failed scope=%s: %s", scope_id, exc)
-
-    for wid in worker_pids:
-        rows = sub_rows_by_pid.get(wid, [])
-        tools_acc: list[str] = []
-        skills_acc: list[Any] = []
-        tokens_acc = sum(int(r.get("tokens_used") or 0) for r in rows)
-        invocations = len(rows)
-
-        # 优先从池化 worker 读完整 TaskState（委派任务常注册在 host session）
-        if agent_pool is not None and room_id:
-            worker_sid = f"rd_meeting:{room_id}:{wid}"
-            w_agent = None
-            try:
-                w_agent = agent_pool.get_existing(worker_sid) if hasattr(agent_pool, "get_existing") else None
-            except Exception:
-                w_agent = None
-            if w_agent is not None:
-                from synapse.rd_meeting.agent_context_probe import _task_snapshot
-
-                snap = _task_snapshot(
-                    w_agent,
-                    worker_sid,
-                    fallback_session_ids=[host_sid] if host_sid else None,
-                )
-                if snap:
-                    tools_acc = list(snap.get("tools_executed") or [])
-                    skills_acc = list(snap.get("skills_executed") or [])
-                usage = getattr(w_agent, "last_usage", None) or {}
-                if isinstance(usage, dict):
-                    pool_tokens = int(usage.get("total_tokens") or usage.get("tokens") or 0)
-                    tokens_acc = max(tokens_acc, pool_tokens)
-
-        # orchestrator 子状态兜底（列表可能被截断为最近 5 条）
-        if rows:
-            if not tools_acc:
-                for r in rows:
-                    tools_acc.extend(list(r.get("tools_executed") or []))
-            if not skills_acc:
-                for r in rows:
-                    skills_acc.extend(list(r.get("skills_executed") or []))
-            if not tokens_acc:
-                tokens_acc = sum(int(r.get("tokens_used") or 0) for r in rows)
-
-        tool_buckets = _count_buckets(tools_acc)
-        skill_buckets = _count_skill_buckets(skills_acc)
-        metrics.workers.append(
-            AgentMetricsRow(
-                profile_id=wid,
-                display_name=_resolve_display_name(wid, fallback=wid),
-                role="worker",
-                delegations=invocations,
-                tool_calls=sum(b["count"] for b in tool_buckets),
-                skill_calls=sum(b["count"] for b in skill_buckets),
-                tokens=tokens_acc,
-                tools=tool_buckets,
-                skills=skill_buckets,
-            )
-        )
-
-    metrics.delegation_total = (metrics.host.delegations if metrics.host else 0)
-    metrics.tool_call_total = (metrics.host.tool_calls if metrics.host else 0) + sum(
-        w.tool_calls for w in metrics.workers
+    metrics.skill_call_total = (host_row.skill_calls if host_row else 0) + sum(
+        w.skill_calls for w in worker_rows
     )
-    metrics.skill_call_total = (metrics.host.skill_calls if metrics.host else 0) + sum(
-        w.skill_calls for w in metrics.workers
-    )
-    if metrics.host and metrics.host.tokens > metrics.node_token_total:
-        # 兜底：若调用方未给 tokens_used，使用 host last_usage
-        metrics.node_token_total = metrics.host.tokens + sum(w.tokens for w in metrics.workers)
     return metrics
 
 

@@ -1086,6 +1086,14 @@ class ReasoningEngine:
                         )
 
             _thinking_t0 = time.time()  # 思维链: 记录 thinking 开始时间
+            _agent = getattr(self._tool_executor, "_agent_ref", None)
+            if _agent is not None:
+                try:
+                    from synapse.rd_meeting.agent_activity import mark_llm_call_start
+
+                    mark_llm_call_start(_agent)
+                except Exception:
+                    pass
             try:
                 decision = await self._reason(
                     working_messages,
@@ -1185,6 +1193,20 @@ class ReasoningEngine:
             # Resource Budget: 记录 token 消耗
             if _in_tokens or _out_tokens:
                 self._budget.record_tokens(_in_tokens, _out_tokens)
+                _agent = getattr(self._tool_executor, "_agent_ref", None)
+                if _agent is not None:
+                    try:
+                        from synapse.rd_meeting.agent_activity import try_record_llm_usage_from_agent
+
+                        try_record_llm_usage_from_agent(
+                            _agent,
+                            input_tokens=_in_tokens,
+                            output_tokens=_out_tokens,
+                            usage_scene=usage_scene,
+                            model=str(current_model or ""),
+                        )
+                    except Exception as _rd_usage_exc:
+                        logger.debug("meeting llm usage record (react) failed: %s", _rd_usage_exc)
             _iter_trace: dict = {
                 "iteration": iteration + 1,
                 "timestamp": datetime.now().isoformat(),
@@ -2505,6 +2527,14 @@ class ReasoningEngine:
                 _stream_usage: dict | None = None
                 _raw_streamed_text: str = ""
 
+                if _agent is not None:
+                    try:
+                        from synapse.rd_meeting.agent_activity import mark_llm_call_start
+
+                        mark_llm_call_start(_agent)
+                    except Exception:
+                        pass
+
                 try:
                     decision = None
                     async for stream_event in self._reason_stream_iter(
@@ -2689,6 +2719,20 @@ class ReasoningEngine:
                     _out_tokens = _stream_usage.get("output_tokens", 0)
                 if _in_tokens or _out_tokens:
                     self._budget.record_tokens(_in_tokens, _out_tokens)
+                    _agent = getattr(self._tool_executor, "_agent_ref", None)
+                    if _agent is not None:
+                        try:
+                            from synapse.rd_meeting.agent_activity import try_record_llm_usage_from_agent
+
+                            try_record_llm_usage_from_agent(
+                                _agent,
+                                input_tokens=_in_tokens,
+                                output_tokens=_out_tokens,
+                                usage_scene=usage_scene,
+                                model=str(current_model or ""),
+                            )
+                        except Exception as _rd_usage_exc:
+                            logger.debug("meeting llm usage record (stream) failed: %s", _rd_usage_exc)
                 _iter_trace: dict = {
                     "iteration": _iteration + 1,
                     "timestamp": datetime.now().isoformat(),

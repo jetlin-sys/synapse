@@ -6438,6 +6438,13 @@ class Agent:
                         )
 
                     # 调用 Brain（可被 cancel_event 中断）
+                    if getattr(self, "_org_context", False):
+                        try:
+                            from synapse.rd_meeting.agent_activity import mark_llm_call_start
+
+                            mark_llm_call_start(self)
+                        except Exception as _mark_exc:
+                            logger.debug("mark_llm_call_start failed: %s", _mark_exc)
                     response = await self._cancellable_llm_call(
                         _cancel_event,
                         max_tokens=self.brain.max_tokens,
@@ -6450,6 +6457,22 @@ class Agent:
 
                     # 成功调用，重置重试计数
                     task_monitor.reset_retry_count()
+
+                    if getattr(self, "_org_context", False):
+                        _usage = getattr(response, "usage", None)
+                        if _usage is not None:
+                            try:
+                                from synapse.rd_meeting.agent_activity import try_record_llm_usage_from_agent
+
+                                try_record_llm_usage_from_agent(
+                                    self,
+                                    input_tokens=int(getattr(_usage, "input_tokens", 0) or 0),
+                                    output_tokens=int(getattr(_usage, "output_tokens", 0) or 0),
+                                    usage_scene=str(task.usage_scene or ""),
+                                    model=str(current_model or ""),
+                                )
+                            except Exception as _usage_exc:
+                                logger.debug("meeting llm usage record failed: %s", _usage_exc)
 
                 except UserCancelledError:
                     logger.info(
