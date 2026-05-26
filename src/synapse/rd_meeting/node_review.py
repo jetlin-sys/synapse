@@ -8,7 +8,8 @@ LLM 跑完后组装并落盘到 ``meeting_pipeline.json.context.node_review[node
 
 1. **metrics**：节点 token / 时长 / 各 agent 委派 / 工具 / 技能 / token 聚合
 2. **summaries**：主持人 + 各协作智能体的工作摘要（由 LLM 在 NODE_REVIEW 阶段
-   基于 ``agents/<node_id>/<pid>/conversation.jsonl`` 总结一次）
+   基于 ``agents/<node_id>/<pid>/activity.jsonl``（主）与 ``conversation.jsonl``（辅）
+   综合总结一次）
 3. **artifacts**：本节点 ``archive/<stage>/<node>/`` 下所有文件（含 mtime / size）
 4. **report_body**：兼容字段，保留 LLM 终稿，前端可不显示
 
@@ -45,6 +46,106 @@ ScopeType = Literal["demand", "task"]
 
 REVIEW_SCHEMA_VERSION = 1
 _SUMMARY_PROMPT_BUDGET_CHARS = 6000  # 单 agent 摘要 prompt 上下文最大字符数
+_ACTIVITY_ROW_PREVIEW_LIMIT = 240
+
+
+def _truncate_excerpt(body: str, limit: int = _SUMMARY_PROMPT_BUDGET_CHARS) -> str:
+    s = str(body or "").strip()
+    if len(s) <= limit:
+        return s
+    head = s[: limit // 2]
+    tail = s[-limit // 2 :]
+    return f"{head}\n\n…（节略 {len(s) - limit} 字符）…\n\n{tail}"
+
+
+def _format_activity_entry(row: dict[str, Any]) -> str:
+    from synapse.rd_meeting.agent_activity import enrich_display
+
+    item = enrich_display(dict(row))
+    cat = str(item.get("category_label") or item.get("category") or "event").strip()
+    seq = item.get("seq")
+    prefix = f"[#{seq}|{cat}]" if seq is not None else f"[{cat}]"
+
+    title = str(item.get("display_title") or "").strip()
+    tool = str(item.get("tool_name") or "").strip()
+    skill = str(item.get("skill_name") or item.get("executing_skill_id") or "").strip()
+    script = str(item.get("script_name") or item.get("executing_script_name") or "").strip()
+
+    head_parts = [prefix]
+    if title:
+        head_parts.append(title)
+    elif tool:
+        head_parts.append(f"`{tool}`")
+    elif skill:
+        head_parts.append(f"`{skill}`")
+    if tool and title and tool not in title:
+        head_parts.append(f"via `{tool}`")
+    if script and script not in ("", "instruction-only"):
+        head_parts.append(f"→ `{script}`")
+    elif script == "instruction-only" and skill:
+        head_parts.append("→ instruction-only")
+    if item.get("success") is False:
+        head_parts.append("(失败)")
+
+    preview = str(item.get("result_preview") or item.get("summary") or "").strip()
+    head = " ".join(head_parts)
+    if not preview:
+        return head
+    if len(preview) > _ACTIVITY_ROW_PREVIEW_LIMIT:
+        preview = preview[:_ACTIVITY_ROW_PREVIEW_LIMIT] + "…"
+    return f"{head}\n  {preview}"
+
+
+def _read_activity_excerpt(scope_id: str, profile_id: str, node_id: str) -> str:
+    """读取 agent 节点 activity.jsonl 并格式化为摘要 prompt 文本。"""
+    from synapse.rd_meeting.agent_activity import read_activity_log
+
+    rows = read_activity_log(scope_id, node_id, profile_id, limit=500)
+    if not rows:
+        return ""
+    lines = [_format_activity_entry(r) for r in rows if isinstance(r, dict)]
+    lines = [ln for ln in lines if ln.strip()]
+    return "\n".join(lines)
+
+
+def _read_conversation_excerpt(scope_id: str, profile_id: str, node_id: str) -> str:
+    """读取 agent 节点 conversation.jsonl（不做总预算截断，由合并函数统一处理）。"""
+    path = agent_node_dir(scope_id, profile_id, node_id) / "conversation.jsonl"
+    if not path.is_file():
+        return ""
+    try:
+        rows = [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug("read conversation %s failed: %s", path, exc)
+        return ""
+    lines: list[str] = []
+    for r in rows:
+        speaker = r.get("speaker", {})
+        kind = speaker.get("kind") or r.get("role") or "?"
+        name = speaker.get("display_name") or speaker.get("profile_id") or "-"
+        text = str(r.get("text") or "").strip()
+        if not text:
+            continue
+        lines.append(f"[{kind}|{name}] {text}")
+    return "\n".join(lines)
+
+
+def _read_agent_summary_context(scope_id: str, profile_id: str, node_id: str) -> str:
+    """综合 activity（主）与 conversation（辅）作为 LLM 摘要上下文。"""
+    activity = _read_activity_excerpt(scope_id, profile_id, node_id)
+    conversation = _read_conversation_excerpt(scope_id, profile_id, node_id)
+    parts: list[str] = []
+    if activity:
+        parts.append("### 行为日志（activity.jsonl，工具/技能/输入输出）\n" + activity)
+    if conversation:
+        parts.append("### 对话记录（conversation.jsonl）\n" + conversation)
+    if not parts:
+        return ""
+    note = (
+        "（说明：行为日志为节点内实时埋点，通常比对话记录更完整；"
+        "总结时优先依据行为日志，对话仅作补充。）"
+    )
+    return _truncate_excerpt(f"{note}\n\n" + "\n\n".join(parts))
 
 
 # ─── 数据结构 ─────────────────────────────────────────────────────────
@@ -396,33 +497,6 @@ def collect_artifact_files(scope_id: str, stage_name: str, node_id: str) -> list
 # ─── 工作摘要（LLM 生成） ─────────────────────────────────────────────
 
 
-def _read_conversation_excerpt(scope_id: str, profile_id: str, node_id: str) -> str:
-    """读取 agent 节点 conversation.jsonl 并裁剪到 prompt 预算内。"""
-    path = agent_node_dir(scope_id, profile_id, node_id) / "conversation.jsonl"
-    if not path.is_file():
-        return ""
-    try:
-        rows = [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.debug("read conversation %s failed: %s", path, exc)
-        return ""
-    lines: list[str] = []
-    for r in rows:
-        speaker = r.get("speaker", {})
-        kind = speaker.get("kind") or r.get("role") or "?"
-        name = speaker.get("display_name") or speaker.get("profile_id") or "-"
-        text = str(r.get("text") or "").strip()
-        if not text:
-            continue
-        lines.append(f"[{kind}|{name}] {text}")
-    body = "\n".join(lines)
-    if len(body) <= _SUMMARY_PROMPT_BUDGET_CHARS:
-        return body
-    head = body[: _SUMMARY_PROMPT_BUDGET_CHARS // 2]
-    tail = body[-_SUMMARY_PROMPT_BUDGET_CHARS // 2 :]
-    return f"{head}\n\n…（节略 {len(body) - _SUMMARY_PROMPT_BUDGET_CHARS} 字符）…\n\n{tail}"
-
-
 def _build_summary_prompt(
     *,
     role: str,
@@ -435,13 +509,15 @@ def _build_summary_prompt(
     return (
         f"# 任务：为 SOP 节点「{node_name}」生成 {role_label} 的本节点工作摘要\n\n"
         f"## 节点目标\n{node_intent or '（未配置）'}\n\n"
-        f"## 你需要总结的对话上下文\n"
-        f"```\n{excerpt or '（本节点没有可读的对话记录）'}\n```\n\n"
+        f"## 你需要总结的工作上下文\n"
+        f"（含 activity 行为日志与 conversation 对话；**优先依据 activity**）\n"
+        f"```\n{excerpt or '（本节点没有可读的行为日志或对话记录）'}\n```\n\n"
         "## 输出要求\n"
         "- 用 Markdown，2-6 段，第一行是一个 H3 标题（含 agent 名称 + 本节点要点）。\n"
         f"- 视角始终是 **{role_label}**：用第一人称 / 第三人称都可，但不要混。\n"
         "- 必须包含：**做了什么**、**关键决策/结论**、**遗留问题（若有）**。\n"
         "- 如果有调用其他 agent / 工具 / 技能的关键节点，简要点名（用反引号包裹）。\n"
+        "- 行为日志中的工具调用、技能加载/执行、失败项须在摘要中体现（若存在）。\n"
         "- 不要复述完整对话，不要列举每一条消息；只挑能让审阅者 30 秒理解全貌的要点。\n"
         "- 严禁编造未在上下文出现的事实。\n"
         "- 直接输出 Markdown 摘要正文，不要任何前后缀说明。\n"
@@ -489,9 +565,9 @@ def _fallback_summary(
 ) -> str:
     """LLM 不可用时的兜底：从 excerpt 拿前 4 段 + 角色信息。"""
     chunks = [c.strip() for c in (excerpt or "").splitlines() if c.strip()]
-    preview = "\n".join(chunks[:6]) if chunks else "（无对话记录可供总结）"
+    preview = "\n".join(chunks[:12]) if chunks else "（无行为日志或对话记录可供总结）"
     head = "### 主持人工作摘要" if role == "host" else f"### {display_name} 工作摘要"
-    return f"{head}\n\n_（LLM 摘要不可用，以下为对话前若干条原文回放）_\n\n```\n{preview}\n```\n"
+    return f"{head}\n\n_（LLM 摘要不可用，以下为工作上下文原文回放）_\n\n```\n{preview}\n```\n"
 
 
 async def generate_agent_summaries(
@@ -532,7 +608,7 @@ async def generate_agent_summaries(
     ]
     for pid, role in targets:
         display = _resolve_display_name(pid, fallback="小鲸" if role == "host" else pid)
-        excerpt = _read_conversation_excerpt(scope_id, pid, node_id)
+        excerpt = _read_agent_summary_context(scope_id, pid, node_id)
         prompt = _build_summary_prompt(
             role=role,
             profile_display_name=display,

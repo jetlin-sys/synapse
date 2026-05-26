@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from synapse.rd_meeting.node_review import (
+    _read_agent_summary_context,
     aggregate_node_metrics,
     build_node_review_payload,
     collect_artifact_files,
@@ -316,3 +317,103 @@ async def test_build_and_save_payload_without_llm(tmp_path):
     assert loaded is not None
     assert loaded["node_id"] == node_id
     assert loaded["metrics"]["host"]["delegations"] == 1
+
+
+@pytest.mark.asyncio
+async def test_summary_context_prefers_activity_jsonl(tmp_path):
+    scope = "scope-act"
+    node_id = "req_clarify"
+    host_dir = agent_node_dir(scope, "default", node_id)
+    host_dir.mkdir(parents=True)
+
+    activity_lines = [
+        {
+            "seq": 1,
+            "category": "skill_load",
+            "skill_name": "whalecloud-dev-tool-requirement-clarify",
+            "skill_tool": "get_skill_info",
+            "display_title": "whalecloud-dev-tool-requirement-clarify",
+            "category_label": "加载技能说明",
+            "success": True,
+            "result_preview": "instruction-only SKILL body",
+        },
+        {
+            "seq": 2,
+            "category": "tool",
+            "tool_name": "run_shell",
+            "display_title": "whalecloud-dev-tool-requirement-clarify",
+            "executing_skill_id": "whalecloud-dev-tool-requirement-clarify",
+            "executing_script_name": "instruction-only",
+            "success": True,
+            "result_preview": "exit 0",
+        },
+    ]
+    (host_dir / "activity.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in activity_lines),
+        encoding="utf-8",
+    )
+
+    ctx = _read_agent_summary_context(scope, "default", node_id)
+    assert "activity.jsonl" in ctx
+    assert "whalecloud-dev-tool-requirement-clarify" in ctx
+    assert "run_shell" in ctx
+    assert "exit 0" in ctx
+    # 无 conversation 时不应报错
+    assert "conversation.jsonl" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_build_payload_fallback_uses_activity_when_no_conversation(tmp_path):
+    scope = "scope-act2"
+    room = "room-act2"
+    node_id = "req_clarify"
+    host_dir = agent_node_dir(scope, "default", node_id)
+    host_dir.mkdir(parents=True)
+    (host_dir / "activity.jsonl").write_text(
+        json.dumps(
+            {
+                "seq": 1,
+                "category": "output",
+                "title": "反馈",
+                "display_title": "反馈",
+                "summary": "已完成需求澄清要点整理",
+                "success": True,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    base = archive_root(scope) / "需求设计" / node_id
+    base.mkdir(parents=True)
+    (base / "需求澄清.md").write_text("# OK", encoding="utf-8")
+
+    pipe_path = meeting_pipeline_path(scope)
+    pipe_path.parent.mkdir(parents=True, exist_ok=True)
+    pipe_path.write_text(
+        json.dumps({"schema_version": 1, "scope_id": scope, "context": {}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    payload = await build_node_review_payload(
+        scope_type="demand",
+        scope_id=scope,
+        room_id=room,
+        node_id=node_id,
+        binding={
+            "host_profile_id": "default",
+            "worker_profile_ids": [],
+            "node_name": "需求澄清",
+            "node_intent": "澄清需求",
+            "stage_name": "需求设计",
+        },
+        report_body="# OK",
+        tokens_used=100,
+        duration_seconds=10,
+        stage_id=2,
+        agent_pool=None,
+        orchestrator=None,
+        use_llm_summary=False,
+    )
+    summary_md = payload["summaries"][0]["summary_markdown"]
+    assert "已完成需求澄清要点整理" in summary_md or "反馈" in summary_md
