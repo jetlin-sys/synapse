@@ -26,6 +26,8 @@ import {
   NODE_TYPE_LABEL,
   SOP_STAGES,
   ALL_NODES,
+  stageIdForNodeId,
+  stageNameForId,
   type NodeType,
   type SOPNode,
   type SOPStage,
@@ -282,8 +284,25 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
       : (live.participants || []).map((p) => participantToRoomAgent(p, 'idle'));
   const agents = mergeAgentsWithLive(roster, live);
   const uiStatus = live.status as MeetingRoom['status'] | undefined;
+  const nextNodeId = (live.current_node_id || '').trim() || room.currentNode;
+  const nodeChanged = nextNodeId !== room.currentNode;
+  const nextStageIndex =
+    live.stage_id != null && Number(live.stage_id) > 0
+      ? Number(live.stage_id)
+      : nodeChanged
+        ? stageIdForNodeId(nextNodeId)
+        : room.stageIndex;
+  const nextStageName =
+    (live.stage_name || '').trim() || stageNameForId(nextStageIndex) || room.stageName;
+  const localState = room.brief.split(' · ')[0] || room.brief;
+  const nextBrief = live.current_node_name
+    ? `${localState} · ${live.current_node_name}`
+    : room.brief;
   return {
     ...room,
+    currentNode: nextNodeId,
+    stageIndex: nextStageIndex,
+    stageName: nextStageName,
     status: uiStatus && ['processing', 'human_intervention', 'completed'].includes(uiStatus)
       ? uiStatus
       : room.status,
@@ -306,9 +325,7 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
     reviewPayload:
       ((live.pending_delivery as { review_payload?: NodeReviewPayload } | undefined)
         ?.review_payload as NodeReviewPayload | undefined) ?? room.reviewPayload ?? null,
-    brief: live.phase
-      ? `${room.brief.split(' · ')[0] || room.brief} · ${live.phase}`
-      : room.brief,
+    brief: live.phase ? `${nextBrief.split(' · ')[0] || nextBrief} · ${live.phase}` : nextBrief,
   };
 }
 
@@ -967,7 +984,7 @@ const InterventionDialog = ({
     if (open && room) {
       setSelectedNodeId(room.currentNode);
     }
-  }, [open, room?.id]);
+  }, [open, room?.id, room?.currentNode, room?.stageIndex]);
 
   useEffect(() => {
     if (!open || !room) return;
@@ -1520,7 +1537,14 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
     const poll = () => {
       void fetchMeetingRoomLive(base, roomId)
         .then((live) => {
-          setActiveRoom((prev) => (prev && prev.id === roomId ? applyLivePatch(prev, live) : prev));
+          setActiveRoom((prev) => {
+            if (!prev || prev.id !== roomId) return prev;
+            const merged = applyLivePatch(prev, live);
+            return merged;
+          });
+          setRooms((prev) =>
+            prev.map((r) => (r.id === roomId ? applyLivePatch(r, live) : r)),
+          );
         })
         .catch(() => {
           /* 轮询失败静默，避免打断会中操作 */

@@ -262,6 +262,8 @@ class MeetingRoomService:
             "run_in_progress": is_room_run_in_progress(room_id),
             "current_node_id": detail.get("current_node_id"),
             "current_node_name": detail.get("current_node_name"),
+            "stage_id": detail.get("stage_id"),
+            "stage_name": detail.get("stage_name"),
             "tokenConsumed": detail.get("tokenConsumed"),
             "tokenBudget": detail.get("tokenBudget"),
             "stageDuration": detail.get("stageDuration"),

@@ -252,6 +252,8 @@ export interface MeetingRoomLivePayload {
   run_in_progress?: boolean;
   current_node_id?: string;
   current_node_name?: string;
+  stage_id?: number;
+  stage_name?: string;
   tokenConsumed?: number;
   tokenBudget?: number;
   stageDuration?: string;
