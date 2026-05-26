@@ -947,9 +947,9 @@ def enrich_display(entry: dict[str, Any]) -> dict[str, Any]:
             row["display_title"] = model
         else:
             row["display_title"] = "LLM 推理"
-        row["presentation_tier"] = "primary"
-    elif normalized in ("tool", "skill_load", "skill_exec", "skill", "skill_load_blocked"):
         row["presentation_tier"] = "secondary"
+    elif normalized in ("tool", "skill_load", "skill_exec", "skill", "skill_load_blocked"):
+        row["presentation_tier"] = "primary"
     # display_title 仅保留技能名或工具名，链式关系由前端用 executing_skill_id + tool_name 组合展示
     esid = str(row.get("executing_skill_id") or "").strip()
     if normalized == "tool":

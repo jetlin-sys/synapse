@@ -144,7 +144,7 @@ function normalizeActivityCategory(category?: string): Exclude<ActivityCategory,
 function isMutedActivityEntry(entry: ProcessingHistoryEntry, cat: Exclude<ActivityCategory, 'all'>): boolean {
   if (entry.presentation_tier === 'secondary') return true;
   if (entry.presentation_tier === 'primary') return false;
-  return cat === 'tool' || isSkillCategory(cat);
+  return cat === 'llm_usage';
 }
 
 function LlmTokenBadges({ entry }: { entry: ProcessingHistoryEntry }) {
@@ -261,8 +261,11 @@ function ProcessingHistoryCard({ entry, isLast }: { entry: ProcessingHistoryEntr
   const renderTitle = () => {
     if (isLlmRow) {
       return (
-        <span className="inline-flex items-center gap-2 flex-wrap min-w-0">
-          <span className="text-xs font-semibold text-violet-100/95 truncate max-w-[220px]" title={title}>
+        <span className={`inline-flex items-center gap-2 flex-wrap min-w-0 ${isMuted ? 'text-muted-foreground/85' : ''}`}>
+          <span
+            className={`text-xs font-semibold truncate max-w-[220px] ${isMuted ? 'text-muted-foreground/90 font-medium' : 'text-violet-100/95'}`}
+            title={title}
+          >
             {title}
           </span>
           <LlmTokenBadges entry={entry} />
@@ -302,7 +305,7 @@ function ProcessingHistoryCard({ entry, isLast }: { entry: ProcessingHistoryEntr
           isMuted
             ? 'border-border/25 bg-black/10 shadow-none hover:opacity-80'
             : `border-border/50 hover:border-border/80 hover:shadow-lg hover:shadow-black/20 bg-gradient-to-br ${chipMeta.glow}`
-        } ${isLlmRow ? 'ring-1 ring-violet-500/20' : ''}`}
+        }`}
       >
         <button
           type="button"
@@ -324,8 +327,8 @@ function ProcessingHistoryCard({ entry, isLast }: { entry: ProcessingHistoryEntr
               {durationLabel ? (
                 <span className="text-[10px] font-mono text-muted-foreground/80">{durationLabel}</span>
               ) : null}
-              {isMuted ? (
-                <span className="text-[10px] text-muted-foreground/60 italic">LLM 执行细节</span>
+              {isMuted && isLlmRow ? (
+                <span className="text-[10px] text-muted-foreground/60 italic">底层推理</span>
               ) : null}
               {entry.success === false ? (
                 <Tag color="error" className="text-[10px] leading-none m-0 px-1 py-0">失败</Tag>

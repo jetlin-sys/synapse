@@ -438,7 +438,7 @@ def test_mark_llm_call_start_records_duration(activity_work):
     assert row["output_tokens"] == 30
     assert row["total_tokens"] == 150
     assert row.get("duration_ms", 0) >= 10
-    assert row["presentation_tier"] == "primary"
+    assert row["presentation_tier"] == "secondary"
     assert "输入 120 token" in row["summary"]
 
     tool_row = enrich_display(
@@ -448,4 +448,4 @@ def test_mark_llm_call_start_records_duration(activity_work):
             "success": True,
         }
     )
-    assert tool_row["presentation_tier"] == "secondary"
+    assert tool_row["presentation_tier"] == "primary"

@@ -425,9 +425,14 @@ const ArtifactsSection: React.FC<{
 
 const DecisionBox: React.FC<{
   busy: boolean;
+  pendingMode: ReviewDecisionMode | null;
   onSubmit: (mode: ReviewDecisionMode, comment: string) => void;
-}> = ({ busy, onSubmit }) => {
+}> = ({ busy, pendingMode, onSubmit }) => {
   const [comment, setComment] = useState('');
+  const btnState = (mode: ReviewDecisionMode) => ({
+    loading: busy && pendingMode === mode,
+    disabled: busy && pendingMode !== mode,
+  });
   return (
     <div className="rounded-2xl border border-blue-500/30 bg-gradient-to-br from-blue-500/[0.06] to-violet-500/[0.04] p-5">
       <div className="flex items-center gap-2 mb-2 text-foreground">
@@ -449,14 +454,14 @@ const DecisionBox: React.FC<{
         <Button
           danger
           icon={<AlertTriangle className="w-4 h-4" />}
-          loading={busy}
+          {...btnState('escalate')}
           onClick={() => onSubmit('escalate', comment.trim())}
         >
           异常介入
         </Button>
         <Button
           icon={<XCircle className="w-4 h-4" />}
-          loading={busy}
+          {...btnState('reject')}
           onClick={() => onSubmit('reject', comment.trim())}
         >
           打回返工
@@ -464,7 +469,7 @@ const DecisionBox: React.FC<{
         <Button
           type="primary"
           icon={<CheckCircle2 className="w-4 h-4" />}
-          loading={busy}
+          {...btnState('approve')}
           onClick={() => onSubmit('approve', comment.trim())}
         >
           通过归档
@@ -488,6 +493,7 @@ export const NodeReviewPanel: React.FC<Props> = ({
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [submittingMode, setSubmittingMode] = useState<ReviewDecisionMode | null>(null);
 
   const load = useCallback(
     async (refresh = false) => {
@@ -514,6 +520,7 @@ export const NodeReviewPanel: React.FC<Props> = ({
   const onSubmit = useCallback(
     async (mode: ReviewDecisionMode, comment: string) => {
       setSubmitting(true);
+      setSubmittingMode(mode);
       try {
         await submitReviewDecision(synapseApiBase, roomId, mode, comment);
         message.success(
@@ -524,6 +531,7 @@ export const NodeReviewPanel: React.FC<Props> = ({
         message.error(e instanceof Error ? e.message : '提交失败');
       } finally {
         setSubmitting(false);
+        setSubmittingMode(null);
       }
     },
     [onDecided, roomId, synapseApiBase],
@@ -663,7 +671,7 @@ export const NodeReviewPanel: React.FC<Props> = ({
 
             {/* 4. Human decision */}
             <section>
-              <DecisionBox busy={submitting} onSubmit={onSubmit} />
+              <DecisionBox busy={submitting} pendingMode={submittingMode} onSubmit={onSubmit} />
             </section>
           </>
         )}
