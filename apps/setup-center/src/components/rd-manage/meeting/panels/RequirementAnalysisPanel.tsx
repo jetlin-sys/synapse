@@ -1,8 +1,7 @@
 /**
  * RequirementAnalysisPanel
  * 需求分析阶段 (stageIndex === 1) 的中栏面板
- * 上 70%: 搜集的产品信息及任务产出物（带独立滚动条）
- * 下 30%: 历史相似工单及明细（Table，带独立滚动条）
+ * 全高：搜集的产品信息及任务产出物（含任务产出物 / 知识库 / 知识图谱 / 历史相似工单 TAB）
  */
 import React, { useState } from 'react';
 import { Tabs, Tag, Table, Progress, Space, Typography, Button, Avatar } from 'antd';
@@ -308,14 +307,14 @@ export function RequirementAnalysisPanel({
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
 
-      {/* ── 70%: 搜集的产品信息及任务产出物 ── */}
+      {/* 搜集的产品信息及任务产出物（全高 TAB 区） */}
       <div
-        style={{ height: '70%', overflowY: 'auto', borderBottom: '1px solid var(--line)' }}
+        style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
         className="custom-scrollbar"
       >
-        <div className="p-5">
+        <div className="p-5 flex flex-col h-full min-h-0">
           {/* Section header */}
-          <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-3 flex items-center gap-2">
+          <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-3 flex items-center gap-2 shrink-0">
             <FileText className="w-3.5 h-3.5 text-indigo-400" /> 搜集的产品信息及任务产出物
           </h4>
 
@@ -323,7 +322,7 @@ export function RequirementAnalysisPanel({
             activeKey={activeTab}
             onChange={setActiveTab}
             size="small"
-            className="req-analysis-tabs"
+            className="req-analysis-tabs flex-1 min-h-0"
             items={[
               {
                 key: 'output',
@@ -358,21 +357,72 @@ export function RequirementAnalysisPanel({
                 ),
               },
               {
+                key: 'similar-tickets',
+                label: <span className="flex items-center gap-1.5 text-xs"><Ticket className="w-3 h-3" />历史相似工单</span>,
+                children: (
+                  <div className="req-analysis-similar-tickets-pane pt-3">
+                    {/* Summary stats row */}
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 5, padding: '0 4px 12px', flexShrink: 0 }}>
+                      {summaryStats.map(s => (
+                        <div key={s.label} style={{
+                          display: 'flex', flexDirection: 'column', gap: 3, padding: '6px 9px',
+                          background: s.bg, border: `1px solid ${s.border}`, borderRadius: 7,
+                        }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            {s.icon}
+                            <Text style={{ fontSize: 10, color: 'var(--muted)' }}>{s.label}</Text>
+                          </div>
+                          <Text style={{ fontSize: 12, color: s.color, fontWeight: 600, fontFamily: 'ui-monospace, monospace' }}>
+                            {s.value}
+                          </Text>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Title row */}
+                    <div style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      paddingBottom: 8, paddingLeft: 4, paddingRight: 4, flexShrink: 0,
+                    }}>
+                      <Space size={8} align="center">
+                        <Database size={13} color="#818cf8" />
+                        <Text style={{ color: 'var(--text)', fontWeight: 600, fontSize: 13 }}>历史相似工单及明细</Text>
+                      </Space>
+                      <Button
+                        type="link" size="small"
+                        style={{ color: '#60a5fa', fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 4, padding: 0 }}
+                        icon={<ExternalLink size={10} />}
+                        iconPlacement="end"
+                      >
+                        查看完整看板
+                      </Button>
+                    </div>
+
+                    {/* Table */}
+                    <div style={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column', background: 'var(--panel2)', borderRadius: 8, border: '1px solid var(--line)' }} className="custom-scrollbar rdMeetingSimilarTable">
+                      <Table<TicketRecord>
+                        dataSource={sortedTickets}
+                        columns={columns}
+                        rowKey="key"
+                        pagination={false}
+                        size="small"
+                        style={{ background: 'transparent' }}
+                        expandable={{
+                          expandedRowKeys: expandedKeys,
+                          expandedRowRender: (record) => <ExpandedDescription description={record.description} />,
+                          showExpandColumn: false,
+                        }}
+                        onRow={() => ({ style: { cursor: 'default' } })}
+                      />
+                    </div>
+                  </div>
+                ),
+              },
+              {
                 key: 'kb',
                 label: <span className="flex items-center gap-1.5 text-xs"><FileText className="w-3 h-3" />知识库检索</span>,
                 children: (
                   <div className="pt-3 space-y-3">
-                    <div className="p-3 bg-indigo-950/20 rounded-xl border border-indigo-900/30">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-900/40 border border-blue-700/40 text-blue-400">历史相似工单 (RAG)</span>
-                        <span className="text-xs text-indigo-400 font-semibold font-mono">匹配度 92%</span>
-                      </div>
-                      <div className="text-sm font-medium text-foreground mb-1.5">FIX: 订单金额总计与实际支付出现 0.01 误差</div>
-                      <p className="text-xs text-muted-foreground leading-relaxed">
-                        引用路径：<code className="text-muted-foreground bg-muted/60 px-1 rounded">docs/engineering/finance/precision-loss.md</code>
-                        {' '}· 核心结论：浮点数计算导致的资金安全风险，必须强制使用 BigDecimal 并指定 RoundingMode。
-                      </p>
-                    </div>
                     <div className="p-3 bg-emerald-950/20 rounded-xl border border-emerald-900/30">
                       <div className="flex items-center justify-between mb-2">
                         <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-900/40 border border-emerald-700/40 text-emerald-400">研发规范库</span>
@@ -430,71 +480,6 @@ export function RequirementAnalysisPanel({
           />
         </div>
 
-      </div>
-
-      {/* ── 30%: 历史相似工单及明细 ── */}
-      <div
-        style={{ height: '30%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--panel)' }}
-      >
-        {/* Section header with stats */}
-        <div style={{
-          padding: '10px 16px 0',
-          borderBottom: '1px solid var(--line)',
-          flexShrink: 0,
-          background: 'var(--panel2)',
-        }}>
-          {/* Title row */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 8, paddingLeft: 4, paddingRight: 4 }}>
-            <Space size={8} align="center">
-              <Ticket size={14} color="#818cf8" />
-              <Text style={{ color: 'var(--text)', fontWeight: 600, fontSize: 13 }}>历史相似工单及明细</Text>
-            </Space>
-            <Button
-              type="link" size="small"
-              style={{ color: '#60a5fa', fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 4, padding: 0 }}
-              icon={<ExternalLink size={10} />}
-              iconPlacement="end"
-            >
-              查看完整看板
-            </Button>
-          </div>
-
-          {/* Summary stats row */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 5, padding: '0 4px 9px' }}>
-            {summaryStats.map(s => (
-              <div key={s.label} style={{
-                display: 'flex', flexDirection: 'column', gap: 3, padding: '6px 9px',
-                background: s.bg, border: `1px solid ${s.border}`, borderRadius: 7,
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                  {s.icon}
-                  <Text style={{ fontSize: 10, color: 'var(--muted)' }}>{s.label}</Text>
-                </div>
-                <Text style={{ fontSize: 12, color: s.color, fontWeight: 600, fontFamily: 'ui-monospace, monospace' }}>
-                  {s.value}
-                </Text>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Table */}
-        <div style={{ flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column', background: 'var(--panel2)' }} className="custom-scrollbar rdMeetingSimilarTable">
-          <Table<TicketRecord>
-            dataSource={sortedTickets}
-            columns={columns}
-            rowKey="key"
-            pagination={false}
-            size="small"
-            style={{ background: 'transparent' }}
-            expandable={{
-              expandedRowKeys: expandedKeys,
-              expandedRowRender: (record) => <ExpandedDescription description={record.description} />,
-              showExpandColumn: false,
-            }}
-            onRow={() => ({ style: { cursor: 'default' } })}
-          />
-        </div>
       </div>
 
     </div>

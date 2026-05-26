@@ -19,7 +19,6 @@ import {
   AlertCircle,
   type LucideIcon,
 } from 'lucide-react';
-import { MeetingHitlForm, type HitlFormSchema } from './MeetingHitlForm';
 import type { MeetingRoomNodeBinding } from '../../../api/meetingRoomService';
 import { toast } from 'sonner';
 import { NODE_TYPE_LABEL, SOP_STAGES, type NodeType, type SOPNode } from '../../../rd-sop/constants';
@@ -38,14 +37,6 @@ const { TextArea } = Input;
 
 /** 主控固定为小鲸（profile id: default） */
 const HOST_PROFILE_ID = 'default';
-
-const DEFAULT_WORKER_PROFILE_IDS = [
-  'whalecloud-requirement-expert',
-  'whalecloud-design-expert',
-  'whalecloud-rd-expert',
-  'whalecloud-test-expert',
-  'whalecloud-qa-expert',
-] as const;
 
 interface AgentProfile {
   id: string;
@@ -214,19 +205,20 @@ function isNodeEnabled(overrides: Record<string, MeetingRoomNodeOverride>, nodeI
   return v !== false;
 }
 
-/** 载入后补齐默认阵容，并锁定主控为小鲸 */
+/** 载入后补齐默认阵容（来自 API / 出厂配置），并锁定主控为小鲸 */
 function hydrateConfigWithDefaults(config: MeetingRoomConfigPayload): MeetingRoomConfigPayload {
   const overrides = { ...(config.node_overrides || {}) };
   for (const nodeId of allSopNodeIds()) {
     const ov = { ...(overrides[nodeId] ?? {}) };
-    const workers = ov.worker_profile_ids;
-    const hasWorkers = Array.isArray(workers) && workers.length > 0;
+    const binding = bindingFor(config.bindings, nodeId);
+    const workersSource = ov.worker_profile_ids ?? binding?.worker_profile_ids;
+    const worker_profile_ids = Array.isArray(workersSource)
+      ? workersSource.filter((id) => id !== HOST_PROFILE_ID)
+      : undefined;
     overrides[nodeId] = {
       ...ov,
       host_profile_id: HOST_PROFILE_ID,
-      worker_profile_ids: hasWorkers
-        ? workers.filter((id) => id !== HOST_PROFILE_ID)
-        : [...DEFAULT_WORKER_PROFILE_IDS],
+      ...(worker_profile_ids !== undefined ? { worker_profile_ids } : {}),
     };
   }
   return { ...config, node_overrides: overrides };
@@ -264,16 +256,15 @@ function normalizeOverridesForSave(
   for (const nodeId of allSopNodeIds()) {
     const ov = nodeOverrides[nodeId] ?? {};
     const b = bindingFor(bindings, nodeId);
-    const workers = ov.worker_profile_ids;
-    const hasWorkers = Array.isArray(workers) && workers.length > 0;
+    const workers = ov.worker_profile_ids ?? b?.worker_profile_ids;
     const entry: MeetingRoomNodeOverride = {
       ...ov,
       host_profile_id: HOST_PROFILE_ID,
-      worker_profile_ids: hasWorkers
-        ? workers.filter((id) => id !== HOST_PROFILE_ID)
-        : [...DEFAULT_WORKER_PROFILE_IDS],
       node_intent: effectiveNodeIntent(ov, b),
     };
+    if (Array.isArray(workers)) {
+      entry.worker_profile_ids = workers.filter((id) => id !== HOST_PROFILE_ID);
+    }
     if (ov.human_confirm !== undefined) entry.human_confirm = ov.human_confirm;
     if (ov.hitl_form_schema) entry.hitl_form_schema = ov.hitl_form_schema;
     out[nodeId] = entry;
@@ -367,10 +358,8 @@ export const MeetingRoomConfigDrawer: React.FC<{
 
   const workerProfileIds = useMemo(() => {
     const raw = override.worker_profile_ids ?? binding?.worker_profile_ids;
-    if (Array.isArray(raw) && raw.length > 0) {
-      return raw.filter((id) => id !== HOST_PROFILE_ID);
-    }
-    return [...DEFAULT_WORKER_PROFILE_IDS];
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((id) => id !== HOST_PROFILE_ID);
   }, [override.worker_profile_ids, binding?.worker_profile_ids]);
 
   const patchOverride = (patch: MeetingRoomNodeOverride) => {
@@ -397,7 +386,6 @@ export const MeetingRoomConfigDrawer: React.FC<{
   const defaultNodeIntent = binding?.default_node_intent ?? binding?.intent ?? '';
   const meetingGoal = effectiveNodeIntent(override, binding);
   const humanConfirm = effectiveHumanConfirm(override, binding);
-  const hitlSchema = (binding?.hitl_form_schema ?? null) as HitlFormSchema | null;
   const nodeOutputs = binding?.node_outputs ?? [];
 
   const patchRoomLevel = (
@@ -876,11 +864,6 @@ export const MeetingRoomConfigDrawer: React.FC<{
                           ? '节点完成后需填写确认表单，小鲸收到结构化结果后再推进下一节点。'
                           : '节点完成后自动推进下一 SOP 节点。'}
                       </p>
-                      {humanConfirm && hitlSchema ? (
-                        <div className="mt-3 pt-3 border-t border-border/40">
-                          <MeetingHitlForm schema={hitlSchema} preview />
-                        </div>
-                      ) : null}
                     </ConfigFieldBox>
                   </div>
 

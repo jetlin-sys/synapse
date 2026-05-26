@@ -59,6 +59,37 @@
   border-bottom: 1px solid var(--line) !important;
 }
 
+.rdMeetingRoot .req-analysis-tabs.ant-tabs {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.rdMeetingRoot .req-analysis-tabs .ant-tabs-content-holder {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.rdMeetingRoot .req-analysis-tabs .ant-tabs-content,
+.rdMeetingRoot .req-analysis-tabs .ant-tabs-tabpane {
+  height: 100%;
+}
+
+.rdMeetingRoot .req-analysis-tabs .ant-tabs-tabpane {
+  overflow-y: auto;
+}
+
+.rdMeetingRoot .req-analysis-similar-tickets-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .rdMeetingRoot .rdMeetingSimilarTable .ant-table,
 .rdMeetingRoot .rdMeetingSimilarTable .ant-table-thead > tr > th,
 .rdMeetingRoot .rdMeetingSimilarTable .ant-table-tbody > tr > td {

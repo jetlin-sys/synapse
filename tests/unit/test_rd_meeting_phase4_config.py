@@ -35,7 +35,25 @@ def test_default_config_contains_v2_fields():
     assert cfg["host_llm_endpoint_key"] == DEFAULT_LLM_ENDPOINT_KEY
     assert cfg["worker_llm_endpoint_key"] == DEFAULT_LLM_ENDPOINT_KEY
     assert "meeting_skill_id" not in cfg, "meeting_skill_id 字段已彻底移除"
-    assert cfg["node_overrides"] == {}
+    overrides = cfg["node_overrides"]
+    assert isinstance(overrides, dict) and overrides, "出厂默认应包含各 SOP 节点覆盖"
+    assert overrides["req_clarify"]["worker_profile_ids"] == [
+        "whalecloud-rd-expert",
+        "whalecloud-requirement-expert",
+    ]
+    assert overrides["boundary"]["enabled"] is False
+    assert overrides["acceptance"]["enabled"] is False
+    assert overrides["req_risk"]["enabled"] is False
+    assert overrides["module_func"]["enabled"] is True
+
+
+def test_load_missing_config_uses_factory_defaults(isolated_config_dir: Path):
+    cfg = load_meeting_room_config()
+    assert cfg["node_overrides"]["req_clarify"]["worker_profile_ids"] == [
+        "whalecloud-rd-expert",
+        "whalecloud-requirement-expert",
+    ]
+    assert cfg["node_overrides"]["boundary"]["enabled"] is False
 
 
 def test_load_v1_config_upgrades_to_v2(isolated_config_dir: Path):

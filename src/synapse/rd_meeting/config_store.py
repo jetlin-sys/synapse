@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_VERSION = "2"
 DEFAULT_LLM_ENDPOINT_KEY = "default"
+_BUNDLED_DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "meeting_room_config.default.json"
 
 
 def rd_meeting_config_dir() -> Path:
@@ -39,13 +42,37 @@ def meeting_room_config_lock_path() -> Path:
     return rd_meeting_config_dir() / "meeting_room_config.lock"
 
 
-def default_meeting_room_config() -> dict[str, Any]:
+def _fallback_meeting_room_config() -> dict[str, Any]:
     return {
         "version": CONFIG_VERSION,
         "host_llm_endpoint_key": DEFAULT_LLM_ENDPOINT_KEY,
         "worker_llm_endpoint_key": DEFAULT_LLM_ENDPOINT_KEY,
         "node_overrides": {},
     }
+
+
+@lru_cache(maxsize=1)
+def _load_bundled_default_config() -> dict[str, Any]:
+    """读取出厂默认配置（随包分发 meeting_room_config.default.json）。"""
+    try:
+        data = json.loads(_BUNDLED_DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("读取出厂 meeting_room_config 失败: %s", exc)
+        return _fallback_meeting_room_config()
+    if not isinstance(data, dict):
+        return _fallback_meeting_room_config()
+    cleaned = copy.deepcopy(data)
+    cleaned.pop("meeting_skill_id", None)
+    cleaned.setdefault("version", CONFIG_VERSION)
+    cleaned.setdefault("host_llm_endpoint_key", DEFAULT_LLM_ENDPOINT_KEY)
+    cleaned.setdefault("worker_llm_endpoint_key", DEFAULT_LLM_ENDPOINT_KEY)
+    overrides = cleaned.get("node_overrides")
+    cleaned["node_overrides"] = overrides if isinstance(overrides, dict) else {}
+    return cleaned
+
+
+def default_meeting_room_config() -> dict[str, Any]:
+    return copy.deepcopy(_load_bundled_default_config())
 
 
 def _coerce_str(value: Any, default: str) -> str:
