@@ -375,6 +375,40 @@ def load_product_assets_from_pipeline(scope_id: str) -> dict[str, Any] | None:
     return assets if isinstance(assets, dict) else None
 
 
+def resolve_repo_code_path(
+    *,
+    local_path: str = "",
+    repo_name: str = "",
+    code_path: str = "",
+    code_root: str = "",
+) -> str:
+    """拼接 CODE_PATH = ``local/<repo_name>/<code_path>``（与前台 ``repo_info.code_path`` 语义一致）。
+
+    - ``local_path``：room_opened 落盘后的克隆根（``work/<scope>/code/<repo_name>/``）
+    - ``code_path``：统一服务 ``get_prod_info.repo_info[].code_path``（克隆后仓库内相对路径）
+    - 未落盘时用 ``code_root`` + ``repo_name`` 作为 ``local`` 段
+    """
+    rel = (code_path or "").strip().strip("/\\")
+    name = (repo_name or "").strip()
+    local = (local_path or "").strip().rstrip("/\\")
+    root = (code_root or "").strip().rstrip("/\\")
+
+    if local:
+        base = local
+    elif root and name:
+        base = str(Path(root) / name)
+    elif root:
+        base = root
+    else:
+        base = ""
+
+    if not base:
+        return rel
+    if rel:
+        return str(Path(base) / rel)
+    return base
+
+
 def enrich_product_with_assets(product: dict[str, Any], assets: dict[str, Any] | None) -> dict[str, Any]:
     """将落盘路径合并进 product / system 段供 prompt 使用。"""
     if not assets:
@@ -400,6 +434,12 @@ def enrich_product_with_assets(product: dict[str, Any], assets: dict[str, Any] |
         if hit:
             merged["local_path"] = hit.get("local_path")
             merged["materialize_status"] = hit.get("status")
+        merged["resolved_code_path"] = resolve_repo_code_path(
+            local_path=str(merged.get("local_path") or ""),
+            repo_name=str(merged.get("repo_name") or ""),
+            code_path=str(merged.get("code_path") or ""),
+            code_root=str(out.get("code_root") or ""),
+        )
         repos_out.append(merged)
     if repos_out:
         out["repos"] = repos_out

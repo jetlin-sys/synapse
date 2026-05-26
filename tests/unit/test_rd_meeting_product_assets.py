@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +19,7 @@ from synapse.rd_meeting.product_assets import (
     bootstrap_product_assets,
     enrich_product_with_assets,
     fetch_prod_doc,
+    resolve_repo_code_path,
     save_product_assets_to_pipeline,
 )
 from synapse.rd_meeting.room_skill import build_product_workspace_paths_section
@@ -56,6 +58,25 @@ def test_materialize_repo_converts_to_utf8_after_clone(monkeypatch, tmp_path):
     )
     assert entry["status"] == "ok"
     assert (dest / "legacy.txt").read_text(encoding="utf-8") == "编码测试"
+
+
+def test_resolve_repo_code_path_joins_local_repo_name_and_subpath():
+    local = "/work/scope/code/demo"
+    assert resolve_repo_code_path(
+        local_path=local,
+        repo_name="demo",
+        code_path="src/core",
+    ) == str(Path(local) / "src/core")
+    assert resolve_repo_code_path(
+        local_path=local,
+        repo_name="demo",
+        code_path="",
+    ) == local
+    assert resolve_repo_code_path(
+        code_root="/work/scope/code",
+        repo_name="demo",
+        code_path="packages/api",
+    ) == str(Path("/work/scope/code") / "demo" / "packages/api")
 
 
 def test_bootstrap_writes_code_and_doc(monkeypatch, tmp_path):
@@ -102,10 +123,20 @@ def test_bootstrap_writes_code_and_doc(monkeypatch, tmp_path):
     assert assets["repos"][0]["status"] == "ok"
     assert len(assets["docs"]) == 2
 
-    product = enrich_product_with_assets({"prod": "myprod", "repos": [], "docs": []}, assets)
+    product = enrich_product_with_assets(
+        {
+            "prod": "myprod",
+            "repos": [{"repo_name": "demo", "code_path": "src/core"}],
+            "docs": [],
+        },
+        assets,
+    )
     assert product["code_root"]
     assert product["doc_root"]
     assert product["repos"][0]["local_path"]
+    assert product["repos"][0]["resolved_code_path"] == str(
+        Path(product["repos"][0]["local_path"]) / "src/core"
+    )
 
     init_ctx = {
         "product": product,
@@ -113,8 +144,9 @@ def test_bootstrap_writes_code_and_doc(monkeypatch, tmp_path):
     }
     block = build_product_workspace_paths_section(init_ctx)
     assert "产品工作区路径" in block
-    assert "code" in block
-    assert "doc" in block
+    assert "CODE_PATH：" in block
+    assert product["repos"][0]["resolved_code_path"] in block
+    assert "REPO_NAME：demo" in block
 
 
 def test_build_product_workspace_paths_includes_archive_dir(monkeypatch, tmp_path):
@@ -133,7 +165,7 @@ def test_build_product_workspace_paths_includes_archive_dir(monkeypatch, tmp_pat
         stage_name="需求分析",
         node_id="req_clarify",
     )
-    assert "会议产出路径(OUTPUT_DIR/ARCHIVE_DIR)" in block
+    assert "会议产出路径（OUTPUT_DIR / ARCHIVE_DIR）" in block
     assert "archive" in block
     assert "req_clarify" in block
     assert "需求分析" in block or "req_clarify" in block

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from synapse.agents.profile import AgentProfile, get_profile_store
+from synapse.rd_meeting.product_assets import resolve_repo_code_path
 from synapse.rd_sop.nodes import node_display_name, stage_name_for_id
 
 logger = logging.getLogger(__name__)
@@ -558,13 +559,22 @@ def build_product_workspace_paths_section(
         for r in repos:
             if not isinstance(r, dict):
                 continue
-            local = str(r.get("local_path") or "").strip()
-            if not local:
-                continue
             name = str(r.get("repo_name") or "仓库").strip()
+            local = str(r.get("local_path") or "").strip()
+            code_path = str(r.get("code_path") or "").strip()
+            resolved = str(r.get("resolved_code_path") or "").strip() or resolve_repo_code_path(
+                local_path=local,
+                repo_name=name,
+                code_path=code_path,
+                code_root=code_root,
+            )
+            if not resolved:
+                continue
             st = str(r.get("materialize_status") or "").strip()
             note = f"（{st}）" if st and st != "ok" else ""
-            lines.append(f"  - 代码 `{name}`：`{local}`{note}")
+            lines.append(f"  - 代码 `{name}` 路径参数：")
+            lines.append(f"    REPO_NAME：{name}")
+            lines.append(f"    CODE_PATH：{resolved}{note}")
     if doc_root:
         lines.append(f"- **产品文档根目录**：`{doc_root}`")
     docs = prod.get("docs")
