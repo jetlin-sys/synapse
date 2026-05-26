@@ -8,8 +8,8 @@ LLM 跑完后组装并落盘到 ``meeting_pipeline.json.context.node_review[node
 
 1. **metrics**：节点 token / 时长 / 各 agent 委派 / 工具 / 技能 / token 聚合
 2. **summaries**：主持人 + 各协作智能体的工作摘要（由 LLM 在 NODE_REVIEW 阶段
-   基于 ``agents/<node_id>/<pid>/activity.jsonl``（主）与 ``conversation.jsonl``（辅）
-   综合总结一次）
+   基于 ``agents/<node_id>/<pid>/activity.jsonl`` 汇总后的结构化上下文生成；
+   **无 activity.jsonl 的智能体视为本节点未参与，不生成摘要**）
 3. **artifacts**：本节点 ``archive/<stage>/<node>/`` 下所有文件（含 mtime / size）
 4. **report_body**：兼容字段，保留 LLM 终稿，前端可不显示
 
@@ -24,6 +24,7 @@ import logging
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from synapse.rd_meeting.agent_session import (
@@ -46,7 +47,9 @@ ScopeType = Literal["demand", "task"]
 
 REVIEW_SCHEMA_VERSION = 1
 _SUMMARY_PROMPT_BUDGET_CHARS = 6000  # 单 agent 摘要 prompt 上下文最大字符数
-_ACTIVITY_ROW_PREVIEW_LIMIT = 240
+_DELEGATION_TOOL_NAMES = frozenset({"delegate_to_agent", "delegate_parallel"})
+_SKILL_CATEGORIES = frozenset({"skill_load", "skill_exec", "skill", "skill_load_blocked"})
+_TASK_SNIPPET_LIMIT = 240
 
 
 def _truncate_excerpt(body: str, limit: int = _SUMMARY_PROMPT_BUDGET_CHARS) -> str:
@@ -58,94 +61,232 @@ def _truncate_excerpt(body: str, limit: int = _SUMMARY_PROMPT_BUDGET_CHARS) -> s
     return f"{head}\n\n…（节略 {len(s) - limit} 字符）…\n\n{tail}"
 
 
-def _format_activity_entry(row: dict[str, Any]) -> str:
-    from synapse.rd_meeting.agent_activity import enrich_display
-
-    item = enrich_display(dict(row))
-    cat = str(item.get("category_label") or item.get("category") or "event").strip()
-    seq = item.get("seq")
-    prefix = f"[#{seq}|{cat}]" if seq is not None else f"[{cat}]"
-
-    title = str(item.get("display_title") or "").strip()
-    tool = str(item.get("tool_name") or "").strip()
-    skill = str(item.get("skill_name") or item.get("executing_skill_id") or "").strip()
-    script = str(item.get("script_name") or item.get("executing_script_name") or "").strip()
-
-    head_parts = [prefix]
-    if title:
-        head_parts.append(title)
-    elif tool:
-        head_parts.append(f"`{tool}`")
-    elif skill:
-        head_parts.append(f"`{skill}`")
-    if tool and title and tool not in title:
-        head_parts.append(f"via `{tool}`")
-    if script and script not in ("", "instruction-only"):
-        head_parts.append(f"→ `{script}`")
-    elif script == "instruction-only" and skill:
-        head_parts.append("→ instruction-only")
-    if item.get("success") is False:
-        head_parts.append("(失败)")
-
-    preview = str(item.get("result_preview") or item.get("summary") or "").strip()
-    head = " ".join(head_parts)
-    if not preview:
-        return head
-    if len(preview) > _ACTIVITY_ROW_PREVIEW_LIMIT:
-        preview = preview[:_ACTIVITY_ROW_PREVIEW_LIMIT] + "…"
-    return f"{head}\n  {preview}"
+def _truncate_snippet(text: str, limit: int = _TASK_SNIPPET_LIMIT) -> str:
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "…"
 
 
-def _read_activity_excerpt(scope_id: str, profile_id: str, node_id: str) -> str:
-    """读取 agent 节点 activity.jsonl 并格式化为摘要 prompt 文本。"""
+def _activity_log_path(scope_id: str, profile_id: str, node_id: str) -> Path:
+    from synapse.rd_meeting.agent_activity import _activity_path
+
+    return _activity_path(scope_id, node_id, profile_id)
+
+
+def _activity_log_exists(scope_id: str, profile_id: str, node_id: str) -> bool:
+    return _activity_log_path(scope_id, profile_id, node_id).is_file()
+
+
+def _format_count_lines(counter: dict[str, int], *, empty_label: str) -> str:
+    if not counter:
+        return empty_label
+    lines = [
+        f"- `{name}`：{count} 次"
+        for name, count in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return "\n".join(lines)
+
+
+def _extract_delegation_items_from_tool_row(row: dict[str, Any]) -> list[dict[str, Any]]:
+    tool_name = str(row.get("tool_name") or "").strip()
+    tool_input = row.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    success = row.get("success") is not False
+    items: list[dict[str, Any]] = []
+    if tool_name == "delegate_to_agent":
+        target = str(
+            tool_input.get("to")
+            or tool_input.get("agent_id")
+            or tool_input.get("profile_id")
+            or ""
+        ).strip()
+        task = str(
+            tool_input.get("message") or tool_input.get("task") or tool_input.get("prompt") or ""
+        ).strip()
+        items.append({"target_id": target, "task": task, "success": success})
+    elif tool_name == "delegate_parallel":
+        tasks = tool_input.get("tasks") or tool_input.get("delegations") or []
+        if isinstance(tasks, list):
+            for task_row in tasks:
+                if not isinstance(task_row, dict):
+                    continue
+                target = str(
+                    task_row.get("to") or task_row.get("agent_id") or task_row.get("profile_id") or ""
+                ).strip()
+                task = str(task_row.get("message") or task_row.get("task") or "").strip()
+                items.append({"target_id": target, "task": task, "success": success})
+    return items
+
+
+def _aggregate_tool_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    from synapse.rd_meeting.agent_activity import _normalize_category
+
+    counter: dict[str, int] = {}
+    for row in rows:
+        if _normalize_category(row) != "tool":
+            continue
+        name = str(row.get("tool_name") or "").strip()
+        if not name or name in _DELEGATION_TOOL_NAMES:
+            continue
+        counter[name] = counter.get(name, 0) + 1
+    return counter
+
+
+def _aggregate_skill_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    from synapse.rd_meeting.agent_activity import _normalize_category
+
+    counter: dict[str, int] = {}
+    for row in rows:
+        cat = _normalize_category(row)
+        if cat in _SKILL_CATEGORIES:
+            name = str(row.get("skill_name") or "").strip()
+            if name:
+                counter[name] = counter.get(name, 0) + 1
+                continue
+        if cat == "tool":
+            esid = str(row.get("executing_skill_id") or "").strip()
+            if esid:
+                counter[esid] = counter.get(esid, 0) + 1
+    return counter
+
+
+def _aggregate_host_delegation_section(rows: list[dict[str, Any]]) -> list[str]:
+    from synapse.rd_meeting.agent_activity import _normalize_category
+
+    lines: list[str] = []
+    human_count = sum(
+        1
+        for row in rows
+        if _normalize_category(row) == "input" and str(row.get("source") or "") == "human"
+    )
+    if human_count:
+        lines.append(f"- 与研发人员（人类）交互：{human_count} 次")
+
+    outbound: list[dict[str, Any]] = []
+    for row in rows:
+        if _normalize_category(row) != "tool":
+            continue
+        outbound.extend(_extract_delegation_items_from_tool_row(row))
+
+    if outbound:
+        lines.append(f"- 委派协作智能体：共 {len(outbound)} 次")
+        for idx, item in enumerate(outbound, start=1):
+            target_id = str(item.get("target_id") or "").strip()
+            target_name = _resolve_display_name(target_id, fallback=target_id or "协作智能体")
+            task = _truncate_snippet(str(item.get("task") or ""))
+            status = "成功" if item.get("success") is not False else "失败"
+            task_part = f"：{task}" if task else ""
+            lines.append(f"  {idx}. 委派给「{target_name}」({target_id or '?'}){task_part} — {status}")
+
+    outputs = [
+        row
+        for row in rows
+        if _normalize_category(row) == "output"
+    ]
+    if outputs:
+        lines.append(f"- 节点产出/反馈：{len(outputs)} 条")
+        for row in outputs[:8]:
+            title = str(row.get("title") or row.get("display_title") or "产出").strip()
+            summary = _truncate_snippet(str(row.get("summary") or ""))
+            ok = row.get("success") is not False
+            status = "成功" if ok else "失败"
+            detail = f" — {summary}" if summary else ""
+            lines.append(f"  - {title}{detail}（{status}）")
+
+    if not lines:
+        return ["- （本节点 activity 中无委派或人类交互记录）"]
+    return lines
+
+
+def _aggregate_worker_delegation_section(rows: list[dict[str, Any]]) -> list[str]:
+    from synapse.rd_meeting.agent_activity import _normalize_category
+
+    delegations = [
+        row
+        for row in rows
+        if _normalize_category(row) == "input" and str(row.get("input_kind") or "") == "delegation"
+    ]
+    feedbacks = [
+        row
+        for row in rows
+        if _normalize_category(row) == "output"
+        and str(row.get("output_kind") or "") == "delegation_feedback"
+    ]
+
+    if not delegations and not feedbacks:
+        return ["- （本节点 activity 中无收到委派或协作反馈记录）"]
+
+    lines: list[str] = []
+    if delegations:
+        lines.append(f"- 收到委派工作：{len(delegations)} 次")
+        for idx, row in enumerate(delegations, start=1):
+            title = str(row.get("title") or "收到委派请求").strip()
+            summary = _truncate_snippet(str(row.get("summary") or ""))
+            fb = feedbacks[idx - 1] if idx - 1 < len(feedbacks) else None
+            if fb:
+                fb_summary = _truncate_snippet(str(fb.get("summary") or ""))
+                ok = fb.get("success") is not False
+                status = "已完成" if ok else "未完成"
+                fb_part = f" — 反馈：{fb_summary}（{status}）" if fb_summary else f"（{status}）"
+            else:
+                fb_part = " — 暂无协作反馈记录"
+            task_part = f"：{summary}" if summary else ""
+            lines.append(f"  {idx}. {title}{task_part}{fb_part}")
+    elif feedbacks:
+        lines.append(f"- 协作反馈：{len(feedbacks)} 条")
+        for row in feedbacks[:8]:
+            summary = _truncate_snippet(str(row.get("summary") or ""))
+            ok = row.get("success") is not False
+            status = "已完成" if ok else "未完成"
+            lines.append(f"  - {summary or '（无摘要）'}（{status}）")
+    return lines
+
+
+def aggregate_activity_for_summary(
+    rows: list[dict[str, Any]],
+    *,
+    role: str,
+    node_name: str,
+) -> str:
+    """将 activity 行汇总为摘要 prompt 的三段结构化上下文（非原始 jsonl）。"""
+    if role == "host":
+        delegation_lines = _aggregate_host_delegation_section(rows)
+    else:
+        delegation_lines = _aggregate_worker_delegation_section(rows)
+
+    tool_counts = _aggregate_tool_counts(rows)
+    skill_counts = _aggregate_skill_counts(rows)
+
+    parts = [
+        f"## 节点环节\n{node_name}",
+        "## 一、委派任务与完成情况\n" + "\n".join(delegation_lines),
+        "## 二、工具使用统计\n"
+        + _format_count_lines(tool_counts, empty_label="（本节点未使用工具）"),
+        "## 三、技能使用统计\n"
+        + _format_count_lines(skill_counts, empty_label="（本节点未使用技能）"),
+    ]
+    return _truncate_excerpt("\n\n".join(parts))
+
+
+def build_activity_summary_context(
+    scope_id: str,
+    profile_id: str,
+    node_id: str,
+    *,
+    role: str,
+    node_name: str,
+) -> str | None:
+    """读取并汇总 activity；若文件不存在返回 ``None``（表示该智能体本节点未参与工作）。"""
+    if not _activity_log_exists(scope_id, profile_id, node_id):
+        return None
     from synapse.rd_meeting.agent_activity import read_activity_log
 
     rows = read_activity_log(scope_id, node_id, profile_id, limit=500)
     if not rows:
-        return ""
-    lines = [_format_activity_entry(r) for r in rows if isinstance(r, dict)]
-    lines = [ln for ln in lines if ln.strip()]
-    return "\n".join(lines)
-
-
-def _read_conversation_excerpt(scope_id: str, profile_id: str, node_id: str) -> str:
-    """读取 agent 节点 conversation.jsonl（不做总预算截断，由合并函数统一处理）。"""
-    path = agent_node_dir(scope_id, profile_id, node_id) / "conversation.jsonl"
-    if not path.is_file():
-        return ""
-    try:
-        rows = [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.debug("read conversation %s failed: %s", path, exc)
-        return ""
-    lines: list[str] = []
-    for r in rows:
-        speaker = r.get("speaker", {})
-        kind = speaker.get("kind") or r.get("role") or "?"
-        name = speaker.get("display_name") or speaker.get("profile_id") or "-"
-        text = str(r.get("text") or "").strip()
-        if not text:
-            continue
-        lines.append(f"[{kind}|{name}] {text}")
-    return "\n".join(lines)
-
-
-def _read_agent_summary_context(scope_id: str, profile_id: str, node_id: str) -> str:
-    """综合 activity（主）与 conversation（辅）作为 LLM 摘要上下文。"""
-    activity = _read_activity_excerpt(scope_id, profile_id, node_id)
-    conversation = _read_conversation_excerpt(scope_id, profile_id, node_id)
-    parts: list[str] = []
-    if activity:
-        parts.append("### 行为日志（activity.jsonl，工具/技能/输入输出）\n" + activity)
-    if conversation:
-        parts.append("### 对话记录（conversation.jsonl）\n" + conversation)
-    if not parts:
-        return ""
-    note = (
-        "（说明：行为日志为节点内实时埋点，通常比对话记录更完整；"
-        "总结时优先依据行为日志，对话仅作补充。）"
-    )
-    return _truncate_excerpt(f"{note}\n\n" + "\n\n".join(parts))
+        return None
+    return aggregate_activity_for_summary(rows, role=role, node_name=node_name)
 
 
 # ─── 数据结构 ─────────────────────────────────────────────────────────
@@ -503,24 +644,42 @@ def _build_summary_prompt(
     profile_display_name: str,
     node_name: str,
     node_intent: str,
-    excerpt: str,
+    activity_context: str,
 ) -> str:
-    role_label = "主持人小鲸" if role == "host" else f"协作智能体「{profile_display_name}」"
+    role_label = "主控智能体（主持人小鲸）" if role == "host" else f"协作智能体「{profile_display_name}」"
+    if role == "host":
+        example = (
+            f"在[{node_name}]研发环节中，分别委派给文档专家智能体 2 次需求整理工作，"
+            "与研发人员交互 3 次，最终完成了需求澄清文档的编写与归档。"
+        )
+        role_hint = (
+            "- 须涵盖：委派了哪些协作智能体、各委派几次及任务要点、与研发人员交互次数、"
+            "节点最终完成情况。\n"
+        )
+    else:
+        example = (
+            f"在[{node_name}]研发环节中，收到了 2 次委派工作，主要工作内容是整理需求澄清要点并生成文档，"
+            "期间使用了 `grep`、`write_file` 工具和 `whalecloud-dev-tool-requirement-clarify` 技能，"
+            "完成情况为已产出需求澄清文档并通过主控验收。"
+        )
+        role_hint = (
+            "- 须涵盖：收到几次委派、主要工作内容、使用了哪些工具与技能、完成情况。\n"
+        )
     return (
-        f"# 任务：为 SOP 节点「{node_name}」生成 {role_label} 的本节点工作摘要\n\n"
+        f"# 任务：撰写 SOP 节点「{node_name}」的 {role_label} 工作总结摘要\n\n"
         f"## 节点目标\n{node_intent or '（未配置）'}\n\n"
-        f"## 你需要总结的工作上下文\n"
-        f"（含 activity 行为日志与 conversation 对话；**优先依据 activity**）\n"
-        f"```\n{excerpt or '（本节点没有可读的行为日志或对话记录）'}\n```\n\n"
+        f"## 本智能体节点活动汇总（已结构化，请据此撰写，勿编造）\n"
+        f"```\n{activity_context}\n```\n\n"
         "## 输出要求\n"
-        "- 用 Markdown，2-6 段，第一行是一个 H3 标题（含 agent 名称 + 本节点要点）。\n"
-        f"- 视角始终是 **{role_label}**：用第一人称 / 第三人称都可，但不要混。\n"
-        "- 必须包含：**做了什么**、**关键决策/结论**、**遗留问题（若有）**。\n"
-        "- 如果有调用其他 agent / 工具 / 技能的关键节点，简要点名（用反引号包裹）。\n"
-        "- 行为日志中的工具调用、技能加载/执行、失败项须在摘要中体现（若存在）。\n"
-        "- 不要复述完整对话，不要列举每一条消息；只挑能让审阅者 30 秒理解全貌的要点。\n"
-        "- 严禁编造未在上下文出现的事实。\n"
-        "- 直接输出 Markdown 摘要正文，不要任何前后缀说明。\n"
+        "- 这是一段**工作总结摘要**（不是对话回放、不是原始日志）。\n"
+        f"- 视角始终是 **{role_label}**。\n"
+        f"{role_hint}"
+        "- 用 1-3 段自然中文，不要 Markdown 标题，不要列表，不要代码块。\n"
+        "- 语气简洁客观，审阅者 30 秒内能读懂本智能体在本节点的贡献。\n"
+        "- 严禁编造汇总数据中未出现的事实。\n"
+        "- 直接输出摘要正文，不要任何前后缀说明。\n\n"
+        "## 输出样例（格式与风格参考，内容须替换为实际汇总数据）\n"
+        f"{example}\n"
     )
 
 
@@ -561,13 +720,16 @@ def _fallback_summary(
     *,
     role: str,
     display_name: str,
-    excerpt: str,
+    activity_context: str,
+    node_name: str,
 ) -> str:
-    """LLM 不可用时的兜底：从 excerpt 拿前 4 段 + 角色信息。"""
-    chunks = [c.strip() for c in (excerpt or "").splitlines() if c.strip()]
-    preview = "\n".join(chunks[:12]) if chunks else "（无行为日志或对话记录可供总结）"
-    head = "### 主持人工作摘要" if role == "host" else f"### {display_name} 工作摘要"
-    return f"{head}\n\n_（LLM 摘要不可用，以下为工作上下文原文回放）_\n\n```\n{preview}\n```\n"
+    """LLM 不可用时的兜底：基于结构化 activity 汇总生成简短摘要。"""
+    head = "### 主控智能体工作摘要" if role == "host" else f"### {display_name} 工作摘要"
+    return (
+        f"{head}\n\n"
+        f"_（LLM 摘要不可用，以下为 [{node_name}] 节点活动汇总）_\n\n"
+        f"{activity_context}\n"
+    )
 
 
 async def generate_agent_summaries(
@@ -608,13 +770,41 @@ async def generate_agent_summaries(
     ]
     for pid, role in targets:
         display = _resolve_display_name(pid, fallback="小鲸" if role == "host" else pid)
-        excerpt = _read_agent_summary_context(scope_id, pid, node_id)
+        activity_context = build_activity_summary_context(
+            scope_id,
+            pid,
+            node_id,
+            role=role,
+            node_name=node_name,
+        )
+        if activity_context is None:
+            logger.info(
+                "[node_review summary skip] scope=%s node=%s profile=%s role=%s "
+                "reason=no_activity_jsonl",
+                scope_id,
+                node_id,
+                pid,
+                role,
+            )
+            continue
         prompt = _build_summary_prompt(
             role=role,
             profile_display_name=display,
             node_name=node_name,
             node_intent=node_intent,
-            excerpt=excerpt,
+            activity_context=activity_context,
+        )
+        logger.info(
+            "[node_review summary prompt] scope=%s node=%s profile=%s role=%s display=%s "
+            "context_chars=%d prompt_chars=%d\n--- prompt begin ---\n%s\n--- prompt end ---",
+            scope_id,
+            node_id,
+            pid,
+            role,
+            display,
+            len(activity_context),
+            len(prompt),
+            prompt,
         )
         markdown = ""
         source = "fallback"
@@ -629,7 +819,12 @@ async def generate_agent_summaries(
             if markdown:
                 source = "llm"
         if not markdown:
-            markdown = _fallback_summary(role=role, display_name=display, excerpt=excerpt)
+            markdown = _fallback_summary(
+                role=role,
+                display_name=display,
+                activity_context=activity_context,
+                node_name=node_name,
+            )
         summaries.append(
             AgentSummary(
                 profile_id=pid,
@@ -802,6 +997,8 @@ __all__ = [
     "ArtifactFile",
     "NodeReviewMetrics",
     "aggregate_node_metrics",
+    "aggregate_activity_for_summary",
+    "build_activity_summary_context",
     "build_node_review_payload",
     "collect_artifact_files",
     "generate_agent_summaries",

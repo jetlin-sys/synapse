@@ -686,6 +686,21 @@ class MeetingRoomService:
         append_user_context_pending(sid, instruction_text)
 
         kind = str(room_state.get("intervention_kind") or "interactive").strip().lower()
+        node_id = str(room_state.get("current_node_id") or "pending")
+        try:
+            from synapse.rd_meeting.binding import resolve_node_binding
+            from synapse.rd_meeting.hitl_confirmed import append_hitl_confirmed
+
+            hitl_binding = resolve_node_binding(node_id) if node_id not in ("", "pending") else None
+            append_hitl_confirmed(
+                sid,
+                node_id,
+                instruction_text,
+                binding=hitl_binding,
+                intervention_kind=kind,
+            )
+        except Exception as exc:
+            logger.debug("append hitl_confirmed failed scope=%s: %s", sid, exc)
         pending = room_state.get("pending_delivery")
         if not isinstance(pending, dict):
             pending = {}
