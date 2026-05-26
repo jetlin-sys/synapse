@@ -283,32 +283,10 @@ def build_meeting_summary_nodes(
 
 
 def history_to_chat_logs(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """会议室 UI 用的简化聊天流（Phase 1：来自 history 事件）。"""
-    from synapse.rd_meeting.flow_log import CHAT_VISIBLE_EVENTS
-    from synapse.rd_meeting.pipeline_chat import format_event_chat_display
+    """会议室 UI 用的结构化聊天流（见 ``chat_display``）。"""
+    from synapse.rd_meeting.chat_display import history_to_chat_logs as _structured_logs
 
-    logs: list[dict[str, Any]] = []
-    for i, ev in enumerate(history):
-        et = str(ev.get("event") or "")
-        if et not in CHAT_VISIBLE_EVENTS:
-            continue
-        text = format_event_chat_display(ev)
-        if not text:
-            continue
-        agent_id = str(ev.get("agent_id") or ("user" if et == "human_intervene" else "system"))
-        if et == "host_prompt_assembled" and agent_id == "system":
-            agent_id = str(ev.get("agent_id") or "default")
-        logs.append(
-            {
-                "id": str(ev.get("id") or f"hist-{i}"),
-                "agentId": agent_id,
-                "text": text,
-                "timestamp": _format_ts_hms(str(ev.get("ts") or "")),
-                "type": str(ev.get("log_type") or ("user" if et == "human_intervene" else "info")),
-                "rich": et in ("work_plan_submitted",),
-            }
-        )
-    return logs
+    return _structured_logs(history)
 
 
 def _format_ts_hms(iso: str) -> str:

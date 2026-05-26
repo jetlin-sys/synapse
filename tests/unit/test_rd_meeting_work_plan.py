@@ -133,6 +133,23 @@ def test_history_includes_work_plan_event() -> None:
     )
     assert len(logs) == 1
     assert "工作安排" in logs[0]["text"]
+    assert logs[0].get("nodeId") is None
+
+
+def test_chat_logs_carry_node_id() -> None:
+    logs = history_to_chat_logs(
+        [
+            {
+                "event": "node_started",
+                "node_id": "req_clarify",
+                "text": "节点初始化\n\n已加载。",
+                "agent_id": "default",
+                "ts": "2026-05-21T10:00:00",
+            }
+        ]
+    )
+    assert len(logs) == 1
+    assert logs[0]["nodeId"] == "req_clarify"
 
 
 def test_clear_work_plan(meeting_scope: str, monkeypatch: pytest.MonkeyPatch) -> None:

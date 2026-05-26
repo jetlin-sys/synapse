@@ -20,12 +20,12 @@ def test_pipeline_transition_not_in_chat_visible():
 
 def test_step_summaries_exclude_instance_data():
     opened = format_room_opened_chat()
-    assert "【步骤 1/3】" in opened
+    assert "开启会议室" in opened
     assert "room_id" not in opened.lower()
     assert "userwork" not in opened
 
     host = format_host_prompt_step_chat()
-    assert "【步骤 3/3】" in host
+    assert "主控提示词组装" in host
     assert "## 一、" not in host
     assert "四段式" in host
 
@@ -69,5 +69,7 @@ def test_room_opened_prefers_process_chat_text():
     }
     assert format_event_chat_display(ev) == STEP_OPEN_SUMMARY
     logs = history_to_chat_logs([{**ev, "chat_text": STEP_OPEN_SUMMARY}])
-    assert logs[0]["agentId"] == "default"
+    assert logs[0]["agentId"] == "system"
+    assert logs[0]["speakerRole"] == "system"
+    assert logs[0]["displayKind"] == "pipeline"
     assert logs[0].get("rich") is not True

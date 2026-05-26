@@ -25,12 +25,34 @@ export interface MeetingRoomListItem {
   stageDuration?: string;
 }
 
+export type MeetingChatSpeakerRoleWire = 'system' | 'host' | 'worker' | 'user';
+
+export type MeetingChatDisplayKindWire =
+  | 'node_context'
+  | 'participants'
+  | 'work_plan'
+  | 'delegation_start'
+  | 'delegation_done'
+  | 'human_report'
+  | 'hitl_tool'
+  | 'pending_confirm'
+  | 'flow_meta'
+  | 'pipeline'
+  | 'plain';
+
 export interface MeetingRoomChatLogWire {
   id: string;
   agentId: string;
   text: string;
   timestamp: string;
   type: 'info' | 'error' | 'success' | 'warning' | 'user';
+  /** 所属 SOP 节点，用于切换节点时过滤历史发言 */
+  nodeId?: string;
+  rich?: boolean;
+  event?: string;
+  speakerRole?: MeetingChatSpeakerRoleWire;
+  displayKind?: MeetingChatDisplayKindWire;
+  payload?: Record<string, unknown>;
 }
 
 export interface MeetingRoomParticipantWire {

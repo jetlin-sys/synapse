@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { ConfigProvider, theme, Avatar, Modal, Button, Input, Tag, Badge, Tooltip, Progress } from 'antd';
+import { ConfigProvider, theme, Avatar, Modal, Button, Tag, Badge, Tooltip, Progress } from 'antd';
 import {
-  approveAndResumeMeetingNode,
   fetchMeetingRoomDetail,
   fetchMeetingRoomLive,
   fetchMeetingRooms,
@@ -33,11 +32,27 @@ import {
   type SOPStage,
 } from '../../../rd-sop/constants';
 import { RequirementAnalysisPanel } from './panels/RequirementAnalysisPanel';
+import { MeetingChatEmpty, MeetingChatMessage } from './MeetingChatMessage';
+import {
+  HOST_PROFILE_ID,
+  MeetingAgentAvatar,
+  resolveLogAgent,
+  stubWorkerAgent,
+  workerColor,
+} from './MeetingAgentAvatar';
+import {
+  filterLogsForSopNode,
+  makeSopScopeDividerLog,
+  resolveChatSpeakerName,
+  shouldShowChatAvatar,
+  sopScopeKey,
+  type MeetingChatLog,
+} from './meetingChatUtils';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Bot, Cpu, FileText, TerminalSquare, AlertTriangle, ShieldAlert, Sparkles, 
-  Users, MessageSquare, CheckCircle2, ChevronRight, Hash, Activity, Send, Zap, Settings2,
-  Globe, Clock, Coins, BrainCircuit, Coffee, MoreHorizontal, CircleDashed, 
+  Users, MessageSquare, CheckCircle2, ChevronRight, Hash, Activity, Zap, Settings2,
+  Globe, Clock, Coins, MoreHorizontal, CircleDashed, 
   Terminal, Code2, GitBranch, FileCode2, Play, User, Info, Network, Code, 
   TestTube, CheckSquare, Flame, TrendingUp, Loader2, AlertCircle, MessageSquareText, ClipboardCheck
 } from 'lucide-react';
@@ -79,15 +94,7 @@ interface RoomAgent extends Agent {
   currentAction: string;
 }
 
-interface LogEntry {
-  id: string;
-  agentId: string;
-  text: string;
-  timestamp: string;
-  type: 'info' | 'error' | 'success' | 'warning' | 'user';
-  /** 后端 pipeline / 提示词等长文 Markdown，需 pre-wrap 展示 */
-  rich?: boolean;
-}
+type LogEntry = MeetingChatLog;
 
 interface MeetingRoom {
   id: string;
@@ -113,23 +120,10 @@ interface MeetingRoom {
   hitlLocked?: boolean;
   hitlSubmission?: { values?: Record<string, unknown>; submitted_at?: string } | null;
   participants?: MeetingRoomParticipantWire[];
+  /** 当前对话绑定的 SOP 作用域（stage:node），切换时清空并重载发言 */
+  chatSopKey?: string;
 }
 
-const HOST_PROFILE_ID = 'default';
-
-const WORKER_COLORS = [
-  'bg-sky-500',
-  'bg-indigo-500',
-  'bg-teal-500',
-  'bg-cyan-500',
-  'bg-emerald-500',
-];
-
-function workerColor(profileId: string): string {
-  let h = 0;
-  for (let i = 0; i < profileId.length; i++) h = (h + profileId.charCodeAt(i)) % WORKER_COLORS.length;
-  return WORKER_COLORS[h] ?? 'bg-sky-500';
-}
 
 function participantToRoomAgent(p: MeetingRoomParticipantWire, status: RoomAgent['status'] = 'idle'): RoomAgent {
   const isHost = p.role === 'host' || p.profile_id === HOST_PROFILE_ID;
@@ -273,16 +267,19 @@ function mapLiveAgents(live: MeetingRoomLivePayload, roster: RoomAgent[] = []): 
   return [participantToRoomAgent(hostRow, hostStatus), ...workers];
 }
 
+function rosterFromLiveParticipants(live: MeetingRoomLivePayload): RoomAgent[] {
+  const parts = live.participants || [];
+  if (!parts.length) return [];
+  const host = parts.find((p) => p.role === 'host') ?? parts[0];
+  const workers = parts.filter((p) => p.profile_id !== host.profile_id);
+  const runBusy = Boolean(live.run_in_progress);
+  return [
+    participantToRoomAgent(host, runBusy ? 'processing' : 'idle'),
+    ...workers.map((w) => participantToRoomAgent(w, runBusy ? 'processing' : 'idle')),
+  ];
+}
+
 function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): MeetingRoom {
-  const logs =
-    live.recent_chat && live.recent_chat.length > 0
-      ? live.recent_chat.map(mapChatWireToLog)
-      : room.logs;
-  const roster =
-    room.agents.length > 0
-      ? room.agents
-      : (live.participants || []).map((p) => participantToRoomAgent(p, 'idle'));
-  const agents = mergeAgentsWithLive(roster, live);
   const uiStatus = live.status as MeetingRoom['status'] | undefined;
   const nextNodeId = (live.current_node_id || '').trim() || room.currentNode;
   const nodeChanged = nextNodeId !== room.currentNode;
@@ -294,6 +291,50 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
         : room.stageIndex;
   const nextStageName =
     (live.stage_name || '').trim() || stageNameForId(nextStageIndex) || room.stageName;
+  const nextSopKey = sopScopeKey(nextStageIndex, nextNodeId);
+  const sopChanged = nextSopKey !== (room.chatSopKey ?? sopScopeKey(room.stageIndex, room.currentNode));
+
+  let logs = room.logs;
+  if (live.recent_chat && live.recent_chat.length > 0) {
+    const mapped = live.recent_chat.map(mapChatWireToLog);
+    logs = sopChanged ? filterLogsForSopNode(mapped, nextNodeId) : mapped;
+    if (sopChanged && logs.length === 0) {
+      logs = [
+        makeSopScopeDividerLog(
+          nextNodeId,
+          nextStageName,
+          (live.current_node_name || '').trim() || undefined,
+        ),
+      ];
+    } else if (sopChanged) {
+      logs = [
+        makeSopScopeDividerLog(
+          nextNodeId,
+          nextStageName,
+          (live.current_node_name || '').trim() || undefined,
+        ),
+        ...logs,
+      ];
+    }
+  } else if (sopChanged) {
+    logs = [
+      makeSopScopeDividerLog(
+        nextNodeId,
+        nextStageName,
+        (live.current_node_name || '').trim() || undefined,
+      ),
+    ];
+  }
+
+  const rosterFromLive = rosterFromLiveParticipants(live);
+  const roster = sopChanged && rosterFromLive.length > 0
+    ? rosterFromLive
+    : room.agents.length > 0
+      ? room.agents
+      : rosterFromLive.length > 0
+        ? rosterFromLive
+        : (live.participants || []).map((p) => participantToRoomAgent(p, 'idle'));
+  const agents = mergeAgentsWithLive(roster, live);
   const localState = room.brief.split(' · ')[0] || room.brief;
   const nextBrief = live.current_node_name
     ? `${localState} · ${live.current_node_name}`
@@ -326,12 +367,15 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
       ((live.pending_delivery as { review_payload?: NodeReviewPayload } | undefined)
         ?.review_payload as NodeReviewPayload | undefined) ?? room.reviewPayload ?? null,
     brief: live.phase ? `${nextBrief.split(' · ')[0] || nextBrief} · ${live.phase}` : nextBrief,
+    chatSopKey: nextSopKey,
+    participants: live.participants?.length ? live.participants : room.participants,
   };
 }
 
 function mapChatWireToLog(w: MeetingRoomChatLogWire): LogEntry {
   const rich =
-    Boolean((w as { rich?: boolean }).rich) ||
+    Boolean(w.rich) ||
+    w.displayKind === 'work_plan' ||
     /^(【步骤|\*\*流程迁移|# 工作安排计划)/.test((w.text || '').trim());
   return {
     id: w.id,
@@ -340,6 +384,11 @@ function mapChatWireToLog(w: MeetingRoomChatLogWire): LogEntry {
     timestamp: w.timestamp,
     type: w.type,
     rich,
+    nodeId: w.nodeId,
+    event: w.event,
+    speakerRole: w.speakerRole,
+    displayKind: w.displayKind,
+    payload: w.payload,
   };
 }
 
@@ -352,7 +401,9 @@ function getLogsTailKey(logs: LogEntry[]): string {
 
 function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
   const timeStr = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  const chatLogs = (item.chat_logs || []).map(mapChatWireToLog);
+  const nodeId = item.current_node_id || 'pending';
+  const stageId = item.stage_id ?? 0;
+  const chatLogs = filterLogsForSopNode((item.chat_logs || []).map(mapChatWireToLog), nodeId);
   const logs =
     chatLogs.length > 0
       ? chatLogs
@@ -391,6 +442,7 @@ function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
       ((item.room_state?.pending_delivery as { review_payload?: NodeReviewPayload } | undefined)
         ?.review_payload as NodeReviewPayload | undefined) ?? null,
     participants: item.participants,
+    chatSopKey: sopScopeKey(item.stage_id ?? 0, item.current_node_id || 'pending'),
   };
 }
 
@@ -662,102 +714,7 @@ const MOCK_BASE_AGENTS: Record<string, Agent> = {
   epsilon: { id: 'epsilon', name: 'Epsilon', role: '领域专家', avatarColor: 'bg-teal-600', icon: <Globe className="w-4 h-4" /> },
 };
 
-// --- Sub-components ---
-
-const AgentStatusIcon = ({ status }: { status: RoomAgent['status'] }) => {
-  switch (status) {
-    case 'processing': return <BrainCircuit className="w-3 h-3 text-blue-400 animate-pulse" />;
-    case 'idle': return <Coffee className="w-3 h-3 text-muted-foreground" />;
-    case 'error': return <AlertTriangle className="w-3 h-3 text-red-400" />;
-  }
-};
-
-const AgentAvatar = ({
-  agent,
-  size = 'normal',
-  showStatusBadge = true,
-  onClick,
-}: {
-  agent: RoomAgent;
-  size?: 'small' | 'normal' | 'large';
-  /** 右上角状态角标（协作流对话框内默认关闭，避免与主头像叠两层图标） */
-  showStatusBadge?: boolean;
-  /** 点击查看该智能体运行时上下文 */
-  onClick?: () => void;
-}) => {
-  const isLarge = size === 'large';
-  const sizeClasses = isLarge ? 'w-10 h-10' : size === 'small' ? 'w-6 h-6' : 'w-8 h-8';
-
-  const handleClick = onClick
-    ? (e: React.MouseEvent) => {
-        e.stopPropagation();
-        onClick();
-      }
-    : undefined;
-
-  const content = (
-    <div
-      role={onClick ? 'button' : undefined}
-      tabIndex={onClick ? 0 : undefined}
-      aria-label={onClick ? `查看 ${agent.name} 上下文` : undefined}
-      onClick={handleClick}
-      onKeyDown={
-        onClick
-          ? (e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                e.stopPropagation();
-                onClick();
-              }
-            }
-          : undefined
-      }
-      className={`relative inline-flex outline-none ${
-        onClick
-          ? 'cursor-pointer transition-transform duration-150 hover:-translate-y-0.5 hover:scale-105 focus-visible:ring-2 focus-visible:ring-blue-500/60 rounded-full'
-          : ''
-      }`}
-    >
-      <div
-        className={`${sizeClasses} rounded-full flex items-center justify-center text-white ${agent.avatarColor} border-2 border-background shadow-lg relative z-10 overflow-hidden`}
-      >
-        {agent.status === 'processing' && (
-          <motion.div
-            className="absolute inset-0 bg-white/20"
-            animate={{ y: ['100%', '-100%'] }}
-            transition={{ repeat: Infinity, duration: 2, ease: 'linear' }}
-          />
-        )}
-        {agent.icon}
-      </div>
-
-      {showStatusBadge ? (
-        <div
-          className={`absolute -top-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border-2 border-background z-20 ${
-            agent.status === 'processing'
-              ? 'bg-blue-900'
-              : agent.status === 'error'
-                ? 'bg-red-900'
-                : 'bg-muted'
-          }`}
-        >
-          <AgentStatusIcon status={agent.status} />
-          {agent.status === 'processing' && (
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-50" />
-          )}
-          {agent.status === 'error' && (
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-40" />
-          )}
-        </div>
-      ) : null}
-    </div>
-  );
-
-  if (!onClick) return content;
-  return (
-    <Tooltip title={`${agent.name} · 点击查看上下文`}>{content}</Tooltip>
-  );
-};
+// --- Sub-components (AgentAvatar → MeetingAgentAvatar.tsx) ---
 
 const RoomCard = ({ room, onClick }: { room: MeetingRoom, onClick: (r: MeetingRoom) => void }) => {
   const [activeLogIndex, setActiveLogIndex] = useState(room.logs.length - 1);
@@ -854,7 +811,7 @@ const RoomCard = ({ room, onClick }: { room: MeetingRoom, onClick: (r: MeetingRo
                 }
               >
                 <div className="flex flex-col items-center gap-1.5 group/ag">
-                  <AgentAvatar agent={agent} />
+                  <MeetingAgentAvatar agent={agent} />
                   <span className="text-[10px] text-muted-foreground max-w-[48px] truncate text-center transition-colors group-hover/ag:text-foreground">
                     {agent.name}
                   </span>
@@ -929,21 +886,16 @@ const InterventionDialog = ({
   room, 
   open, 
   onClose,
-  onIntervene,
-  onApprovePass,
-  approveBusy,
+  onHitlSubmit,
   synapseApiBase,
 }: { 
   room: MeetingRoom | null; 
   open: boolean; 
   onClose: () => void;
-  onIntervene: (text: string, options?: { resumeRun?: boolean }) => void;
-  onApprovePass?: () => void;
-  approveBusy?: boolean;
+  /** 仅中栏人工确认表单提交时使用，协作流只读 */
+  onHitlSubmit?: (text: string) => void;
   synapseApiBase?: string;
 }) => {
-  const [inputText, setInputText] = useState('');
-  const [isTyping, setIsTyping] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [centerTab, setCenterTab] = useState<'detail' | 'hitl'>('detail');
   const [contextOpen, setContextOpen] = useState(false);
@@ -1000,12 +952,6 @@ const InterventionDialog = ({
     scrollLogsToBottom();
   }, [open, room?.logs, scrollLogsToBottom]);
 
-  useEffect(() => {
-    if (open && isTyping) {
-      scrollLogsToBottom();
-    }
-  }, [open, isTyping, scrollLogsToBottom]);
-
   if (!room) return null;
 
   const openAgentContext = (agent: RoomAgent) => {
@@ -1017,14 +963,6 @@ const InterventionDialog = ({
       isHost: agent.id === HOST_PROFILE_ID || agent.role === '会议主持',
     });
     setContextOpen(true);
-  };
-
-  const handleSend = () => {
-    if (!inputText.trim()) return;
-    onIntervene(inputText);
-    setInputText('');
-    setIsTyping(true);
-    setTimeout(() => setIsTyping(false), 1500);
   };
 
   // Only show nodes for the current stage
@@ -1242,7 +1180,7 @@ const InterventionDialog = ({
                       const summary = Object.entries(values)
                         .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(',') : String(v)}`)
                         .join('\n');
-                      onIntervene(`[人工确认表单]\n${summary}`, { resumeRun: true });
+                      onHitlSubmit?.(`[人工确认表单]\n${summary}`);
                     }}
                   />
                 </div>
@@ -1334,7 +1272,7 @@ const InterventionDialog = ({
                  <Avatar size="small" className="bg-muted text-[10px] ring-2 ring-background">我</Avatar>
                  <span className="mx-1 text-muted-foreground/70">|</span>
                  {room.agents.map(a => (
-                   <AgentAvatar
+                   <MeetingAgentAvatar
                      key={a.id}
                      agent={a}
                      size="small"
@@ -1347,138 +1285,44 @@ const InterventionDialog = ({
           </div>
 
           {/* Chat Logs */}
-          <div className="flex-1 overflow-y-auto p-5 space-y-5 custom-scrollbar scroll-smooth">
-            {room.logs.map((log, index) => {
-              const isUser = log.type === 'user';
-              const agent = room.agents.find(a => a.id === log.agentId);
-              return (
-                <motion.div 
-                  key={log.id || index}
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className={`flex gap-2.5 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
-                >
-                  {!isUser && agent && (
-                    <div className="shrink-0 mt-0.5">
-                      <AgentAvatar
-                        agent={agent}
-                        size="small"
-                        showStatusBadge={false}
-                        onClick={() => openAgentContext(agent)}
-                      />
-                    </div>
-                  )}
-                  <div className={`flex flex-col max-w-[85%] ${isUser ? 'items-end' : 'items-start'}`}>
-                    <div className="flex items-center gap-2 mb-1 px-1">
-                      <span className="text-[11px] font-medium text-foreground/90">
-                        {isUser ? '我 (人类专家)' : resolveSpeakerName(room, log.agentId)}
-                      </span>
-                      <span className="text-[9px] text-muted-foreground font-mono">{log.timestamp}</span>
-                    </div>
-                    <div className={`px-3 py-2.5 rounded-xl text-[13px] leading-relaxed shadow-sm
-                      ${isUser ? 'bg-blue-600 text-white rounded-tr-sm' : 
-                        log.type === 'error' ? 'bg-red-950/40 border border-red-900/50 text-red-200 rounded-tl-sm' :
-                        log.type === 'warning' ? 'bg-amber-950/40 border border-amber-900/50 text-amber-200 rounded-tl-sm' :
-                        log.type === 'success' ? 'bg-green-950/40 border border-green-900/50 text-green-200 rounded-tl-sm' :
-                        'bg-muted border border-border/50 text-foreground rounded-tl-sm'
-                      } ${log.rich ? 'max-h-[min(70vh,520px)] overflow-y-auto custom-scrollbar whitespace-pre-wrap font-mono text-[11px]' : ''}`}>
-                      {log.type === 'error' && <ShieldAlert className="w-3.5 h-3.5 inline-block mr-1.5 -mt-0.5 text-red-400" />}
-                      {log.type === 'warning' && <AlertTriangle className="w-3.5 h-3.5 inline-block mr-1.5 -mt-0.5 text-amber-400" />}
-                      {log.type === 'success' && <CheckCircle2 className="w-3.5 h-3.5 inline-block mr-1.5 -mt-0.5 text-green-400" />}
-                      {log.text}
-                    </div>
-                  </div>
-                </motion.div>
-              );
-            })}
-            
-            <AnimatePresence>
-              {isTyping && (
-                <motion.div 
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  exit={{ opacity: 0, scale: 0.95 }}
-                  className="flex gap-2.5 flex-row items-center"
-                >
-                  <div className="shrink-0">
-                    <AgentAvatar agent={room.agents[0]} size="small" showStatusBadge={false} />
-                  </div>
-                  <div className="bg-muted border border-border/50 rounded-xl rounded-tl-sm px-3 py-2.5 text-muted-foreground text-xs flex items-center gap-2">
-                    <BrainCircuit className="w-3.5 h-3.5 animate-pulse text-blue-400" />
-                    <span>{room.agents[0].name} 正在思考...</span>
-                    <span className="flex gap-1 ml-1">
-                      <span className="w-1 h-1 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                      <span className="w-1 h-1 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                      <span className="w-1 h-1 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                    </span>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
+          <div className="flex-1 overflow-y-auto px-4 py-4 custom-scrollbar scroll-smooth">
+            <div className="rd-meeting-chat-stream">
+              {room.logs.length === 0 ? <MeetingChatEmpty /> : null}
+              {room.logs.map((log, index) => {
+                const agent = resolveLogAgent(room.agents, log.agentId, log);
+                const speaker = resolveChatSpeakerName(
+                  log,
+                  agent?.name || resolveSpeakerName(room, log.agentId),
+                );
+                const showAvatar = shouldShowChatAvatar(log);
+                const avatarAgent =
+                  agent ??
+                  (log.speakerRole === 'worker'
+                    ? stubWorkerAgent(log.agentId, speaker)
+                    : undefined);
+                return (
+                  <motion.div
+                    key={log.id || `log-${index}`}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.22 }}
+                  >
+                    <MeetingChatMessage
+                      log={log}
+                      speakerName={speaker}
+                      agent={showAvatar ? avatarAgent : undefined}
+                      showAvatar={showAvatar}
+                      onAvatarClick={
+                        showAvatar && avatarAgent && log.speakerRole !== 'system'
+                          ? () => openAgentContext(avatarAgent)
+                          : undefined
+                      }
+                    />
+                  </motion.div>
+                );
+              })}
+            </div>
             <div ref={logsEndRef} className="h-2" />
-          </div>
-
-          {/* Input Area */}
-          <div className="p-4 bg-[color:var(--panel2)] border-t border-border shrink-0">
-            {hitlAvailable ? (
-              <button
-                type="button"
-                onClick={() => setCenterTab('hitl')}
-                className="w-full mb-3 px-3 py-2 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs flex items-center justify-between hover:bg-amber-500/15 transition-colors"
-              >
-                <span className="flex items-center gap-2">
-                  <ClipboardCheck className="w-3.5 h-3.5" />
-                  {hitlBadgeText}：请到中栏「人工确认」Tab 提交
-                </span>
-                <ChevronRight className="w-3.5 h-3.5" />
-              </button>
-            ) : null}
-            <div className="flex items-end gap-2.5 bg-[color:var(--panel)] border border-border p-2 rounded-xl focus-within:border-blue-500/50 focus-within:ring-1 focus-within:ring-blue-500/20 transition-all">
-              <Input.TextArea
-                value={inputText}
-                onChange={e => setInputText(e.target.value)}
-                placeholder={room.status === 'human_intervention' ? "下发指令唤醒智能体..." : "@Alpha 下发新指令..."}
-                autoSize={{ minRows: 1, maxRows: 3 }}
-                className="bg-transparent border-none text-foreground placeholder:text-muted-foreground shadow-none focus:ring-0 custom-scrollbar resize-none text-[13px]"
-                style={{ boxShadow: 'none' }}
-                onPressEnter={(e) => {
-                  if (!e.shiftKey) {
-                    e.preventDefault();
-                    handleSend();
-                  }
-                }}
-              />
-              <Button 
-                type="primary" 
-                icon={<Send className="w-3.5 h-3.5" />} 
-                onClick={handleSend}
-                className="bg-blue-600 hover:bg-blue-500 h-8 w-9 px-0 flex items-center justify-center shrink-0 rounded-lg border-none shadow-[0_4px_12px_rgba(37,99,235,0.3)] mb-0.5"
-              />
-            </div>
-            <div className="mt-2.5 flex items-center justify-between text-[11px] text-muted-foreground px-1">
-              <div className="flex items-center gap-3">
-                {onApprovePass && room.hitlPendingSummary ? (
-                  <button
-                    type="button"
-                    disabled={approveBusy}
-                    className="flex items-center gap-1 transition-colors hover:text-blue-400 disabled:opacity-50"
-                    onClick={() => onApprovePass()}
-                  >
-                    <Zap className="h-3 w-3" /> 确认总结并推进
-                  </button>
-                ) : onApprovePass ? (
-                  <button
-                    type="button"
-                    disabled={approveBusy}
-                    className="flex items-center gap-1 transition-colors hover:text-blue-400 disabled:opacity-50"
-                    onClick={() => onApprovePass()}
-                  >
-                    <Zap className="h-3 w-3" /> 一键通过
-                  </button>
-                ) : null}
-              </div>
-              <span>Enter 发送</span>
-            </div>
           </div>
         </div>
 
@@ -1503,8 +1347,6 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
   const [activeRoom, setActiveRoom] = useState<MeetingRoom | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
-  const [approveBusy, setApproveBusy] = useState(false);
-
   const reloadRooms = useCallback(async () => {
     const base = (synapseApiBase || '').trim();
     if (!base) {
@@ -1594,42 +1436,17 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
       });
   };
 
-  const handleApprovePass = () => {
-    if (!activeRoom) return;
-    const base = (synapseApiBase || '').trim();
-    if (!base) return;
-    setApproveBusy(true);
-    void approveAndResumeMeetingNode(base, activeRoom.id)
-      .then((detail) => {
-        const updatedRoom = mapDetailToRoom(detail);
-        setActiveRoom(updatedRoom);
-        setRooms((prev) => prev.map((r) => (r.id === updatedRoom.id ? updatedRoom : r)));
-        toast.success('已确认总结，归档并推进至下一节点');
-        void reloadRooms();
-      })
-      .catch((e) => {
-        toast.error(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => setApproveBusy(false));
-  };
-
-  const handleIntervene = (text: string, options?: { resumeRun?: boolean }) => {
+  const handleHitlSubmit = (text: string) => {
     if (!activeRoom) return;
     const base = (synapseApiBase || '').trim();
     if (!base) return;
 
-    const messageType =
-      activeRoom.status === 'processing' && !options?.resumeRun ? 'chat' : 'instruction';
-
-    void interveneMeetingRoom(base, activeRoom.id, text, messageType, {
-      resumeRun: options?.resumeRun ?? messageType === 'instruction',
-    })
+    void interveneMeetingRoom(base, activeRoom.id, text, 'instruction', { resumeRun: true })
       .then((detail) => {
         const updatedRoom = mapDetailToRoom(detail);
-        const locked = Boolean(detail.room_state?.hitl_locked);
-        updatedRoom.brief = locked
+        updatedRoom.brief = Boolean(detail.room_state?.hitl_locked)
           ? '表单已提交并锁定，系统正在继续处理…'
-          : '人类专家已介入并下发指令，正在重新评估状态...';
+          : updatedRoom.brief;
         setActiveRoom(updatedRoom);
         setRooms((prev) => prev.map((r) => (r.id === updatedRoom.id ? updatedRoom : r)));
         if ((detail as { resume_run_started?: boolean }).resume_run_started) {
@@ -1637,21 +1454,7 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
         }
       })
       .catch((e) => {
-        const msg = e instanceof Error ? e.message : String(e);
-        const fallback: MeetingRoom = {
-          ...activeRoom,
-          logs: [
-            ...activeRoom.logs,
-            {
-              id: Date.now().toString(),
-              agentId: 'user',
-              text,
-              timestamp: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-              type: 'user',
-            },
-          ],
-        };
-        setActiveRoom(fallback);
+        toast.error(e instanceof Error ? e.message : String(e));
       });
   };
 
@@ -1717,9 +1520,7 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
           room={activeRoom}
           open={dialogOpen}
           onClose={() => setDialogOpen(false)}
-          onIntervene={handleIntervene}
-          onApprovePass={handleApprovePass}
-          approveBusy={approveBusy}
+          onHitlSubmit={handleHitlSubmit}
           synapseApiBase={synapseApiBase}
         />
 

@@ -1,0 +1,501 @@
+"""协作会议流：history 事件 → 结构化 chat log（含展示类型与发言角色）。"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from synapse.rd_meeting.flow_log import CHAT_VISIBLE_EVENTS, is_flow_log_json
+from synapse.rd_meeting.pipeline_chat import format_event_chat_display
+
+# 发言角色：system=编排/日志；host=小鲸；worker=协作智能体；user=人工
+SPEAKER_SYSTEM = "system"
+SPEAKER_HOST = "host"
+SPEAKER_WORKER = "worker"
+SPEAKER_USER = "user"
+
+DELEGATION_START_RE = re.compile(
+    r"^小鲸\s*→\s*(.+?)：已委派协作",
+)
+DELEGATION_DONE_RE = re.compile(
+    r"^(.+?)\s+(completed|failed)(?:\s*·\s*(\d+)s)?(?:\s*：(.*))?$",
+    re.DOTALL,
+)
+
+
+def _try_parse_json(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw.startswith("{"):
+        return None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _is_node_context_payload(obj: dict[str, Any]) -> bool:
+    return isinstance(obj.get("order"), dict) and (
+        isinstance(obj.get("product"), dict) or isinstance(obj.get("system"), dict)
+    )
+
+
+def _is_participants_meta(obj: dict[str, Any]) -> bool:
+    return bool(obj.get("room_id")) and (
+        obj.get("worker_profile_ids") is not None or obj.get("participants") is not None
+    )
+
+
+def _is_human_report_meta(obj: dict[str, Any]) -> bool:
+    return bool(str(obj.get("report_preview") or "").strip()) or obj.get("success") is not None
+
+
+def _format_ts_hms(iso: str) -> str:
+    from synapse.rd_meeting.room_runtime import _format_ts_hms as _fmt
+
+    return _fmt(iso)
+
+
+def _base_row(ev: dict[str, Any], index: int) -> dict[str, Any]:
+    et = str(ev.get("event") or "")
+    node_id = str(ev.get("node_id") or "").strip() or None
+    return {
+        "id": str(ev.get("id") or f"hist-{index}"),
+        "event": et,
+        "nodeId": node_id,
+        "timestamp": _format_ts_hms(str(ev.get("ts") or "")),
+        "type": str(ev.get("log_type") or ("user" if et == "human_intervene" else "info")),
+    }
+
+
+def _row(
+    ev: dict[str, Any],
+    index: int,
+    *,
+    text: str,
+    agent_id: str,
+    speaker_role: str,
+    display_kind: str,
+    payload: dict[str, Any] | None = None,
+    rich: bool = False,
+    suffix: str = "",
+) -> dict[str, Any]:
+    row = _base_row(ev, index)
+    row["agentId"] = agent_id
+    row["speakerRole"] = speaker_role
+    row["displayKind"] = display_kind
+    row["text"] = text
+    if payload is not None:
+        row["payload"] = payload
+    if rich:
+        row["rich"] = True
+    if suffix:
+        row["id"] = f"{row['id']}{suffix}"
+    return row
+
+
+def _participants_payload(ev: dict[str, Any]) -> dict[str, Any]:
+    binding = ev.get("binding") if isinstance(ev.get("binding"), dict) else {}
+    participants = ev.get("participants") if isinstance(ev.get("participants"), list) else []
+    workers = binding.get("worker_profile_ids")
+    if workers is None and participants:
+        host_pid = str(binding.get("host_profile_id") or ev.get("agent_id") or "default")
+        workers = [
+            str(p.get("profile_id") or "")
+            for p in participants
+            if isinstance(p, dict)
+            and str(p.get("profile_id") or "") != host_pid
+            and str(p.get("role") or "") != "host"
+        ]
+    return {
+        "room_id": str(ev.get("room_id") or ""),
+        "node_id": str(ev.get("node_id") or ""),
+        "host_profile_id": str(binding.get("host_profile_id") or ev.get("agent_id") or "default"),
+        "worker_profile_ids": list(workers or []),
+        "participants": participants,
+        "log_type": str(ev.get("log_type") or "info"),
+        "agent_id": str(ev.get("agent_id") or "default"),
+    }
+
+
+def _expand_node_started(ev: dict[str, Any], index: int, host_id: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    raw_text = str(ev.get("text") or "").strip()
+    obj = _try_parse_json(raw_text)
+    if obj and _is_node_context_payload(obj):
+        out.append(
+            _row(
+                ev,
+                index,
+                text="节点基础信息（工单 / 产品 / 系统）",
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="node_context",
+                payload=obj,
+                suffix="-ctx",
+            )
+        )
+    part = _participants_payload(ev)
+    if part.get("worker_profile_ids") or part.get("participants"):
+        out.append(
+            _row(
+                ev,
+                index,
+                text="参会智能体阵容",
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="participants",
+                payload=part,
+                suffix="-roster",
+            )
+        )
+    if not out:
+        display = format_event_chat_display(ev)
+        if display:
+            out.append(
+                _row(
+                    ev,
+                    index,
+                    text=display,
+                    agent_id=host_id,
+                    speaker_role=SPEAKER_HOST,
+                    display_kind="plain",
+                )
+            )
+    return out
+
+
+def expand_history_event_to_chat(ev: dict[str, Any], index: int) -> list[dict[str, Any]]:
+    """单条 history → 0..n 条 UI chat log。"""
+    et = str(ev.get("event") or "")
+    if et not in CHAT_VISIBLE_EVENTS:
+        return []
+
+    host_id = str(ev.get("agent_id") or "default")
+    if et == "human_intervene":
+        text = format_event_chat_display(ev)
+        if not text:
+            return []
+        return [
+            _row(
+                ev,
+                index,
+                text=text,
+                agent_id="user",
+                speaker_role=SPEAKER_USER,
+                display_kind="plain",
+            )
+        ]
+
+    if et == "node_started":
+        return _expand_node_started(ev, index, host_id)
+
+    if et == "work_plan_submitted":
+        text = str(ev.get("text") or format_event_chat_display(ev) or "").strip()
+        if not text:
+            return []
+        return [
+            _row(
+                ev,
+                index,
+                text=text,
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="work_plan",
+                payload={
+                    "room_id": str(ev.get("room_id") or ""),
+                    "node_id": str(ev.get("node_id") or ""),
+                    "plan_id": ev.get("plan_id"),
+                    "item_count": ev.get("item_count"),
+                },
+                rich=True,
+            )
+        ]
+
+    if et == "delegation_started":
+        text = format_event_chat_display(ev)
+        if not text:
+            return []
+        payload = {
+            "headline": text.split("\n")[0] if text else "",
+            "plan_item_id": str(ev.get("plan_item_id") or ""),
+            "reason": str(ev.get("reason") or ""),
+            "task_preview": str(ev.get("task_preview") or ""),
+            "to_agent": str(ev.get("to_agent") or ""),
+            "from_agent": str(ev.get("from_agent") or host_id),
+        }
+        return [
+            _row(
+                ev,
+                index,
+                text=text,
+                agent_id=host_id,
+                speaker_role=SPEAKER_HOST,
+                display_kind="delegation_start",
+                payload=payload,
+            )
+        ]
+
+    if et == "delegation_finished":
+        text = format_event_chat_display(ev)
+        if not text:
+            return []
+        worker_id = str(ev.get("to_agent") or ev.get("agent_id") or "worker")
+        payload = {
+            "headline": text.split("\n")[0] if text else "",
+            "ok": bool(ev.get("ok", True)),
+            "status": str(ev.get("status") or ""),
+            "result_summary": str(ev.get("result_summary") or ""),
+            "elapsed_s": ev.get("elapsed_s"),
+            "to_agent": worker_id,
+        }
+        return [
+            _row(
+                ev,
+                index,
+                text=text,
+                agent_id=worker_id,
+                speaker_role=SPEAKER_WORKER,
+                display_kind="delegation_done",
+                payload=payload,
+            )
+        ]
+
+    if et == "hitl_dynamic":
+        detail = str(ev.get("detail") or format_event_chat_display(ev) or "").strip()
+        if not detail:
+            return []
+        return [
+            _row(
+                ev,
+                index,
+                text=detail,
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="hitl_tool",
+                payload={
+                    "room_id": str(ev.get("room_id") or ""),
+                    "node_id": str(ev.get("node_id") or ""),
+                    "source": str(ev.get("source") or "tool"),
+                },
+            )
+        ]
+
+    if et in ("host_llm_end", "human_gate") and str(ev.get("report_preview") or "").strip():
+        preview = str(ev.get("report_preview") or "")[:800]
+        payload = {
+            k: ev[k]
+            for k in (
+                "room_id",
+                "node_id",
+                "report_preview",
+                "success",
+                "host_profile_id",
+                "tokens_used",
+            )
+            if k in ev
+        }
+        if payload.get("tokens_used") is not None:
+            payload["tokens_used_hint"] = int(payload["tokens_used"])
+            payload["tokens_note"] = "该值为流程占位估计，非精确计量"
+        return [
+            _row(
+                ev,
+                index,
+                text=preview,
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="human_report",
+                payload=payload,
+            )
+        ]
+
+    if et == "node_pending_confirm":
+        payload = {
+            k: ev[k]
+            for k in (
+                "room_id",
+                "node_id",
+                "duration_seconds",
+                "dynamic_form",
+                "source",
+                "review_summary_count",
+                "review_artifact_count",
+            )
+            if k in ev
+        }
+        tokens = ev.get("tokens_used")
+        if tokens is not None:
+            payload["tokens_used_hint"] = int(tokens)
+            payload["tokens_note"] = "该值为流程占位估计，非精确计量"
+        text = (
+            f"节点待确认 · 耗时 {payload.get('duration_seconds', '?')}s"
+            + (" · 动态问卷" if payload.get("dynamic_form") else "")
+        )
+        return [
+            _row(
+                ev,
+                index,
+                text=text,
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="pending_confirm",
+                payload=payload,
+            )
+        ]
+
+    raw_text = str(ev.get("text") or "").strip()
+    obj = _try_parse_json(raw_text) if raw_text else None
+
+    if obj and _is_node_context_payload(obj):
+        return [
+            _row(
+                ev,
+                index,
+                text="节点基础信息（工单 / 产品 / 系统）",
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="node_context",
+                payload=obj,
+            )
+        ]
+
+    if obj and _is_participants_meta(obj):
+        return [
+            _row(
+                ev,
+                index,
+                text="参会智能体阵容",
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="participants",
+                payload=obj,
+            )
+        ]
+
+    if obj and _is_human_report_meta(obj):
+        preview = str(obj.get("report_preview") or obj.get("message") or "")[:500]
+        return [
+            _row(
+                ev,
+                index,
+                text=preview or "人工确认门控",
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="human_report",
+                payload=obj,
+            )
+        ]
+
+    if obj and et not in ("host_prompt_assembled",):
+        # 其它紧凑 JSON 元数据 → 系统卡片，避免整段 JSON 气泡
+        return [
+            _row(
+                ev,
+                index,
+                text=str(resolve_flow_stage_label(et)),
+                agent_id=SPEAKER_SYSTEM,
+                speaker_role=SPEAKER_SYSTEM,
+                display_kind="flow_meta",
+                payload=obj,
+            )
+        ]
+
+    display = format_event_chat_display(ev)
+    if not display:
+        return []
+
+    speaker_role = SPEAKER_SYSTEM
+    agent_out = SPEAKER_SYSTEM
+    display_kind = "pipeline" if _looks_like_pipeline_chat(display, et) else "plain"
+
+    if et in ("delegation_started",):
+        speaker_role = SPEAKER_HOST
+        agent_out = host_id
+        display_kind = "delegation_start"
+    elif et in ("delegation_finished",):
+        speaker_role = SPEAKER_WORKER
+        agent_out = str(ev.get("to_agent") or ev.get("agent_id") or "worker")
+        display_kind = "delegation_done"
+    elif et in (
+        "room_opened",
+        "node_init",
+        "host_prompt_assembled",
+        "host_llm_begin",
+        "host_llm_end",
+        "run_node_scheduled",
+        "prewarm_workers",
+        "human_gate",
+        "node_pending_clarify",
+        "hitl_approved",
+        "hitl_rejected",
+    ):
+        speaker_role = SPEAKER_SYSTEM
+        agent_out = SPEAKER_SYSTEM
+        if et == "human_gate":
+            display_kind = "human_report"
+        else:
+            display_kind = "pipeline" if display_kind == "pipeline" else "plain"
+    elif et == "chat_message":
+        speaker_role = SPEAKER_HOST
+        agent_out = host_id
+        display_kind = "plain"
+    elif host_id and host_id != "system":
+        # 默认：仍归系统，除非明确是 host 对话
+        if et in ("host_llm_end",) and not ev.get("chat_text"):
+            speaker_role = SPEAKER_SYSTEM
+            agent_out = SPEAKER_SYSTEM
+        else:
+            speaker_role = SPEAKER_SYSTEM
+            agent_out = SPEAKER_SYSTEM
+
+    rich = et == "work_plan_submitted" or display.strip().startswith("# 工作安排计划")
+
+    return [
+        _row(
+            ev,
+            index,
+            text=display,
+            agent_id=agent_out,
+            speaker_role=speaker_role,
+            display_kind=display_kind,
+            rich=rich,
+        )
+    ]
+
+
+def resolve_flow_stage_label(event_type: str) -> str:
+    from synapse.rd_meeting.flow_log import EVENT_FLOW_STAGE
+
+    return EVENT_FLOW_STAGE.get(event_type, event_type or "流程")
+
+
+def _looks_like_pipeline_chat(text: str, event_type: str) -> bool:
+    if event_type in (
+        "room_opened",
+        "node_init",
+        "host_prompt_assembled",
+        "host_llm_begin",
+        "phase_change",
+    ):
+        return True
+    first = (text or "").split("\n")[0].strip()
+    return first in (
+        "开启会议室",
+        "节点初始化",
+        "主控提示词组装",
+        "流程待机",
+        "主控触发执行",
+        "主控触发总结",
+    )
+
+
+def history_to_chat_logs(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """会议室 UI chat log（结构化展示 + 系统/主持/协作角色）。"""
+    logs: list[dict[str, Any]] = []
+    for i, ev in enumerate(history):
+        if not isinstance(ev, dict):
+            continue
+        logs.extend(expand_history_event_to_chat(ev, i))
+    return logs
