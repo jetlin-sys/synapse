@@ -116,12 +116,32 @@ class TestPresetSkillFixes:
         has_review = any("code-review" in s for s in devops.skills)
         assert has_review, "devops-engineer should have 'code-review' skill"
 
-    def test_default_agent_has_all_skills_mode(self):
+    def test_default_agent_has_meeting_skills_and_isolated_memory(self):
         from synapse.agents.presets import SYSTEM_PRESETS
         from synapse.agents.profile import SkillsMode
         default = next(p for p in SYSTEM_PRESETS if p.id == "default")
-        assert default.skills == []
-        assert default.skills_mode == SkillsMode.ALL
+        assert default.skills == [
+            "whalecloud-dev-tool-ask-user",
+            "whalecloud-dev-tool-base-scripts",
+            "whalecloud-dev-tool-doc-generate",
+        ]
+        assert default.skills_mode == SkillsMode.INCLUSIVE
+        assert default.memory_mode == "isolated"
+        assert default.memory_inherit_global is True
+
+    def test_whalecloud_expert_presets_have_dev_tool_skills(self):
+        from synapse.agents.presets import SYSTEM_PRESETS
+        req = next(p for p in SYSTEM_PRESETS if p.id == "whalecloud-requirement-expert")
+        rd = next(p for p in SYSTEM_PRESETS if p.id == "whalecloud-rd-expert")
+        assert req.skills == [
+            "whalecloud-dev-tool-base-scripts",
+            "whalecloud-dev-tool-requirement-clarify",
+        ]
+        assert rd.skills == [
+            "whalecloud-dev-tool-base-scripts",
+            "whalecloud-dev-tool-c-code-access",
+            "whalecloud-dev-tool-module-function",
+        ]
 
 
 class TestOrgModeUnaffected:

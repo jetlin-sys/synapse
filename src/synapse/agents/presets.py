@@ -22,7 +22,11 @@ SYSTEM_PRESETS: list[AgentProfile] = [
         name="小鲸",
         description="通用助手；外部技能请在「核心技能」中勾选，仅对这些技能暴露能力目录",
         type=AgentType.SYSTEM,
-        skills=[],
+        skills=[
+            "whalecloud-dev-tool-ask-user",
+            "whalecloud-dev-tool-base-scripts",
+            "whalecloud-dev-tool-doc-generate",
+        ],
         skills_mode=SkillsMode.INCLUSIVE,
         custom_prompt="",
         icon="🐋",
@@ -30,6 +34,8 @@ SYSTEM_PRESETS: list[AgentProfile] = [
         category="general",
         fallback_profile_id=None,
         created_by="system",
+        memory_mode="isolated",
+        memory_inherit_global=True,
         name_i18n={"zh": "小鲸", "en": "Synapse"},
         description_i18n={
             "zh": "通用助手；外部技能请在「核心技能」中勾选，仅对这些技能暴露能力目录",
@@ -689,7 +695,10 @@ SYSTEM_PRESETS: list[AgentProfile] = [
         name="浩鲸需求分析专家",
         description="浩鲸需求分析专家，擅长需求拆解与分析",
         type=AgentType.SYSTEM,
-        skills=[],
+        skills=[
+            "whalecloud-dev-tool-base-scripts",
+            "whalecloud-dev-tool-requirement-clarify",
+        ],
         skills_mode=SkillsMode.INCLUSIVE,
         custom_prompt="你是浩鲸需求分析专家。擅长需求拆解与分析。",
         icon="🎯",
@@ -721,7 +730,11 @@ SYSTEM_PRESETS: list[AgentProfile] = [
         name="浩鲸产品研发专家",
         description="浩鲸产品研发专家，擅长代码编写与系统实现",
         type=AgentType.SYSTEM,
-        skills=[],
+        skills=[
+            "whalecloud-dev-tool-base-scripts",
+            "whalecloud-dev-tool-c-code-access",
+            "whalecloud-dev-tool-module-function",
+        ],
         skills_mode=SkillsMode.INCLUSIVE,
         custom_prompt="你是浩鲸产品研发专家。擅长代码编写与系统实现。",
         icon="💻",
@@ -796,15 +809,13 @@ def deploy_system_presets(store: ProfileStore) -> int:
                     or sorted(existing.tools) != sorted(preset.tools)
                     or existing.tools_mode != preset.tools_mode
                     or existing.skills_mode != preset.skills_mode
+                    or existing.memory_mode != preset.memory_mode
+                    or existing.memory_inherit_global != preset.memory_inherit_global
                 )
                 if needs_upgrade:
                     data = existing.to_dict()
                     data["skills_mode"] = preset.skills_mode.value
-                    if preset.id == "default" and preset.skills_mode == SkillsMode.INCLUSIVE:
-                        # 预置 default 的 skills 为空；人设勾选以 data/agents/profiles/default.json 为准
-                        data["skills"] = list(existing.skills)
-                    else:
-                        data["skills"] = preset.skills
+                    data["skills"] = preset.skills
                     data["category"] = preset.category
                     data["tools"] = preset.tools
                     data["tools_mode"] = preset.tools_mode
@@ -812,6 +823,8 @@ def deploy_system_presets(store: ProfileStore) -> int:
                     data["mcp_mode"] = preset.mcp_mode
                     data["plugins"] = preset.plugins
                     data["plugins_mode"] = preset.plugins_mode
+                    data["memory_mode"] = preset.memory_mode
+                    data["memory_inherit_global"] = preset.memory_inherit_global
                     updated = AgentProfile.from_dict(data)
                     store._cache[preset.id] = updated
                     store._persist(updated)
