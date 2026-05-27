@@ -86,6 +86,24 @@ const ACCENT = {
   },
 };
 
+/** profile_id 跟在智能体名后，同行省略，悬停展示全量 */
+const ProfileIdInline: React.FC<{ profileId: string; className?: string }> = ({
+  profileId,
+  className = '',
+}) => {
+  const id = (profileId || '').trim();
+  if (!id) return null;
+  return (
+    <Tooltip title={id} placement="topLeft" mouseEnterDelay={0.2}>
+      <span
+        className={`min-w-0 truncate text-[10px] text-muted-foreground font-mono cursor-default ${className}`}
+      >
+        {id}
+      </span>
+    </Tooltip>
+  );
+};
+
 // ─── Metrics ────────────────────────────────────────────────────────────
 
 const MetricStat: React.FC<{
@@ -112,13 +130,15 @@ const AgentMetricsCard: React.FC<{ row: NodeReviewAgentRow }> = ({ row }) => {
   const total = row.tool_calls + row.skill_calls;
   return (
     <div className="rounded-xl border border-border/60 bg-[color:var(--panel)]/60 p-4 transition hover:border-border hover:shadow-lg">
-      <div className="flex items-center gap-2 mb-3">
-        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] ${accent.badge}`}>
+      <div className="mb-3 flex min-w-0 items-center gap-2">
+        <span className={`inline-flex shrink-0 items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] ${accent.badge}`}>
           {accent.icon}
           {accent.label}
         </span>
-        <span className="font-semibold text-foreground truncate">{row.display_name}</span>
-        <span className="text-[10px] text-muted-foreground font-mono">{row.profile_id}</span>
+        <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
+          <span className="shrink-0 font-semibold text-foreground">{row.display_name}</span>
+          <ProfileIdInline profileId={row.profile_id} className="flex-1" />
+        </div>
       </div>
 
       <div className="grid grid-cols-4 gap-2 mb-3 text-center">
@@ -188,9 +208,10 @@ const AgentSummaryItem: React.FC<{ summary: NodeReviewSummary; defaultOpen?: boo
           {accent.icon}
           {accent.label}
         </span>
-        <span className="font-semibold text-foreground flex-1 text-left truncate">
-          {summary.display_name}
-        </span>
+        <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden text-left">
+          <span className="shrink-0 font-semibold text-foreground">{summary.display_name}</span>
+          <ProfileIdInline profileId={summary.profile_id} className="flex-1" />
+        </div>
         {!isLlm ? (
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
             兜底摘要

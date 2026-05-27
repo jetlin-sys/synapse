@@ -60,20 +60,13 @@ class Speaker:
 
 
 def _resolve_display_name(profile_id: str) -> str:
-    """根据 profile_id 查 AgentProfile 的 display_name；找不到返回 profile_id 本身。"""
+    """根据 profile_id 查展示名；ephemeral 分身回退到 base profile + 分身序号。"""
+    from synapse.rd_meeting.participants import resolve_profile_display_name
+
     pid = (profile_id or "").strip()
     if not pid:
         return ""
-    try:
-        from synapse.rd_meeting.room_skill import resolve_agent_profile
-
-        profile = resolve_agent_profile(pid)
-        if profile is not None:
-            name = profile.get_display_name() or profile.name or pid
-            return str(name)
-    except Exception as exc:  # pragma: no cover - profile 模块异常仅做兜底
-        logger.debug("resolve display_name failed for %s: %s", pid, exc)
-    return pid
+    return resolve_profile_display_name(pid)
 
 
 def normalize_speaker(

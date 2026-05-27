@@ -2,14 +2,29 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from synapse.rd_sop.manifest import DEFAULT_HOST_PROFILE_ID
 
+# 并行委派分身：ephemeral_{base_profile_id}_{timestamp_ms}_{clone_index}
+_EPHEMERAL_PROFILE_RE = re.compile(r"^ephemeral_(.+)_(\d{10,})_(\d+)$")
 
-def resolve_profile_display_name(profile_id: str) -> str:
-    """解析智能体展示名（与 orchestrator._resolve_profile 同源，避免 UI 显示 profile id）。"""
-    pid = (profile_id or "").strip() or DEFAULT_HOST_PROFILE_ID
+
+def parse_ephemeral_profile_id(profile_id: str) -> tuple[str, int] | None:
+    """解析 ephemeral 分身 profile_id，返回 (base_profile_id, clone_index)。"""
+    pid = (profile_id or "").strip()
+    m = _EPHEMERAL_PROFILE_RE.match(pid)
+    if not m:
+        return None
+    return m.group(1), int(m.group(3))
+
+
+def _lookup_profile_name(profile_id: str) -> str | None:
+    """从 ProfileStore / SYSTEM_PRESETS 解析展示名；找不到返回 None。"""
+    pid = (profile_id or "").strip()
+    if not pid:
+        return None
     try:
         from synapse.agents.presets import SYSTEM_PRESETS
         from synapse.agents.profile import get_profile_store
@@ -25,6 +40,23 @@ def resolve_profile_display_name(profile_id: str) -> str:
                 return str(getattr(sp, "name", None) or sp.get_display_name() or pid)
     except Exception:
         pass
+    return None
+
+
+def resolve_profile_display_name(profile_id: str) -> str:
+    """解析智能体展示名（与 orchestrator._resolve_profile 同源，避免 UI 显示 profile id）。"""
+    pid = (profile_id or "").strip() or DEFAULT_HOST_PROFILE_ID
+    direct = _lookup_profile_name(pid)
+    if direct:
+        return direct
+
+    parsed = parse_ephemeral_profile_id(pid)
+    if parsed is not None:
+        base_id, clone_idx = parsed
+        base_name = _lookup_profile_name(base_id)
+        label = base_name or base_id
+        return f"{label} (分身{clone_idx})"
+
     if pid == DEFAULT_HOST_PROFILE_ID:
         return "小鲸"
     return pid

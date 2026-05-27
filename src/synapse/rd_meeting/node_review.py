@@ -376,15 +376,15 @@ def _now_iso() -> str:
 
 
 def _resolve_display_name(profile_id: str, fallback: str = "") -> str:
-    try:
-        from synapse.rd_meeting.room_skill import resolve_agent_profile
+    from synapse.rd_meeting.participants import resolve_profile_display_name
 
-        p = resolve_agent_profile(profile_id)
-        if p is not None:
-            return p.get_display_name() or p.name or profile_id
-    except Exception as exc:  # pragma: no cover
-        logger.debug("resolve display_name failed pid=%s: %s", profile_id, exc)
-    return fallback or profile_id
+    pid = (profile_id or "").strip()
+    if not pid:
+        return fallback or profile_id
+    name = resolve_profile_display_name(pid)
+    if name != pid:
+        return name
+    return fallback or pid
 
 
 def _counter_dict_to_tool_buckets(counter: dict[str, int]) -> list[dict[str, Any]]:
