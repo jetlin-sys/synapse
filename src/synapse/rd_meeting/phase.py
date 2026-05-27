@@ -14,7 +14,6 @@ _VALID = {
     "clarify_gate",
     "result_gate",
     "exception_gate",
-    "document",
     "completed",
     "waiting",
 }
@@ -54,7 +53,6 @@ def phase_prompt_hint(scope_id: str, *, human_confirm: bool) -> str:
         "clarify_gate": "当前处于**会中人工确认**阶段：用户提交问卷后将继续本节点。",
         "result_gate": "当前处于**结果确认**阶段：用户 approve 后才可归档推进。",
         "exception_gate": "当前处于**异常人工介入**阶段：请根据用户反馈调整策略。",
-        "document": "当前处于**文档生成**阶段：请产出 NODE_OUTPUTS 约定文件名。",
         "running": "当前节点执行中：可按需输出会中问卷（interactive）或继续委派。",
         "waiting": "当前流程待机：等待调度下一流程步骤（见 meeting_pipeline.json）。",
     }

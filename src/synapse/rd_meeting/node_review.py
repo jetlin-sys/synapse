@@ -876,8 +876,14 @@ async def build_node_review_payload(
     }
 
 
-def save_node_review(scope_id: str, node_id: str, payload: dict[str, Any]) -> None:
-    """写 ``meeting_pipeline.json.context.node_review[node_id]`` + room_state.pending_delivery.review_payload。"""
+def save_node_review(
+    scope_id: str,
+    node_id: str,
+    payload: dict[str, Any],
+    *,
+    sync_pending: bool = True,
+) -> None:
+    """写 ``meeting_pipeline.json.context.node_review[node_id]``；可选同步 room_state.pending_delivery。"""
     sid = (scope_id or "").strip()
     nid = (node_id or "").strip()
     if not sid or not nid:
@@ -893,6 +899,9 @@ def save_node_review(scope_id: str, node_id: str, payload: dict[str, Any]) -> No
         raw["context"] = ctx
         raw["updated_at"] = _now_iso()
         write_json_file(pipeline_path, raw)
+
+    if not sync_pending:
+        return
 
     room_state = dict(load_room_state(sid) or {})
     pending = room_state.get("pending_delivery") if isinstance(room_state.get("pending_delivery"), dict) else {}

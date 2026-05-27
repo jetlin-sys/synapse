@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Literal
@@ -23,7 +24,7 @@ from synapse.rd_meeting.dev_status import (
     save_dev_status,
 )
 from synapse.rd_meeting.participants import build_meeting_participants
-from synapse.rd_meeting.paths import meeting_pipeline_path, scope_dir
+from synapse.rd_meeting.paths import agent_sop_node_dir, meeting_pipeline_path, scope_dir
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
     load_room_state,
@@ -48,7 +49,6 @@ PipelinePhase = Literal[
     "clarify_gate",
     "result_gate",
     "exception_gate",
-    "document",
     "completed",
     "waiting",
 ]
@@ -62,6 +62,7 @@ STEP_NODE_INIT = "node_init"
 STEP_ASSEMBLE_HOST_PROMPT = "assemble_host_prompt"
 STEP_NODE_REVIEW = "node_review"
 STEP_NODE_FINISH = "node_finish"
+STEP_REPROCESS_PREP = "reprocess_prep"
 STEP_WAITING = "waiting"
 STEP_DONE = "done"
 
@@ -73,6 +74,7 @@ _VALID_FLOW_STEPS = frozenset(
         STEP_ASSEMBLE_HOST_PROMPT,
         STEP_NODE_REVIEW,
         STEP_NODE_FINISH,
+        STEP_REPROCESS_PREP,
         STEP_WAITING,
         STEP_DONE,
     }
@@ -85,7 +87,6 @@ _VALID_PHASES = frozenset(
         "clarify_gate",
         "result_gate",
         "exception_gate",
-        "document",
         "completed",
         "waiting",
     }
@@ -99,6 +100,7 @@ FLOW_STEP_LABEL: dict[str, str] = {
     STEP_ASSEMBLE_HOST_PROMPT: "主控提示词组装",
     STEP_NODE_REVIEW: "节点确认总结",
     STEP_NODE_FINISH: "节点收尾",
+    STEP_REPROCESS_PREP: "重新处理准备",
     STEP_WAITING: "流程待机",
     STEP_DONE: "流程结束",
 }
@@ -110,6 +112,7 @@ FLOW_STEP_NEXT: dict[str, str] = {
     STEP_ASSEMBLE_HOST_PROMPT: STEP_WAITING,
     STEP_NODE_REVIEW: STEP_WAITING,  # NODE_REVIEW → 等用户确认 → confirm_node_delivery → NODE_FINISH
     STEP_NODE_FINISH: STEP_NODE_INIT,
+    STEP_REPROCESS_PREP: STEP_NODE_INIT,
 }
 
 
@@ -782,6 +785,61 @@ def _cleanup_agents_for_finished_node(
             logger.warning("reset worker %s context failed: %s", wid, exc)
 
 
+def _step_reprocess_prep(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
+    """重新处理准备：清理当前节点 agents/<node_id>/ 过程数据，重置 room_state 介入态。"""
+    sid = ctx.scope_id
+    data = ctx.dev_status or load_dev_status(sid) or {}
+    room_id = pipe.room_id or str((data.get("meeting_room") or {}).get("room_id") or "")
+    run_node = _resolve_run_node_id(pipe, data)
+    if run_node in ("pending", ""):
+        pipe.mark_step_completed(STEP_REPROCESS_PREP)
+        pipe.set_flow_step(STEP_WAITING, reason="无有效节点，无法重新处理")
+        return
+
+    node_dir = agent_sop_node_dir(sid, run_node)
+    if node_dir.is_dir():
+        try:
+            shutil.rmtree(node_dir)
+            logger.info("reprocess_prep: removed sop dir %s", node_dir)
+        except OSError as exc:
+            logger.warning("reprocess_prep: failed to remove %s: %s", node_dir, exc)
+
+    rs = load_room_state(sid) or {}
+    if isinstance(rs, dict):
+        rs = dict(rs)
+        rs["status"] = "processing"
+        for key in (
+            "hitl_form_schema",
+            "hitl_locked",
+            "hitl_submission",
+            "pending_delivery",
+            "intervention_kind",
+            "agents_active",
+        ):
+            rs.pop(key, None)
+        save_room_state(sid, rs)
+        ctx.room_state = rs
+
+    append_history_event(
+        sid,
+        {
+            "event": "reprocess_prep",
+            "room_id": room_id,
+            "node_id": run_node,
+            "text": f"重新处理准备：已清理节点 {run_node} 的过程数据",
+            "flow_stage": FLOW_STEP_LABEL[STEP_REPROCESS_PREP],
+            "log_type": "info",
+            "agent_id": "system",
+        },
+    )
+
+    pipe.mark_step_completed(STEP_REPROCESS_PREP)
+    pipe.set_flow_step(
+        FLOW_STEP_NEXT[STEP_REPROCESS_PREP],
+        reason=f"过程数据已清理，重新初始化节点 {run_node}",
+    )
+
+
 def _step_node_finish(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     """节点收尾：dump host + worker trace、严格冷启动 messages / TaskState，写流日志；
     随后自动进入下一节点的 INIT。
@@ -850,6 +908,7 @@ FLOW_STEP_HANDLERS: dict[str, StepHandler] = {
     STEP_OPEN_MEETING: _step_open_meeting,
     STEP_NODE_INIT: _step_node_init,
     STEP_ASSEMBLE_HOST_PROMPT: _step_assemble_host_prompt,
+    STEP_REPROCESS_PREP: _step_reprocess_prep,
     STEP_NODE_FINISH: _step_node_finish,
 }
 

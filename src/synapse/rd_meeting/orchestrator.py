@@ -8,23 +8,22 @@ import os
 import time
 import uuid
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
+from synapse.rd_meeting.agent_activity import (
+    record_input,
+    resolve_binding_for_profile,
+    set_agent_activity_binding,
+)
+from synapse.rd_meeting.agent_runtime import apply_meeting_agent_runtime
 from synapse.rd_meeting.agent_session import (
     bind_meeting_agent_session,
     clear_meeting_agent_session,
     ensure_host_session,
     host_session_id,
 )
-from synapse.rd_meeting.agent_activity import (
-    record_input,
-    resolve_binding_for_profile,
-    set_agent_activity_binding,
-)
 from synapse.rd_meeting.agent_trace import append_event as trace_append_event
 from synapse.rd_meeting.agent_trace import write_agent_meta
-from synapse.rd_meeting.artifacts import write_node_deliverables
 from synapse.rd_meeting.binding import resolve_node_binding
 from synapse.rd_meeting.bootstrap import build_node_init_message
 from synapse.rd_meeting.dev_status import load_dev_status, save_dev_status
@@ -56,7 +55,7 @@ from synapse.rd_meeting.host_prompt_cache import (
 from synapse.rd_meeting.init_context import build_node_init_log_data
 from synapse.rd_meeting.notifications import schedule_human_intervention_notify
 from synapse.rd_meeting.participants import build_meeting_participants
-from synapse.rd_meeting.paths import archive_node_dir, archive_root, scope_dir
+from synapse.rd_meeting.paths import archive_node_dir, scope_dir
 from synapse.rd_meeting.phase import set_phase
 from synapse.rd_meeting.pipeline_chat import format_host_first_call_chat
 from synapse.rd_meeting.room_runtime import (
@@ -64,7 +63,6 @@ from synapse.rd_meeting.room_runtime import (
     load_room_state,
     save_room_state,
 )
-from synapse.rd_meeting.agent_runtime import apply_meeting_agent_runtime
 from synapse.rd_meeting.room_skill import (
     DEFAULT_LLM_ENDPOINT_KEY,
     build_room_skill_prompt,
@@ -74,13 +72,19 @@ from synapse.rd_meeting.room_skill import (
 from synapse.rd_meeting.user_context import drain_user_context_for_prompt
 from synapse.rd_meeting.userwork_sync import patch_userwork_summary
 from synapse.rd_meeting.validation import (
-    resolve_delivery_body_for_archive,
+    normalize_node_output_body,
     validate_node_archive_artifacts,
 )
 from synapse.rd_sop.manifest import (
     next_node_id,
+    node_output_artifacts,
 )
-from synapse.rd_sop.nodes import ALL_NODES, node_display_name, stage_id_for_node_id, stage_name_for_id
+from synapse.rd_sop.nodes import (
+    ALL_NODES,
+    node_display_name,
+    stage_id_for_node_id,
+    stage_name_for_id,
+)
 
 _MAX_SKIP_CHAIN = len(ALL_NODES) + 2
 
@@ -142,19 +146,22 @@ def _skip_node_report_body(node_id: str) -> str:
     )
 
 
-def write_archive_artifact(
+def _write_simulated_agent_deliverables(
     scope_id: str,
     stage_name: str,
     node_id: str,
-    *,
-    filename: str,
     content: str,
-) -> Path:
+) -> None:
+    """dry-run 专用：模拟智能体按 NODE_OUTPUTS 约定落盘（非 confirm 流程代写）。"""
+    body = normalize_node_output_body(node_id, content)
+    if len(body.strip()) < 80:
+        body = f"{body.rstrip()}\n\n{'x' * 80}"
     dest_dir = archive_node_dir(scope_id, stage_name, node_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    path = dest_dir / filename
-    path.write_text(content, encoding="utf-8")
-    return path
+    for name in node_output_artifacts(node_id):
+        if not name or name.startswith("（") or not name.lower().endswith(".md"):
+            continue
+        (dest_dir / name).write_text(body, encoding="utf-8")
 
 
 class MeetingRoomOrchestrator:
@@ -475,17 +482,8 @@ class MeetingRoomOrchestrator:
         sync_userwork: bool = True,
         agent_pool: Any | None = None,
     ) -> dict[str, Any]:
-        """配置关闭的节点：不写 LLM，归档跳过说明并立即推进。"""
+        """配置关闭的节点：不写 LLM、不写产出物，仅记录事件并推进。"""
         sid = scope_id.strip()
-        body = _skip_node_report_body(node_id)
-        stage_name = stage_name_for_id(stage_id_for_node_id(node_id))
-        artifact_path = write_archive_artifact(
-            sid,
-            stage_name,
-            node_id,
-            filename="skipped.md",
-            content=body,
-        )
         append_history_event(
             sid,
             {
@@ -495,18 +493,12 @@ class MeetingRoomOrchestrator:
                 "reason": "disabled_in_config",
             },
         )
-        artifacts = [
-            {
-                "name": artifact_path.name,
-                "relative_path": artifact_path.relative_to(scope_dir(sid)).as_posix(),
-            }
-        ]
         return self.on_node_complete(
             scope_type=scope_type,
             scope_id=sid,
             room_id=room_id,
             node_id=node_id,
-            artifacts=artifacts,
+            artifacts=None,
             tokens_used=0,
             duration_seconds=0,
             sync_userwork=sync_userwork,
@@ -1085,16 +1077,8 @@ class MeetingRoomOrchestrator:
             )
             return {"status": "rework", "node_id": node_id, "room_state": room_state}
 
-        report_body = resolve_delivery_body_for_archive(
-            sid,
-            node_id,
-            str(pending.get("report_body") or ""),
-        )
-
         stage_id = int(pending.get("stage_id") or stage_id_for_node_id(node_id))
         stage_name = stage_name_for_id(stage_id)
-        set_phase(sid, "document")
-        artifacts = write_node_deliverables(sid, stage_name, node_id, report_body)
         validation = validate_node_archive_artifacts(sid, stage_name, node_id)
         if not validation.ok:
             raise ValueError("node_archive_validation_failed: " + "; ".join(validation.errors))
@@ -1106,7 +1090,7 @@ class MeetingRoomOrchestrator:
             scope_id=sid,
             room_id=room_id,
             node_id=node_id,
-            artifacts=artifacts,
+            artifacts=validation.artifacts,
             tokens_used=tokens_used,
             duration_seconds=duration,
             sync_userwork=sync_userwork,
@@ -1125,7 +1109,6 @@ class MeetingRoomOrchestrator:
         save_room_state(sid, rs)
 
         from synapse.rd_meeting.binding import resolve_node_binding
-        from synapse.rd_meeting.pipeline_chat import format_host_first_call_chat
 
         binding = resolve_node_binding(node_id)
         host_id = str(binding.get("host_profile_id") or "default").strip() or "default"
@@ -1304,9 +1287,13 @@ class MeetingRoomOrchestrator:
             report_body = (
                 f"# {node_display_name(node_id)} 交付结论（dry-run）\n\n"
                 f"scope: {scope_type}/{sid}\n\n"
-                f"本节点模拟执行完成，交付物已归档。完成时间：{_now_iso()}。\n"
+                f"本节点模拟执行完成，交付完成。完成时间：{_now_iso()}。\n"
             )
             tokens_used = 128
+            _dry_stage = stage_name_for_id(
+                int(dev.get("stage_id") or stage_id_for_node_id(node_id))
+            )
+            _write_simulated_agent_deliverables(sid, _dry_stage, node_id, report_body)
         else:
             host_profile_id = str(binding.get("host_profile_id") or host_id or "default")
             host_profile = _resolve_profile(host_profile_id)
@@ -1377,7 +1364,9 @@ class MeetingRoomOrchestrator:
                     prompt = f"{prompt}\n\n{user_ctx}"
                 try:
                     from synapse.rd_meeting.hitl_context import read_hitl_context
-                    from synapse.rd_meeting.hitl_feedback import prompt_for_followup_interactive_round
+                    from synapse.rd_meeting.hitl_feedback import (
+                        prompt_for_followup_interactive_round,
+                    )
 
                     prior_ctx = read_hitl_context(sid, node_id, binding=binding)
                     prior_rounds = len(prior_ctx.get("rounds") or [])
@@ -1734,7 +1723,6 @@ class MeetingRoomOrchestrator:
                 "skipped_nodes": skipped_nodes or None,
             }
 
-        artifacts = write_node_deliverables(sid, stage_name, node_id, report_body)
         validation = validate_node_archive_artifacts(sid, stage_name, node_id)
         if not validation.ok:
             append_history_event(
@@ -1754,12 +1742,33 @@ class MeetingRoomOrchestrator:
                 "node_id": node_id,
                 "validation_errors": validation.errors,
             }
+        try:
+            from synapse.rd_meeting.agent_session import resolve_meeting_orchestrator
+            from synapse.rd_meeting.node_review import build_node_review_payload, save_node_review
+
+            review_payload = await build_node_review_payload(
+                scope_type=scope_type,  # type: ignore[arg-type]
+                scope_id=sid,
+                room_id=room_id,
+                node_id=node_id,
+                binding=binding,
+                report_body=report_body,
+                tokens_used=tokens_used,
+                duration_seconds=int(duration),
+                stage_id=stage_id,
+                agent_pool=agent_pool,
+                orchestrator=resolve_meeting_orchestrator(agent_pool),
+                use_llm_summary=True,
+            )
+            save_node_review(sid, node_id, review_payload, sync_pending=False)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("persist node review before auto-complete failed scope=%s node=%s: %s", sid, node_id, exc)
         out = self.on_node_complete(
             scope_type=scope_type,
             scope_id=sid,
             room_id=room_id,
             node_id=node_id,
-            artifacts=artifacts,
+            artifacts=validation.artifacts,
             tokens_used=tokens_used,
             duration_seconds=duration,
             advance=True,
@@ -1891,3 +1900,14 @@ def schedule_enter_node_review(
 def is_room_run_in_progress(room_id: str) -> bool:
     t = _running_tasks.get(room_id.strip())
     return t is not None and not t.done()
+
+
+def cancel_room_run(room_id: str) -> bool:
+    """取消进行中的节点执行任务（重新处理前调用）。"""
+    key = room_id.strip()
+    t = _running_tasks.get(key)
+    if t is None or t.done():
+        return False
+    t.cancel()
+    _running_tasks.pop(key, None)
+    return True

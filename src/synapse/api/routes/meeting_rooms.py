@@ -18,6 +18,7 @@ from synapse.rd_meeting.node_review import (
     save_node_review,
 )
 from synapse.rd_meeting.orchestrator import MeetingRoomOrchestrator
+from synapse.rd_meeting.participants import build_meeting_participants
 from synapse.rd_meeting.paths import agent_node_dir, agent_sop_profile_dir
 from synapse.rd_meeting.room_runtime import load_room_state
 from synapse.rd_meeting.service import MeetingRoomService
@@ -147,6 +148,22 @@ async def intervene_meeting(room_id: str, body: InterveneBody, request: Request)
         return error_response(500, "intervene_meeting_failed", str(exc))
 
 
+@router.post("/api/dev/meeting-rooms/{room_id}/reprocess")
+async def reprocess_meeting_room(room_id: str, request: Request) -> dict:
+    """重新处理当前 SOP 节点：清理过程数据并从 node_init 重跑。"""
+    pool = getattr(request.app.state, "agent_pool", None)
+    try:
+        item = _service.reprocess_current_node(room_id, agent_pool=pool)
+        return success_response(item)
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "not_found" in msg else 400
+        return error_response(code, msg)
+    except Exception as exc:
+        logger.exception("reprocess_meeting_room failed: %s", exc)
+        return error_response(500, "reprocess_meeting_room_failed", str(exc))
+
+
 @router.post("/api/dev/meeting-rooms/open")
 async def open_meeting(body: OpenMeetingBody, request: Request) -> dict:
     pool = getattr(request.app.state, "agent_pool", None)
@@ -253,6 +270,31 @@ def _resolve_scope_for_room(room_id: str) -> tuple[str, str] | None:
     return sid, scope_type
 
 
+@router.get("/api/dev/meeting-rooms/{room_id}/nodes/{node_id}/participants")
+async def get_node_participants(room_id: str, node_id: str) -> dict:
+    """按 SOP 节点 binding 返回参会智能体阵容（切换议题时前端刷新头像栏）。"""
+    resolved = _resolve_scope_for_room(room_id)
+    if resolved is None:
+        return error_response(404, "meeting_room_not_found")
+    sid, scope_type = resolved
+    nid = (node_id or "").strip()
+    if not nid:
+        return error_response(400, "node_id_required")
+    from synapse.rd_meeting.binding import resolve_node_binding
+
+    binding = resolve_node_binding(nid, scope_type=scope_type, scope_id=sid)  # type: ignore[arg-type]
+    binding["node_id"] = nid
+    participants = build_meeting_participants(binding)
+    return success_response(
+        {
+            "room_id": room_id,
+            "scope_id": sid,
+            "node_id": nid,
+            "participants": participants,
+        }
+    )
+
+
 @router.get("/api/dev/meeting-rooms/{room_id}/node-review")
 async def get_node_review(
     room_id: str,
@@ -273,20 +315,43 @@ async def get_node_review(
 
     room_state = load_room_state(sid) or {}
     pending = room_state.get("pending_delivery") if isinstance(room_state.get("pending_delivery"), dict) else {}
-    target_node = (node_id or "").strip() or str(pending.get("node_id") or room_state.get("current_node_id") or "")
+    current_node = str(room_state.get("current_node_id") or "").strip()
+    dev = load_dev_status(sid) or {}
+    if not current_node:
+        current_node = str(dev.get("current_node_id") or "").strip()
+    target_node = (node_id or "").strip() or str(pending.get("node_id") or current_node or "")
     if not target_node:
         return error_response(400, "node_id_required")
 
+    pending_node = str(pending.get("node_id") or "").strip()
+    pending_matches = pending_node == target_node or (not pending_node and target_node == current_node)
+    is_historical = bool(current_node) and target_node != current_node
+
+    cached = load_node_review(sid, target_node)
+
+    def _summaries_all_fallback(payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        rows = payload.get("summaries")
+        if not isinstance(rows, list) or not rows:
+            return False
+        return all(
+            isinstance(s, dict) and str(s.get("source") or "fallback") == "fallback"
+            for s in rows
+        )
+
     if not refresh:
-        payload = load_node_review(sid, target_node)
-        if payload is not None:
-            return success_response(payload)
-        # 回退：pending_delivery.review_payload 也可能就是 payload
+        if cached is not None and not _summaries_all_fallback(cached):
+            return success_response(cached)
+        # 回退：仅 pending 对应该节点时才用 review_payload，避免历史节点串数据
         inline = pending.get("review_payload") if isinstance(pending, dict) else None
-        if isinstance(inline, dict):
+        if isinstance(inline, dict) and pending_matches and not _summaries_all_fallback(inline):
             return success_response(inline)
 
-    # refresh=true 或缓存缺失：用 binding 重新装配（不走 LLM）
+    # refresh=true：仅刷新 metrics/artifacts，保留已有 LLM 摘要
+    # 缓存缺失（历史节点回看）：尝试 LLM 重新生成摘要（activity 可能仍在 agents/<node>/）
+    use_llm_summary = not refresh
+
     try:
         from synapse.rd_meeting.agent_session import resolve_meeting_orchestrator
         from synapse.rd_meeting.binding import resolve_node_binding
@@ -295,21 +360,49 @@ async def get_node_review(
         binding = resolve_node_binding(target_node, scope_type=scope_type, scope_id=sid)  # type: ignore[arg-type]
         binding["node_id"] = target_node
         pool = getattr(request.app.state, "agent_pool", None)
+
+        report_body = ""
+        tokens_used = 0
+        duration_seconds = 0
+        stage_id_val = stage_id_for_node_id(target_node)
+        if isinstance(pending, dict) and pending_matches:
+            report_body = str(pending.get("report_body") or "")
+            tokens_used = int(pending.get("tokens_used") or 0)
+            duration_seconds = int(pending.get("duration_seconds") or 0)
+            stage_id_val = int(pending.get("stage_id") or stage_id_val)
+        elif cached is not None:
+            report_body = str(cached.get("report_body") or "")
+            metrics = cached.get("metrics") if isinstance(cached.get("metrics"), dict) else {}
+            tokens_used = int(metrics.get("node_token_total") or 0)
+            duration_seconds = int(metrics.get("node_duration_seconds") or 0)
+            stage_id_val = int(cached.get("stage_id") or stage_id_val)
+
         payload = await build_node_review_payload(
             scope_type=scope_type,  # type: ignore[arg-type]
             scope_id=sid,
             room_id=room_id,
             node_id=target_node,
             binding=binding,
-            report_body=str(pending.get("report_body") or "") if isinstance(pending, dict) else "",
-            tokens_used=int(pending.get("tokens_used") or 0) if isinstance(pending, dict) else 0,
-            duration_seconds=int(pending.get("duration_seconds") or 0) if isinstance(pending, dict) else 0,
-            stage_id=int(pending.get("stage_id") or stage_id_for_node_id(target_node)) if isinstance(pending, dict) else stage_id_for_node_id(target_node),
+            report_body=report_body,
+            tokens_used=tokens_used,
+            duration_seconds=duration_seconds,
+            stage_id=stage_id_val,
             agent_pool=pool,
             orchestrator=resolve_meeting_orchestrator(pool),
-            use_llm_summary=False,  # refresh 仅刷新 metrics，不再二次跑 LLM
+            use_llm_summary=use_llm_summary,
         )
-        save_node_review(sid, target_node, payload)
+
+        if refresh and cached is not None:
+            old_summaries = cached.get("summaries")
+            if isinstance(old_summaries, list) and old_summaries:
+                payload["summaries"] = old_summaries
+
+        save_node_review(
+            sid,
+            target_node,
+            payload,
+            sync_pending=pending_matches and target_node == current_node and not is_historical,
+        )
         return success_response(payload)
     except Exception as exc:
         logger.exception("refresh node_review failed: %s", exc)

@@ -31,6 +31,7 @@ from synapse.rd_meeting.hitl_submission import (
 from synapse.rd_meeting.live import collect_live_sub_agents
 from synapse.rd_meeting.orchestrator import (
     MeetingRoomOrchestrator,
+    cancel_room_run,
     is_room_run_in_progress,
     schedule_run_node,
 )
@@ -41,6 +42,7 @@ from synapse.rd_meeting.pipeline import MeetingPipeline
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
     build_meeting_summary_nodes,
+    extract_skipped_node_ids,
     history_to_chat_logs,
     list_archive_index,
     load_room_state,
@@ -446,6 +448,57 @@ class MeetingRoomService:
             except Exception as exc:
                 logger.warning("open_meeting async tail schedule failed: %s", exc)
         return ctx.detail
+
+    def reprocess_current_node(
+        self,
+        room_id: str,
+        *,
+        agent_pool: Any | None = None,
+    ) -> dict[str, Any]:
+        """重新处理当前 SOP 节点：清理过程数据后从 node_init 重跑（非全量重开会议室）。"""
+        rid = (room_id or "").strip()
+        if not rid:
+            raise ValueError("room_id required")
+
+        detail = self.get_room_detail(rid)
+        if detail is None:
+            raise ValueError("meeting_room_not_found")
+
+        sid = str(detail.get("scope_id") or "").strip()
+        if not sid:
+            raise ValueError("scope_id missing")
+
+        scope = detail.get("scope_type") or "demand"
+        scope_type: ScopeType = scope if scope in ("demand", "task") else "demand"
+
+        from synapse.rd_meeting.pipeline import (
+            STEP_REPROCESS_PREP,
+            PipelineRunContext,
+            run_pipeline_until_waiting,
+        )
+
+        cancel_room_run(rid)
+
+        dev = load_dev_status(sid) or {}
+        ctx = PipelineRunContext(
+            scope_type=scope_type,
+            scope_id=sid,
+            sync_userwork=False,
+            promote_to_processing=False,
+            agent_pool=agent_pool,
+            dev_status=dev,
+            detail=dict(detail),
+        )
+
+        pipe = MeetingPipeline.load_or_create(sid, scope_type=scope_type)
+        pipe.set_flow_step(STEP_REPROCESS_PREP, reason="用户触发重新处理")
+        pipe.save()
+
+        run_pipeline_until_waiting(ctx, initial_flow_step=STEP_REPROCESS_PREP)
+
+        dev = load_dev_status(sid) or {}
+        titles = build_title_index()
+        return self._room_detail_payload(dev, sid, titles)
 
     async def _open_meeting_async_tail(
         self,
@@ -979,9 +1032,10 @@ class MeetingRoomService:
             item["tokenConsumed"] = int(m.get("tokens") or 0)
             item["tokenBudget"] = int(m.get("token_budget") or 150_000)
             rs = str(room_state.get("status") or "")
-            if rs in ("processing", "human_intervention", "completed"):
+            if rs in ("processing", "human_intervention", "completed", "failed"):
                 item["status"] = rs
 
+        item["skipped_node_ids"] = extract_skipped_node_ids(history)
         scope = data.get("scope") if isinstance(data.get("scope"), dict) else {}
         scope_type = str(scope.get("type") or "demand")
         node_id = str(data.get("current_node_id") or "pending")

@@ -211,7 +211,7 @@ def synapse_work_home(monkeypatch: pytest.MonkeyPatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_human_confirm_defers_archive_until_approved(synapse_work_home):
+async def test_human_confirm_defers_advance_until_approved(synapse_work_home):
     from synapse.rd_meeting.dev_status import load_dev_status, save_dev_status
     from synapse.rd_meeting.room_runtime import list_archive_index, load_room_state
     from synapse.rd_sop.manifest import next_node_id
@@ -233,7 +233,11 @@ async def test_human_confirm_defers_archive_until_approved(synapse_work_home):
     assert result["result"].get("pending_confirm") is True
 
     arch = list_archive_index(scope_id)
-    assert not any(a["node_id"] == "boundary" for a in arch)
+    assert any(a["node_id"] == "boundary" for a in arch)
+
+    dev_before = load_dev_status(scope_id)
+    assert dev_before is not None
+    assert dev_before["current_node_id"] == "boundary"
 
     rs = load_room_state(scope_id)
     assert rs is not None

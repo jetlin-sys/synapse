@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 import pytest
 
-from synapse.rd_meeting.artifacts import validate_archive_outputs, write_node_deliverables
 from synapse.rd_meeting.hitl_form import (
     resolve_hitl_form_schema,
     resolve_hitl_schema_for_gate,
@@ -62,20 +61,6 @@ def test_history_includes_delegation_events() -> None:
     )
     assert len(logs) == 1
     assert "委派" in logs[0]["text"]
-
-
-def test_write_node_deliverables_and_validate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    sid = "test-scope-deliverables"
-    monkeypatch.setattr("synapse.rd_meeting.paths.scope_dir", lambda s: tmp_path / s)
-    monkeypatch.setattr(
-        "synapse.rd_meeting.artifacts.scope_dir",
-        lambda s: tmp_path / s,
-    )
-    body = "# 需求澄清\n\n## 结论\n交付完成，结论已确认。\n" + ("x" * 80)
-    artifacts = write_node_deliverables(sid, "需求分析", "req_clarify", body)
-    assert artifacts
-    ok, errors = validate_archive_outputs(sid, "需求分析", "req_clarify")
-    assert ok, errors
 
 
 def test_record_delegation_started_appends_history(

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from synapse.rd_sop.manifest import get_node_manifest_entry, node_output_artifacts
 from synapse.rd_sop.nodes import node_display_name
@@ -13,6 +14,7 @@ from synapse.rd_sop.nodes import node_display_name
 class NodeOutputValidation:
     ok: bool
     errors: list[str]
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
 
 
 _MIN_BODY_LEN = 80
@@ -100,7 +102,11 @@ def validate_node_archive_artifacts(
             errors=[f"归档目录不存在：archive/{stg}/{node_id}/"],
         )
 
+    from synapse.rd_meeting.paths import scope_dir
+
+    scope_root = scope_dir(scope_id)
     errors: list[str] = []
+    artifacts: list[dict[str, Any]] = []
     for name in names:
         path = dest / name
         rel = f"archive/{stg}/{node_id}/{name}"
@@ -112,9 +118,17 @@ def validate_node_archive_artifacts(
         except OSError as exc:
             errors.append(f"{name}: 读取失败（{exc}）")
             continue
-        errors.extend(_validate_markdown_body(node_id, body, filename=name))
+        file_errors = _validate_markdown_body(node_id, body, filename=name)
+        if file_errors:
+            errors.extend(file_errors)
+            continue
+        try:
+            relative_path = path.resolve().relative_to(scope_root.resolve()).as_posix()
+        except ValueError:
+            relative_path = rel
+        artifacts.append({"name": name, "relative_path": relative_path})
 
-    return NodeOutputValidation(ok=len(errors) == 0, errors=errors)
+    return NodeOutputValidation(ok=len(errors) == 0, errors=errors, artifacts=artifacts)
 
 
 def validate_node_archive_files(

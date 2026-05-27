@@ -50,6 +50,10 @@ interface Props {
   /** 父组件可预置 payload（来自 live.pending_delivery.review_payload）以避免首屏空白 */
   initialPayload?: NodeReviewPayload | null;
   onDecided?: (mode: ReviewDecisionMode) => void;
+  /** 只读模式：隐藏人工裁决区（节点处理详情） */
+  readOnly?: boolean;
+  /** 只读模式标题 */
+  title?: string;
 }
 
 const MD_EXTS = new Set(['.md', '.markdown']);
@@ -508,6 +512,8 @@ export const NodeReviewPanel: React.FC<Props> = ({
   nodeId,
   initialPayload,
   onDecided,
+  readOnly = false,
+  title,
 }) => {
   const [payload, setPayload] = useState<NodeReviewPayload | null>(initialPayload ?? null);
   const [loading, setLoading] = useState(false);
@@ -523,6 +529,11 @@ export const NodeReviewPanel: React.FC<Props> = ({
       setError(null);
       try {
         const data = await fetchNodeReview(synapseApiBase, roomId, { nodeId, refresh });
+        if (nodeId && data.node_id && data.node_id !== nodeId) {
+          setPayload(null);
+          setError(`节点数据不匹配（期望 ${nodeId}，收到 ${data.node_id}）`);
+          return;
+        }
         setPayload(data);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -535,8 +546,10 @@ export const NodeReviewPanel: React.FC<Props> = ({
   );
 
   useEffect(() => {
-    if (payload == null) void load(false);
-  }, [load, payload]);
+    setPayload(readOnly ? null : (initialPayload ?? null));
+    setError(null);
+    void load(false);
+  }, [nodeId, roomId, synapseApiBase, readOnly, load]);
 
   const onSubmit = useCallback(
     async (mode: ReviewDecisionMode, comment: string) => {
@@ -559,7 +572,7 @@ export const NodeReviewPanel: React.FC<Props> = ({
   );
 
   const metrics = payload?.metrics;
-  const headerActions = (
+  const headerActions = readOnly ? null : (
     <div className="flex items-center gap-2">
       <Tooltip title="重新计算 metrics / 产出物（不重跑 LLM 摘要）">
         <Button
@@ -578,12 +591,14 @@ export const NodeReviewPanel: React.FC<Props> = ({
   const workerMetrics = metrics?.workers ?? [];
 
   return (
-    <div className="h-full overflow-y-auto custom-scrollbar bg-[color:var(--panel)]">
+    <div className="h-full min-h-0 overflow-y-auto custom-scrollbar bg-[color:var(--panel)]">
       <div className="max-w-[980px] mx-auto p-6 space-y-5">
         {/* Header */}
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div className="text-[11px] text-muted-foreground uppercase tracking-wider">节点确认总结</div>
+            <div className="text-[11px] text-muted-foreground uppercase tracking-wider">
+              {readOnly ? title || '节点处理详情' : '节点确认总结'}
+            </div>
             <h2 className="text-xl font-semibold text-foreground mt-1">
               {payload?.node_name || nodeId || '—'}
               <span className="ml-2 text-[12px] font-mono text-muted-foreground">
@@ -691,9 +706,11 @@ export const NodeReviewPanel: React.FC<Props> = ({
             </section>
 
             {/* 4. Human decision */}
-            <section>
-              <DecisionBox busy={submitting} pendingMode={submittingMode} onSubmit={onSubmit} />
-            </section>
+            {!readOnly ? (
+              <section>
+                <DecisionBox busy={submitting} pendingMode={submittingMode} onSubmit={onSubmit} />
+              </section>
+            ) : null}
           </>
         )}
       </div>

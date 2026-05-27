@@ -162,6 +162,20 @@ def append_history_event(scope_id: str, event: dict[str, Any]) -> dict[str, Any]
     return row
 
 
+def extract_skipped_node_ids(history: list[dict[str, Any]]) -> list[str]:
+    """从 room_history 提取已跳过的 SOP 节点 id（按出现顺序去重）。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for ev in history:
+        if str(ev.get("event") or "") != "node_skipped":
+            continue
+        nid = str(ev.get("node_id") or "").strip()
+        if nid and nid not in seen:
+            seen.add(nid)
+            out.append(nid)
+    return out
+
+
 def read_history(scope_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
     path = room_history_path(scope_id)
     if not path.is_file():

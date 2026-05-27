@@ -16,7 +16,7 @@ export interface MeetingRoomListItem {
   current_node_id: string;
   current_node_name: string;
   local_process_state: string;
-  status: 'processing' | 'human_intervention' | 'completed';
+  status: 'processing' | 'human_intervention' | 'completed' | 'failed';
   pipeline_enabled: boolean;
   meeting_room_active: boolean;
   updated_at?: string;
@@ -68,6 +68,7 @@ export interface MeetingRoomDetail extends MeetingRoomListItem {
   chat_logs?: MeetingRoomChatLogWire[];
   participants?: MeetingRoomParticipantWire[];
   current_node_binding?: Record<string, unknown>;
+  skipped_node_ids?: string[];
 }
 
 export interface MeetingRoomArchiveEntry {
@@ -494,6 +495,18 @@ export async function interveneMeetingRoom(
   );
 }
 
+export async function reprocessMeetingRoom(
+  synapseApiBase: string,
+  roomId: string,
+): Promise<MeetingRoomDetail> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  return apiPost<MeetingRoomDetail>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/reprocess`,
+    {},
+  );
+}
+
 export async function fetchPendingHumanIntervention(
   synapseApiBase: string,
 ): Promise<MeetingRoomListItem[]> {
@@ -599,6 +612,18 @@ export interface NodeReviewPayload {
   artifacts: NodeReviewArtifactFile[];
   report_body: string;
   generated_at?: string;
+}
+
+export async function fetchMeetingNodeParticipants(
+  synapseApiBase: string,
+  roomId: string,
+  nodeId: string,
+): Promise<{ node_id: string; participants: MeetingRoomParticipantWire[] }> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  return apiGet<{ node_id: string; participants: MeetingRoomParticipantWire[] }>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/nodes/${encodeURIComponent(nodeId)}/participants`,
+  );
 }
 
 export async function fetchNodeReview(

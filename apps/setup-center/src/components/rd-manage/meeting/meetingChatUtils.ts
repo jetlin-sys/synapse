@@ -140,7 +140,26 @@ export function sopScopeKey(stageIndex: number, nodeId: string): string {
   return `${stageIndex}:${(nodeId || 'pending').trim()}`;
 }
 
-/** 仅保留当前 SOP 节点之后的发言（优先 nodeId 元数据） */
+/** 按 SOP 节点精确过滤（仅保留 nodeId 匹配或未标注 nodeId 的全局消息） */
+export function filterLogsForNodeExact(logs: MeetingChatLog[], nodeId: string): MeetingChatLog[] {
+  const nid = (nodeId || 'pending').trim();
+  if (!nid || !logs.length) return logs;
+  return logs.filter((l) => !l.nodeId || l.nodeId === nid);
+}
+
+/** 合并协作流日志（按 id 去重，保留既有顺序并追加新条目） */
+export function mergeChatLogs(existing: MeetingChatLog[], incoming: MeetingChatLog[]): MeetingChatLog[] {
+  if (!incoming.length) return existing;
+  const byId = new Map(existing.map((l) => [l.id, l]));
+  const order = existing.map((l) => l.id);
+  for (const l of incoming) {
+    if (!byId.has(l.id)) order.push(l.id);
+    byId.set(l.id, l);
+  }
+  return order.map((id) => byId.get(id)!);
+}
+
+/** @deprecated 使用 filterLogsForNodeExact；保留兼容旧截断逻辑 */
 export function filterLogsForSopNode(logs: MeetingChatLog[], nodeId: string): MeetingChatLog[] {
   const nid = (nodeId || 'pending').trim();
   if (!nid || !logs.length) return logs;

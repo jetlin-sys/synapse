@@ -49,6 +49,7 @@ import {
   type WorkOrderDbMetricsPayload,
 } from '../../api/rdManageService';
 import {
+  fetchMeetingRooms,
   fetchMeetingSummary,
   openMeetingRoom,
   type MeetingRoomArchiveEntry,
@@ -69,6 +70,7 @@ import {
   type ProductKnowledgePatch,
 } from '@/components/product/types';
 import { ViewId } from '../../types';
+import { MeetingNodeDetailPanel, type MeetingNodeVisualState } from './meeting/panels/MeetingNodeDetailPanel';
 import { Label } from '@/components/ui/label';
 import { SearchableVirtualSelect } from '@/components/product/SearchableVirtualSelect';
 import {
@@ -190,6 +192,13 @@ type NodeState =
   | 'awaiting_human'
   | 'full_manual'
   | 'pending';
+
+function mapNodeStateForPanel(state: NodeState): MeetingNodeVisualState {
+  if (state === 'awaiting_human') return 'human_intervention';
+  if (state === 'full_manual') return 'pending';
+  if (state === 'completed' || state === 'processing' || state === 'error') return state;
+  return 'pending';
+}
 
 // --- Subcomponents for Outputs ---
 
@@ -559,6 +568,7 @@ export const OrderManagement: React.FC<{
   const [meetingSummary, setMeetingSummary] = useState<MeetingSummaryPayload | null>(null);
   const [meetingSummaryLoading, setMeetingSummaryLoading] = useState(false);
   const [meetingSummaryErr, setMeetingSummaryErr] = useState<string | null>(null);
+  const [roomScopeIndex, setRoomScopeIndex] = useState<Map<string, string>>(new Map());
 
   const [collapsedStages, setCollapsedStages] = useState<Record<number, boolean>>({});
   const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
@@ -678,6 +688,26 @@ export const OrderManagement: React.FC<{
       cancelled = true;
     };
   }, [sopMeetingScope, synapseApiBase]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchMeetingRooms(synapseApiBase)
+      .then((list) => {
+        if (cancelled) return;
+        const m = new Map<string, string>();
+        for (const r of list) {
+          const key = `${r.scope_type}:${r.scope_id}`;
+          if (r.room_id) m.set(key, r.room_id);
+        }
+        setRoomScopeIndex(m);
+      })
+      .catch(() => {
+        if (!cancelled) setRoomScopeIndex(new Map());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [synapseApiBase, boardDataInitialized]);
 
   const meetingNodeMetricsById = useMemo(() => {
     const m = new Map<string, { deal_seconds: number; tokens: number }>();
@@ -1119,16 +1149,44 @@ export const OrderManagement: React.FC<{
     setTicketModalOpen(true);
   };
 
-  const handleJumpToMeeting = (roomId?: string, scopeType?: 'demand' | 'task', scopeId?: string) => {
-    if (roomId) {
-      setMeetingRoomFocus({ roomId, scopeType, scopeId });
-    }
-    if (onViewChange) {
-      onViewChange("workbench_meeting");
-    } else {
-      window.dispatchEvent(new CustomEvent('changeView', { detail: 'workbench_meeting' }));
-    }
-  };
+  const handleJumpToMeeting = useCallback(
+    (roomId?: string, scopeType?: 'demand' | 'task', scopeId?: string) => {
+      const rid = (roomId || meetingSummary?.room_id || '').trim();
+      const st = scopeType ?? sopMeetingScope?.scopeType;
+      const sid = (scopeId ?? sopMeetingScope?.scopeId ?? '').trim();
+      if (rid) {
+        setMeetingRoomFocus({ roomId: rid, scopeType: st, scopeId: sid || undefined });
+      }
+      if (onViewChange) {
+        onViewChange('workbench_meeting');
+      } else {
+        window.dispatchEvent(new CustomEvent('changeView', { detail: 'workbench_meeting' }));
+      }
+    },
+    [meetingSummary?.room_id, onViewChange, sopMeetingScope],
+  );
+
+  const navigateToMeetingRoom = useCallback(
+    async (scopeType: 'demand' | 'task', scopeId: string) => {
+      const sid = scopeId.trim();
+      if (!sid) return;
+      let roomId = roomScopeIndex.get(`${scopeType}:${sid}`);
+      if (!roomId) {
+        try {
+          const summary = await fetchMeetingSummary(synapseApiBase, scopeType, sid);
+          roomId = (summary.room_id || '').trim() || undefined;
+        } catch {
+          /* fallback below */
+        }
+      }
+      if (roomId) {
+        handleJumpToMeeting(roomId, scopeType, sid);
+        return;
+      }
+      toast.message(t('rdManageOrder.meetingRoomNotFound', { defaultValue: '未找到活跃会议室，请先一键开会' }));
+    },
+    [handleJumpToMeeting, roomScopeIndex, synapseApiBase, t],
+  );
 
   const handleOneClickOpenMeeting = useCallback(
     (e: React.MouseEvent, ticket: Ticket, workItemId?: string) => {
@@ -1315,7 +1373,7 @@ export const OrderManagement: React.FC<{
                   </p>
                 </div>
               </div>
-              <Button type="primary" block size="large" className="bg-amber-600 hover:bg-amber-500 border-none" onClick={handleJumpToMeeting}>
+              <Button type="primary" block size="large" className="bg-amber-600 hover:bg-amber-500 border-none" onClick={() => handleJumpToMeeting()}>
                 跳转研发会议室 (预置 TODO)
               </Button>
             </div>
@@ -1344,7 +1402,7 @@ export const OrderManagement: React.FC<{
             <div className="flex flex-col items-center justify-center h-48 bg-blue-950/20 border border-blue-900/50 rounded-xl border-dashed">
               <Play className="w-12 h-12 text-blue-500 mb-4 ml-1" />
               <p className="text-sm text-slate-300 mb-5">环境就绪，等待人工确认启动智能研发任务</p>
-              <Button type="primary" size="large" className="bg-blue-600 hover:bg-blue-500 border-none px-8" onClick={handleJumpToMeeting}>
+              <Button type="primary" size="large" className="bg-blue-600 hover:bg-blue-500 border-none px-8" onClick={() => handleJumpToMeeting()}>
                 进入研发会议室确认启动
               </Button>
             </div>
@@ -1392,7 +1450,7 @@ export const OrderManagement: React.FC<{
                   </div>
                 </div>
                 {state === 'awaiting_human' ? (
-                   <Button type="primary" size="small" className="bg-blue-600 text-xs border-none" onClick={handleJumpToMeeting}>
+                   <Button type="primary" size="small" className="bg-blue-600 text-xs border-none" onClick={() => handleJumpToMeeting()}>
                      去研发会议室审批
                    </Button>
                 ) : (
@@ -1615,12 +1673,26 @@ export const OrderManagement: React.FC<{
                     onClick={() => {
                       setActiveTicketId(ticket.id);
                       setActiveWorkItemId(isWorkItem ? item.id : '');
+                      const shouldJumpMeeting =
+                        !rowActionOverlay &&
+                        (ticket.status === 'processing' || ticket.status === 'error' || rowHitl);
+                      if (shouldJumpMeeting) {
+                        void navigateToMeetingRoom(
+                          isWorkItem ? 'task' : 'demand',
+                          item.id,
+                        );
+                      }
                     }}
                     className={`group relative mb-1 cursor-pointer overflow-hidden rounded-[10px] px-2.5 py-3 transition-[background,box-shadow] duration-150 ${
                       isActive 
                         ? 'bg-[rgba(37,99,235,0.09)] ring-1 ring-border' 
                         : 'hover:bg-[rgba(37,99,235,0.05)]'
-                    }`}
+                    } ${!rowActionOverlay && (ticket.status === 'processing' || ticket.status === 'error' || rowHitl) ? 'hover:ring-1 hover:ring-primary/30' : ''}`}
+                    title={
+                      !rowActionOverlay && (ticket.status === 'processing' || ticket.status === 'error' || rowHitl)
+                        ? t('rdManageOrder.clickToOpenMeeting', { defaultValue: '点击进入研发会议室' })
+                        : undefined
+                    }
                   >
                     {/* Left Status Line */}
                     <div className={`absolute bottom-0 left-0 top-0 w-1 ${statusBorderColor}`} />
@@ -1637,6 +1709,17 @@ export const OrderManagement: React.FC<{
                               : 'bg-destructive text-destructive-foreground hover:bg-destructive/90'
                           }`}
                           onClick={(e) => {
+                            e.stopPropagation();
+                            if (rowHitl) {
+                              const scopeType = isWorkItem ? ('task' as const) : ('demand' as const);
+                              const scopeId = item.id.trim();
+                              const busyKey = `${scopeType}:${scopeId}`;
+                              setOpeningMeetingKey(busyKey);
+                              void navigateToMeetingRoom(scopeType, scopeId).finally(() => {
+                                setOpeningMeetingKey(null);
+                              });
+                              return;
+                            }
                             void handleOneClickOpenMeeting(e, ticket, isWorkItem ? item.id : undefined);
                           }}
                         >
@@ -2207,7 +2290,21 @@ export const OrderManagement: React.FC<{
 
             <div className="min-h-0 flex-1">
               <h4 className="mb-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">执行产物 / 交互区</h4>
-              {renderNodeOutput(selectedNode, displayTicket)}
+              {meetingSummary?.room_id && selectedNode ? (
+                <MeetingNodeDetailPanel
+                  synapseApiBase={synapseApiBase}
+                  roomId={meetingSummary.room_id}
+                  scopeType={sopMeetingScope?.scopeType}
+                  scopeId={sopMeetingScope?.scopeId}
+                  nodeId={selectedNode.id}
+                  nodeName={selectedNode.name}
+                  nodeDesc={selectedNode.desc}
+                  nodeState={mapNodeStateForPanel(getNodeStateGlobal(displayTicket, selectedNode.id))}
+                  pollMs={displayTicket.status === 'processing' ? 5000 : 0}
+                />
+              ) : (
+                renderNodeOutput(selectedNode, displayTicket)
+              )}
             </div>
           </div>
         )}
