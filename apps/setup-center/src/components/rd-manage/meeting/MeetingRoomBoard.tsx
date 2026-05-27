@@ -808,6 +808,7 @@ const InterventionDialog = ({
   const logsEndRef = useRef<HTMLDivElement>(null);
   const lastLogKeyRef = useRef('');
   const interventionRoomIdRef = useRef<string | null>(null);
+  const hitlAutoFocusRef = useRef<string | null>(null);
 
   const hitlLocked = Boolean(room?.hitlLocked);
   const hasReviewPayload = !!(room?.reviewPayload && room.status === 'human_intervention' && !hitlLocked);
@@ -825,6 +826,17 @@ const InterventionDialog = ({
     if (k === 'interactive') return '澄清待回复';
     return '待人工确认';
   }, [hitlKind]);
+
+  const hitlFocusKey = useMemo(() => {
+    if (!hitlAvailable || !room) return null;
+    const schema = room.hitlFormSchema as { title?: string; questions?: unknown[] } | null | undefined;
+    const schemaSig = schema
+      ? `${schema.title ?? ''}:${schema.questions?.length ?? 0}`
+      : hasReviewPayload
+        ? `review:${room.reviewPayload?.node_id ?? room.currentNode}`
+        : 'hitl';
+    return `${room.id}:${room.currentNode}:${schemaSig}`;
+  }, [hitlAvailable, room, hasReviewPayload]);
 
   const chatNodeId = selectedNodeId || room?.currentNode || 'pending';
   const displayChatLogs = useMemo(
@@ -921,7 +933,9 @@ const InterventionDialog = ({
   useEffect(() => {
     if (!open) {
       setSelectedNodeId(null);
+      setCenterTab('detail');
       interventionRoomIdRef.current = null;
+      hitlAutoFocusRef.current = null;
       return;
     }
     if (!room) return;
@@ -930,6 +944,20 @@ const InterventionDialog = ({
       setSelectedNodeId(room.currentNode);
     }
   }, [open, room?.id, room?.currentNode]);
+
+  /** 人工确认触发或待办更新时，自动切到「人工确认」并聚焦当前节点 */
+  useEffect(() => {
+    if (!open) return;
+    if (!hitlAvailable || !hitlFocusKey) {
+      hitlAutoFocusRef.current = null;
+      setCenterTab((tab) => (tab === 'hitl' ? 'detail' : tab));
+      return;
+    }
+    if (hitlAutoFocusRef.current === hitlFocusKey) return;
+    hitlAutoFocusRef.current = hitlFocusKey;
+    setCenterTab('hitl');
+    if (room?.currentNode) setSelectedNodeId(room.currentNode);
+  }, [open, hitlAvailable, hitlFocusKey, room?.currentNode]);
 
   useEffect(() => {
     if (!open) return;
