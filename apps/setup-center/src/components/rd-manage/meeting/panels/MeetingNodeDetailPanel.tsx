@@ -541,17 +541,6 @@ export function MeetingNodeDetailPanel({
           ) : null}
         </div>
       )}
-      {(review?.summaries ?? []).length ? (
-        <div className="space-y-2">
-          <h5 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">工作摘要</h5>
-          {review!.summaries.map((s) => (
-            <div key={s.profile_id} className="rounded-xl border border-border/50 bg-black/20 p-4">
-              <div className="mb-2 text-xs font-medium text-foreground">{s.display_name}</div>
-              <ReviewMarkdown content={s.summary_markdown} />
-            </div>
-          ))}
-        </div>
-      ) : null}
     </div>
   );
 

@@ -5,14 +5,23 @@ import {
   fetchMeetingRoomLive,
   fetchMeetingRooms,
   fetchMeetingNodeParticipants,
+  fetchMeetingRoomConfig,
   interveneMeetingRoom,
   reprocessMeetingRoom,
   type MeetingRoomChatLogWire,
   type MeetingRoomDetail,
   type MeetingRoomListItem,
   type MeetingRoomLivePayload,
+  type MeetingRoomConfigPayload,
+  type MeetingRoomNodeOverride,
   type MeetingRoomParticipantWire,
 } from '../../../api/meetingRoomService';
+import {
+  buildConfiguredRoomRoster,
+  liveAgentsById,
+  profilesToMap,
+  type MeetingAgentProfileWire,
+} from './meetingRoomRoster';
 import { consumeMeetingRoomFocus } from '../../../rd-meeting/focus';
 import { MeetingRoomConfigDrawer } from './MeetingRoomConfigDrawer';
 import { MeetingHitlForm, type HitlFormSchema } from './MeetingHitlForm';
@@ -438,12 +447,34 @@ function mapListItemToRoom(item: MeetingRoomListItem): MeetingRoom {
   return mapDetailToRoom(item as MeetingRoomDetail);
 }
 
+function isSopNodeEnabled(
+  overrides: Record<string, MeetingRoomNodeOverride>,
+  nodeId: string,
+): boolean {
+  const v = overrides[nodeId]?.enabled;
+  if (v === undefined || v === null) return true;
+  return v !== false;
+}
+
+function buildDisabledSopNodeIds(
+  overrides: Record<string, MeetingRoomNodeOverride> | undefined,
+): Set<string> {
+  const out = new Set<string>();
+  if (!overrides) return out;
+  for (const node of ALL_NODES) {
+    if (!isSopNodeEnabled(overrides, node.id)) out.add(node.id);
+  }
+  return out;
+}
+
 const getNodeStateGlobal = (
   room: MeetingRoom,
   nodeId: string,
+  disabledNodeIds?: ReadonlySet<string>,
 ): 'completed' | 'processing' | 'error' | 'human_intervention' | 'pending' | 'skipped' => {
   const skipped = room.skippedNodeIds ?? [];
   if (skipped.includes(nodeId)) return 'skipped';
+  if (disabledNodeIds?.has(nodeId)) return 'skipped';
 
   const targetIndex = ALL_NODES.findIndex((n) => n.id === nodeId);
   const currentIndex = ALL_NODES.findIndex((n) => n.id === room.currentNode);
@@ -497,7 +528,109 @@ const SkippedNodeDetailPanel = ({ nodeName }: { nodeName: string }) => (
 
 // --- Sub-components (AgentAvatar → MeetingAgentAvatar.tsx) ---
 
-const RoomCard = ({ room, onClick }: { room: MeetingRoom, onClick: (r: MeetingRoom) => void }) => {
+/** 看板卡片用：不含「待处理」的流水线阶段 */
+const MEETING_PIPELINE_STAGES = SOP_STAGES.filter((s) => s.id > 0);
+
+function roomCardStatusLabel(status: MeetingRoom['status']): string {
+  switch (status) {
+    case 'human_intervention':
+      return '待介入';
+    case 'processing':
+      return '进行中';
+    case 'completed':
+      return '已完成';
+    case 'failed':
+      return '异常';
+    default:
+      return '';
+  }
+}
+
+/** 会议室阶段进度：与标题分行，圆点+文案强制单行（必要时横向滚动） */
+const RoomCardStageProgress = ({ room }: { room: MeetingRoom }) => {
+  const statusTone =
+    room.status === 'human_intervention'
+      ? 'text-red-400'
+      : room.status === 'processing'
+        ? 'text-blue-400'
+        : room.status === 'failed'
+          ? 'text-red-400'
+          : 'text-green-400';
+
+  const statusDot =
+    room.status === 'human_intervention'
+      ? 'bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.8)]'
+      : room.status === 'processing'
+        ? 'bg-blue-500 shadow-[0_0_6px_rgba(59,130,246,0.8)] animate-pulse'
+        : room.status === 'failed'
+          ? 'bg-red-500'
+          : 'bg-green-500';
+
+  const currentStageLabel = room.stageName || stageNameForId(room.stageIndex);
+
+  return (
+    <div className="flex w-full min-w-0 items-center gap-2">
+      <div
+        className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto flex-nowrap [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        aria-label="SOP 阶段进度"
+      >
+        {MEETING_PIPELINE_STAGES.map((stage, idx) => {
+          const isPast = room.stageIndex > stage.id || room.status === 'completed';
+          const isActive = room.stageIndex === stage.id && room.status !== 'completed';
+          const dotCls = isPast
+            ? 'bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.5)]'
+            : isActive
+              ? room.status === 'human_intervention'
+                ? 'bg-amber-500 shadow-[0_0_6px_rgba(245,158,11,0.7)]'
+                : 'bg-blue-500 shadow-[0_0_6px_rgba(59,130,246,0.8)]'
+              : 'bg-muted-foreground/35';
+          const textCls = isPast
+            ? 'text-emerald-600/90 dark:text-emerald-400/90'
+            : isActive
+              ? room.status === 'human_intervention'
+                ? 'text-amber-400'
+                : 'text-blue-400'
+              : 'text-muted-foreground/50';
+
+          return (
+            <React.Fragment key={stage.id}>
+              {idx > 0 ? (
+                <span
+                  className={`h-px w-2 shrink-0 ${isPast || isActive ? 'bg-emerald-500/40' : 'bg-border/50'}`}
+                  aria-hidden
+                />
+              ) : null}
+              <Tooltip title={stage.name}>
+                <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap">
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} aria-hidden />
+                  <span className={`text-[9px] font-medium leading-none ${textCls}`}>{stage.name}</span>
+                </span>
+              </Tooltip>
+            </React.Fragment>
+          );
+        })}
+      </div>
+      <span
+        className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-[10px] font-medium ${statusTone}`}
+      >
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusDot}`} aria-hidden />
+        [{room.stageIndex}/{room.totalStages}] {currentStageLabel}
+        <span className="text-muted-foreground/60">·</span>
+        {roomCardStatusLabel(room.status)}
+      </span>
+    </div>
+  );
+};
+
+const RoomCard = ({
+  room,
+  rosterAgents,
+  onClick,
+}: {
+  room: MeetingRoom;
+  rosterAgents: RoomAgent[];
+  onClick: (r: MeetingRoom) => void;
+}) => {
   const [activeLogIndex, setActiveLogIndex] = useState(room.logs.length - 1);
 
   useEffect(() => {
@@ -509,7 +642,9 @@ const RoomCard = ({ room, onClick }: { room: MeetingRoom, onClick: (r: MeetingRo
   }, [room]);
 
   const activeLog = room.logs[activeLogIndex] || room.logs[room.logs.length - 1];
-  const activeAgent = room.agents.find(a => a.id === activeLog?.agentId);
+  const activeAgent =
+    rosterAgents.find((a) => a.id === activeLog?.agentId) ||
+    room.agents.find((a) => a.id === activeLog?.agentId);
 
   const borderColor = 
     room.status === 'human_intervention' ? 'border-red-500/50 hover:border-red-400' :
@@ -526,30 +661,22 @@ const RoomCard = ({ room, onClick }: { room: MeetingRoom, onClick: (r: MeetingRo
       whileHover={{ y: -4, scale: 1.01 }}
       whileTap={{ scale: 0.98 }}
       onClick={() => onClick(room)}
-      className={`cursor-pointer bg-card border ${borderColor} ${glowColor} rounded-2xl overflow-hidden flex flex-col h-[340px] transition-all duration-300 relative group`}
+      className={`cursor-pointer bg-card border ${borderColor} ${glowColor} rounded-2xl overflow-hidden flex flex-col h-[380px] transition-all duration-300 relative group`}
     >
-      {/* Header */}
-      <div className="p-4 border-b border-border/50 bg-muted/10 flex flex-col gap-3">
-        <div className="flex items-start justify-between">
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2">
-              <Hash className="w-3.5 h-3.5 text-muted-foreground" />
-              <span className="text-xs font-mono text-muted-foreground">{room.ticketId}</span>
-            </div>
-            <h3 className="text-sm font-semibold text-foreground line-clamp-1 pr-2">{room.ticketTitle}</h3>
+      <div className="shrink-0 border-b border-border/50 bg-muted/10 p-3 flex flex-col gap-2">
+        <Tooltip title={`${room.ticketId} · ${room.ticketTitle}`}>
+          <div className="flex min-w-0 items-center gap-2 whitespace-nowrap">
+            <Hash className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span className="shrink-0 font-mono text-xs text-muted-foreground">{room.ticketId}</span>
+            <span className="shrink-0 text-muted-foreground/40">|</span>
+            <h3 className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
+              {room.ticketTitle}
+            </h3>
           </div>
-          <Badge 
-            status={room.status === 'human_intervention' ? 'error' : room.status === 'processing' ? 'processing' : 'success'} 
-            text={
-              <span className={`text-xs whitespace-nowrap ${room.status === 'human_intervention' ? 'text-red-400' : room.status === 'processing' ? 'text-blue-400' : 'text-green-400'}`}>
-                [{room.stageIndex}/{room.totalStages}] {room.stageName}
-              </span>
-            } 
-          />
-        </div>
+        </Tooltip>
+        <RoomCardStageProgress room={room} />
 
-        {/* Metrics */}
-        <div className="flex items-center gap-4 text-xs">
+        <div className="flex items-center gap-3 text-xs">
           <div className="flex items-center gap-1.5 text-muted-foreground bg-muted/40 px-2 py-1 rounded-md border border-border/50">
             <Clock className="w-3 h-3 text-indigo-400" />
             <span className="font-mono">{room.stageDuration}</span>
@@ -571,56 +698,48 @@ const RoomCard = ({ room, onClick }: { room: MeetingRoom, onClick: (r: MeetingRo
         </div>
       </div>
 
-      {/* Body: Agents & Brief */}
-      <div className="p-4 flex-1 flex flex-col justify-between gap-4">
-        {/* Humanized Agents Presentation */}
-        <div className="flex flex-col gap-3">
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] text-muted-foreground uppercase tracking-wider flex items-center gap-1">
-              <Users className="w-3 h-3" /> 参会代表 ({room.agents.length})
-            </span>
-          </div>
-          <div className="flex items-center gap-3">
-            {room.agents.slice(0, 3).map(agent => (
-              <Tooltip 
-                key={agent.id} 
+      <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
+        <div className="shrink-0">
+          <span className="mb-1.5 flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+            <Users className="h-3 w-3" /> 参会代表 ({rosterAgents.length})
+          </span>
+          <div className="flex items-center gap-2 overflow-x-auto flex-nowrap [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {rosterAgents.map((agent) => (
+              <Tooltip
+                key={agent.id}
                 title={
                   <div className="flex flex-col gap-1">
-                    <span className="font-medium text-white">{agent.name} · {agent.role}</span>
+                    <span className="font-medium text-white">
+                      {agent.name} · {agent.role}
+                    </span>
                     <span className="text-xs text-foreground/90">状态: {agent.currentAction}</span>
                   </div>
                 }
               >
-                <div className="flex flex-col items-center gap-1.5 group/ag">
+                <div className="group/ag flex shrink-0 flex-col items-center gap-1">
                   <MeetingAgentAvatar agent={agent} />
-                  <span className="text-[10px] text-muted-foreground max-w-[48px] truncate text-center transition-colors group-hover/ag:text-foreground">
+                  <span className="max-w-[52px] truncate text-center text-[10px] text-muted-foreground transition-colors group-hover/ag:text-foreground">
                     {agent.name}
                   </span>
                 </div>
               </Tooltip>
             ))}
-            {room.agents.length > 3 && (
-              <div className="w-8 h-8 rounded-full bg-muted border-2 border-background flex items-center justify-center text-xs text-muted-foreground">
-                +{room.agents.length - 3}
-              </div>
-            )}
           </div>
         </div>
 
-        {/* Dynamic Log Brief */}
-        <div className="bg-muted/40 rounded-xl p-3 border border-border/50 h-[88px] flex flex-col justify-center relative overflow-hidden group-hover:border-border transition-colors">
-          <div className="absolute top-2 left-3 text-[9px] text-muted-foreground font-mono flex items-center gap-1">
-            <Activity className="w-3 h-3" /> 最新发言
+        <div className="relative flex min-h-[88px] min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border/50 bg-muted/40 p-3 group-hover:border-border transition-colors">
+          <div className="mb-1 flex shrink-0 items-center gap-1 font-mono text-[9px] text-muted-foreground">
+            <Activity className="h-3 w-3" /> 最新发言
           </div>
-          
+
           <AnimatePresence mode="wait">
             <motion.div
               key={activeLog?.id}
-              initial={{ opacity: 0, y: 10 }}
+              initial={{ opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
+              exit={{ opacity: 0, y: -6 }}
               transition={{ duration: 0.3 }}
-              className="mt-4 flex items-start gap-2"
+              className="flex min-h-0 flex-1 items-start gap-2 overflow-hidden"
             >
               <div className={`mt-0.5 w-4 h-4 rounded-full flex shrink-0 items-center justify-center text-white opacity-80 ${activeAgent?.avatarColor || 'bg-muted'}`}>
                 {activeAgent?.icon || <Bot className="w-2.5 h-2.5" />}
@@ -682,6 +801,7 @@ const InterventionDialog = ({
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [centerTab, setCenterTab] = useState<'detail' | 'hitl'>('detail');
   const [selectedNodeParticipants, setSelectedNodeParticipants] = useState<MeetingRoomParticipantWire[]>([]);
+  const [disabledSopNodeIds, setDisabledSopNodeIds] = useState<Set<string>>(() => new Set());
   const [contextOpen, setContextOpen] = useState(false);
   const [contextAgent, setContextAgent] = useState<AgentContextTarget | null>(null);
 
@@ -750,6 +870,26 @@ const InterventionDialog = ({
       );
     });
   }, [room, selectedNodeParticipants, chatNodeId]);
+
+  useEffect(() => {
+    if (!open) {
+      setDisabledSopNodeIds(new Set());
+      return;
+    }
+    const base = (synapseApiBase || '').trim();
+    if (!base) return;
+    let cancelled = false;
+    void fetchMeetingRoomConfig(base)
+      .then((cfg) => {
+        if (!cancelled) setDisabledSopNodeIds(buildDisabledSopNodeIds(cfg.node_overrides));
+      })
+      .catch(() => {
+        if (!cancelled) setDisabledSopNodeIds(new Set());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, synapseApiBase]);
 
   useEffect(() => {
     if (!open || !room?.id || !chatNodeId) {
@@ -857,12 +997,14 @@ const InterventionDialog = ({
         {/* COL 1: Current Stage Agenda List (320px) */}
         <div className="w-[320px] bg-[color:var(--panel)] flex flex-col shrink-0">
           {/* Ticket Header */}
-          <div className="p-4 border-b border-border/60 flex flex-col justify-center gap-1.5 h-[72px]">
+          <div className="p-4 border-b border-border/60 flex flex-col justify-center gap-1.5 min-h-[88px]">
             <div className="text-xs text-muted-foreground font-mono flex items-center gap-1.5 min-w-0">
               <GitBranch className="w-3 h-3 shrink-0" />
               <span className="truncate">{room.ticketId}</span>
             </div>
-            <h3 className="text-sm font-semibold text-foreground truncate">{room.ticketTitle}</h3>
+            <h3 className="text-sm font-semibold text-foreground line-clamp-3 leading-snug break-words">
+              {room.ticketTitle}
+            </h3>
           </div>
           
           {/* Stage Banner */}
@@ -881,7 +1023,7 @@ const InterventionDialog = ({
           {/* Agenda Items - only current stage nodes */}
           <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-2">
             {stageNodes.map((node, idx) => {
-              const state = getNodeStateGlobal(room, node.id);
+              const state = getNodeStateGlobal(room, node.id, disabledSopNodeIds);
               const typeInfo = getNodeTypeInfo(node.type);
               const isSelected = selectedNode?.id === node.id;
               const isCurrentNode = node.id === room.currentNode;
@@ -1064,7 +1206,7 @@ const InterventionDialog = ({
               </div>
             ) : selectedNode ? (
               (() => {
-                const selectedNodeState = getNodeStateGlobal(room, selectedNode.id);
+                const selectedNodeState = getNodeStateGlobal(room, selectedNode.id, disabledSopNodeIds);
                 const detailViewMode = resolveNodeDetailViewMode(selectedNodeState);
                 const typeInfo = getNodeTypeInfo(selectedNode.type);
 
@@ -1097,7 +1239,7 @@ const InterventionDialog = ({
                             ) : selectedNodeState === 'completed' ? (
                               <Badge status="success" text={<span className="text-xs text-green-400">已完成</span>} />
                             ) : selectedNodeState === 'skipped' ? (
-                              <Badge status="default" text={<span className="text-xs text-slate-400">已跳过</span>} />
+                              <Badge status="default" text={<span className="text-xs text-slate-400">未开启</span>} />
                             ) : selectedNodeState === 'pending' ? (
                               <Badge status="default" text={<span className="text-xs text-muted-foreground">待执行</span>} />
                             ) : null}
@@ -1244,6 +1386,51 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
   const [activeRoom, setActiveRoom] = useState<MeetingRoom | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [roomConfig, setRoomConfig] = useState<MeetingRoomConfigPayload | null>(null);
+  const [agentProfiles, setAgentProfiles] = useState<Map<string, MeetingAgentProfileWire>>(
+    () => new Map(),
+  );
+  const configOpenPrev = useRef(false);
+
+  const loadMeetingConfig = useCallback(async () => {
+    const base = (synapseApiBase || '').trim();
+    if (!base) {
+      setRoomConfig(null);
+      setAgentProfiles(new Map());
+      return;
+    }
+    try {
+      const [cfg, profilesRes] = await Promise.all([
+        fetchMeetingRoomConfig(base),
+        fetch(`${base}/api/agents/profiles?include_hidden=true`).then((r) => r.json()),
+      ]);
+      setRoomConfig(cfg);
+      setAgentProfiles(profilesToMap((profilesRes?.profiles as MeetingAgentProfileWire[]) || []));
+    } catch {
+      /* 配置拉取失败时卡片仍用 API 参会人兜底 */
+    }
+  }, [synapseApiBase]);
+
+  useEffect(() => {
+    void loadMeetingConfig();
+  }, [loadMeetingConfig]);
+
+  useEffect(() => {
+    if (configOpenPrev.current && !configOpen) void loadMeetingConfig();
+    configOpenPrev.current = configOpen;
+  }, [configOpen, loadMeetingConfig]);
+
+  const rosterForRoom = useCallback(
+    (room: MeetingRoom): RoomAgent[] => {
+      const configured = buildConfiguredRoomRoster(room.currentNode, roomConfig, agentProfiles, {
+        roomStatus: room.status,
+        liveById: liveAgentsById(room.agents),
+      });
+      if (roomConfig) return configured;
+      return room.agents.length > 0 ? room.agents : configured;
+    },
+    [roomConfig, agentProfiles],
+  );
   const reloadRooms = useCallback(async () => {
     const base = (synapseApiBase || '').trim();
     if (!base) {
@@ -1421,11 +1608,12 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
           ) : null}
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 max-w-[1600px] mx-auto relative z-10">
             <AnimatePresence>
-              {rooms.map(room => (
-                <RoomCard 
-                  key={room.id} 
-                  room={room} 
-                  onClick={handleOpenRoom} 
+              {rooms.map((room) => (
+                <RoomCard
+                  key={room.id}
+                  room={room}
+                  rosterAgents={rosterForRoom(room)}
+                  onClick={handleOpenRoom}
                 />
               ))}
             </AnimatePresence>
