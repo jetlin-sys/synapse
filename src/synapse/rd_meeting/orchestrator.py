@@ -15,6 +15,7 @@ from synapse.rd_meeting.agent_activity import (
     resolve_binding_for_profile,
     set_agent_activity_binding,
 )
+from synapse.rd_meeting.agent_prompt import set_meeting_prompt_node_id
 from synapse.rd_meeting.agent_runtime import apply_meeting_agent_runtime
 from synapse.rd_meeting.agent_session import (
     bind_meeting_agent_session,
@@ -58,6 +59,10 @@ from synapse.rd_meeting.participants import build_meeting_participants
 from synapse.rd_meeting.paths import archive_node_dir, scope_dir
 from synapse.rd_meeting.phase import set_phase
 from synapse.rd_meeting.pipeline_chat import format_host_first_call_chat
+from synapse.rd_meeting.prewarm_coordinator import (
+    bump_meeting_prewarm_generation,
+    is_meeting_prewarm_generation_current,
+)
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
     load_room_state,
@@ -177,13 +182,25 @@ class MeetingRoomOrchestrator:
         ticket_title: str,
         binding: dict[str, Any],
         host_profile_id: str,
+        prewarm_generation: int = 0,
     ) -> None:
         """为本会议室预先创建所有 Worker 实例并注入会议室 SKILL / 端点。
 
         预热的好处：
         - 小鲸通过 ``delegate_to_agent`` 委派时，pool 已有正确端点 + SKILL；
         - Worker 之间可直接 ``send_agent_message`` 协作（pool 内可见）。
+
+        ``prewarm_generation`` 与 :mod:`prewarm_coordinator` 配合，丢弃过期的异步 prewarm。
         """
+        if prewarm_generation > 0 and not is_meeting_prewarm_generation_current(
+            room_id, prewarm_generation
+        ):
+            logger.debug(
+                "prewarm skipped stale generation room=%s gen=%s",
+                room_id,
+                prewarm_generation,
+            )
+            return
         worker_ids = [
             str(w).strip()
             for w in binding.get("worker_profile_ids") or []
@@ -193,6 +210,15 @@ class MeetingRoomOrchestrator:
             return
         skill_body = get_meeting_room_rules()
         for wid in worker_ids:
+            if prewarm_generation > 0 and not is_meeting_prewarm_generation_current(
+                room_id, prewarm_generation
+            ):
+                logger.debug(
+                    "prewarm aborted mid-loop stale generation room=%s gen=%s",
+                    room_id,
+                    prewarm_generation,
+                )
+                return
             profile = _resolve_profile(wid)
             if profile is None:
                 logger.warning("worker profile %s not found, skip prewarm", wid)
@@ -316,6 +342,7 @@ class MeetingRoomOrchestrator:
             agent._org_context = True  # type: ignore[attr-defined]
         except Exception as exc:
             logger.debug("set _org_context failed for role=%s: %s", role, exc)
+        set_meeting_prompt_node_id(agent, nid or "pending")
 
         if target_pid:
             try:
@@ -341,6 +368,7 @@ class MeetingRoomOrchestrator:
                     detail={
                         "role": role,
                         "endpoint": endpoint_key,
+                        "node_id": nid or "pending",
                         "reused_host_prompt": reused_host_prompt,
                     },
                 )
@@ -1378,6 +1406,7 @@ class MeetingRoomOrchestrator:
                         "agent_id": host_profile_id,
                     },
                 )
+                prewarm_gen = bump_meeting_prewarm_generation(room_id)
                 await self._prewarm_meeting_room(
                     agent_pool=agent_pool,
                     room_id=room_id,
@@ -1386,6 +1415,7 @@ class MeetingRoomOrchestrator:
                     ticket_title=ticket_title,
                     binding=binding,
                     host_profile_id=host_profile_id,
+                    prewarm_generation=prewarm_gen,
                 )
 
                 host_sid = host_session_id(room_id)

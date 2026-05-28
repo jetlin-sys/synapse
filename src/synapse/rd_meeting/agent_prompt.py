@@ -13,6 +13,30 @@ from synapse.rd_meeting.paths import scope_dir
 logger = logging.getLogger(__name__)
 
 MEETING_PROMPT_MARKER = "# 你是 Synapse 研发会议室参会智能体"
+MEETING_PROMPT_NODE_ATTR = "_rd_meeting_prompt_node_id"
+
+
+def get_meeting_prompt_node_id(agent: Any) -> str:
+    return str(getattr(agent, MEETING_PROMPT_NODE_ATTR, "") or "").strip()
+
+
+def set_meeting_prompt_node_id(agent: Any, node_id: str) -> None:
+    try:
+        setattr(agent, MEETING_PROMPT_NODE_ATTR, (node_id or "").strip() or "pending")
+    except Exception as exc:
+        logger.debug("set_meeting_prompt_node_id failed: %s", exc)
+
+
+def clear_meeting_prompt_binding(agent: Any) -> None:
+    """节点收尾：解除会议室短路，迫使下一节点重新 _configure_meeting_agent。"""
+    try:
+        setattr(agent, MEETING_PROMPT_NODE_ATTR, "")
+    except Exception as exc:
+        logger.debug("clear meeting prompt node id failed: %s", exc)
+    try:
+        agent._org_context = False  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.debug("clear _org_context failed: %s", exc)
 
 
 def _refresh_meeting_activity_binding(
@@ -48,13 +72,18 @@ def is_meeting_room_system_prompt(text: str) -> bool:
     return MEETING_PROMPT_MARKER in (text or "")
 
 
-def is_meeting_agent_configured(agent: Any) -> bool:
-    """Agent 是否已绑定会议室专用 system prompt（且已开启短路标记）。"""
+def is_meeting_agent_configured(agent: Any, *, expected_node_id: str | None = None) -> bool:
+    """Agent 是否已绑定当前 SOP 节点的会议室 system prompt（且已开启短路标记）。"""
     if not getattr(agent, "_org_context", None):
         return False
     ctx = getattr(agent, "_context", None)
     system = str(getattr(ctx, "system", "") or "")
-    return is_meeting_room_system_prompt(system)
+    if not is_meeting_room_system_prompt(system):
+        return False
+    expected = (expected_node_id or "").strip()
+    if expected:
+        return get_meeting_prompt_node_id(agent) == expected
+    return True
 
 
 def resolve_rd_meeting_pool_session_id(
@@ -81,7 +110,7 @@ def ensure_meeting_agent_configured(
     agent_profile_id: str,
     depth: int = 0,
 ) -> bool:
-    """若池化 Agent 尚未注入会议室 prompt，则按当前节点 binding 补配。
+    """若池化 Agent 尚未注入当前节点会议室 prompt，则按 binding 补配或重配。
 
     Returns:
         是否属于研发会议室上下文（无论是否本次新配置）。
@@ -112,7 +141,7 @@ def ensure_meeting_agent_configured(
     )
     binding["node_id"] = node_id
 
-    if is_meeting_agent_configured(agent):
+    if is_meeting_agent_configured(agent, expected_node_id=node_id):
         _refresh_meeting_activity_binding(
             agent,
             scope_id=scope_id,
@@ -123,6 +152,16 @@ def ensure_meeting_agent_configured(
             binding=binding,
         )
         return True
+
+    prior_node = get_meeting_prompt_node_id(agent)
+    if prior_node and prior_node != node_id:
+        logger.info(
+            "Reconfiguring meeting prompt (node changed %s -> %s) session=%s profile=%s",
+            prior_node,
+            node_id,
+            session_id,
+            agent_profile_id,
+        )
 
     if depth > 0:
         role: Literal["host", "worker"] = "worker"

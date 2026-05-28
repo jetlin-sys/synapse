@@ -1692,9 +1692,8 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
     const base = (synapseApiBase || '').trim();
     if (!base) return;
     const roomId = activeRoom.id;
-    const pollNodeId = activeRoom.currentNode;
     const poll = () => {
-      void fetchMeetingRoomLive(base, roomId, pollNodeId)
+      void fetchMeetingRoomLive(base, roomId)
         .then((live) => {
           setActiveRoom((prev) => {
             if (!prev || prev.id !== roomId) return prev;
@@ -1712,7 +1711,7 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
     poll();
     const timer = window.setInterval(poll, 3000);
     return () => window.clearInterval(timer);
-  }, [dialogOpen, activeRoom?.id, activeRoom?.currentNode, synapseApiBase]);
+  }, [dialogOpen, activeRoom?.id, synapseApiBase]);
 
   useEffect(() => {
     const focus = consumeMeetingRoomFocus();

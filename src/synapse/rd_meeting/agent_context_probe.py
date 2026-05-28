@@ -16,6 +16,7 @@ from synapse.rd_meeting.agent_activity import (
     read_activity_log,
 )
 from synapse.rd_meeting.agent_session import host_session_id
+from synapse.rd_meeting.agent_trace import read_system_prompt_snapshot
 from synapse.rd_meeting.dev_status import load_dev_status
 from synapse.rd_meeting.live import scope_id_for_room_id
 from synapse.rd_meeting.paths import scope_dir
@@ -776,13 +777,18 @@ def collect_meeting_agent_contexts(
             role = "host" if pid == host_profile_id else "worker"
             sid = host_sid if role == "host" else f"{prefix}{pid}"
             task = _merge_task_with_activity(None, activity_raw)
+            system_prompt = read_system_prompt_snapshot(scope_id, pid, target_node_id)
+            system_prompt, system_truncated = _truncate_text(
+                system_prompt, message_char_limit * 2
+            )
             agents.append(
                 {
                     "session_id": sid,
                     "profile_id": pid,
                     "role": role,
                     "current_node_id": target_node_id,
-                    "system_prompt": "",
+                    "system_prompt": system_prompt,
+                    "system_prompt_truncated": system_truncated,
                     "messages": [],
                     "messages_count": 0,
                     "processing_history": processing_history,

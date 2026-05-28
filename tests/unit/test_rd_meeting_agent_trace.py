@@ -101,8 +101,8 @@ def test_normalize_speaker_system_and_tool():
     ) == Speaker(kind="tool", display_name="工具")
 
 
-def _fake_agent(messages, *, tools=None, skills=None, last_usage=None):
-    ctx = SimpleNamespace(messages=list(messages))
+def _fake_agent(messages, *, tools=None, skills=None, last_usage=None, system=""):
+    ctx = SimpleNamespace(messages=list(messages), system=system)
     task = SimpleNamespace(
         tools_executed=list(tools or []),
         skills_executed=list(skills or []),
@@ -139,6 +139,7 @@ def test_dump_agent_node_trace_writes_conversation_and_tools(tmp_path):
         tools=["shell", "run_skill_script"],
         skills=[{"skill": "doc-generate", "tool": "run_skill_script", "script": "render.py"}],
         last_usage={"total_tokens": 1234},
+        system="# 你是 Synapse 研发会议室参会智能体\n\nhost prompt body",
     )
 
     out = dump_agent_node_trace(
@@ -180,6 +181,37 @@ def test_dump_agent_node_trace_writes_conversation_and_tools(tmp_path):
         for line in (base / "events.jsonl").read_text("utf-8").splitlines()
     ]
     assert any(e["event"] == "dumped" for e in events)
+
+    prompt_text = (base / "system_prompt.txt").read_text("utf-8")
+    assert "研发会议室参会智能体" in prompt_text
+    meta = json.loads((base / "meta.json").read_text("utf-8"))
+    assert meta["prompt_snapshot"]["file"] == "system_prompt.txt"
+    assert meta["prompt_snapshot"]["source"] == "node_finish_dump"
+    assert meta["prompt_snapshot"]["bytes"] == len(prompt_text.encode("utf-8"))
+
+
+def test_read_system_prompt_snapshot_returns_empty_when_missing(tmp_path):
+    from synapse.rd_meeting.agent_trace import read_system_prompt_snapshot
+
+    assert read_system_prompt_snapshot("scope-X", "default", "req_clarify") == ""
+
+
+def test_read_system_prompt_snapshot_reads_dumped_file(tmp_path):
+    from synapse.rd_meeting.agent_trace import read_system_prompt_snapshot
+
+    scope = "scope-read"
+    pid = "default"
+    nid = "req_clarify"
+    agent = _fake_agent([], system="saved prompt snapshot")
+    dump_agent_node_trace(
+        scope,
+        pid,
+        nid,
+        agent=agent,
+        host_profile_id="default",
+        role="host",
+    )
+    assert read_system_prompt_snapshot(scope, pid, nid) == "saved prompt snapshot"
 
 
 def test_reset_agent_node_context_clears_messages_and_task(tmp_path):

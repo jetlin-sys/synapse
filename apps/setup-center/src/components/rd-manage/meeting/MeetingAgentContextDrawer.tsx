@@ -1153,6 +1153,13 @@ export function MeetingAgentContextDrawer({
     return out;
   }, [processingHistory]);
 
+  const systemPromptEmptyHint = useMemo(() => {
+    if (entry?.offline_from_disk) {
+      return '该节点执行时未落盘 System Prompt（节点需正常收尾后才会保存）';
+    }
+    return '暂无 system prompt（可能尚未触发 LLM）';
+  }, [entry?.offline_from_disk]);
+
   const avatarColor = agent?.isHost ? 'bg-violet-500' : agent?.avatarColor || 'bg-sky-500';
 
   const nodeLabel = useMemo(() => {
@@ -1333,7 +1340,7 @@ export function MeetingAgentContextDrawer({
                   title="System Prompt"
                   icon={<Sparkles className="w-3 h-3 text-violet-400" />}
                   text={entry.system_prompt || ''}
-                  emptyHint="暂无 system prompt（可能尚未触发 LLM）"
+                  emptyHint={systemPromptEmptyHint}
                   defaultOpen={view === 'prompt'}
                   maxHeight={view === 'prompt' ? 640 : 280}
                 />

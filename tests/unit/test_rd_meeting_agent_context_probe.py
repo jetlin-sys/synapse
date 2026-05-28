@@ -244,3 +244,41 @@ def test_collect_agent_contexts_scopes_to_requested_node(synapse_work_home, monk
     assert historical["current_node_id"] == "boundary"
     assert historical["agents"] == []
     assert historical["sub_agents"] == []
+
+
+def test_collect_historical_node_reads_system_prompt_from_disk(synapse_work_home, monkeypatch):
+    """历史节点只读节点收尾落盘的 system_prompt.txt。"""
+    scope_id = "ctx-prompt-scope"
+    work = synapse_work_home / scope_id
+    node_dir = work / "agents" / "boundary" / "default"
+    node_dir.mkdir(parents=True)
+    (work / "dev.status").write_text(
+        json.dumps(
+            {
+                "current_node_id": "req_clarify",
+                "meeting_room": {"room_id": "mr_prompt", "active": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (node_dir / "activity.jsonl").write_text(
+        json.dumps({"category": "output", "title": "done"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (node_dir / "system_prompt.txt").write_text(
+        "# 你是 Synapse 研发会议室参会智能体\n\nhistorical prompt",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "synapse.rd_meeting.agent_context_probe.scope_id_for_room_id",
+        lambda rid: scope_id if rid == "mr_prompt" else None,
+    )
+
+    payload = collect_meeting_agent_contexts("mr_prompt", None, node_id="boundary")
+    assert payload["current_node_id"] == "boundary"
+    assert len(payload["agents"]) == 1
+    host = payload["agents"][0]
+    assert host["profile_id"] == "default"
+    assert host["offline_from_disk"] is True
+    assert "historical prompt" in host["system_prompt"]

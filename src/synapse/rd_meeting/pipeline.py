@@ -724,12 +724,19 @@ def _schedule_prewarm_for_init(
         return  # 非 async 上下文（如纯同步测试），跳过
 
     from synapse.rd_meeting.orchestrator import MeetingRoomOrchestrator
+    from synapse.rd_meeting.prewarm_coordinator import (
+        bump_meeting_prewarm_generation,
+        is_meeting_prewarm_generation_current,
+    )
 
     host_id = str(binding.get("host_profile_id") or "default").strip() or "default"
     orch = MeetingRoomOrchestrator()
+    prewarm_gen = bump_meeting_prewarm_generation(room_id)
 
     async def _runner() -> None:
         try:
+            if not is_meeting_prewarm_generation_current(room_id, prewarm_gen):
+                return
             await orch._prewarm_meeting_room(
                 agent_pool=agent_pool,
                 room_id=room_id,
@@ -738,6 +745,7 @@ def _schedule_prewarm_for_init(
                 ticket_title=ticket_title,
                 binding=binding,
                 host_profile_id=host_id,
+                prewarm_generation=prewarm_gen,
             )
         except Exception as exc:  # pragma: no cover
             logger.warning("prewarm at node_init failed scope=%s: %s", scope_id, exc)
@@ -816,6 +824,12 @@ def _cleanup_agents_for_finished_node(
             )
         except Exception as exc:  # pragma: no cover
             logger.warning("reset host context failed scope=%s: %s", scope_id, exc)
+        try:
+            from synapse.rd_meeting.agent_prompt import clear_meeting_prompt_binding
+
+            clear_meeting_prompt_binding(host_agent)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("clear host meeting prompt binding failed scope=%s: %s", scope_id, exc)
 
     for wid in worker_ids:
         worker_sid = f"rd_meeting:{room_id}:{wid}"
@@ -850,6 +864,12 @@ def _cleanup_agents_for_finished_node(
             )
         except Exception as exc:  # pragma: no cover
             logger.warning("reset worker %s context failed: %s", wid, exc)
+        try:
+            from synapse.rd_meeting.agent_prompt import clear_meeting_prompt_binding
+
+            clear_meeting_prompt_binding(worker_agent)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("clear worker %s meeting prompt binding failed: %s", wid, exc)
 
 
 def _step_reprocess_prep(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:

@@ -5,6 +5,7 @@
 - 每个智能体在节点内有自己的目录 ``work/<scope>/agents/<node_id>/<profile_id>/``。
 - 节点级 trace 与 activity 同目录，包含：
   * ``conversation.jsonl``：归一化后的对话记录（user/host/coworker/system/tool）。
+  * ``system_prompt.txt``：节点收尾时 ``agent._context.system`` 快照（历史节点上下文只读此文件）。
   * ``tools.jsonl``：工具调用快照（来自 ``agent_state.tools_executed``）。
   * ``skills.jsonl``：技能调用快照（来自 ``agent_state.skills_executed``）。
   * ``usage.json``：本节点 token 累计（来自 ``agent.last_usage``）。
@@ -20,6 +21,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Iterable
@@ -31,6 +33,9 @@ from typing import Any, Literal
 from synapse.rd_meeting.paths import agent_node_dir, agent_sop_profile_dir
 
 logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT_FILENAME = "system_prompt.txt"
+PROMPT_SNAPSHOT_SOURCE = "node_finish_dump"
 
 SpeakerKind = Literal["user", "host", "coworker", "system", "tool", "unknown"]
 
@@ -153,6 +158,75 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:  # pragma: no cover
         logger.warning("agent_trace write %s failed: %s", path, exc)
+
+
+def system_prompt_path(scope_id: str, profile_id: str, node_id: str) -> Path:
+    """节点级 system prompt 快照路径。"""
+    return agent_sop_profile_dir(scope_id, node_id, profile_id) / SYSTEM_PROMPT_FILENAME
+
+
+def read_system_prompt_snapshot(scope_id: str, profile_id: str, node_id: str) -> str:
+    """读取节点收尾落盘的 system prompt；文件不存在则返回空串。"""
+    path = system_prompt_path(scope_id, profile_id, node_id)
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:  # pragma: no cover
+        logger.warning("read system prompt %s failed: %s", path, exc)
+        return ""
+
+
+def _merge_prompt_snapshot_meta(
+    scope_id: str,
+    profile_id: str,
+    node_id: str,
+    *,
+    prompt_text: str,
+) -> None:
+    """在 ``meta.json`` 中记录 prompt 快照元数据（保留已有字段）。"""
+    meta_path = agent_sop_profile_dir(scope_id, node_id, profile_id) / "meta.json"
+    payload: dict[str, Any] = {}
+    if meta_path.is_file():
+        try:
+            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug("read meta for prompt snapshot failed: %s", exc)
+    encoded = prompt_text.encode("utf-8")
+    payload["prompt_snapshot"] = {
+        "file": SYSTEM_PROMPT_FILENAME,
+        "bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "captured_at": _now_iso(),
+        "source": PROMPT_SNAPSHOT_SOURCE,
+    }
+    _write_json(meta_path, payload)
+
+
+def _write_system_prompt_snapshot(
+    base: Path,
+    *,
+    scope_id: str,
+    profile_id: str,
+    node_id: str,
+    agent: Any,
+) -> None:
+    ctx = getattr(agent, "_context", None)
+    prompt_text = str(getattr(ctx, "system", "") or "")
+    prompt_path = base / SYSTEM_PROMPT_FILENAME
+    try:
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+    except OSError as exc:  # pragma: no cover
+        logger.warning("dump system prompt %s failed: %s", prompt_path, exc)
+        return
+    _merge_prompt_snapshot_meta(
+        scope_id,
+        profile_id,
+        node_id,
+        prompt_text=prompt_text,
+    )
 
 
 # ─── 消息归一化 ────────────────────────────────────────────────────────
@@ -352,6 +426,14 @@ def dump_agent_node_trace(
     except OSError as exc:  # pragma: no cover
         logger.warning("dump conversation %s failed: %s", conv_path, exc)
         return None
+
+    _write_system_prompt_snapshot(
+        base,
+        scope_id=sid,
+        profile_id=pid,
+        node_id=nid,
+        agent=agent,
+    )
 
     state = getattr(agent, "agent_state", None)
     task = getattr(state, "current_task", None) if state is not None else None

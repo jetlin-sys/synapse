@@ -298,6 +298,8 @@ export interface MeetingRoomLivePayload {
   }[];
   recent_history?: Record<string, unknown>[];
   recent_chat?: MeetingRoomChatLogWire[];
+  /** 仅当请求带 node_id 时：本次 recent_chat 对应的浏览节点，不等于流水线 current_node_id */
+  view_node_id?: string;
   skipped_node_ids?: string[];
   participants?: MeetingRoomParticipantWire[];
   intervention_kind?: string;

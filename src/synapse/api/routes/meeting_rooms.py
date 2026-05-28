@@ -99,11 +99,11 @@ async def get_meeting_room_live(room_id: str, request: Request, node_id: str = "
     if item is None:
         return error_response(404, "meeting_room_not_found")
     nid = (node_id or "").strip()
-    if nid and nid != str(item.get("current_node_id") or ""):
+    if nid:
         chat = _service.get_room_node_chat(room_id, nid)
         if chat is not None:
             item = dict(item)
-            item["current_node_id"] = nid
+            item["view_node_id"] = nid
             item["recent_history"] = chat.get("history")
             item["recent_chat"] = chat.get("chat_logs")
     return success_response(item)
