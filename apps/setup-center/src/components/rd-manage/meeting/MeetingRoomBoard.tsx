@@ -68,7 +68,9 @@ import {
   Terminal, Code2, GitBranch, FileCode2, Play, User, Info, Network, Code, 
   TestTube, CheckSquare, Flame, TrendingUp, Loader2, AlertCircle, MessageSquareText, ClipboardCheck,
   SkipForward, RotateCw, ArrowLeft, Layers,
+  Search, PenLine, ShieldCheck, Check, Container,
 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 
 const { darkAlgorithm } = theme;
 
@@ -549,44 +551,255 @@ const SkippedNodeDetailPanel = ({ nodeName }: { nodeName: string }) => (
 /** 看板卡片用：不含「待处理」的流水线阶段 */
 const MEETING_PIPELINE_STAGES = SOP_STAGES.filter((s) => s.id > 0);
 
-/** 会议室弹窗 SOP 阶段导航主题（与配置抽屉对齐） */
-const STAGE_NAV_THEME: Record<
-  number,
-  { accent: string; badge: string; panel: string; dot: string }
-> = {
+/** 会议室弹窗 SOP 阶段导航主题（与配置抽屉色系对齐，增强对比与光效） */
+type StageNavTheme = {
+  accent: string;
+  badge: string;
+  panel: string;
+  dot: string;
+  ring: string;
+  glow: string;
+  gradient: string;
+  iconBg: string;
+  iconBorder: string;
+  bar: string;
+  short: string;
+  Icon: LucideIcon;
+};
+
+const STAGE_NAV_THEME: Record<number, StageNavTheme> = {
   1: {
-    accent: 'text-sky-400',
-    badge: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
-    panel: 'border-sky-500/20 bg-sky-500/[0.06]',
-    dot: 'bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.6)]',
+    accent: 'text-sky-300',
+    badge: 'bg-sky-500/20 text-sky-200 border-sky-400/40',
+    panel: 'border-sky-400/45 bg-sky-500/15',
+    dot: 'bg-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.85)]',
+    ring: 'ring-sky-400/55',
+    glow: 'shadow-[0_0_20px_rgba(56,189,248,0.35),inset_0_1px_0_rgba(255,255,255,0.08)]',
+    gradient: 'bg-gradient-to-b from-sky-500/25 via-sky-500/12 to-sky-950/20',
+    iconBg: 'bg-sky-500/25',
+    iconBorder: 'border-sky-400/50',
+    bar: 'bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.55)]',
+    short: '分析',
+    Icon: Search,
   },
   2: {
-    accent: 'text-violet-400',
-    badge: 'bg-violet-500/15 text-violet-300 border-violet-500/30',
-    panel: 'border-violet-500/20 bg-violet-500/[0.06]',
-    dot: 'bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.6)]',
+    accent: 'text-violet-300',
+    badge: 'bg-violet-500/20 text-violet-200 border-violet-400/40',
+    panel: 'border-violet-400/45 bg-violet-500/15',
+    dot: 'bg-violet-400 shadow-[0_0_10px_rgba(167,139,250,0.85)]',
+    ring: 'ring-violet-400/55',
+    glow: 'shadow-[0_0_20px_rgba(167,139,250,0.35),inset_0_1px_0_rgba(255,255,255,0.08)]',
+    gradient: 'bg-gradient-to-b from-violet-500/25 via-violet-500/12 to-violet-950/20',
+    iconBg: 'bg-violet-500/25',
+    iconBorder: 'border-violet-400/50',
+    bar: 'bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.55)]',
+    short: '设计',
+    Icon: PenLine,
   },
   3: {
-    accent: 'text-indigo-400',
-    badge: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30',
-    panel: 'border-indigo-500/20 bg-indigo-500/[0.06]',
-    dot: 'bg-indigo-400 shadow-[0_0_8px_rgba(129,140,248,0.6)]',
+    accent: 'text-indigo-300',
+    badge: 'bg-indigo-500/20 text-indigo-200 border-indigo-400/40',
+    panel: 'border-indigo-400/45 bg-indigo-500/15',
+    dot: 'bg-indigo-400 shadow-[0_0_10px_rgba(129,140,248,0.85)]',
+    ring: 'ring-indigo-400/55',
+    glow: 'shadow-[0_0_20px_rgba(129,140,248,0.35),inset_0_1px_0_rgba(255,255,255,0.08)]',
+    gradient: 'bg-gradient-to-b from-indigo-500/25 via-indigo-500/12 to-indigo-950/20',
+    iconBg: 'bg-indigo-500/25',
+    iconBorder: 'border-indigo-400/50',
+    bar: 'bg-indigo-400 shadow-[0_0_8px_rgba(129,140,248,0.55)]',
+    short: '环境',
+    Icon: Container,
   },
   4: {
-    accent: 'text-amber-400',
-    badge: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-    panel: 'border-amber-500/20 bg-amber-500/[0.06]',
-    dot: 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.6)]',
+    accent: 'text-amber-300',
+    badge: 'bg-amber-500/20 text-amber-200 border-amber-400/40',
+    panel: 'border-amber-400/45 bg-amber-500/15',
+    dot: 'bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.85)]',
+    ring: 'ring-amber-400/55',
+    glow: 'shadow-[0_0_20px_rgba(251,191,36,0.35),inset_0_1px_0_rgba(255,255,255,0.08)]',
+    gradient: 'bg-gradient-to-b from-amber-500/25 via-amber-500/12 to-amber-950/20',
+    iconBg: 'bg-amber-500/25',
+    iconBorder: 'border-amber-400/50',
+    bar: 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.55)]',
+    short: '开发',
+    Icon: Terminal,
   },
   5: {
-    accent: 'text-rose-400',
-    badge: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
-    panel: 'border-rose-500/20 bg-rose-500/[0.06]',
-    dot: 'bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.6)]',
+    accent: 'text-rose-300',
+    badge: 'bg-rose-500/20 text-rose-200 border-rose-400/40',
+    panel: 'border-rose-400/45 bg-rose-500/15',
+    dot: 'bg-rose-400 shadow-[0_0_10px_rgba(251,113,133,0.85)]',
+    ring: 'ring-rose-400/55',
+    glow: 'shadow-[0_0_20px_rgba(251,113,133,0.35),inset_0_1px_0_rgba(255,255,255,0.08)]',
+    gradient: 'bg-gradient-to-b from-rose-500/25 via-rose-500/12 to-rose-950/20',
+    iconBg: 'bg-rose-500/25',
+    iconBorder: 'border-rose-400/50',
+    bar: 'bg-rose-400 shadow-[0_0_8px_rgba(251,113,133,0.55)]',
+    short: '走查',
+    Icon: ShieldCheck,
   },
 };
 
 const DEFAULT_STAGE_THEME = STAGE_NAV_THEME[1];
+
+/** 会议室 UI 阶段展示名（步进器/标题；与 SOP 全名解耦，如 需求研发 → 环境） */
+function meetingStageNavLabel(stageId: number, fallback?: string): string {
+  return STAGE_NAV_THEME[stageId]?.short ?? fallback ?? stageNameForId(stageId);
+}
+
+/** 会议室侧栏：SOP 流水线阶段步进器（高对比 + 滑动光晕指示） */
+function MeetingSopStageStepper({
+  viewStageId,
+  pipelineStageId,
+  roomCompleted,
+  roomProcessing,
+  onSelect,
+}: {
+  viewStageId: number;
+  pipelineStageId: number;
+  roomCompleted: boolean;
+  roomProcessing: boolean;
+  onSelect: (stageId: number) => void;
+}) {
+  const stages = MEETING_PIPELINE_STAGES;
+  const pipelineIdx = roomCompleted
+    ? Math.max(0, stages.length - 1)
+    : Math.max(0, stages.findIndex((s) => s.id === pipelineStageId));
+
+  return (
+    <div
+      className="relative rounded-xl border border-border/50 bg-gradient-to-b from-muted/35 via-background/80 to-muted/25 p-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
+      role="tablist"
+      aria-label="SOP 阶段切换"
+    >
+      {/* 底部流水线轨道 */}
+      <div
+        className="pointer-events-none absolute left-[10%] right-[10%] top-[1.15rem] h-[2px] rounded-full bg-border/50"
+        aria-hidden
+      />
+      <div
+        className="pointer-events-none absolute left-[10%] top-[1.15rem] h-[2px] rounded-full transition-all duration-700 ease-out"
+        style={{
+          width:
+            stages.length > 1
+              ? `${(pipelineIdx / (stages.length - 1)) * 80}%`
+              : '0%',
+        }}
+        aria-hidden
+      >
+        <div
+          className={`h-full w-full rounded-full ${
+            STAGE_NAV_THEME[stages[pipelineIdx]?.id ?? 1]?.bar ?? 'bg-emerald-400'
+          }`}
+        />
+      </div>
+
+      <div className="relative flex items-stretch gap-0.5">
+        {stages.map((stage, idx) => {
+          const theme = STAGE_NAV_THEME[stage.id] ?? DEFAULT_STAGE_THEME;
+          const active = viewStageId === stage.id;
+          const isPipeline = !roomCompleted && pipelineStageId === stage.id;
+          const isPast = pipelineStageId > stage.id || roomCompleted;
+          const isFuture = !isPast && !isPipeline;
+          const StageIcon = theme.Icon;
+
+          return (
+            <React.Fragment key={stage.id}>
+              {idx > 0 ? (
+                <span
+                  className={`mt-[1.1rem] h-px w-1 shrink-0 self-start transition-colors duration-300 ${
+                    isPast || active ? 'bg-emerald-500/50' : 'bg-border/40'
+                  }`}
+                  aria-hidden
+                />
+              ) : null}
+              <Tooltip title={`${stage.name}${isPipeline ? ' · 流水线当前' : isPast ? ' · 已完成' : ''}`}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => onSelect(stage.id)}
+                  className={`group relative flex min-w-0 flex-1 flex-col items-center rounded-lg px-0.5 py-2 transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-offset-background ${
+                    active ? `z-10 scale-[1.04] ${theme.ring}` : 'hover:scale-[1.02] hover:bg-foreground/[0.04]'
+                  }`}
+                >
+                  {active ? (
+                    <motion.span
+                      layoutId="meeting-room-sop-stage-active"
+                      className={`absolute inset-0 rounded-lg border ring-1 ${theme.panel} ${theme.ring} ${theme.glow} ${theme.gradient}`}
+                      transition={{ type: 'spring', stiffness: 420, damping: 32 }}
+                    />
+                  ) : null}
+
+                  <span className="relative z-10 flex flex-col items-center gap-1 w-full">
+                    <span
+                      className={`relative flex h-8 w-8 items-center justify-center rounded-full border-2 transition-all duration-300 ${
+                        active
+                          ? `${theme.iconBg} ${theme.iconBorder} ${theme.glow}`
+                          : isPast
+                            ? 'border-emerald-500/45 bg-emerald-500/15'
+                            : isPipeline
+                              ? `${theme.iconBg} ${theme.iconBorder} shadow-[0_0_12px_rgba(255,255,255,0.06)]`
+                              : 'border-border/55 bg-muted/30 group-hover:border-border/80 group-hover:bg-muted/45'
+                      }`}
+                    >
+                      {isPast && !active ? (
+                        <Check className="h-3.5 w-3.5 text-emerald-400" strokeWidth={2.5} aria-hidden />
+                      ) : (
+                        <StageIcon
+                          className={`h-3.5 w-3.5 ${
+                            active
+                              ? theme.accent
+                              : isPipeline
+                                ? theme.accent
+                                : isFuture
+                                  ? 'text-foreground/45 group-hover:text-foreground/65'
+                                  : 'text-foreground/55 group-hover:text-foreground/75'
+                          }`}
+                          aria-hidden
+                        />
+                      )}
+                      {isPipeline ? (
+                        <span
+                          className={`absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-background ${theme.dot} ${
+                            roomProcessing ? 'animate-pulse' : ''
+                          }`}
+                          aria-label="流水线当前阶段"
+                        />
+                      ) : null}
+                    </span>
+
+                    <span
+                      className={`w-full truncate text-center text-[10px] font-bold leading-tight tracking-tight ${
+                        active
+                          ? theme.accent
+                          : isPast
+                            ? 'text-emerald-400/90'
+                            : isPipeline
+                              ? theme.accent
+                              : 'text-foreground/55 group-hover:text-foreground/75'
+                      }`}
+                    >
+                      {meetingStageNavLabel(stage.id, theme.short)}
+                    </span>
+
+                    <span
+                      className={`rounded px-1 py-px text-[9px] font-bold tabular-nums leading-none ${
+                        active ? theme.badge : 'text-foreground/40 bg-muted/30'
+                      }`}
+                    >
+                      {stage.id}
+                    </span>
+                  </span>
+                </button>
+              </Tooltip>
+            </React.Fragment>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function roomCardStatusLabel(status: MeetingRoom['status']): string {
   switch (status) {
@@ -1155,68 +1368,29 @@ const InterventionDialog = ({
           </div>
           
           {/* SOP Stage Navigator */}
-          <div className="px-3 py-2.5 border-b border-border/40 bg-muted/20 shrink-0">
-            <div className="flex items-center gap-1.5 mb-2">
-              <Layers className="w-3 h-3 text-muted-foreground shrink-0" />
-              <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-                SOP 阶段
+          <div className="px-3 py-3 border-b border-border/40 bg-gradient-to-b from-muted/25 to-background/60 shrink-0">
+            <div className="flex items-center justify-between gap-2 mb-2.5">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <Layers className="w-3.5 h-3.5 text-foreground/70 shrink-0" />
+                <span className="text-[11px] font-semibold text-foreground/90 tracking-wide">
+                  SOP 流水线
+                </span>
+              </div>
+              <span
+                className={`shrink-0 rounded-md border px-1.5 py-0.5 text-[9px] font-bold tabular-nums ${
+                  (STAGE_NAV_THEME[pipelineStageId] ?? DEFAULT_STAGE_THEME).badge
+                }`}
+              >
+                {pipelineStageId}/{MEETING_PIPELINE_STAGES.length}
               </span>
             </div>
-            <div
-              className="flex items-stretch gap-1 overflow-x-auto flex-nowrap [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-              role="tablist"
-              aria-label="SOP 阶段切换"
-            >
-              {MEETING_PIPELINE_STAGES.map((stage) => {
-                const theme = STAGE_NAV_THEME[stage.id] ?? DEFAULT_STAGE_THEME;
-                const active = effectiveViewStageId === stage.id;
-                const isPipeline = pipelineStageId === stage.id;
-                const isPast = pipelineStageId > stage.id || room.status === 'completed';
-                return (
-                  <button
-                    key={stage.id}
-                    type="button"
-                    role="tab"
-                    aria-selected={active}
-                    title={stage.name}
-                    onClick={() => handleStageSelect(stage.id)}
-                    className={`group relative flex-1 min-w-[3.25rem] rounded-lg border px-1 py-1.5 transition-all duration-200 ${
-                      active
-                        ? `${theme.panel} border-opacity-80 shadow-[0_4px_14px_rgba(0,0,0,0.12)] scale-[1.02]`
-                        : 'border-border/40 bg-muted/20 hover:border-border/60 hover:bg-muted/35'
-                    }`}
-                  >
-                    <span
-                      className={`block text-center text-[9px] font-bold tabular-nums leading-none ${
-                        active ? theme.accent : 'text-muted-foreground/80'
-                      }`}
-                    >
-                      {stage.id}
-                    </span>
-                    <span
-                      className={`mx-auto mt-1 block truncate text-center text-[8px] leading-tight px-0.5 ${
-                        active ? theme.accent : 'text-muted-foreground/60'
-                      }`}
-                    >
-                      {stage.name.slice(0, 4)}
-                    </span>
-                    {isPipeline ? (
-                      <span
-                        className={`absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full ${theme.dot} ${
-                          room.status === 'processing' ? 'animate-pulse' : ''
-                        }`}
-                        aria-label="当前流水线阶段"
-                      />
-                    ) : isPast ? (
-                      <span
-                        className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-emerald-500/80"
-                        aria-label="已完成阶段"
-                      />
-                    ) : null}
-                  </button>
-                );
-              })}
-            </div>
+            <MeetingSopStageStepper
+              viewStageId={effectiveViewStageId}
+              pipelineStageId={pipelineStageId}
+              roomCompleted={room.status === 'completed'}
+              roomProcessing={room.status === 'processing'}
+              onSelect={handleStageSelect}
+            />
           </div>
 
           {/* Stage Banner */}
@@ -1234,7 +1408,7 @@ const InterventionDialog = ({
                   (STAGE_NAV_THEME[effectiveViewStageId] ?? DEFAULT_STAGE_THEME).accent
                 }`}
               >
-                {currentStage?.name ?? stageNameForId(effectiveViewStageId)} · 会议议题清单
+                {meetingStageNavLabel(effectiveViewStageId, currentStage?.name)} · 会议议题清单
               </span>
             </div>
             <p className="text-[10px] text-muted-foreground/80 mt-1 ml-4">
@@ -1242,7 +1416,7 @@ const InterventionDialog = ({
               {!isViewingPipelineStage ? (
                 <span className="text-muted-foreground/60">
                   {' '}
-                  · 当前流水线在「{stageNameForId(pipelineStageId)}」
+                  · 当前流水线在「{meetingStageNavLabel(pipelineStageId)}」
                 </span>
               ) : null}
             </p>
