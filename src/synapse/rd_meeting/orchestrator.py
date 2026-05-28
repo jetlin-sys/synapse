@@ -376,6 +376,7 @@ class MeetingRoomOrchestrator:
         duration_seconds: int = 0,
         sync_userwork: bool = True,
         advance: bool = True,
+        schedule_pipeline_advance: bool = True,
         ticket_title: str = "",
         agent_pool: Any | None = None,
     ) -> dict[str, Any]:
@@ -455,7 +456,8 @@ class MeetingRoomOrchestrator:
 
         # 节点完成 + 已推进到下一节点 → 异步触发 node_finish → init → assemble → schedule_run_node
         # 让 SOP 流程自动接力，不再依赖人工再次"一键开会"。
-        if advance and next_id:
+        # pipeline 内 inline skip 时由同一次 run_pipeline while 切 flow_step，不再 schedule。
+        if advance and next_id and schedule_pipeline_advance:
             try:
                 from synapse.rd_meeting.pipeline import schedule_node_finish
 
@@ -480,6 +482,7 @@ class MeetingRoomOrchestrator:
         ticket_title: str = "",
         sync_userwork: bool = True,
         agent_pool: Any | None = None,
+        schedule_pipeline_advance: bool = True,
     ) -> dict[str, Any]:
         """跳过配置关闭的 SOP 节点（不写 node_init / 不跑 LLM），推进到首个 enabled 节点。"""
         sid = scope_id.strip()
@@ -519,6 +522,7 @@ class MeetingRoomOrchestrator:
                 ticket_title=ticket_title,
                 sync_userwork=sync_userwork,
                 agent_pool=agent_pool,
+                schedule_pipeline_advance=schedule_pipeline_advance,
             )
             next_id = skip_out.get("next_node_id")
             if not next_id:
@@ -543,6 +547,7 @@ class MeetingRoomOrchestrator:
         ticket_title: str = "",
         sync_userwork: bool = True,
         agent_pool: Any | None = None,
+        schedule_pipeline_advance: bool = True,
     ) -> dict[str, Any]:
         """配置关闭的节点：不写 LLM、不写产出物，仅记录事件并推进。"""
         sid = scope_id.strip()
@@ -565,6 +570,7 @@ class MeetingRoomOrchestrator:
             duration_seconds=0,
             sync_userwork=sync_userwork,
             advance=True,
+            schedule_pipeline_advance=schedule_pipeline_advance,
             ticket_title=ticket_title,
             agent_pool=agent_pool,
         )
@@ -1238,6 +1244,7 @@ class MeetingRoomOrchestrator:
             ticket_title=ticket_title,
             sync_userwork=True,
             agent_pool=agent_pool,
+            schedule_pipeline_advance=False,
         )
         skipped_nodes: list[str] = list(skip_prep.get("skipped_nodes") or [])
         if skip_prep.get("status") == "completed":

@@ -10,7 +10,7 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Literal
 
 from synapse.rd_meeting.bootstrap import append_host_prompt_chat, append_node_init_chat
 from synapse.rd_meeting.host_prompt import assemble_host_prompt_bundle, save_host_prompt_snapshot
@@ -502,8 +502,37 @@ def _step_open_meeting(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     pipe.set_flow_step(nxt, reason="开启会议室完成")
 
 
-def _advance_past_disabled_nodes(pipe: MeetingPipeline, ctx: PipelineRunContext) -> bool:
-    """节点初始化前跳过 disabled 节点。返回 True 表示流程已结束（无后续节点）。"""
+AdvancePastResult = Literal["done", "skip_redirect", "continue"]
+
+
+def _redirect_pipeline_to_finish_skipped(pipe: MeetingPipeline, skipped_nodes: list[str]) -> None:
+    """pipeline 内 skip disabled 节点：同一次 while 切到 node_finish，不另 schedule。"""
+    if not skipped_nodes:
+        return
+    pctx = pipe._data.get("context")
+    if not isinstance(pctx, dict):
+        pctx = {}
+    first = skipped_nodes[0]
+    rest = skipped_nodes[1:]
+    pctx["last_finished_node_id"] = first
+    if rest:
+        pctx["pending_finish_node_ids"] = rest
+    else:
+        pctx.pop("pending_finish_node_ids", None)
+    pipe._data["context"] = pctx
+    pipe.set_flow_step(
+        STEP_NODE_FINISH,
+        reason=f"跳过 disabled 节点 {first}，同 pipeline 内收尾",
+    )
+
+
+def _advance_past_disabled_nodes(pipe: MeetingPipeline, ctx: PipelineRunContext) -> AdvancePastResult:
+    """节点初始化/组装前跳过 disabled 节点。
+
+    - ``done``：剩余节点均已跳过，流程结束
+    - ``skip_redirect``：已 skip，caller 应 return，由同 pipeline while 进入 node_finish
+    - ``continue``：当前节点 enabled，继续本 step
+    """
     sid = ctx.scope_id
     data = ctx.dev_status or load_dev_status(sid) or {}
     room_id = pipe.room_id or str((data.get("meeting_room") or {}).get("room_id") or "")
@@ -515,19 +544,27 @@ def _advance_past_disabled_nodes(pipe: MeetingPipeline, ctx: PipelineRunContext)
         room_id=room_id,
         ticket_title=str(ctx.detail.get("ticket_title") or ""),
         agent_pool=ctx.agent_pool,
+        schedule_pipeline_advance=False,
     )
     ctx.dev_status = load_dev_status(sid) or ctx.dev_status
     if result.get("status") == "completed":
         pipe.set_flow_step(STEP_DONE, reason="剩余节点均已跳过，流程结束")
-        return True
-    return False
+        return "done"
+    skipped = [str(n).strip() for n in (result.get("skipped_nodes") or []) if str(n).strip()]
+    if skipped:
+        _redirect_pipeline_to_finish_skipped(pipe, skipped)
+        return "skip_redirect"
+    return "continue"
 
 
 def _step_node_init(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     """第二步：节点初始化（userwork 上下文日志，不含主控 prompt）。"""
     sid = ctx.scope_id
-    if _advance_past_disabled_nodes(pipe, ctx):
+    advance = _advance_past_disabled_nodes(pipe, ctx)
+    if advance == "done":
         pipe.mark_step_completed(STEP_NODE_INIT)
+        return
+    if advance == "skip_redirect":
         return
     data = ctx.dev_status
     if not data:
@@ -582,8 +619,11 @@ def _step_node_init(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
 def _step_assemble_host_prompt(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     """第三步：组装小鲸主控提示词并写入协作会议流（完整展示）。"""
     sid = ctx.scope_id
-    if _advance_past_disabled_nodes(pipe, ctx):
+    advance = _advance_past_disabled_nodes(pipe, ctx)
+    if advance == "done":
         pipe.mark_step_completed(STEP_ASSEMBLE_HOST_PROMPT)
+        return
+    if advance == "skip_redirect":
         return
     data = ctx.dev_status
     if not data:
@@ -921,6 +961,23 @@ def _step_node_finish(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     )
 
     pipe.mark_step_completed(STEP_NODE_FINISH)
+
+    pctx_after = pipe._data.get("context") if isinstance(pipe._data.get("context"), dict) else {}
+    pending = pctx_after.get("pending_finish_node_ids")
+    if isinstance(pending, list) and pending:
+        next_finish = str(pending.pop(0)).strip()
+        if next_finish:
+            pctx_after["last_finished_node_id"] = next_finish
+            pctx_after["pending_finish_node_ids"] = pending
+            pipe._data["context"] = pctx_after
+            pipe.set_flow_step(
+                STEP_NODE_FINISH,
+                reason=f"继续收尾 skipped 节点 {next_finish}",
+            )
+            return
+        pctx_after.pop("pending_finish_node_ids", None)
+        pipe._data["context"] = pctx_after
+
     # 若没有下一个节点（next_node 为空 / "pending"），收尾后置 DONE，不再 INIT
     if not next_node or next_node == "pending":
         pipe.set_flow_step(STEP_DONE, reason="无下一节点，流程结束")

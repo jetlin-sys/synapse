@@ -86,11 +86,21 @@ def _format_ts_hms(iso: str) -> str:
     return _fmt(iso)
 
 
+def _history_chat_id(ev: dict[str, Any], index: int) -> str:
+    """节点级唯一 id，避免 mergeChatLogs 时不同 SOP 节点的 hist-{n} 互相覆盖。"""
+    nid = str(ev.get("node_id") or "").strip() or "pending"
+    raw = str(ev.get("id") or f"hist-{index}").strip() or f"hist-{index}"
+    prefix = f"{nid}:"
+    if raw.startswith(prefix):
+        return raw
+    return f"{prefix}{raw}"
+
+
 def _base_row(ev: dict[str, Any], index: int) -> dict[str, Any]:
     et = str(ev.get("event") or "")
     node_id = str(ev.get("node_id") or "").strip() or None
     return {
-        "id": str(ev.get("id") or f"hist-{index}"),
+        "id": _history_chat_id(ev, index),
         "event": et,
         "nodeId": node_id,
         "timestamp": _format_ts_hms(str(ev.get("ts") or "")),

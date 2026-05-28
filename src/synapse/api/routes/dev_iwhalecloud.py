@@ -2540,6 +2540,83 @@ async def transfer_demand_stage(body: TransferDemandStageRequest) -> dict:
     return _forward_response(resp)
 
 
+class TransferDemandToDesigningRequest(BaseModel):
+    demandNo: str = Field(..., description="需求单号")
+    user: str = Field(..., description="操作人工号")
+    comments: str = Field("", description="转单备注")
+
+
+@router.post("/api/dev/iwhalecloud/transfer_demand_to_designing")
+async def transfer_demand_to_designing(body: TransferDemandToDesigningRequest) -> dict:
+    """
+    功能：将需求单转到需求设计环节。
+    用法：传入需求单号、操作人工号、备注，将需求单转到需求设计环节。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "errorcode": 0,
+        "message": "success",
+        "data": null
+    }
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{demandNo}/stage，返回码code为"9999"表示成功
+    """
+    if not body.demandNo:
+        return error_response(400, "demandNo 不能为空")
+    url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/ai-gateway/devspace/rpc/v3/task/{body.demandNo}/stage"
+    payload = {
+        "ownerUserCode": body.user,
+        "operateUserCode": body.user,
+        "taskFlowStageId": DEV_IWHALECLOUD_DEMAND_STAGE_DESIGNING,
+        "comments": body.comments or "",
+    }
+    logger.debug("transfer_demand_to_designing url:%s, payload:%s", url, payload)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+            _log_httpx_response("transfer_demand_to_designing", resp)
+    except httpx.RequestError as exc:
+        logger.exception("调用研发云转需求单到需求设计环节接口异常: %s", exc)
+        return error_response(-1, f"调用研发云转需求单到需求设计环节接口异常: {exc}")
+    return _forward_response(resp)
+
+
+class TransferDemandToDevelopingRequest(BaseModel):
+    demandNo: str = Field(..., description="需求单号")
+    user: str = Field(..., description="操作人工号")
+    comments: str = Field("", description="转单备注")
+
+
+@router.post("/api/dev/iwhalecloud/transfer_demand_to_developing")
+async def transfer_demand_to_developing(body: TransferDemandToDevelopingRequest) -> dict:
+    """
+    功能：将需求单转到需求开发环节。
+    用法：传入需求单号、操作人工号、备注，将需求单转到需求开发环节。
+    接口类型：研发云提供标准API接口
+    返回数据格式：{
+        "errorcode": 0,
+        "message": "success",
+        "data": null
+    }
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{demandNo}/stage，返回码code为"9999"表示成功
+    """
+    if not body.demandNo:
+        return error_response(400, "demandNo 不能为空")
+    url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/ai-gateway/devspace/rpc/v3/task/{body.demandNo}/stage"
+    payload = {
+        "ownerUserCode": body.user,
+        "operateUserCode": body.user,
+        "taskFlowStageId": DEV_IWHALECLOUD_DEMAND_STAGE_DEVELOPING,
+        "comments": body.comments or "",
+    }
+    logger.debug("transfer_demand_to_developing url:%s, payload:%s", url, payload)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+            _log_httpx_response("transfer_demand_to_developing", resp)
+    except httpx.RequestError as exc:
+        logger.exception("调用研发云转需求单到需求开发环节接口异常: %s", exc)
+        return error_response(-1, f"调用研发云转需求单到需求开发环节接口异常: {exc}")
+    return _forward_response(resp)
+
 
 class CreateCommentRequest(BaseModel):
     taskNo: str = Field(..., description="任务单号")

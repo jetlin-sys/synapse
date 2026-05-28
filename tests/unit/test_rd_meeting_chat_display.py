@@ -144,3 +144,37 @@ def test_delegation_roles() -> None:
         7,
     )[0]
     assert done["speakerRole"] == "worker"
+
+
+def test_chat_log_ids_are_scoped_by_node_id() -> None:
+    logs = history_to_chat_logs(
+        [
+            {
+                "event": "human_intervene",
+                "node_id": "boundary",
+                "text": "跳过说明",
+                "ts": "2026-05-28T16:09:21",
+            },
+            {
+                "event": "human_intervene",
+                "node_id": "module_func",
+                "text": "下一节点",
+                "ts": "2026-05-28T16:09:22",
+            },
+        ]
+    )
+    assert len(logs) == 2
+    assert logs[0]["id"] == "boundary:hist-0"
+    assert logs[1]["id"] == "module_func:hist-1"
+    assert logs[0]["id"] != logs[1]["id"]
+
+    # 模拟 live 分节点拉取：各自 index 都从 0 起，但 id 仍不冲突
+    a = history_to_chat_logs(
+        [{"event": "human_intervene", "node_id": "boundary", "text": "a", "ts": "1"}]
+    )
+    b = history_to_chat_logs(
+        [{"event": "human_intervene", "node_id": "module_func", "text": "b", "ts": "2"}]
+    )
+    assert a[0]["id"] == "boundary:hist-0"
+    assert b[0]["id"] == "module_func:hist-0"
+    assert a[0]["id"] != b[0]["id"]
