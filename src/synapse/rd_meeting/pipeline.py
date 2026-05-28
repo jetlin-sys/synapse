@@ -502,9 +502,33 @@ def _step_open_meeting(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     pipe.set_flow_step(nxt, reason="开启会议室完成")
 
 
+def _advance_past_disabled_nodes(pipe: MeetingPipeline, ctx: PipelineRunContext) -> bool:
+    """节点初始化前跳过 disabled 节点。返回 True 表示流程已结束（无后续节点）。"""
+    sid = ctx.scope_id
+    data = ctx.dev_status or load_dev_status(sid) or {}
+    room_id = pipe.room_id or str((data.get("meeting_room") or {}).get("room_id") or "")
+    from synapse.rd_meeting.orchestrator import MeetingRoomOrchestrator
+
+    result = MeetingRoomOrchestrator().advance_past_disabled_nodes(
+        scope_type=ctx.scope_type,
+        scope_id=sid,
+        room_id=room_id,
+        ticket_title=str(ctx.detail.get("ticket_title") or ""),
+        agent_pool=ctx.agent_pool,
+    )
+    ctx.dev_status = load_dev_status(sid) or ctx.dev_status
+    if result.get("status") == "completed":
+        pipe.set_flow_step(STEP_DONE, reason="剩余节点均已跳过，流程结束")
+        return True
+    return False
+
+
 def _step_node_init(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     """第二步：节点初始化（userwork 上下文日志，不含主控 prompt）。"""
     sid = ctx.scope_id
+    if _advance_past_disabled_nodes(pipe, ctx):
+        pipe.mark_step_completed(STEP_NODE_INIT)
+        return
     data = ctx.dev_status
     if not data:
         data = load_dev_status(sid) or {}
@@ -558,6 +582,9 @@ def _step_node_init(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
 def _step_assemble_host_prompt(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
     """第三步：组装小鲸主控提示词并写入协作会议流（完整展示）。"""
     sid = ctx.scope_id
+    if _advance_past_disabled_nodes(pipe, ctx):
+        pipe.mark_step_completed(STEP_ASSEMBLE_HOST_PROMPT)
+        return
     data = ctx.dev_status
     if not data:
         data = load_dev_status(sid) or {}
@@ -885,6 +912,7 @@ def _step_node_finish(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
         {
             "event": "node_finished",
             "room_id": room_id,
+            "node_id": last_node_id or next_node,
             "next_node_id": next_node,
             "flow_stage": "节点收尾",
             "log_type": "info",

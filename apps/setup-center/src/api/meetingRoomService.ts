@@ -298,6 +298,7 @@ export interface MeetingRoomLivePayload {
   }[];
   recent_history?: Record<string, unknown>[];
   recent_chat?: MeetingRoomChatLogWire[];
+  skipped_node_ids?: string[];
   participants?: MeetingRoomParticipantWire[];
   intervention_kind?: string;
   hitl_form_schema?: HitlFormSchema;
@@ -309,11 +310,34 @@ export interface MeetingRoomLivePayload {
 export async function fetchMeetingRoomLive(
   synapseApiBase: string,
   roomId: string,
+  nodeId?: string,
 ): Promise<MeetingRoomLivePayload> {
   const base = synapseApiBase.replace(/\/$/, '');
+  const qs = nodeId ? `?node_id=${encodeURIComponent(nodeId)}` : '';
   return apiGet<MeetingRoomLivePayload>(
     base,
-    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/live`,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/live${qs}`,
+  );
+}
+
+export interface MeetingRoomNodeChatPayload {
+  room_id: string;
+  scope_id?: string;
+  node_id: string;
+  history?: Record<string, unknown>[];
+  chat_logs?: MeetingRoomChatLogWire[];
+}
+
+export async function fetchMeetingRoomNodeChat(
+  synapseApiBase: string,
+  roomId: string,
+  nodeId: string,
+): Promise<MeetingRoomNodeChatPayload> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  const qs = `?node_id=${encodeURIComponent(nodeId)}`;
+  return apiGet<MeetingRoomNodeChatPayload>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/chat${qs}`,
   );
 }
 

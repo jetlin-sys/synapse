@@ -151,7 +151,7 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr("synapse.rd_meeting.room_skill.resolve_agent_profile", lambda pid: None)
     monkeypatch.setattr(
         "synapse.rd_meeting.room_runtime.room_history_path",
-        lambda sid: scope_dir(sid) / "room_history.jsonl",
+        lambda sid, node_id="pending": scope_dir(sid) / "room_history.jsonl",
     )
     return tmp_path
 

@@ -471,6 +471,68 @@ class MeetingRoomOrchestrator:
 
         return {"dev_status": dev, "room_state": room_state, "next_node_id": next_id}
 
+    def advance_past_disabled_nodes(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        room_id: str,
+        ticket_title: str = "",
+        sync_userwork: bool = True,
+        agent_pool: Any | None = None,
+    ) -> dict[str, Any]:
+        """跳过配置关闭的 SOP 节点（不写 node_init / 不跑 LLM），推进到首个 enabled 节点。"""
+        sid = scope_id.strip()
+        dev = load_dev_status(sid)
+        if dev is None:
+            raise ValueError("dev_status_not_found")
+
+        skipped_nodes: list[str] = []
+        for _ in range(_MAX_SKIP_CHAIN):
+            node_id = str(dev.get("current_node_id") or "pending")
+            if node_id == "pending":
+                return {
+                    "current_node_id": node_id,
+                    "skipped_nodes": skipped_nodes,
+                    "status": "pending",
+                    "dev_status": dev,
+                }
+            binding = resolve_node_binding(
+                node_id,
+                scope_type=scope_type,
+                scope_id=sid,
+                ticket_title=ticket_title,
+            )
+            if binding.get("enabled", True):
+                return {
+                    "current_node_id": node_id,
+                    "skipped_nodes": skipped_nodes,
+                    "status": "ready",
+                    "dev_status": dev,
+                }
+            skipped_nodes.append(node_id)
+            skip_out = self.on_node_skipped(
+                scope_type=scope_type,
+                scope_id=sid,
+                room_id=room_id,
+                node_id=node_id,
+                ticket_title=ticket_title,
+                sync_userwork=sync_userwork,
+                agent_pool=agent_pool,
+            )
+            next_id = skip_out.get("next_node_id")
+            if not next_id:
+                return {
+                    "skipped_nodes": skipped_nodes,
+                    "status": "completed",
+                    "skipped_llm": True,
+                }
+            dev = load_dev_status(sid)
+            if dev is None:
+                raise ValueError("dev_status_not_found")
+
+        raise ValueError("skip_chain_exceeded")
+
     def on_node_skipped(
         self,
         *,
@@ -1169,41 +1231,27 @@ class MeetingRoomOrchestrator:
         if dev is None:
             raise ValueError("dev_status_not_found")
 
-        node_id = str(dev.get("current_node_id") or "pending")
-        if node_id == "pending":
+        skip_prep = self.advance_past_disabled_nodes(
+            scope_type=scope_type,
+            scope_id=sid,
+            room_id=room_id,
+            ticket_title=ticket_title,
+            sync_userwork=True,
+            agent_pool=agent_pool,
+        )
+        skipped_nodes: list[str] = list(skip_prep.get("skipped_nodes") or [])
+        if skip_prep.get("status") == "completed":
+            return {
+                "status": "completed",
+                "skipped_nodes": skipped_nodes,
+                "skipped_llm": True,
+            }
+        node_id = str(skip_prep.get("current_node_id") or "pending")
+        if node_id == "pending" or skip_prep.get("status") == "pending":
             raise ValueError("invalid_current_node")
-
-        skipped_nodes: list[str] = []
-        for _ in range(_MAX_SKIP_CHAIN):
-            binding = resolve_node_binding(
-                node_id,
-                scope_type=scope_type,
-                scope_id=sid,
-                ticket_title=ticket_title,
-            )
-            if binding.get("enabled", True):
-                break
-            skipped_nodes.append(node_id)
-            skip_out = self.on_node_skipped(
-                scope_type=scope_type,
-                scope_id=sid,
-                room_id=room_id,
-                node_id=node_id,
-                ticket_title=ticket_title,
-                sync_userwork=True,
-                agent_pool=agent_pool,
-            )
-            next_id = skip_out.get("next_node_id")
-            if not next_id:
-                return {
-                    "status": "completed",
-                    "skipped_nodes": skipped_nodes,
-                    "skipped_llm": True,
-                }
-            node_id = str(next_id)
-            dev = load_dev_status(sid)
-            if dev is None:
-                raise ValueError("dev_status_not_found")
+        dev = skip_prep.get("dev_status") or load_dev_status(sid)
+        if dev is None:
+            raise ValueError("dev_status_not_found")
 
         binding = resolve_node_binding(
             node_id,
@@ -1816,11 +1864,14 @@ def schedule_run_node(
             )
         except Exception as exc:
             logger.exception("meeting room run_node failed room=%s: %s", room_id, exc)
+            rs_fail = load_room_state(scope_id.strip()) or {}
+            fail_node = str(rs_fail.get("current_node_id") or "pending") if isinstance(rs_fail, dict) else "pending"
             append_history_event(
                 scope_id.strip(),
                 {
                     "event": "node_failed",
                     "room_id": room_id,
+                    "node_id": fail_node,
                     "error": str(exc),
                     "text": str(exc),
                     "id": uuid.uuid4().hex[:12],

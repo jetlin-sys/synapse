@@ -353,7 +353,7 @@ def _delegation_runs_from_history(
 
     pending: list[dict[str, Any]] = []
     runs: list[dict[str, Any]] = []
-    for ev in read_history(sid, limit=500):
+    for ev in read_history(sid, node_id=nid_filter or None, limit=500):
         if not isinstance(ev, dict):
             continue
         if nid_filter:
@@ -642,7 +642,7 @@ def _worker_profile_ids_from_delegation_history(
 
     ids: list[str] = []
     seen: set[str] = set()
-    for ev in read_history(sid, limit=500):
+    for ev in read_history(sid, node_id=nid_filter or None, limit=500):
         if not isinstance(ev, dict):
             continue
         if nid_filter:

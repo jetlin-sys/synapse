@@ -219,7 +219,9 @@ class MeetingRoomService:
             return None
         scope_id = str(detail.get("scope_id") or "")
         room_state = detail.get("room_state") if isinstance(detail.get("room_state"), dict) else {}
-        history = read_history(scope_id, limit=history_limit) if scope_id else []
+        node_id = str(detail.get("current_node_id") or "pending")
+        history = read_history(scope_id, node_id=node_id, limit=history_limit) if scope_id else []
+        all_history = read_history(scope_id, limit=500) if scope_id else []
 
         orchestrator = self._resolve_orchestrator(agent_pool)
 
@@ -238,7 +240,6 @@ class MeetingRoomService:
             else []
         )
         scope_type = str(detail.get("scope_type") or "demand")
-        node_id = str(detail.get("current_node_id") or "pending")
         binding = resolve_node_binding(
             node_id,
             scope_type=scope_type,
@@ -281,6 +282,7 @@ class MeetingRoomService:
             "hitl_locked": bool(room_state.get("hitl_locked")),
             "hitl_submission": room_state.get("hitl_submission"),
             "pending_delivery": room_state.get("pending_delivery"),
+            "skipped_node_ids": extract_skipped_node_ids(all_history),
         }
 
     def get_room_detail(self, room_id: str) -> dict[str, Any] | None:
@@ -297,6 +299,22 @@ class MeetingRoomService:
             if isinstance(mr, dict) and str(mr.get("room_id") or "").strip() == rid:
                 return self._room_detail_payload(data, scope_id, build_title_index())
         return None
+
+    def get_room_node_chat(self, room_id: str, node_id: str) -> dict[str, Any] | None:
+        """按 SOP 节点读取协作会议流（``agents/<node_id>/room_history.jsonl``）。"""
+        detail = self.get_room_detail(room_id)
+        if detail is None:
+            return None
+        scope_id = str(detail.get("scope_id") or "")
+        nid = (node_id or detail.get("current_node_id") or "pending").strip() or "pending"
+        history = read_history(scope_id, node_id=nid, limit=500) if scope_id else []
+        return {
+            "room_id": room_id,
+            "scope_id": scope_id,
+            "node_id": nid,
+            "history": history,
+            "chat_logs": history_to_chat_logs(history),
+        }
 
     def get_dev_status(self, scope_type: ScopeType, scope_id: str) -> dict[str, Any] | None:
         sid = (scope_id or "").strip()
@@ -680,6 +698,7 @@ class MeetingRoomService:
             {
                 "event": "human_intervene",
                 "room_id": rid,
+                "node_id": str(detail.get("current_node_id") or rs.get("current_node_id") or "pending"),
                 "text": text,
                 "message_type": message_type,
                 "log_type": "user",
@@ -796,6 +815,7 @@ class MeetingRoomService:
             {
                 "event": "hitl_form_submitted",
                 "room_id": rid,
+                "node_id": str(room_state.get("current_node_id") or detail.get("current_node_id") or "pending"),
                 "text": text,
                 "message_type": "instruction",
                 "log_type": "user",
@@ -894,6 +914,7 @@ class MeetingRoomService:
                     {
                         "event": "hitl_exception_abort",
                         "room_id": rid,
+                        "node_id": str(rs2.get("current_node_id") or detail.get("current_node_id") or "pending"),
                         "comment": comment,
                         "log_type": "warning",
                         "agent_id": "user",

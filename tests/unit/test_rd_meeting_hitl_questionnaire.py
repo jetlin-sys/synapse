@@ -53,7 +53,7 @@ def meeting_scope(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "synapse.rd_meeting.room_runtime.room_history_path",
-        lambda s: work / "room_history.jsonl",
+        lambda s, node_id="pending": work / "room_history.jsonl",
     )
     monkeypatch.setattr(
         "synapse.rd_meeting.room_runtime.room_state_lock_path",

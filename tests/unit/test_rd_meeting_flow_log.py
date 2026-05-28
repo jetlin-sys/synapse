@@ -43,7 +43,7 @@ def test_append_history_event_writes_formatted_line(tmp_path, monkeypatch):
     hist = work / "room_history.jsonl"
     monkeypatch.setattr(
         "synapse.rd_meeting.room_runtime.room_history_path",
-        lambda sid: hist,
+        lambda sid, node_id="pending": hist,
     )
 
     append_history_event(

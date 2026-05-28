@@ -92,10 +92,33 @@ async def get_meeting_room(room_id: str) -> dict:
 
 
 @router.get("/api/dev/meeting-rooms/{room_id}/live")
-async def get_meeting_room_live(room_id: str, request: Request) -> dict:
+async def get_meeting_room_live(room_id: str, request: Request, node_id: str = "") -> dict:
     """会议室 live 快照：委派进度、子 Agent、phase、近期聊天事件（轮询）。"""
     pool = getattr(request.app.state, "agent_pool", None)
     item = _service.get_room_live(room_id, agent_pool=pool)
+    if item is None:
+        return error_response(404, "meeting_room_not_found")
+    nid = (node_id or "").strip()
+    if nid and nid != str(item.get("current_node_id") or ""):
+        chat = _service.get_room_node_chat(room_id, nid)
+        if chat is not None:
+            item = dict(item)
+            item["current_node_id"] = nid
+            item["recent_history"] = chat.get("history")
+            item["recent_chat"] = chat.get("chat_logs")
+    return success_response(item)
+
+
+@router.get("/api/dev/meeting-rooms/{room_id}/chat")
+async def get_meeting_room_chat(room_id: str, node_id: str = "") -> dict:
+    """按 SOP 节点读取协作会议流 chat_logs。"""
+    nid = (node_id or "").strip()
+    if not nid:
+        detail = _service.get_room_detail(room_id)
+        if detail is None:
+            return error_response(404, "meeting_room_not_found")
+        nid = str(detail.get("current_node_id") or "pending")
+    item = _service.get_room_node_chat(room_id, nid)
     if item is None:
         return error_response(404, "meeting_room_not_found")
     return success_response(item)

@@ -75,8 +75,9 @@ def room_state_lock_path(scope_id: str) -> Path:
     return scope_dir(scope_id) / "room_state.lock"
 
 
-def room_history_path(scope_id: str) -> Path:
-    return scope_dir(scope_id) / "room_history.jsonl"
+def room_history_path(scope_id: str, node_id: str = "pending") -> Path:
+    """SOP 节点级协作流：``work/<scope>/agents/<node_id>/room_history.jsonl``。"""
+    return agent_sop_node_dir(scope_id, node_id) / "room_history.jsonl"
 
 
 def meeting_pipeline_path(scope_id: str) -> Path:

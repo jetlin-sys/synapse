@@ -56,7 +56,7 @@ def test_pipeline_file_created_on_open_flow(monkeypatch, tmp_path):
     monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
     monkeypatch.setattr(
         "synapse.rd_meeting.room_runtime.room_history_path",
-        lambda sid: work / "room_history.jsonl",
+        lambda sid, node_id="pending": work / "room_history.jsonl",
     )
     monkeypatch.setattr(
         "synapse.rd_meeting.product_context.ensure_prod_in_catalog",

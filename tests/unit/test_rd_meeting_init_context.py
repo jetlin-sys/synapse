@@ -90,7 +90,7 @@ def test_open_meeting_step1_userwork_and_init_log(monkeypatch, tmp_path):
     hist = work / "room_history.jsonl"
     monkeypatch.setattr(
         "synapse.rd_meeting.room_runtime.room_history_path",
-        lambda sid: hist,
+        lambda sid, node_id="pending": hist,
     )
     monkeypatch.setattr(
         "synapse.rd_meeting.init_context.resolve_product_for_meeting",

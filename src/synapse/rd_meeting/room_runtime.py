@@ -1,4 +1,4 @@
-"""Phase 1：room_state.json、room_history.jsonl、archive/ 读写。"""
+"""Phase 1：room_state.json、agents/<node_id>/room_history.jsonl、archive/ 读写。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any, Literal
 from filelock import FileLock
 
 from synapse.rd_meeting.paths import (
+    agents_root,
     archive_root,
     room_history_path,
     room_state_lock_path,
@@ -149,12 +150,68 @@ def sync_room_state_from_dev(
     return payload
 
 
+def resolve_history_node_id(scope_id: str, event: dict[str, Any]) -> str:
+    """解析 history 应写入的 SOP 节点目录。"""
+    for key in ("node_id", "current_node_id"):
+        val = str(event.get(key) or "").strip()
+        if val and val != "pending":
+            return val
+    rs = load_room_state(scope_id)
+    if isinstance(rs, dict):
+        cur = str(rs.get("current_node_id") or "").strip()
+        if cur and cur != "pending":
+            return cur
+    try:
+        from synapse.rd_meeting.dev_status import load_dev_status
+
+        dev = load_dev_status(scope_id)
+        if isinstance(dev, dict):
+            cur = str(dev.get("current_node_id") or "").strip()
+            if cur and cur != "pending":
+                return cur
+    except Exception:
+        pass
+    return "pending"
+
+
+def _read_history_file(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("读取 room_history 失败 %s: %s", path, exc)
+        return []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
+def _merge_history_rows(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for group in groups:
+        merged.extend(group)
+    merged.sort(key=lambda ev: str(ev.get("ts") or ""))
+    return merged
+
+
 def append_history_event(scope_id: str, event: dict[str, Any]) -> dict[str, Any]:
     from synapse.rd_meeting.flow_log import apply_flow_log_format
 
-    path = room_history_path(scope_id)
+    node_id = resolve_history_node_id(scope_id, event)
+    path = room_history_path(scope_id, node_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     row = apply_flow_log_format(dict(event))
+    row.setdefault("node_id", node_id)
     row.setdefault("ts", _now_iso())
     line = json.dumps(row, ensure_ascii=False, default=str)
     with path.open("a", encoding="utf-8") as fh:
@@ -176,27 +233,40 @@ def extract_skipped_node_ids(history: list[dict[str, Any]]) -> list[str]:
     return out
 
 
-def read_history(scope_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
-    path = room_history_path(scope_id)
-    if not path.is_file():
+def read_history(
+    scope_id: str,
+    *,
+    node_id: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """读取协作流 history。
+
+    - ``node_id`` 指定时：只读 ``agents/<node_id>/room_history.jsonl``。
+    - ``node_id`` 为 ``None``：合并各 SOP 节点 history（供 summary / 全量 chat 展示）。
+    """
+    sid = (scope_id or "").strip()
+    if not sid:
         return []
-    rows: list[dict[str, Any]] = []
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        logger.warning("读取 room_history 失败 %s: %s", path, exc)
-        return []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(item, dict):
-            rows.append(item)
-    if len(rows) > limit:
+
+    if node_id is not None:
+        nid = (node_id or "pending").strip() or "pending"
+        rows = _read_history_file(room_history_path(sid, nid))
+        if limit and len(rows) > limit:
+            return rows[-limit:]
+        return rows
+
+    groups: list[list[dict[str, Any]]] = []
+    root = agents_root(sid)
+    if root.is_dir():
+        for entry in sorted(root.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir():
+                continue
+            hist = entry / "room_history.jsonl"
+            if hist.is_file():
+                groups.append(_read_history_file(hist))
+    rows = _merge_history_rows(*groups) if groups else []
+
+    if limit and len(rows) > limit:
         return rows[-limit:]
     return rows
 

@@ -46,7 +46,7 @@ def _isolate(monkeypatch, tmp_path):
     # room_history 路径锁定到 tmp，避免污染 ~/.synapse
     monkeypatch.setattr(
         "synapse.rd_meeting.room_runtime.room_history_path",
-        lambda sid: scope_dir(sid) / "room_history.jsonl",
+        lambda sid, node_id="pending": scope_dir(sid) / "room_history.jsonl",
     )
     return tmp_path
 

@@ -9,7 +9,12 @@ from typing import Any
 from synapse.rd_meeting.dev_status import read_dev_status_file
 from synapse.rd_meeting.participants import resolve_profile_display_name
 from synapse.rd_meeting.paths import iter_work_order_directories
-from synapse.rd_meeting.room_runtime import append_history_event, load_room_state, save_room_state
+from synapse.rd_meeting.room_runtime import (
+    append_history_event,
+    load_room_state,
+    resolve_history_node_id,
+    save_room_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,13 @@ def append_meeting_live_event(
     }
     if extra:
         row.update(extra)
+    rs = load_room_state(scope_id) or {}
+    if isinstance(rs, dict):
+        cur = str(rs.get("current_node_id") or "").strip()
+        if cur and "node_id" not in row:
+            row["node_id"] = cur
+    if "node_id" not in row:
+        row["node_id"] = resolve_history_node_id(scope_id, row)
     append_history_event(scope_id, row)
 
 

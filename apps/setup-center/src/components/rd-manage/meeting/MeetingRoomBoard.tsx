@@ -3,6 +3,7 @@ import { ConfigProvider, theme, Avatar, Modal, Button, Tag, Badge, Tooltip, Prog
 import {
   fetchMeetingRoomDetail,
   fetchMeetingRoomLive,
+  fetchMeetingRoomNodeChat,
   fetchMeetingRooms,
   fetchMeetingNodeParticipants,
   fetchMeetingRoomConfig,
@@ -362,6 +363,9 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
     brief: live.phase ? `${nextBrief.split(' · ')[0] || nextBrief} · ${live.phase}` : nextBrief,
     chatSopKey: nextSopKey,
     participants: live.participants?.length ? live.participants : room.participants,
+    skippedNodeIds: live.skipped_node_ids?.length
+      ? live.skipped_node_ids
+      : room.skippedNodeIds,
     reprocessing: false,
   };
 }
@@ -788,6 +792,7 @@ const InterventionDialog = ({
   onClose,
   onHitlSubmit,
   onReprocess,
+  onMergeNodeChat,
   synapseApiBase,
 }: { 
   room: MeetingRoom | null; 
@@ -796,6 +801,8 @@ const InterventionDialog = ({
   /** 仅中栏人工确认表单提交时使用，协作流只读 */
   onHitlSubmit?: (text: string) => void;
   onReprocess?: () => void;
+  /** 按 SOP 节点合并协作流（来自 agents/<node_id>/room_history.jsonl） */
+  onMergeNodeChat?: (nodeId: string, logs: LogEntry[]) => void;
   synapseApiBase?: string;
 }) => {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -808,6 +815,7 @@ const InterventionDialog = ({
   const logsEndRef = useRef<HTMLDivElement>(null);
   const lastLogKeyRef = useRef('');
   const interventionRoomIdRef = useRef<string | null>(null);
+  const lastFollowedNodeRef = useRef<string | null>(null);
   const hitlAutoFocusRef = useRef<string | null>(null);
 
   const hitlLocked = Boolean(room?.hitlLocked);
@@ -924,6 +932,25 @@ const InterventionDialog = ({
     };
   }, [open, room?.id, chatNodeId, synapseApiBase]);
 
+  useEffect(() => {
+    if (!open || !room?.id || !chatNodeId || !onMergeNodeChat) return;
+    const base = (synapseApiBase || '').trim();
+    if (!base) return;
+    let cancelled = false;
+    void fetchMeetingRoomNodeChat(base, room.id, chatNodeId)
+      .then((payload) => {
+        if (cancelled) return;
+        const logs = (payload.chat_logs || []).map(mapChatWireToLog);
+        onMergeNodeChat(chatNodeId, logs);
+      })
+      .catch(() => {
+        /* 节点 chat 拉取失败时保留已有缓存 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, room?.id, chatNodeId, synapseApiBase, onMergeNodeChat]);
+
   const scrollLogsToBottom = useCallback(() => {
     setTimeout(() => {
       logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -935,12 +962,16 @@ const InterventionDialog = ({
       setSelectedNodeId(null);
       setCenterTab('detail');
       interventionRoomIdRef.current = null;
+      lastFollowedNodeRef.current = null;
       hitlAutoFocusRef.current = null;
       return;
     }
-    if (!room) return;
+    if (!room?.currentNode) return;
     if (interventionRoomIdRef.current !== room.id) {
       interventionRoomIdRef.current = room.id;
+    }
+    if (lastFollowedNodeRef.current !== room.currentNode) {
+      lastFollowedNodeRef.current = room.currentNode;
       setSelectedNodeId(room.currentNode);
     }
   }, [open, room?.id, room?.currentNode]);
@@ -1502,8 +1533,9 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
     const base = (synapseApiBase || '').trim();
     if (!base) return;
     const roomId = activeRoom.id;
+    const pollNodeId = activeRoom.currentNode;
     const poll = () => {
-      void fetchMeetingRoomLive(base, roomId)
+      void fetchMeetingRoomLive(base, roomId, pollNodeId)
         .then((live) => {
           setActiveRoom((prev) => {
             if (!prev || prev.id !== roomId) return prev;
@@ -1521,7 +1553,7 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
     poll();
     const timer = window.setInterval(poll, 3000);
     return () => window.clearInterval(timer);
-  }, [dialogOpen, activeRoom?.id, synapseApiBase]);
+  }, [dialogOpen, activeRoom?.id, activeRoom?.currentNode, synapseApiBase]);
 
   useEffect(() => {
     const focus = consumeMeetingRoomFocus();
@@ -1583,6 +1615,21 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
         toast.error(e instanceof Error ? e.message : String(e));
       });
   };
+
+  const handleMergeNodeChat = useCallback((nodeId: string, logs: LogEntry[]) => {
+    const apply = (room: MeetingRoom): MeetingRoom => {
+      const others = (room.allChatLogs ?? room.logs).filter(
+        (l) => (l.nodeId || '').trim() && (l.nodeId || '').trim() !== nodeId,
+      );
+      return { ...room, allChatLogs: mergeChatLogs(others, logs) };
+    };
+    setActiveRoom((prev) => {
+      if (!prev) return prev;
+      const next = apply(prev);
+      setRooms((rooms) => rooms.map((r) => (r.id === prev.id ? next : r)));
+      return next;
+    });
+  }, []);
 
   const handleReprocess = () => {
     if (!activeRoom) return;
@@ -1669,6 +1716,7 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
           onClose={() => setDialogOpen(false)}
           onHitlSubmit={handleHitlSubmit}
           onReprocess={handleReprocess}
+          onMergeNodeChat={handleMergeNodeChat}
           synapseApiBase={synapseApiBase}
         />
 
