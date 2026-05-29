@@ -940,6 +940,10 @@ class ToolExecutor:
         if self._current_mode in ("plan", "ask"):
             return None
 
+        agent_ref = getattr(self, "_agent_ref", None)
+        if agent_ref is not None and getattr(agent_ref, "_is_sub_agent_call", False):
+            return None
+
         if tool_name in (
             "create_todo",
             "create_plan_file",

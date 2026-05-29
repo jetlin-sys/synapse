@@ -3370,10 +3370,17 @@ class Agent:
         elif mode == "agent":
             from ..tools.handlers.plan import require_todo_for_session, should_require_todo
 
-            has_multi_actions = should_require_todo(message)
-            if intent_result.todo_required or has_multi_actions:
-                require_todo_for_session(conversation_id, True)
-                logger.info(f"[Session:{session_id}] Multi-step task detected, Plan required")
+            # 子 Agent：委派正文已是结构化步骤，勿再 compound Todo 门禁
+            if self._is_sub_agent_call:
+                require_todo_for_session(conversation_id, False)
+                logger.info(
+                    f"[Session:{session_id}] Sub-agent: todo gate disabled (require_todo=False)"
+                )
+            else:
+                has_multi_actions = should_require_todo(message)
+                if intent_result.todo_required or has_multi_actions:
+                    require_todo_for_session(conversation_id, True)
+                    logger.info(f"[Session:{session_id}] Multi-step task detected, Plan required")
 
         # 9. Task definition setup
         self._current_task_definition = compiler_summary
@@ -6098,7 +6105,9 @@ class Agent:
         # Todo 强制检查（仅 Agent 模式；plan/ask 模式跳过）
         # ============================================
         _effective_mode = getattr(self.tool_executor, "_current_mode", "agent")
-        if _effective_mode not in ("plan", "ask"):
+        if _effective_mode not in ("plan", "ask") and not getattr(
+            self, "_is_sub_agent_call", False
+        ):
             _todo_exempt = (
                 "create_todo",
                 "create_plan_file",
