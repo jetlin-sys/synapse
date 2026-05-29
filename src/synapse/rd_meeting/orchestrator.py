@@ -68,6 +68,7 @@ from synapse.rd_meeting.room_runtime import (
     load_room_state,
     save_room_state,
 )
+from synapse.rd_meeting.sop_stage_hooks import schedule_sop_stage_transition_hook
 from synapse.rd_meeting.room_skill import (
     DEFAULT_LLM_ENDPOINT_KEY,
     build_room_skill_prompt,
@@ -440,6 +441,7 @@ class MeetingRoomOrchestrator:
         room_state["status"] = "processing"
 
         next_id: str | None = None
+        prev_stage_id = stage_id_for_node_id(node_id)
         if advance:
             next_id = next_node_id(node_id)
             if next_id:
@@ -448,6 +450,16 @@ class MeetingRoomOrchestrator:
                 dev["sop_node_display"] = node_display_name(next_id)
                 room_state["current_node_id"] = next_id
                 room_state["stage_id"] = dev["stage_id"]
+                next_stage_id = int(dev["stage_id"])
+                if prev_stage_id != next_stage_id:
+                    schedule_sop_stage_transition_hook(
+                        scope_type=scope_type,  # type: ignore[arg-type]
+                        scope_id=sid,
+                        from_stage=prev_stage_id,
+                        to_stage=next_stage_id,
+                        completed_node_id=node_id,
+                        next_node_id=next_id,
+                    )
             else:
                 dev["local_process_state"] = "已完成"
                 room_state["status"] = "completed"
