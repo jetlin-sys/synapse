@@ -1885,7 +1885,6 @@ class CreateTaskRequest(BaseModel):
     taskNo: str= Field(..., description="需求单号")
     taskTitle: str = Field(..., description="标题")
     comments: str = Field(..., description="描述信息")
-    ownerUserCode: str = Field(..., description="负责人工号")
     projectId: int | None = Field(None, description="项目空间标志:与productModuleName必须二选一传值")
     productModuleName: str | None = Field(None, description="应用模块名称:与projectId必须二选一传值")
     branchVersionName: str | None = Field(None, description="产品分支名称:可以是主产品分支,也可以是Trunk产品分支")
@@ -1893,7 +1892,6 @@ class CreateTaskRequest(BaseModel):
     taskClassification: str | None = Field(None, description="领域:TECH-技术,FUNCTION-功能,SECURITY-安全,PERFORMANCE-性能,USE_OPTIMIZATION-体验,示例值(FUNCTION)")
     taskPri: int | None = Field(None, description="优先级:5-较低,6-普通,7-紧急,8-非常紧急,示例值(5)")
     patchName: str = Field(..., description="补丁计划名称")
-    userId: int = Field(..., description="用户ID")
     taskImpactList: list[CreateTaskImpactItem] = Field(..., description="任务影响点（创建后将自动新增并确认）")
     performanceImpact: str = Field(..., description="性能影响")
     functionalImpact: str = Field(..., description="功能影响")
@@ -1902,11 +1900,11 @@ class CreateTaskRequest(BaseModel):
     securityImpact: str = Field(..., description="安全影响")
     compatibilityImpact: str = Field(..., description="兼容性影响")
 
-def _build_create_task_payload(body: CreateTaskRequest) -> dict:
+def _build_create_task_payload(body: CreateTaskRequest, ownerUserCode: str) -> dict:
     payload: dict = {
         "taskTitle": body.taskTitle,
         "comments": body.comments,
-        "ownerUserCode": body.ownerUserCode,
+        "ownerUserCode": ownerUserCode,
     }
     if body.projectId is not None:
         payload["projectId"] = body.projectId
@@ -1941,13 +1939,21 @@ async def create_task(body: CreateTaskRequest) -> dict:
             "baseBranchName": "来源分支名称", 
         }
     }
-    转调：POST /portal/ai-gateway/devspace/rpc/v3/user-story/{body.taskNo}/work-item/inner，返回码code为“9999”表示成功
+    转调：POST /portal/ai-gateway/devspace/rpc/v3/user-story/{body.taskNo}/work-item/inner，返回码code为"9999"表示成功
     """
+    userinfo = _load_userinfo_plain()
+    if not userinfo:
+        return error_response(400, "未登录，请先调用 /api/dev/iwhalecloud/login 完成引导")
+    employee_id = userinfo.get("employee_id", "")
+    user_id = userinfo.get("userId")
+    if not employee_id:
+        return error_response(400, "userinfo 中缺少 employee_id（负责人工号）")
+    if not user_id:
+        return error_response(400, "userinfo 中缺少 userId")
+
     # 参数校验：统一入口必须具备负责人、版本、影响点等
     if not body.taskNo:
         return error_response(400, "taskNo 不能为空")
-    if not body.ownerUserCode:
-        return error_response(400, "ownerUserCode 不能为空，不允许创建任务")
     if body.projectId is None and body.productModuleName is None:
         return error_response(400, "projectId 与 productModuleName 必须二选一传值")
     if not body.patchName or not body.productModuleName or not body.branchVersionName:
@@ -1963,7 +1969,7 @@ async def create_task(body: CreateTaskRequest) -> dict:
 
     # 步骤1：调用创建任务单接口
     url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/ai-gateway/devspace/rpc/v3/user-story/{body.taskNo}/work-item/inner"
-    payload = _build_create_task_payload(body)
+    payload = _build_create_task_payload(body, employee_id)
     logger.debug("create_task url:%s, payload:%s", url, payload)
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -2003,20 +2009,20 @@ async def create_task(body: CreateTaskRequest) -> dict:
 
     # 步骤6：新增任务影响点（必须）
     impact_items = [AddTaskImpactItem(taskImpactId=it.taskImpactId, taskId=created_task_id, taskImpactDesc=it.taskImpactDesc) for it in body.taskImpactList]
-    add_impact_body = AddTaskImpactRequest(userId=body.userId, taskImpactList=impact_items)
+    add_impact_body = AddTaskImpactRequest(userId=user_id, taskImpactList=impact_items)
     add_impact_result = await _add_task_impact(add_impact_body)
     if isinstance(add_impact_result, dict) and add_impact_result.get("errorcode") not in (None, 0):
         return error_response(502, "任务已创建，但新增任务影响点失败", error=str(add_impact_result))
 
-    # 步骤7：自动确认影响点
-    confirm_items = [
-        TaskImpactConfirmItem(taskImpactId=it.taskImpactId, taskId=created_task_id, confirmResult="Y", confirmRole="DEV")
-        for it in impact_items
-    ]
-    confirm_body = TaskImpactConfirmRequest(userId=body.userId, taskImpactList=confirm_items)
-    confirm_result = await _task_impact_confirm(confirm_body)
-    if isinstance(confirm_result, dict) and confirm_result.get("errorcode") not in (None, 0):
-        return error_response(502, "任务已创建，但影响点确认失败", error=str(confirm_result))
+    # 步骤7：自动确认影响点（暂时屏蔽）
+    # confirm_items = [
+    #     TaskImpactConfirmItem(taskImpactId=it.taskImpactId, taskId=created_task_id, confirmResult="Y", confirmRole="DEV")
+    #     for it in impact_items
+    # ]
+    # confirm_body = TaskImpactConfirmRequest(userId=user_id, taskImpactList=confirm_items)
+    # confirm_result = await _task_impact_confirm(confirm_body)
+    # if isinstance(confirm_result, dict) and confirm_result.get("errorcode") not in (None, 0):
+    #     return error_response(502, "任务已创建，但影响点确认失败", error=str(confirm_result))
 
     # 步骤9：更新任务影响评估
     auto_eval = {
@@ -2027,7 +2033,7 @@ async def create_task(body: CreateTaskRequest) -> dict:
         "securityImpact": body.securityImpact,
         "compatibilityImpact": body.compatibilityImpact,
     }
-    update_eval_body = UpdateTaskImpactEvaluationRequest(taskId=created_task_id, userId=body.userId, **auto_eval)
+    update_eval_body = UpdateTaskImpactEvaluationRequest(taskId=created_task_id, userId=user_id, **auto_eval)
     eval_result = await _update_task_impact_evaluation(update_eval_body)
     if isinstance(eval_result, dict) and eval_result.get("errorcode") not in (None, 0):
         return error_response(502, "任务已创建，但研发单影响评估编辑失败", error=str(eval_result))
@@ -2035,8 +2041,8 @@ async def create_task(body: CreateTaskRequest) -> dict:
     # 步骤10：转开发中（仅做状态流转）
     transfer_body = TransferTaskStageRequest(
         taskNo=created_task_no,
-        ownerUserCode=body.ownerUserCode,
-        operateUserCode=body.ownerUserCode,
+        ownerUserCode=employee_id,
+        operateUserCode=employee_id,
         taskFlowStageId=DEV_IWHALECLOUD_TASK_STAGE_DEVELOPING,
         comments="create_task 统一入口：自动转开发中",
     )
@@ -2050,26 +2056,18 @@ async def create_task(body: CreateTaskRequest) -> dict:
         return error_response(502, "任务已创建，但创建特性分支失败", error=str(branch_result))
     branch_data = branch_result.get("data") if isinstance(branch_result, dict) else None
 
-    # 步骤12：将新研发单落盘到 userwork.json，并设置初始 sop_node 为"任务执行"
-    work_item = {
-        "task_no": created_task_no,
-        "task_title": body.taskTitle,
-        "task_desc": body.comments,
-        "created_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "sccb_work_hours": None,
-        "stage_name": "待处理",
-        "product_module_id": branch_data.get("productModuleId") if isinstance(branch_data, dict) else None,
-        "product_module_name": branch_data.get("productModuleName") if isinstance(branch_data, dict) else (body.productModuleName or ""),
-        "repo_url": branch_data.get("repoUrl") if isinstance(branch_data, dict) else "",
-        "sop_node": "任务执行",
-    }
-    append_owned_work_item_to_demand(body.taskNo, work_item)
-
     return success_response(
         {
-            "taskNo": created_task_no,
-            "taskId": created_task_id,
-            "branch": branch_data,
+            "task_no": created_task_no,
+            "task_title": body.taskTitle,
+            "task_desc": body.comments,
+            "created_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "sccb_work_hours": None,
+            "stage_name": "开发中",
+            "product_module_id": branch_data.get("productModuleId") if isinstance(branch_data, dict) else None,
+            "product_module_name": branch_data.get("productModuleName") if isinstance(branch_data, dict) else (body.productModuleName or ""),
+            "repo_url": branch_data.get("repoUrl") if isinstance(branch_data, dict) else "",
+            "sop_node": "任务执行",
         },
         "创建任务统一流程执行成功",
     )
@@ -2542,7 +2540,6 @@ async def transfer_demand_stage(body: TransferDemandStageRequest) -> dict:
 
 class TransferDemandToDesigningRequest(BaseModel):
     demandNo: str = Field(..., description="需求单号")
-    user: str = Field(..., description="操作人工号")
     comments: str = Field("", description="转单备注")
 
 
@@ -2550,7 +2547,7 @@ class TransferDemandToDesigningRequest(BaseModel):
 async def transfer_demand_to_designing(body: TransferDemandToDesigningRequest) -> dict:
     """
     功能：将需求单转到需求设计环节。
-    用法：传入需求单号、操作人工号、备注，将需求单转到需求设计环节。
+    用法：传入需求单号、备注，将需求单转到需求设计环节。
     接口类型：研发云提供标准API接口
     返回数据格式：{
         "errorcode": 0,
@@ -2559,12 +2556,19 @@ async def transfer_demand_to_designing(body: TransferDemandToDesigningRequest) -
     }
     转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{demandNo}/stage，返回码code为"9999"表示成功
     """
+    userinfo = _load_userinfo_plain()
+    if not userinfo:
+        return error_response(400, "未登录，请先调用 /api/dev/iwhalecloud/login 完成引导")
+    employee_id = userinfo.get("employee_id", "")
+    if not employee_id:
+        return error_response(400, "userinfo 中缺少 employee_id（操作人工号）")
+
     if not body.demandNo:
         return error_response(400, "demandNo 不能为空")
     url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/ai-gateway/devspace/rpc/v3/task/{body.demandNo}/stage"
     payload = {
-        "ownerUserCode": body.user,
-        "operateUserCode": body.user,
+        "ownerUserCode": employee_id,
+        "operateUserCode": employee_id,
         "taskFlowStageId": DEV_IWHALECLOUD_DEMAND_STAGE_DESIGNING,
         "comments": body.comments or "",
     }
@@ -2581,7 +2585,6 @@ async def transfer_demand_to_designing(body: TransferDemandToDesigningRequest) -
 
 class TransferDemandToDevelopingRequest(BaseModel):
     demandNo: str = Field(..., description="需求单号")
-    user: str = Field(..., description="操作人工号")
     comments: str = Field("", description="转单备注")
 
 
@@ -2589,7 +2592,7 @@ class TransferDemandToDevelopingRequest(BaseModel):
 async def transfer_demand_to_developing(body: TransferDemandToDevelopingRequest) -> dict:
     """
     功能：将需求单转到需求开发环节。
-    用法：传入需求单号、操作人工号、备注，将需求单转到需求开发环节。
+    用法：传入需求单号、备注，将需求单转到需求开发环节。
     接口类型：研发云提供标准API接口
     返回数据格式：{
         "errorcode": 0,
@@ -2598,12 +2601,19 @@ async def transfer_demand_to_developing(body: TransferDemandToDevelopingRequest)
     }
     转调：POST /portal/ai-gateway/devspace/rpc/v3/task/{demandNo}/stage，返回码code为"9999"表示成功
     """
+    userinfo = _load_userinfo_plain()
+    if not userinfo:
+        return error_response(400, "未登录，请先调用 /api/dev/iwhalecloud/login 完成引导")
+    employee_id = userinfo.get("employee_id", "")
+    if not employee_id:
+        return error_response(400, "userinfo 中缺少 employee_id（操作人工号）")
+
     if not body.demandNo:
         return error_response(400, "demandNo 不能为空")
     url = f"{DEV_IWHALECLOUD_BASE_URL}/portal/ai-gateway/devspace/rpc/v3/task/{body.demandNo}/stage"
     payload = {
-        "ownerUserCode": body.user,
-        "operateUserCode": body.user,
+        "ownerUserCode": employee_id,
+        "operateUserCode": employee_id,
         "taskFlowStageId": DEV_IWHALECLOUD_DEMAND_STAGE_DEVELOPING,
         "comments": body.comments or "",
     }
