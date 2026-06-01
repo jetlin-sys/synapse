@@ -1085,12 +1085,18 @@ const InterventionDialog = ({
   const lastFollowedNodeRef = useRef<string | null>(null);
   const hitlAutoFocusRef = useRef<string | null>(null);
 
+  const chatNodeId = selectedNodeId || room?.currentNode || 'pending';
+  /** 人工确认表单/结果确认仅归属当前流水线节点（或 review_payload 指定节点） */
+  const hitlTargetNodeId = (room?.reviewPayload?.node_id ?? room?.currentNode ?? '').trim();
+  const isViewingHitlNode = Boolean(hitlTargetNodeId && chatNodeId === hitlTargetNodeId);
+
   const hitlLocked = Boolean(room?.hitlLocked);
   const hasReviewPayload = !!(room?.reviewPayload && room.status === 'human_intervention' && !hitlLocked);
   const hitlAvailable = !!(
     (room?.hitlFormSchema || hasReviewPayload) &&
     room?.status === 'human_intervention' &&
-    !hitlLocked
+    !hitlLocked &&
+    isViewingHitlNode
   );
   const hitlKind = (room?.hitlFormSchema as { summary_kind?: string; intervention_kind?: string } | undefined)
     ?? (hasReviewPayload ? { intervention_kind: 'result_confirm' as const } : undefined);
@@ -1113,7 +1119,6 @@ const InterventionDialog = ({
     return `${room.id}:${room.currentNode}:${schemaSig}`;
   }, [hitlAvailable, room, hasReviewPayload]);
 
-  const chatNodeId = selectedNodeId || room?.currentNode || 'pending';
   const displayChatLogs = useMemo(
     () => (room ? filterLogsForNodeExact(room.allChatLogs ?? room.logs, chatNodeId) : []),
     [room, chatNodeId],
@@ -1281,6 +1286,14 @@ const InterventionDialog = ({
     }
   }, [open, hitlAvailable, hitlFocusKey, room?.currentNode]);
 
+  /** 切换到历史节点时离开「人工确认」Tab，避免在非待确认节点展示表单 */
+  useEffect(() => {
+    if (!open) return;
+    if (centerTab === 'hitl' && !isViewingHitlNode) {
+      setCenterTab('detail');
+    }
+  }, [open, centerTab, isViewingHitlNode]);
+
   useEffect(() => {
     if (!open) return;
     lastLogKeyRef.current = '';
@@ -1357,14 +1370,30 @@ const InterventionDialog = ({
         {/* COL 1: SOP Stage + Agenda List (320px) */}
         <div className="w-[320px] bg-[color:var(--panel)] flex flex-col shrink-0">
           {/* Ticket Header */}
-          <div className="p-4 border-b border-border/60 flex flex-col justify-center gap-1.5 min-h-[88px]">
-            <div className="text-xs text-muted-foreground font-mono flex items-center gap-1.5 min-w-0">
-              <GitBranch className="w-3 h-3 shrink-0" />
-              <span className="truncate">{room.ticketId}</span>
+          <div className="p-4 border-b border-border/60 flex flex-col gap-2 shrink-0">
+            <Button
+              size="small"
+              icon={<ArrowLeft className="w-3.5 h-3.5" />}
+              onClick={onClose}
+              className="self-start"
+            >
+              返回看板
+            </Button>
+            <div className="flex items-baseline gap-2 min-w-0">
+              <h3
+                className="text-sm font-semibold text-foreground leading-snug truncate min-w-0 flex-1"
+                title={room.ticketTitle}
+              >
+                {room.ticketTitle}
+              </h3>
+              <span
+                className="text-xs text-muted-foreground font-mono shrink-0 flex items-center gap-1 max-w-[42%]"
+                title={room.ticketId}
+              >
+                <GitBranch className="w-3 h-3 shrink-0" />
+                <span className="truncate">{room.ticketId}</span>
+              </span>
             </div>
-            <h3 className="text-sm font-semibold text-foreground line-clamp-3 leading-snug break-words">
-              {room.ticketTitle}
-            </h3>
           </div>
           
           {/* SOP Stage Navigator */}
@@ -1434,7 +1463,10 @@ const InterventionDialog = ({
                 <motion.div
                   key={node.id}
                   whileHover={{ x: 2 }}
-                  onClick={() => setSelectedNodeId(node.id)}
+                  onClick={() => {
+                    setSelectedNodeId(node.id);
+                    if (node.id !== hitlTargetNodeId) setCenterTab('detail');
+                  }}
                   className={`cursor-pointer rounded-xl p-3 border transition-all duration-200 ${
                     isSelected
                       ? 'bg-blue-950/30 border-blue-700/60 shadow-[0_0_12px_rgba(59,130,246,0.1)]'
@@ -1539,13 +1571,6 @@ const InterventionDialog = ({
               </button>
             </div>
             <div className="flex items-center gap-2">
-              <Button
-                size="small"
-                icon={<ArrowLeft className="w-3.5 h-3.5" />}
-                onClick={onClose}
-              >
-                返回看板
-              </Button>
               {canReprocess ? (
                 <Button
                   size="small"
