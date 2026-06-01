@@ -272,6 +272,7 @@ class MeetingRoomService:
             "tokenConsumed": detail.get("tokenConsumed"),
             "tokenBudget": detail.get("tokenBudget"),
             "stageDuration": detail.get("stageDuration"),
+            "meetingStartedAt": detail.get("meetingStartedAt"),
             "agents_active": agents_active,
             "participants": participants,
             "sub_agents": sub_agents,
@@ -1060,6 +1061,7 @@ class MeetingRoomService:
             item["stageDuration"] = self._format_duration(int(m.get("stage_seconds") or 0))
             item["tokenConsumed"] = int(m.get("tokens") or 0)
             item["tokenBudget"] = int(m.get("token_budget") or 150_000)
+            item["meetingStartedAt"] = str(m.get("stage_started_at") or "").strip()
             rs = str(room_state.get("status") or "")
             if rs in ("processing", "human_intervention", "completed", "failed"):
                 item["status"] = rs
@@ -1159,11 +1161,13 @@ class MeetingRoomService:
         token_consumed = 0
         token_budget = 150_000
         stage_duration = "—"
+        meeting_started_at = ""
         if room_state and isinstance(room_state.get("metrics"), dict):
             m = room_state["metrics"]
             token_consumed = int(m.get("tokens") or 0)
             token_budget = int(m.get("token_budget") or 150_000)
             stage_duration = self._format_duration(int(m.get("stage_seconds") or 0))
+            meeting_started_at = str(m.get("stage_started_at") or "").strip()
 
         return {
             "room_id": str(mr.get("room_id") or ""),
@@ -1185,4 +1189,5 @@ class MeetingRoomService:
             "tokenConsumed": token_consumed,
             "tokenBudget": token_budget,
             "stageDuration": stage_duration,
+            "meetingStartedAt": meeting_started_at,
         }

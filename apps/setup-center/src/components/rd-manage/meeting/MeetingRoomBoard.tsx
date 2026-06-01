@@ -122,6 +122,7 @@ interface MeetingRoom {
   totalStages: number;
   status: 'processing' | 'human_intervention' | 'completed' | 'failed';
   stageDuration: string;
+  meetingStartedAt?: string;
   tokenConsumed: number;
   tokenBudget: number;
   agents: RoomAgent[];
@@ -350,6 +351,7 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
     tokenConsumed: live.tokenConsumed ?? room.tokenConsumed,
     tokenBudget: live.tokenBudget ?? room.tokenBudget,
     stageDuration: live.stageDuration || room.stageDuration,
+    meetingStartedAt: live.meetingStartedAt || room.meetingStartedAt,
     hitlFormSchema:
       live.hitl_form_schema !== undefined
         ? ((live.hitl_form_schema as HitlFormSchema | null) ?? null)
@@ -426,6 +428,7 @@ function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
     totalStages: SOP_STAGES.length,
     status: item.status,
     stageDuration: item.stageDuration || '—',
+    meetingStartedAt: item.meetingStartedAt,
     tokenConsumed: item.tokenConsumed ?? 0,
     tokenBudget: item.tokenBudget ?? 150000,
     agents: buildAgentsFromDetail(item),
@@ -801,6 +804,144 @@ function MeetingSopStageStepper({
   );
 }
 
+function resolveSopNodeName(nodeId: string): string {
+  const n = ALL_NODES.find((x) => x.id === nodeId);
+  return n?.name || nodeId;
+}
+
+function formatMeetingStartedAt(raw?: string): string {
+  if (!raw?.trim()) return '—';
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw.trim();
+  return d.toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+function formatTokenConsumed(consumed: number, budget: number): string {
+  const k = consumed >= 1000 ? `${(consumed / 1000).toFixed(1)}k` : String(consumed);
+  const bk = budget >= 1000 ? `${(budget / 1000).toFixed(0)}k` : String(budget);
+  return `${k} / ${bk}`;
+}
+
+function meetingStatusTagColor(status: MeetingRoom['status']): string {
+  switch (status) {
+    case 'human_intervention':
+      return 'error';
+    case 'failed':
+      return 'error';
+    case 'completed':
+      return 'success';
+    default:
+      return 'processing';
+  }
+}
+
+/** 会议室全宽顶栏：工单信息 + 运行指标（跨左/中/右三栏） */
+const MeetingRoomTitleBar = ({
+  room,
+  onBack,
+}: {
+  room: MeetingRoom;
+  onBack: () => void;
+}) => {
+  const currentNodeName = resolveSopNodeName(room.currentNode);
+  const tokenPct = room.tokenBudget > 0
+    ? Math.min(100, (room.tokenConsumed / room.tokenBudget) * 100)
+    : 0;
+  const tokenHot = room.tokenBudget > 0 && room.tokenConsumed > room.tokenBudget * 0.9;
+
+  return (
+    <header className="shrink-0 border-b border-border/60 bg-gradient-to-r from-[color:var(--panel)] via-[color:var(--panel2)] to-[color:var(--panel)] px-4 py-3">
+      <div className="flex items-center gap-4 min-w-0">
+        <div className="flex items-center gap-3 min-w-0 shrink-0">
+          <Button
+            size="small"
+            icon={<ArrowLeft className="w-3.5 h-3.5" />}
+            onClick={onBack}
+            className="shrink-0 border-border/60"
+          >
+            返回看板
+          </Button>
+          <div className="h-8 w-px bg-border/50 shrink-0" aria-hidden />
+          <div className="min-w-0 flex flex-col gap-0.5">
+            <div className="flex items-center gap-2 min-w-0">
+              <Sparkles className="w-4 h-4 text-violet-400 shrink-0" />
+              <h2
+                className="text-sm font-semibold text-foreground truncate"
+                title={room.ticketTitle}
+              >
+                {room.ticketTitle}
+              </h2>
+            </div>
+            <div
+              className="flex items-center gap-1.5 text-[11px] text-muted-foreground font-mono pl-6 min-w-0"
+              title={room.ticketId}
+            >
+              <GitBranch className="w-3 h-3 shrink-0" />
+              <span className="truncate">{room.ticketId}</span>
+              {room.branch && room.branch !== '—' ? (
+                <>
+                  <span className="text-muted-foreground/40">·</span>
+                  <span className="truncate">{room.branch}</span>
+                </>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex-1 flex items-center justify-center gap-2 min-w-0 flex-wrap">
+          <Tooltip title={`会议开始于 ${formatMeetingStartedAt(room.meetingStartedAt)} · 累计处理 ${room.stageDuration}`}>
+            <div className="inline-flex items-center gap-2 rounded-lg border border-border/50 bg-muted/25 px-3 py-1.5 text-[11px] text-muted-foreground">
+              <Clock className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+              <span className="text-foreground/80 whitespace-nowrap">开始</span>
+              <span className="font-mono text-foreground whitespace-nowrap">
+                {formatMeetingStartedAt(room.meetingStartedAt)}
+              </span>
+            </div>
+          </Tooltip>
+          <Tooltip title={`流水线当前节点 · ${room.stageName}`}>
+            <div className="inline-flex items-center gap-2 rounded-lg border border-blue-500/25 bg-blue-500/8 px-3 py-1.5 text-[11px] max-w-[280px]">
+              <Activity className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+              <span className="text-muted-foreground whitespace-nowrap">当前节点</span>
+              <span className="font-medium text-blue-300 truncate">{currentNodeName}</span>
+            </div>
+          </Tooltip>
+          <Tooltip title={`Token 总消耗 ${room.tokenConsumed.toLocaleString()} / 预算 ${room.tokenBudget.toLocaleString()}`}>
+            <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/25 bg-amber-500/8 px-3 py-1.5 text-[11px] min-w-[140px]">
+              <Coins className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span className="text-muted-foreground whitespace-nowrap">Token</span>
+              <span className={`font-mono whitespace-nowrap ${tokenHot ? 'text-red-400' : 'text-amber-200/90'}`}>
+                {formatTokenConsumed(room.tokenConsumed, room.tokenBudget)}
+              </span>
+              <Progress
+                percent={tokenPct}
+                showInfo={false}
+                size="small"
+                strokeColor={tokenHot ? '#ef4444' : '#f59e0b'}
+                trailColor="rgba(255,255,255,0.08)"
+                className="!mb-0 min-w-[48px] max-w-[72px]"
+              />
+            </div>
+          </Tooltip>
+        </div>
+
+        <Tag
+          color={meetingStatusTagColor(room.status)}
+          className="m-0 shrink-0 border-0 text-[11px] px-2.5 py-0.5"
+        >
+          {roomCardStatusLabel(room.status)}
+        </Tag>
+      </div>
+    </header>
+  );
+};
+
 function roomCardStatusLabel(status: MeetingRoom['status']): string {
   switch (status) {
     case 'human_intervention':
@@ -1131,7 +1272,6 @@ const InterventionDialog = ({
       SOP_STAGES.find((s) => s.id === effectiveViewStageId)
     : undefined;
   const pipelineStageId = room ? stageIdForNodeId(room.currentNode) || room.stageIndex : 0;
-  const isViewingPipelineStage = effectiveViewStageId === pipelineStageId;
   const stageNodes = currentStage?.nodes || [];
   const selectedNode =
     stageNodes.find((n) => n.id === selectedNodeId) ||
@@ -1365,37 +1505,12 @@ const InterventionDialog = ({
         } as Record<string, string>),
       }}
     >
-      <div className="flex h-[min(92vh,960px)] divide-x divide-slate-800/60">
-        
-        {/* COL 1: SOP Stage + Agenda List (320px) */}
-        <div className="w-[320px] bg-[color:var(--panel)] flex flex-col shrink-0">
-          {/* Ticket Header */}
-          <div className="p-4 border-b border-border/60 flex flex-col gap-2 shrink-0">
-            <Button
-              size="small"
-              icon={<ArrowLeft className="w-3.5 h-3.5" />}
-              onClick={onClose}
-              className="self-start"
-            >
-              返回看板
-            </Button>
-            <div className="flex items-baseline gap-2 min-w-0">
-              <h3
-                className="text-sm font-semibold text-foreground leading-snug truncate min-w-0 flex-1"
-                title={room.ticketTitle}
-              >
-                {room.ticketTitle}
-              </h3>
-              <span
-                className="text-xs text-muted-foreground font-mono shrink-0 flex items-center gap-1 max-w-[42%]"
-                title={room.ticketId}
-              >
-                <GitBranch className="w-3 h-3 shrink-0" />
-                <span className="truncate">{room.ticketId}</span>
-              </span>
-            </div>
-          </div>
-          
+      <div className="flex h-[min(92vh,960px)] flex-col overflow-hidden">
+        <MeetingRoomTitleBar room={room} onBack={onClose} />
+
+        <div className="flex min-h-0 flex-1 divide-x divide-border/50">
+        {/* 左栏：SOP 阶段 + 议题清单 */}
+        <div className="w-[320px] bg-[color:var(--panel)] flex flex-col shrink-0 min-h-0">
           {/* SOP Stage Navigator */}
           <div className="px-3 py-3 border-b border-border/40 bg-gradient-to-b from-muted/25 to-background/60 shrink-0">
             <div className="flex items-center justify-between gap-2 mb-2.5">
@@ -1422,36 +1537,7 @@ const InterventionDialog = ({
             />
           </div>
 
-          {/* Stage Banner */}
-          <div className="px-4 py-3 border-b border-border/40 bg-muted/30">
-            <div className="flex items-center gap-2">
-              <div
-                className={`w-2 h-2 rounded-full shrink-0 ${
-                  isViewingPipelineStage
-                    ? 'bg-blue-500 shadow-[0_0_6px_rgba(59,130,246,0.8)]'
-                    : 'bg-muted-foreground/50'
-                }`}
-              />
-              <span
-                className={`text-xs font-semibold uppercase tracking-wider ${
-                  (STAGE_NAV_THEME[effectiveViewStageId] ?? DEFAULT_STAGE_THEME).accent
-                }`}
-              >
-                {meetingStageNavLabel(effectiveViewStageId, currentStage?.name)} · 会议议题清单
-              </span>
-            </div>
-            <p className="text-[10px] text-muted-foreground/80 mt-1 ml-4">
-              共 {stageNodes.length} 个议题节点 · 点击查看产物
-              {!isViewingPipelineStage ? (
-                <span className="text-muted-foreground/60">
-                  {' '}
-                  · 当前流水线在「{meetingStageNavLabel(pipelineStageId)}」
-                </span>
-              ) : null}
-            </p>
-          </div>
-
-          {/* Agenda Items - only current stage nodes */}
+          {/* 议题节点列表 */}
           <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-2">
             {stageNodes.map((node, idx) => {
               const state = getNodeStateGlobal(room, node.id, disabledSopNodeIds);
@@ -1526,10 +1612,9 @@ const InterventionDialog = ({
           </div>
         </div>
 
-        {/* COL 2: Tabs【节点详情 / 人工确认】 */}
-        <div className="flex-1 bg-background flex flex-col relative overflow-hidden">
-          {/* Tab Header */}
-          <div className="h-[72px] border-b border-border/60 px-6 flex items-center justify-between bg-[color:var(--panel)] shrink-0">
+        {/* 中栏：节点详情 / 人工确认 */}
+        <div className="flex-1 bg-background flex flex-col relative overflow-hidden min-h-0 min-w-0">
+          <div className="h-14 border-b border-border/60 px-5 flex items-center justify-between bg-[color:var(--panel)] shrink-0">
             <div className="flex items-center gap-2">
               <button
                 type="button"
@@ -1715,42 +1800,35 @@ const InterventionDialog = ({
           </div>
         </div>
 
-        {/* COL 3: Multi-Agent Chat / Interventions (440px) */}
-        <div className="w-[440px] flex flex-col h-full bg-[color:var(--panel)] shrink-0">
-          {/* Main Header / Members Top Bar */}
-          <div className="p-3 border-b border-border bg-[color:var(--panel2)] shrink-0 h-[72px] flex flex-col justify-center">
-            <div className="flex items-center justify-between mb-1.5">
-               <span className="text-sm font-semibold text-foreground flex items-center gap-2 min-w-0">
-                 <MessageSquare className="w-4 h-4 text-violet-400 shrink-0" />
-                 <span className="truncate">
-                   协作会议流
-                   {selectedNode ? (
-                     <span className="font-normal text-muted-foreground">
-                       {' '}
-                       · {selectedNode.name}
-                     </span>
-                   ) : null}
-                 </span>
-               </span>
-               <Tag color={room.status === 'human_intervention' ? 'error' : room.status === 'failed' ? 'error' : 'processing'} className="m-0 border-0 text-[10px]">
-                 {room.status === 'human_intervention' ? '请求专家介入' : room.status === 'failed' ? '流程异常' : 'AI 处理中'}
-               </Tag>
+        {/* 右栏：协作会议流 */}
+        <div className="w-[440px] flex flex-col min-h-0 bg-[color:var(--panel)] shrink-0">
+          <div className="px-4 py-2.5 border-b border-border/60 bg-[color:var(--panel2)] shrink-0">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <span className="text-sm font-semibold text-foreground flex items-center gap-2 min-w-0">
+                <MessageSquare className="w-4 h-4 text-violet-400 shrink-0" />
+                <span className="truncate">协作会议流</span>
+              </span>
+              {selectedNode ? (
+                <span className="text-[10px] font-mono text-muted-foreground truncate max-w-[45%]" title={selectedNode.name}>
+                  {selectedNode.name}
+                </span>
+              ) : null}
             </div>
-            <div className="flex items-center justify-between text-xs text-muted-foreground">
-               <span>参会成员:</span>
-               <div className="flex items-center gap-2">
-                 <Avatar size="small" className="bg-muted text-[10px] ring-2 ring-background">我</Avatar>
-                 <span className="mx-1 text-muted-foreground/70">|</span>
-                 {displayAgents.map(a => (
-                   <MeetingAgentAvatar
-                     key={a.id}
-                     agent={a}
-                     size="small"
-                     showStatusBadge={false}
-                     onClick={() => openAgentContext(a)}
-                   />
-                 ))}
-               </div>
+            <div className="flex items-center gap-2 text-[11px] text-muted-foreground min-w-0">
+              <Users className="w-3.5 h-3.5 shrink-0" />
+              <span className="shrink-0">参会</span>
+              <div className="flex items-center gap-1.5 min-w-0 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                <Avatar size="small" className="bg-muted text-[9px] ring-2 ring-background shrink-0">我</Avatar>
+                {displayAgents.map((a) => (
+                  <MeetingAgentAvatar
+                    key={a.id}
+                    agent={a}
+                    size="small"
+                    showStatusBadge={false}
+                    onClick={() => openAgentContext(a)}
+                  />
+                ))}
+              </div>
             </div>
           </div>
 
@@ -1796,6 +1874,7 @@ const InterventionDialog = ({
           </div>
         </div>
 
+        </div>
       </div>
 
       <MeetingAgentContextDrawer

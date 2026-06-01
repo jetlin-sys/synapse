@@ -23,6 +23,8 @@ export interface MeetingRoomListItem {
   tokenConsumed?: number;
   tokenBudget?: number;
   stageDuration?: string;
+  /** ISO 时间，来自 room_state.metrics.stage_started_at */
+  meetingStartedAt?: string;
 }
 
 export type MeetingChatSpeakerRoleWire = 'system' | 'host' | 'worker' | 'user';
@@ -280,6 +282,7 @@ export interface MeetingRoomLivePayload {
   tokenConsumed?: number;
   tokenBudget?: number;
   stageDuration?: string;
+  meetingStartedAt?: string;
   agents_active?: { profile_id: string; role?: string; status?: string }[];
   sub_agents?: {
     agent_id?: string;
