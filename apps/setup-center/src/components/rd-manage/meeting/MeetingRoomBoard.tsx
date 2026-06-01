@@ -1508,9 +1508,9 @@ const InterventionDialog = ({
       <div className="flex h-[min(92vh,960px)] flex-col overflow-hidden">
         <MeetingRoomTitleBar room={room} onBack={onClose} />
 
-        <div className="flex min-h-0 flex-1 divide-x divide-border/50">
+        <div className="flex min-h-0 flex-1">
         {/* 左栏：SOP 阶段 + 议题清单 */}
-        <div className="w-[320px] bg-[color:var(--panel)] flex flex-col shrink-0 min-h-0">
+        <div className="w-[320px] bg-[color:var(--panel)] flex flex-col shrink-0 min-h-0 border-r border-border/60">
           {/* SOP Stage Navigator */}
           <div className="px-3 py-3 border-b border-border/40 bg-gradient-to-b from-muted/25 to-background/60 shrink-0">
             <div className="flex items-center justify-between gap-2 mb-2.5">
@@ -1801,7 +1801,7 @@ const InterventionDialog = ({
         </div>
 
         {/* 右栏：协作会议流 */}
-        <div className="w-[440px] flex flex-col min-h-0 bg-[color:var(--panel)] shrink-0">
+        <div className="w-[440px] flex flex-col min-h-0 bg-[color:var(--panel)] shrink-0 border-l border-border/60">
           <div className="h-14 shrink-0 flex items-center border-b border-border/60 px-4 bg-gradient-to-b from-muted/25 to-background/60">
             <div className="flex items-center gap-3 min-w-0 w-full">
               <div className="flex items-center gap-1.5 shrink-0">
