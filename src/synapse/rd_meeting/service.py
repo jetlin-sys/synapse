@@ -483,7 +483,7 @@ class MeetingRoomService:
         *,
         agent_pool: Any | None = None,
     ) -> dict[str, Any]:
-        """重新处理当前 SOP 节点：清理过程数据后从 node_init 重跑（非全量重开会议室）。"""
+        """重新处理当前 SOP 节点：清理过程数据、当前节点归档产出后从 node_init 重跑。"""
         rid = (room_id or "").strip()
         if not rid:
             raise ValueError("room_id required")

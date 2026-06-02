@@ -28,7 +28,12 @@ from synapse.rd_meeting.dev_status import (
     save_dev_status,
 )
 from synapse.rd_meeting.participants import build_meeting_participants
-from synapse.rd_meeting.paths import agent_sop_node_dir, meeting_pipeline_path, scope_dir
+from synapse.rd_meeting.paths import (
+    agent_sop_node_dir,
+    archive_node_dir,
+    meeting_pipeline_path,
+    scope_dir,
+)
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
     load_room_state,
@@ -43,6 +48,7 @@ from synapse.rd_sop.nodes import (
     node_display_name,
     resolve_sop_raw_to_node_id,
     stage_id_for_node_id,
+    stage_name_for_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -906,8 +912,96 @@ def _cleanup_agents_for_finished_node(
             logger.warning("clear worker %s meeting prompt binding failed: %s", wid, exc)
 
 
+def clear_current_node_reprocess_artifacts(
+    scope_id: str,
+    node_id: str,
+    *,
+    stage_id: int | None = None,
+) -> None:
+    """重新处理：清理当前 SOP 节点归档、pipeline 节点缓存与工单级快照/标记文件。"""
+    sid = (scope_id or "").strip()
+    nid = (node_id or "").strip()
+    if not sid or not nid or nid == "pending":
+        return
+
+    stg_id = int(stage_id) if stage_id is not None else stage_id_for_node_id(nid)
+    stage_name = stage_name_for_id(stg_id)
+    archive_dir = archive_node_dir(sid, stage_name, nid)
+    if archive_dir.is_dir():
+        try:
+            shutil.rmtree(archive_dir)
+            logger.info("reprocess_prep: removed archive dir %s", archive_dir)
+        except OSError as exc:
+            logger.warning("reprocess_prep: failed to remove archive %s: %s", archive_dir, exc)
+
+    root = scope_dir(sid)
+    for name in ("host_prompt_snapshot.md", "hitl.flag.json"):
+        path = root / name
+        if path.is_file():
+            try:
+                path.unlink()
+                logger.info("reprocess_prep: removed %s", path)
+            except OSError as exc:
+                logger.warning("reprocess_prep: failed to remove %s: %s", path, exc)
+
+    path = meeting_pipeline_path(sid)
+    raw = read_json_file(path)
+    if not isinstance(raw, dict):
+        return
+    ctx = raw.get("context")
+    if not isinstance(ctx, dict):
+        ctx = {}
+    node_review = ctx.get("node_review")
+    if isinstance(node_review, dict) and nid in node_review:
+        nr = dict(node_review)
+        nr.pop(nid, None)
+        ctx["node_review"] = nr
+    ctx.pop("host_prompt", None)
+    raw["context"] = ctx
+    raw["phase"] = "running"
+    raw["updated_at"] = _now_iso()
+    write_json_file(path, raw)
+
+
+def clear_room_state_for_node_reprocess(scope_id: str, node_id: str) -> dict[str, Any]:
+    """重新处理：清理 room_state 内本节点缓存、门控残留与参会人列表。"""
+    from synapse.rd_meeting.host_prompt_cache import clear_host_prompt_cache
+
+    sid = (scope_id or "").strip()
+    nid = (node_id or "").strip()
+    clear_host_prompt_cache(sid)
+
+    rs = dict(load_room_state(sid) or {})
+    rs["status"] = "processing"
+    rs["phase"] = "running"
+    for key in (
+        "hitl_form_schema",
+        "hitl_locked",
+        "hitl_submission",
+        "pending_delivery",
+        "intervention_kind",
+        "agents_active",
+        "rework_instruction",
+        "user_context_pending",
+        "participants",
+        "pending_host_llm_begin_kind",
+        "stopped_at",
+        "stopped_reason",
+    ):
+        rs.pop(key, None)
+
+    node_metrics = rs.get("node_metrics")
+    if isinstance(node_metrics, dict):
+        nm = dict(node_metrics)
+        nm.pop(nid, None)
+        rs["node_metrics"] = nm
+
+    save_room_state(sid, rs)
+    return rs
+
+
 def _step_reprocess_prep(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None:
-    """重新处理准备：清理当前节点 agents/<node_id>/ 过程数据，重置 room_state 介入态。"""
+    """重新处理准备：清理当前节点过程目录、归档产出与 room_state 介入态。"""
     sid = ctx.scope_id
     data = ctx.dev_status or load_dev_status(sid) or {}
     room_id = pipe.room_id or str((data.get("meeting_room") or {}).get("room_id") or "")
@@ -917,6 +1011,9 @@ def _step_reprocess_prep(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None
         pipe.set_flow_step(STEP_WAITING, reason="无有效节点，无法重新处理")
         return
 
+    stage_id = int(data.get("stage_id") or stage_id_for_node_id(run_node))
+    clear_current_node_reprocess_artifacts(sid, run_node, stage_id=stage_id)
+
     node_dir = agent_sop_node_dir(sid, run_node)
     if node_dir.is_dir():
         try:
@@ -925,21 +1022,15 @@ def _step_reprocess_prep(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None
         except OSError as exc:
             logger.warning("reprocess_prep: failed to remove %s: %s", node_dir, exc)
 
-    rs = load_room_state(sid) or {}
-    if isinstance(rs, dict):
-        rs = dict(rs)
-        rs["status"] = "processing"
-        for key in (
-            "hitl_form_schema",
-            "hitl_locked",
-            "hitl_submission",
-            "pending_delivery",
-            "intervention_kind",
-            "agents_active",
-        ):
-            rs.pop(key, None)
-        save_room_state(sid, rs)
-        ctx.room_state = rs
+    from synapse.rd_meeting.hitl_lifecycle import reset_human_confirm_lifecycle
+    from synapse.rd_meeting.hitl_submit import clear_pending_questionnaire
+
+    reset_human_confirm_lifecycle(sid)
+    clear_pending_questionnaire(sid)
+
+    ctx.room_state = clear_room_state_for_node_reprocess(sid, run_node)
+    pipe.set_phase("running", sync_room_state=False)
+    pipe.save()
 
     append_history_event(
         sid,
@@ -947,7 +1038,7 @@ def _step_reprocess_prep(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None
             "event": "reprocess_prep",
             "room_id": room_id,
             "node_id": run_node,
-            "text": f"重新处理准备：已清理节点 {run_node} 的过程数据",
+            "text": f"重新处理准备：已清理节点 {run_node} 的过程数据与归档产出",
             "flow_stage": FLOW_STEP_LABEL[STEP_REPROCESS_PREP],
             "log_type": "info",
             "agent_id": "system",
