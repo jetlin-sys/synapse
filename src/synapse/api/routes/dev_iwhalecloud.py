@@ -1877,10 +1877,6 @@ async def get_ci_flow_build_status(body: GetCiFlowBuildStatusRequest) -> dict:
 
 
 
-class CreateTaskImpactItem(BaseModel):
-    taskImpactId: int = Field(..., description="影响点 ID")
-    taskImpactDesc: str = Field(..., description="任务影响描述")
-
 class CreateTaskRequest(BaseModel):
     taskNo: str= Field(..., description="需求单号")
     taskTitle: str = Field(..., description="标题")
@@ -1889,10 +1885,8 @@ class CreateTaskRequest(BaseModel):
     productModuleName: str | None = Field(None, description="应用模块名称:与projectId必须二选一传值")
     branchVersionName: str | None = Field(None, description="产品分支名称:可以是主产品分支,也可以是Trunk产品分支")
     mainBranchVersionTaskNo: str | None = Field(None, description="Trunk分支关联的主分支单号")
-    taskClassification: str | None = Field(None, description="领域:TECH-技术,FUNCTION-功能,SECURITY-安全,PERFORMANCE-性能,USE_OPTIMIZATION-体验,示例值(FUNCTION)")
-    taskPri: int | None = Field(None, description="优先级:5-较低,6-普通,7-紧急,8-非常紧急,示例值(5)")
     patchName: str = Field(..., description="补丁计划名称")
-    taskImpactList: list[CreateTaskImpactItem] = Field(..., description="任务影响点（创建后将自动新增并确认）")
+    selfTestDesc: str = Field(..., description="自测描述")
     performanceImpact: str = Field(..., description="性能影响")
     functionalImpact: str = Field(..., description="功能影响")
     cfgChangeDescription: str = Field(..., description="配置变更说明")
@@ -1905,6 +1899,8 @@ def _build_create_task_payload(body: CreateTaskRequest, ownerUserCode: str) -> d
         "taskTitle": body.taskTitle,
         "comments": body.comments,
         "ownerUserCode": ownerUserCode,
+        "taskClassification": "FUNCTION",  # 领域写死为功能
+        "taskPri": 6,  # 优先级写死为普通
     }
     if body.projectId is not None:
         payload["projectId"] = body.projectId
@@ -1914,32 +1910,28 @@ def _build_create_task_payload(body: CreateTaskRequest, ownerUserCode: str) -> d
         payload["branchVersionName"] = body.branchVersionName
     if body.mainBranchVersionTaskNo is not None:
         payload["mainBranchVersionTaskNo"] = body.mainBranchVersionTaskNo
-    if body.taskClassification is not None:
-        payload["taskClassification"] = body.taskClassification
-    if body.taskPri is not None:
-        payload["taskPri"] = body.taskPri
     return payload
 
 @router.post("/api/dev/iwhalecloud/create_task")
 async def create_task(body: CreateTaskRequest) -> dict:
     """
     功能：需求单拆单。
-    用法：传入需求单号、负责人、版本、影响点等，创建需求单。
+    用法：传入需求单号、负责人、版本、影响点等，基于需求单创建任务单（拆单）。
     接口类型：研发云提供标准API接口
+    内部调用：POST /portal/ai-gateway/devspace/rpc/v3/user-story/{body.taskNo}/work-item/inner
+    返回码：code="9999" 表示成功
     返回数据格式：{
-        "taskNo": "任务单号",
-        "taskId": "任务ID",
-        "branch": {
-            "productModuleId": 应用模块ID, 
-            "productModuleName": "产品模块名称", 
-            "repoId": 仓库ID, 
-            "repoName": "仓库名称", 
-            "repoUrl": "仓库URL", 
-            "branchName": "特性分支名称", 
-            "baseBranchName": "来源分支名称", 
-        }
+        "task_no": "任务单号",
+        "task_title": "任务标题",
+        "task_desc": "任务描述",
+        "created_date": "创建时间",
+        "sccb_work_hours": "工时",
+        "stage_name": "阶段名称",
+        "product_module_id": "应用模块ID",
+        "product_module_name": "应用模块名称",
+        "repo_url": "仓库URL",
+        "sop_node": "SOP节点"
     }
-    转调：POST /portal/ai-gateway/devspace/rpc/v3/user-story/{body.taskNo}/work-item/inner，返回码code为"9999"表示成功
     """
     userinfo = _load_userinfo_plain()
     if not userinfo:
@@ -1958,8 +1950,8 @@ async def create_task(body: CreateTaskRequest) -> dict:
         return error_response(400, "projectId 与 productModuleName 必须二选一传值")
     if not body.patchName or not body.productModuleName or not body.branchVersionName:
         return error_response(400, "未传版本名称（补丁计划名称）、应用模块名称、产品分支名称，不允许创建任务单")
-    if not body.taskImpactList:
-        return error_response(400, "taskImpactList 为空，请传入任务影响点")
+    if not body.selfTestDesc:
+        return error_response(400, "selfTestDesc 不能为空")
     if not body.performanceImpact or not body.functionalImpact or not body.cfgChangeDescription or not body.upgradeRisk or not body.securityImpact or not body.compatibilityImpact:
         return error_response(400, "performanceImpact、functionalImpact、cfgChangeDescription、upgradeRisk、securityImpact、compatibilityImpact 不能为空")
     try:
@@ -2008,21 +2000,17 @@ async def create_task(body: CreateTaskRequest) -> dict:
         )
 
     # 步骤6：新增任务影响点（必须）
-    impact_items = [AddTaskImpactItem(taskImpactId=it.taskImpactId, taskId=created_task_id, taskImpactDesc=it.taskImpactDesc) for it in body.taskImpactList]
-    add_impact_body = AddTaskImpactRequest(userId=user_id, taskImpactList=impact_items)
-    add_impact_result = await _add_task_impact(add_impact_body)
-    if isinstance(add_impact_result, dict) and add_impact_result.get("errorcode") not in (None, 0):
-        return error_response(502, "任务已创建，但新增任务影响点失败", error=str(add_impact_result))
+    # impact_items = [AddTaskImpactItem(taskImpactId=it.taskImpactId, taskId=created_task_id, taskImpactDesc=it.taskImpactDesc) for it in body.taskImpactList]
+    # add_impact_body = AddTaskImpactRequest(userId=user_id, taskImpactList=impact_items)
+    # add_impact_result = await _add_task_impact(add_impact_body)
+    # if isinstance(add_impact_result, dict) and add_impact_result.get("errorcode") not in (None, 0):
+    #     return error_response(502, "任务已创建，但新增任务影响点失败", error=str(add_impact_result))
 
-    # 步骤7：自动确认影响点（暂时屏蔽）
-    # confirm_items = [
-    #     TaskImpactConfirmItem(taskImpactId=it.taskImpactId, taskId=created_task_id, confirmResult="Y", confirmRole="DEV")
-    #     for it in impact_items
-    # ]
-    # confirm_body = TaskImpactConfirmRequest(userId=user_id, taskImpactList=confirm_items)
-    # confirm_result = await _task_impact_confirm(confirm_body)
-    # if isinstance(confirm_result, dict) and confirm_result.get("errorcode") not in (None, 0):
-    #     return error_response(502, "任务已创建，但影响点确认失败", error=str(confirm_result))
+    # 步骤7：自动确认影响点
+    confirm_body = TaskImpactConfirmRequest(taskId=created_task_id, selfTestDesc=body.selfTestDesc)
+    confirm_result = await _task_impact_confirm(confirm_body)
+    if isinstance(confirm_result, dict) and confirm_result.get("errorcode") not in (None, 0):
+        return error_response(502, "任务已创建，但影响点确认失败", error=str(confirm_result))
 
     # 步骤9：更新任务影响评估
     auto_eval = {
@@ -2182,19 +2170,10 @@ async def _add_task_impact(body: AddTaskImpactRequest) -> dict:
     return _forward_response(resp)
 
 
-class TaskImpactConfirmItem(BaseModel):
-    taskImpactId: int = Field(..., description="任务影响ID")
-    taskId: int = Field(..., description="任务ID")
-    confirmResult: str = Field("Y", description="确认结果，例如 Y/N")
-    confirmRole: str = Field("DEV", description="确认角色，例如 DEV")
-
 class TaskImpactConfirmRequest(BaseModel):
-    """任务影响确认：userId 与 taskImpactList。"""
-    userId: int = Field(..., description="用户ID")
-    taskImpactList: list[TaskImpactConfirmItem] = Field(
-        ...,
-        description="影响确认项列表",
-    )
+    """任务影响确认：taskId 与 selfTestDesc。"""
+    taskId: int = Field(..., description="任务ID")
+    selfTestDesc: str = Field(..., description="自测描述")
 
 def _build_task_impact_confirm_headers(x_csrf_token: str, cookie_header: str | None) -> dict:
     headers = {
@@ -2227,30 +2206,51 @@ async def _task_impact_confirm(body: TaskImpactConfirmRequest) -> dict:
     """
     内部调用：任务影响确认。
 
-    转调：
-    POST /portal/zcm-devspace/task/{taskId}/impact/detail/confirm?userId={userId}
+    接口：POST /portal/zcm-devspace/task/{taskId}/impact/detail/confirm?userId={userId}
+    请求体字段：
+    - taskImpactId: 写死 "327588"
+    - confirmRole: 写死 "DEV"
+    - confirmUserId: 从 userinfo 解密获取
+    - confirmResult: 写死 "Y"
+    - selfTestDesc: 由参数传递
+    - note: 内部赋值为 selfTestDesc
+    - relatedTaskId: 写死 null
+    - taskId: 由参数传递
+    - confirmTaskId: 内部赋值为 taskId
     """
-    items = body.taskImpactList
-    user_id = body.userId
-    if not items:
-        return error_response(400, "taskImpactList 不能为空")
+    # 从 userinfo 解密获取 userId
+    userinfo = _load_userinfo_plain()
+    if not userinfo:
+        return error_response(400, "未登录，请先调用 /api/dev/iwhalecloud/login 完成引导")
+    confirm_user_id = userinfo.get("userId")
+    if not confirm_user_id:
+        return error_response(400, "userinfo 中缺少 userId")
 
-    # 上游 URL 只有一个 taskId，要求 taskImpactList 内 taskId 一致
-    task_id = items[0].taskId
-    for it in items:
-        if it.taskId != task_id:
-            return error_response(400, "taskImpactList 内 taskId 必须全部一致")
-
+    task_id = body.taskId
+    self_test_desc = body.selfTestDesc
     url = (
         f"{DEV_IWHALECLOUD_BASE_URL}/portal/zcm-devspace/task/{task_id}/"
-        f"impact/detail/confirm?userId={user_id}"
+        f"impact/detail/confirm?userId={confirm_user_id}"
     )
     try:
         csrf, ck = await _ensure_valid_creds_async()
     except ValueError as e:
         return error_response(400, str(e))
     headers = _build_task_impact_confirm_headers(csrf, ck)
-    payload = [it.model_dump() for it in items]
+    # 根据新接口格式构建请求体
+    payload = [
+        {
+            "taskId": task_id,
+            "taskImpactId": "327588",
+            "confirmRole": "DEV",
+            "confirmUserId": confirm_user_id,
+            "confirmResult": "Y",
+            "note": self_test_desc,
+            "relatedTaskId": None,
+            "selfTestDesc": self_test_desc,
+            "confirmTaskId": task_id,
+        }
+    ]
 
     logger.debug("task_impact_confirm url:%s payload:%s", url, payload)
     try:
