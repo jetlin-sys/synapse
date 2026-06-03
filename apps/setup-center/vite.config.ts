@@ -68,6 +68,10 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // Tauri cargo 会写入 target/；Windows 上正在运行的 .exe 被 fs.watch 会 EBUSY
+    watch: {
+      ignored: ["**/src-tauri/target/**"],
+    },
     ...(isWebBuild
       ? {
           proxy: {
