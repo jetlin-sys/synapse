@@ -10,8 +10,10 @@ import pytest
 from synapse.rd_meeting.node_review import (
     _extract_llm_text,
     _is_invalid_summary_response,
+    apply_preserved_summaries,
     build_activity_summary_context,
     aggregate_node_metrics,
+    build_node_review_metrics_only,
     build_node_review_payload,
     collect_artifact_files,
     load_node_review,
@@ -391,6 +393,59 @@ async def test_build_and_save_payload_without_llm(tmp_path):
     assert loaded is not None
     assert loaded["node_id"] == node_id
     assert loaded["metrics"]["host"]["delegations"] == 1
+
+
+def test_build_node_review_metrics_only_empty_summaries(tmp_path, monkeypatch):
+    scope = "scope-metrics-only"
+    node_id = "req_clarify"
+    room = "room-mo"
+    stage_id = 2
+    monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
+    scope_dir(scope).mkdir(parents=True, exist_ok=True)
+
+    host_dir = agent_node_dir(scope, "default", node_id)
+    host_dir.mkdir(parents=True)
+    (host_dir / "activity.jsonl").write_text(
+        json.dumps(
+            {
+                "seq": 1,
+                "category": "tool",
+                "tool_name": "delegate_to_agent",
+                "success": True,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    arc = archive_root(scope) / "需求设计" / node_id
+    arc.mkdir(parents=True)
+    (arc / "out.md").write_text("ok", encoding="utf-8")
+
+    payload = build_node_review_metrics_only(
+        scope_type="demand",
+        scope_id=scope,
+        room_id=room,
+        node_id=node_id,
+        binding={"host_profile_id": "default", "worker_profile_ids": [], "node_name": "需求澄清"},
+        report_body="",
+        tokens_used=0,
+        duration_seconds=0,
+        stage_id=stage_id,
+        agent_pool=None,
+        orchestrator=None,
+    )
+    assert payload["summaries"] == []
+    assert payload["metrics"]["host"]["delegations"] == 1
+    assert len(payload["artifacts"]) == 1
+
+
+def test_apply_preserved_summaries():
+    payload = {"summaries": []}
+    cached = {"summaries": [{"profile_id": "default", "source": "llm"}]}
+    apply_preserved_summaries(payload, None, cached)
+    assert len(payload["summaries"]) == 1
+    assert payload["summaries"][0]["source"] == "llm"
 
 
 @pytest.mark.asyncio

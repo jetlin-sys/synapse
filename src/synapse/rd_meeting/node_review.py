@@ -755,18 +755,19 @@ async def generate_agent_summaries(
             node_intent=node_intent,
             activity_context=activity_context,
         )
-        logger.info(
-            "[node_review summary prompt] scope=%s node=%s profile=%s role=%s display=%s "
-            "context_chars=%d prompt_chars=%d\n--- prompt begin ---\n%s\n--- prompt end ---",
-            scope_id,
-            node_id,
-            pid,
-            role,
-            display,
-            len(activity_context),
-            len(prompt),
-            prompt,
-        )
+        if use_llm:
+            logger.info(
+                "[node_review summary prompt] scope=%s node=%s profile=%s role=%s display=%s "
+                "context_chars=%d prompt_chars=%d\n--- prompt begin ---\n%s\n--- prompt end ---",
+                scope_id,
+                node_id,
+                pid,
+                role,
+                display,
+                len(activity_context),
+                len(prompt),
+                prompt,
+            )
         markdown = ""
         source = "fallback"
         if use_llm and host_agent is not None:
@@ -805,6 +806,87 @@ async def generate_agent_summaries(
 # ─── payload 组装 + 落盘 ──────────────────────────────────────────────
 
 
+def _parse_node_review_binding(
+    binding: dict[str, Any],
+    node_id: str,
+) -> tuple[str, list[str], str, str]:
+    host_pid = str(binding.get("host_profile_id") or "default").strip() or "default"
+    worker_pids = [
+        str(w).strip()
+        for w in (binding.get("worker_profile_ids") or [])
+        if str(w).strip() and str(w).strip() != host_pid
+    ]
+    node_name = str(binding.get("node_name") or node_display_name(node_id))
+    node_intent = str(binding.get("node_intent") or binding.get("intent") or "")
+    return host_pid, worker_pids, node_name, node_intent
+
+
+def build_node_review_metrics_only(
+    *,
+    scope_type: ScopeType,
+    scope_id: str,
+    room_id: str,
+    node_id: str,
+    binding: dict[str, Any],
+    report_body: str,
+    tokens_used: int,
+    duration_seconds: int,
+    stage_id: int,
+    agent_pool: Any | None,
+    orchestrator: Any | None,
+) -> dict[str, Any]:
+    """仅装配 metrics + artifacts（无 summaries）。
+
+    用于节点进行中/手动 ``refresh=true`` 轮询，避免重复读 activity 生成 fallback 摘要。
+    """
+    _host_pid, _worker_pids, node_name, node_intent = _parse_node_review_binding(binding, node_id)
+    metrics = aggregate_node_metrics(
+        scope_id=scope_id,
+        room_id=room_id,
+        node_id=node_id,
+        binding=binding,
+        agent_pool=agent_pool,
+        orchestrator=orchestrator,
+        tokens_used=tokens_used,
+        duration_seconds=duration_seconds,
+    )
+    artifacts = collect_artifact_files(
+        scope_id,
+        str(binding.get("stage_name") or stage_name_for_id(stage_id)),
+        node_id,
+    )
+    return {
+        "schema_version": REVIEW_SCHEMA_VERSION,
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "room_id": room_id,
+        "node_id": node_id,
+        "node_name": node_name,
+        "node_intent": node_intent,
+        "stage_id": stage_id,
+        "metrics": metrics.to_dict(),
+        "summaries": [],
+        "artifacts": [a.to_dict() for a in artifacts],
+        "report_body": report_body or "",
+        "generated_at": _now_iso(),
+    }
+
+
+def apply_preserved_summaries(
+    payload: dict[str, Any],
+    *sources: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """从已有 payload 复制 summaries（refresh 时保留 LLM 摘要，不重新生成）。"""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        rows = src.get("summaries")
+        if isinstance(rows, list) and rows:
+            payload["summaries"] = rows
+            return payload
+    return payload
+
+
 async def build_node_review_payload(
     *,
     scope_type: ScopeType,
@@ -820,27 +902,21 @@ async def build_node_review_payload(
     orchestrator: Any | None,
     use_llm_summary: bool = True,
 ) -> dict[str, Any]:
-    """组装节点确认总结 payload。"""
-    host_pid = str(binding.get("host_profile_id") or "default").strip() or "default"
-    worker_pids = [
-        str(w).strip()
-        for w in (binding.get("worker_profile_ids") or [])
-        if str(w).strip() and str(w).strip() != host_pid
-    ]
-    node_name = str(binding.get("node_name") or node_display_name(node_id))
-    node_intent = str(binding.get("node_intent") or binding.get("intent") or "")
-
-    metrics = aggregate_node_metrics(
+    """组装完整节点确认总结 payload（含 summaries）。"""
+    host_pid, worker_pids, node_name, node_intent = _parse_node_review_binding(binding, node_id)
+    payload = build_node_review_metrics_only(
+        scope_type=scope_type,
         scope_id=scope_id,
         room_id=room_id,
         node_id=node_id,
         binding=binding,
-        agent_pool=agent_pool,
-        orchestrator=orchestrator,
+        report_body=report_body,
         tokens_used=tokens_used,
         duration_seconds=duration_seconds,
+        stage_id=stage_id,
+        agent_pool=agent_pool,
+        orchestrator=orchestrator,
     )
-
     summaries = await generate_agent_summaries(
         scope_id=scope_id,
         room_id=room_id,
@@ -852,28 +928,8 @@ async def build_node_review_payload(
         agent_pool=agent_pool,
         use_llm=use_llm_summary,
     )
-
-    artifacts = collect_artifact_files(
-        scope_id,
-        str(binding.get("stage_name") or stage_name_for_id(stage_id)),
-        node_id,
-    )
-
-    return {
-        "schema_version": REVIEW_SCHEMA_VERSION,
-        "scope_type": scope_type,
-        "scope_id": scope_id,
-        "room_id": room_id,
-        "node_id": node_id,
-        "node_name": node_name,
-        "node_intent": node_intent,
-        "stage_id": stage_id,
-        "metrics": metrics.to_dict(),
-        "summaries": [asdict(s) for s in summaries],
-        "artifacts": [a.to_dict() for a in artifacts],
-        "report_body": report_body or "",
-        "generated_at": _now_iso(),
-    }
+    payload["summaries"] = [asdict(s) for s in summaries]
+    return payload
 
 
 def save_node_review(
@@ -971,7 +1027,9 @@ __all__ = [
     "NodeReviewMetrics",
     "aggregate_node_metrics",
     "aggregate_activity_for_summary",
+    "apply_preserved_summaries",
     "build_activity_summary_context",
+    "build_node_review_metrics_only",
     "build_node_review_payload",
     "collect_artifact_files",
     "generate_agent_summaries",

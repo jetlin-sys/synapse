@@ -12,6 +12,8 @@ from synapse.api.schemas import error_response, success_response
 from synapse.rd_meeting.dev_status import load_dev_status
 from synapse.rd_meeting.live import scope_id_for_room_id
 from synapse.rd_meeting.node_review import (
+    apply_preserved_summaries,
+    build_node_review_metrics_only,
     build_node_review_payload,
     load_node_review,
     read_artifact_file,
@@ -176,7 +178,7 @@ async def intervene_meeting(room_id: str, body: InterveneBody, request: Request)
 class ReprocessBody(BaseModel):
     node_id: str | None = Field(
         None,
-        description="要重新处理的 SOP 节点；缺省为流水线当前节点。历史节点暂未实现",
+        description="要重新处理的 SOP 节点；缺省为流水线当前节点。历史节点须与当前节点同阶段",
     )
 
 
@@ -409,10 +411,6 @@ async def get_node_review(
         if isinstance(inline, dict) and pending_matches and not _summaries_all_fallback(inline):
             return success_response(inline)
 
-    # refresh=true：仅刷新 metrics/artifacts，保留已有 LLM 摘要
-    # 缓存缺失（历史节点回看）：尝试 LLM 重新生成摘要（activity 可能仍在 agents/<node>/）
-    use_llm_summary = not refresh
-
     try:
         from synapse.rd_meeting.agent_session import resolve_meeting_orchestrator
         from synapse.rd_meeting.binding import resolve_node_binding
@@ -421,6 +419,7 @@ async def get_node_review(
         binding = resolve_node_binding(target_node, scope_type=scope_type, scope_id=sid)  # type: ignore[arg-type]
         binding["node_id"] = target_node
         pool = getattr(request.app.state, "agent_pool", None)
+        orchestrator = resolve_meeting_orchestrator(pool)
 
         report_body = ""
         tokens_used = 0
@@ -438,7 +437,7 @@ async def get_node_review(
             duration_seconds = int(metrics.get("node_duration_seconds") or 0)
             stage_id_val = int(cached.get("stage_id") or stage_id_val)
 
-        payload = await build_node_review_payload(
+        common = dict(
             scope_type=scope_type,  # type: ignore[arg-type]
             scope_id=sid,
             room_id=room_id,
@@ -449,14 +448,19 @@ async def get_node_review(
             duration_seconds=duration_seconds,
             stage_id=stage_id_val,
             agent_pool=pool,
-            orchestrator=resolve_meeting_orchestrator(pool),
-            use_llm_summary=use_llm_summary,
+            orchestrator=orchestrator,
         )
 
-        if refresh and cached is not None:
-            old_summaries = cached.get("summaries")
-            if isinstance(old_summaries, list) and old_summaries:
-                payload["summaries"] = old_summaries
+        if refresh:
+            payload = build_node_review_metrics_only(**common)
+            inline = pending.get("review_payload") if isinstance(pending, dict) else None
+            apply_preserved_summaries(
+                payload,
+                cached,
+                inline if pending_matches and isinstance(inline, dict) else None,
+            )
+        else:
+            payload = await build_node_review_payload(**common, use_llm_summary=True)
 
         save_node_review(
             sid,

@@ -58,8 +58,11 @@ from synapse.rd_meeting.user_context import (
 from synapse.rd_meeting.userwork_sync import build_title_index, patch_userwork_summary
 from synapse.rd_meeting.validation import resolve_delivery_body_for_archive
 from synapse.rd_sop.manifest import list_manifest_stages
+from synapse.rd_sop.manifest import is_system_node
 from synapse.rd_sop.nodes import (
+    ALL_NODES,
     node_display_name,
+    stage_id_for_node_id,
     stage_name_for_id,
 )
 
@@ -554,20 +557,133 @@ class MeetingRoomService:
         node_id: str | None = None,
         agent_pool: Any | None = None,
     ) -> dict[str, Any]:
-        """重新处理指定节点：当前节点走 prep→node_init；历史节点 TODO-2。"""
+        """重新处理指定节点：当前节点或同阶段历史节点，prep→node_init 重跑。"""
         rid = (room_id or "").strip()
         detail = self.get_room_detail(rid)
         if detail is None:
             raise ValueError("meeting_room_not_found")
         sid = str(detail.get("scope_id") or "").strip()
+        if not sid:
+            raise ValueError("scope_id missing")
         rs = load_room_state(sid) or {}
         current = str(
             rs.get("current_node_id") or detail.get("current_node_id") or "pending"
         ).strip()
         target = (node_id or current).strip() or current
-        if target != current:
-            raise ValueError("historical_reprocess_not_implemented")
-        return self.reprocess_current_node(rid, agent_pool=agent_pool)
+        if target == current:
+            return self.reprocess_current_node(rid, agent_pool=agent_pool)
+        return self._reprocess_historical_node(
+            rid,
+            sid,
+            target=target,
+            current=current,
+            detail=detail,
+            agent_pool=agent_pool,
+        )
+
+    def _validate_historical_reprocess_target(self, *, target: str, current: str) -> list[str]:
+        """校验历史重处理目标，返回 [target..current] 闭区间节点 id。"""
+        if is_system_node(target):
+            raise ValueError("system_node_reprocess_forbidden")
+
+        ids = [str(n["id"]) for n in ALL_NODES]
+        try:
+            t_idx = ids.index(target)
+            c_idx = ids.index(current)
+        except ValueError as exc:
+            raise ValueError("invalid_reprocess_target") from exc
+
+        if t_idx >= c_idx:
+            raise ValueError("invalid_reprocess_target")
+
+        if stage_id_for_node_id(target) != stage_id_for_node_id(current):
+            raise ValueError("cross_stage_reprocess_forbidden")
+
+        node_range = ids[t_idx : c_idx + 1]
+        for nid in node_range:
+            if is_system_node(nid):
+                raise ValueError("system_node_in_reprocess_range")
+        return node_range
+
+    def _reprocess_historical_node(
+        self,
+        room_id: str,
+        scope_id: str,
+        *,
+        target: str,
+        current: str,
+        detail: dict[str, Any],
+        agent_pool: Any | None = None,
+    ) -> dict[str, Any]:
+        """历史节点重处理：回退光标到 target，清理 [target..current] 区间后从 node_init 重跑。"""
+        if str(detail.get("status") or "").strip() == "completed":
+            raise ValueError("room_completed")
+
+        node_range = self._validate_historical_reprocess_target(target=target, current=current)
+
+        scope = detail.get("scope_type") or "demand"
+        scope_type: ScopeType = scope if scope in ("demand", "task") else "demand"
+
+        from synapse.rd_meeting.pipeline import (
+            STEP_REPROCESS_PREP,
+            PipelineRunContext,
+            run_pipeline_until_waiting,
+        )
+
+        cancel_room_run(room_id)
+
+        dev = load_dev_status(scope_id) or {}
+        dev["current_node_id"] = target
+        dev["stage_id"] = stage_id_for_node_id(target)
+        dev["sop_node_display"] = node_display_name(target)
+        dev["local_process_state"] = "处理中"
+        save_dev_status(scope_id, dev)
+        room_id_val = str((dev.get("meeting_room") or {}).get("room_id") or room_id or "").strip()
+        if room_id_val:
+            sync_room_state_from_dev(
+                scope_id,
+                room_id=room_id_val,
+                scope_type=scope_type,
+                stage_id=int(dev.get("stage_id") or 0),
+                current_node_id=target,
+                local_process_state="处理中",
+            )
+
+        patch_userwork_summary(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            sop_node=node_display_name(target),
+            local_process_state="处理中",
+        )
+
+        pipe = MeetingPipeline.load(scope_id)
+        pctx = pipe._data.get("context")
+        if not isinstance(pctx, dict):
+            pctx = {}
+        pctx["reprocess_node_ids"] = node_range
+        pctx["reprocess_historical_target"] = target
+        pipe._data["context"] = pctx
+        pipe._data["current_node_id"] = target
+        pipe.set_flow_step(
+            STEP_REPROCESS_PREP,
+            reason=f"用户触发历史节点重新处理：{node_display_name(target)}",
+        )
+        pipe.save()
+
+        ctx = PipelineRunContext(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            sync_userwork=False,
+            promote_to_processing=False,
+            agent_pool=agent_pool,
+            dev_status=dev,
+            detail=dict(detail),
+        )
+        run_pipeline_until_waiting(ctx, initial_flow_step=STEP_REPROCESS_PREP)
+
+        dev = load_dev_status(scope_id) or {}
+        titles = build_title_index()
+        return self._room_detail_payload(dev, scope_id, titles)
 
     def stop_room_run(self, room_id: str, *, reason: str = "user_stop") -> dict[str, Any]:
         """终止当前节点后台运行，会议室标为 stopped。"""

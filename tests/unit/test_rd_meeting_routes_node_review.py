@@ -179,6 +179,25 @@ async def test_node_review_returns_cached_payload(client):
     assert data["artifacts"][0]["name"] == "需求澄清.md"
 
 
+async def test_node_review_refresh_skips_generate_agent_summaries(client, monkeypatch):
+    async def _forbidden(**_kwargs):
+        raise AssertionError("generate_agent_summaries must not run on refresh=true")
+
+    monkeypatch.setattr(
+        "synapse.rd_meeting.node_review.generate_agent_summaries",
+        _forbidden,
+    )
+    resp = await client.get(
+        f"/api/dev/meeting-rooms/{ROOM_ID}/node-review",
+        params={"refresh": "true"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    data = body.get("data") if isinstance(body, dict) and "data" in body else body
+    assert data["summaries"][0]["source"] == "llm"
+    assert data["node_id"] == NODE_ID
+
+
 async def test_node_review_explicit_node_id_param(client):
     resp = await client.get(
         f"/api/dev/meeting-rooms/{ROOM_ID}/node-review",

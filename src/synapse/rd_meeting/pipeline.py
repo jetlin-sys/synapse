@@ -45,6 +45,7 @@ from synapse.rd_meeting.room_runtime import (
 from synapse.rd_meeting.userwork_sync import build_title_index, patch_userwork_summary
 from synapse.rd_sop.manifest import is_system_node
 from synapse.rd_sop.nodes import (
+    ALL_NODES,
     node_display_name,
     resolve_sop_raw_to_node_id,
     stage_id_for_node_id,
@@ -912,13 +913,26 @@ def _cleanup_agents_for_finished_node(
             logger.warning("clear worker %s meeting prompt binding failed: %s", wid, exc)
 
 
+def sop_reprocess_node_id_range(target_node_id: str, current_node_id: str) -> list[str]:
+    """返回 [target, current] 闭区间内的 SOP 节点 id（按流水线顺序）。"""
+    ids = [str(n["id"]) for n in ALL_NODES]
+    target = (target_node_id or "").strip()
+    current = (current_node_id or "").strip()
+    t_idx = ids.index(target)
+    c_idx = ids.index(current)
+    if t_idx > c_idx:
+        raise ValueError("invalid_reprocess_target")
+    return ids[t_idx : c_idx + 1]
+
+
 def clear_current_node_reprocess_artifacts(
     scope_id: str,
     node_id: str,
     *,
     stage_id: int | None = None,
+    clear_scope_root_files: bool = True,
 ) -> None:
-    """重新处理：清理当前 SOP 节点归档、pipeline 节点缓存与工单级快照/标记文件。"""
+    """重新处理：清理 SOP 节点归档、pipeline 节点缓存；可选清理工单级快照/标记。"""
     sid = (scope_id or "").strip()
     nid = (node_id or "").strip()
     if not sid or not nid or nid == "pending":
@@ -934,15 +948,16 @@ def clear_current_node_reprocess_artifacts(
         except OSError as exc:
             logger.warning("reprocess_prep: failed to remove archive %s: %s", archive_dir, exc)
 
-    root = scope_dir(sid)
-    for name in ("host_prompt_snapshot.md", "hitl.flag.json"):
-        path = root / name
-        if path.is_file():
-            try:
-                path.unlink()
-                logger.info("reprocess_prep: removed %s", path)
-            except OSError as exc:
-                logger.warning("reprocess_prep: failed to remove %s: %s", path, exc)
+    if clear_scope_root_files:
+        root = scope_dir(sid)
+        for name in ("host_prompt_snapshot.md", "hitl.flag.json"):
+            path = root / name
+            if path.is_file():
+                try:
+                    path.unlink()
+                    logger.info("reprocess_prep: removed %s", path)
+                except OSError as exc:
+                    logger.warning("reprocess_prep: failed to remove %s: %s", path, exc)
 
     path = meeting_pipeline_path(sid)
     raw = read_json_file(path)
@@ -956,20 +971,60 @@ def clear_current_node_reprocess_artifacts(
         nr = dict(node_review)
         nr.pop(nid, None)
         ctx["node_review"] = nr
-    ctx.pop("host_prompt", None)
+    if clear_scope_root_files:
+        ctx.pop("host_prompt", None)
     raw["context"] = ctx
     raw["phase"] = "running"
     raw["updated_at"] = _now_iso()
     write_json_file(path, raw)
 
 
-def clear_room_state_for_node_reprocess(scope_id: str, node_id: str) -> dict[str, Any]:
-    """重新处理：清理 room_state 内本节点缓存、门控残留与参会人列表。"""
+def _remove_agent_sop_node_dir(scope_id: str, node_id: str) -> None:
+    node_dir = agent_sop_node_dir(scope_id, node_id)
+    if node_dir.is_dir():
+        try:
+            shutil.rmtree(node_dir)
+            logger.info("reprocess_prep: removed sop dir %s", node_dir)
+        except OSError as exc:
+            logger.warning("reprocess_prep: failed to remove %s: %s", node_dir, exc)
+
+
+def clear_nodes_for_historical_reprocess(scope_id: str, node_ids: list[str]) -> None:
+    """历史重处理：按 current→target 逆序清理索引区间内各节点产物与 agents 目录。"""
+    ordered = [str(n).strip() for n in node_ids if str(n).strip() and str(n).strip() != "pending"]
+    if not ordered:
+        return
+    for idx, nid in enumerate(reversed(ordered)):
+        stg = stage_id_for_node_id(nid)
+        clear_current_node_reprocess_artifacts(
+            scope_id,
+            nid,
+            stage_id=stg,
+            clear_scope_root_files=(idx == 0),
+        )
+        _remove_agent_sop_node_dir(scope_id, nid)
+
+
+def clear_room_state_for_node_reprocess(
+    scope_id: str,
+    node_id: str,
+    *,
+    extra_node_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """重新处理：清理 room_state 内节点缓存、门控残留与参会人列表。"""
     from synapse.rd_meeting.host_prompt_cache import clear_host_prompt_cache
 
     sid = (scope_id or "").strip()
     nid = (node_id or "").strip()
     clear_host_prompt_cache(sid)
+
+    metric_ids: list[str] = []
+    if nid:
+        metric_ids.append(nid)
+    for x in extra_node_ids or []:
+        xs = str(x).strip()
+        if xs and xs not in metric_ids:
+            metric_ids.append(xs)
 
     rs = dict(load_room_state(sid) or {})
     rs["status"] = "processing"
@@ -995,7 +1050,8 @@ def clear_room_state_for_node_reprocess(scope_id: str, node_id: str) -> dict[str
     node_metrics = rs.get("node_metrics")
     if isinstance(node_metrics, dict):
         nm = dict(node_metrics)
-        nm.pop(nid, None)
+        for mid in metric_ids:
+            nm.pop(mid, None)
         rs["node_metrics"] = nm
 
     save_room_state(sid, rs)
@@ -1013,16 +1069,23 @@ def _step_reprocess_prep(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None
         pipe.set_flow_step(STEP_WAITING, reason="无有效节点，无法重新处理")
         return
 
-    stage_id = int(data.get("stage_id") or stage_id_for_node_id(run_node))
-    clear_current_node_reprocess_artifacts(sid, run_node, stage_id=stage_id)
+    pctx = pipe._data.get("context")
+    if not isinstance(pctx, dict):
+        pctx = {}
+    raw_range = pctx.get("reprocess_node_ids")
+    range_ids = (
+        [str(x).strip() for x in raw_range if str(x).strip() and str(x).strip() != "pending"]
+        if isinstance(raw_range, list)
+        else []
+    )
+    historical = len(range_ids) > 1
 
-    node_dir = agent_sop_node_dir(sid, run_node)
-    if node_dir.is_dir():
-        try:
-            shutil.rmtree(node_dir)
-            logger.info("reprocess_prep: removed sop dir %s", node_dir)
-        except OSError as exc:
-            logger.warning("reprocess_prep: failed to remove %s: %s", node_dir, exc)
+    if historical:
+        clear_nodes_for_historical_reprocess(sid, range_ids)
+    else:
+        stage_id = int(data.get("stage_id") or stage_id_for_node_id(run_node))
+        clear_current_node_reprocess_artifacts(sid, run_node, stage_id=stage_id)
+        _remove_agent_sop_node_dir(sid, run_node)
 
     from synapse.rd_meeting.hitl_lifecycle import reset_human_confirm_lifecycle
     from synapse.rd_meeting.hitl_submit import clear_pending_questionnaire
@@ -1030,17 +1093,28 @@ def _step_reprocess_prep(pipe: MeetingPipeline, ctx: PipelineRunContext) -> None
     reset_human_confirm_lifecycle(sid)
     clear_pending_questionnaire(sid)
 
-    ctx.room_state = clear_room_state_for_node_reprocess(sid, run_node)
+    extra = [n for n in range_ids if n != run_node] if historical else None
+    ctx.room_state = clear_room_state_for_node_reprocess(sid, run_node, extra_node_ids=extra)
     pipe.set_phase("running", sync_room_state=False)
+    if historical:
+        pctx.pop("reprocess_node_ids", None)
+        pctx.pop("reprocess_historical_target", None)
+        pipe._data["context"] = pctx
     pipe.save()
 
+    prep_text = (
+        f"历史节点重新处理：已清理 {range_ids[0]} → {range_ids[-1]} 共 {len(range_ids)} 个节点"
+        if historical
+        else f"重新处理准备：已清理节点 {run_node} 的过程数据与归档产出"
+    )
     append_history_event(
         sid,
         {
             "event": "reprocess_prep",
             "room_id": room_id,
             "node_id": run_node,
-            "text": f"重新处理准备：已清理节点 {run_node} 的过程数据与归档产出",
+            "node_ids": range_ids if historical else [run_node],
+            "text": prep_text,
             "flow_stage": FLOW_STEP_LABEL[STEP_REPROCESS_PREP],
             "log_type": "info",
             "agent_id": "system",

@@ -1339,12 +1339,29 @@ const InterventionDialog = ({
     stageNodes.find((n) => n.id === room?.currentNode) ||
     stageNodes[0];
 
+  const reprocessableRoomStatus =
+    room?.status === 'failed' ||
+    room?.status === 'human_intervention' ||
+    room?.status === 'stopped';
+
+  const canReprocessHistoricalNode = (nodeId: string, nodeType: string) =>
+    Boolean(
+      room &&
+      reprocessableRoomStatus &&
+      !room.runInProgress &&
+      nodeId !== room.currentNode &&
+      nodeType !== 'system' &&
+      stageIdForNodeId(nodeId) === stageIdForNodeId(room.currentNode) &&
+      getNodeStateGlobal(room, nodeId, disabledSopNodeIds) === 'completed',
+    );
+
   const canReprocess = Boolean(
     room &&
     selectedNode &&
-    (room.status === 'failed' ||
-      room.status === 'human_intervention' ||
-      room.status === 'stopped'),
+    reprocessableRoomStatus &&
+    !room.runInProgress &&
+    (selectedNode.id === room.currentNode ||
+      canReprocessHistoricalNode(selectedNode.id, selectedNode.type)),
   );
 
   const canStopNodeRun = Boolean(
@@ -1640,6 +1657,19 @@ const InterventionDialog = ({
                         }}
                       >
                         <Square className="h-3.5 w-3.5 fill-current" />
+                      </button>
+                    </Tooltip>
+                  ) : canReprocessHistoricalNode(node.id, node.type) ? (
+                    <Tooltip title="重新处理该节点（将清理本节点至当前节点之间的过程数据）">
+                      <button
+                        type="button"
+                        className="absolute bottom-2 right-2 z-10 flex h-7 w-7 items-center justify-center rounded-md border border-amber-500/40 bg-amber-950/50 text-amber-200 hover:bg-amber-900/70"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onReprocess?.(node.id);
+                        }}
+                      >
+                        <RotateCw className="h-3.5 w-3.5" />
                       </button>
                     </Tooltip>
                   ) : null}
@@ -2183,8 +2213,14 @@ export const MeetingRoomBoard = ({ synapseApiBase }: { synapseApiBase?: string }
       .catch((e) => {
         setActiveRoom((prev) => (prev ? { ...prev, reprocessing: false } : prev));
         const msg = e instanceof Error ? e.message : String(e);
-        if (msg.includes('historical_reprocess_not_implemented')) {
-          toast.error('历史节点重处理方案待定（TODO-2）');
+        if (msg.includes('cross_stage_reprocess_forbidden')) {
+          toast.error('不允许跨阶段重新处理');
+        } else if (msg.includes('system_node')) {
+          toast.error('系统节点不允许重新处理');
+        } else if (msg.includes('invalid_reprocess_target')) {
+          toast.error('只能重新处理当前阶段内已完成的历史节点');
+        } else if (msg.includes('room_completed')) {
+          toast.error('会议室已结束，无法重新处理');
         } else {
           toast.error(msg);
         }
