@@ -47,6 +47,7 @@ import {
 } from '../../../rd-sop/constants';
 import { MeetingNodeDetailPanel, type MeetingNodeVisualState } from './panels/MeetingNodeDetailPanel';
 import { CrossNodeReprocessIcon } from './CrossNodeReprocessIcon';
+import { StopNodeRunIcon } from './StopNodeRunIcon';
 import {
   effectiveHumanConfirmByType,
   resolveMeetingInterventionPanel,
@@ -1651,13 +1652,13 @@ const InterventionDialog = ({
                     <Tooltip title="终止本节点运行">
                       <button
                         type="button"
-                        className="absolute bottom-2 right-2 z-10 flex h-7 w-7 items-center justify-center rounded-md border border-red-500/40 bg-red-950/60 text-red-300 hover:bg-red-900/80"
+                        className="rd-meeting-node-stop-btn absolute bottom-2 right-2 z-10 flex h-7 w-7 items-center justify-center rounded-full text-red-400"
                         onClick={(e) => {
                           e.stopPropagation();
                           onStopRun?.();
                         }}
                       >
-                        <Square className="h-3.5 w-3.5 fill-current" />
+                        <StopNodeRunIcon className="h-5 w-5" />
                       </button>
                     </Tooltip>
                   ) : null}
