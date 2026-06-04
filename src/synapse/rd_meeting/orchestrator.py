@@ -1186,7 +1186,13 @@ class MeetingRoomOrchestrator:
         """校验已通过但主控未交 interactive 问卷：强制重跑主控直至其生成（无系统兜底表单）。"""
         sid = scope_id.strip()
         rs_locked = load_room_state(sid) or {}
-        if should_enter_node_review_after_hitl_locked(sid, node_id, rs_locked):
+        try:
+            from synapse.rd_meeting.work_plan import plan_awaiting_hitl
+
+            plan_pending = plan_awaiting_hitl(sid)
+        except Exception:
+            plan_pending = False
+        if should_enter_node_review_after_hitl_locked(sid, node_id, rs_locked) and not plan_pending:
             return await self.enter_node_review_gate(
                 scope_type=scope_type,
                 scope_id=sid,
@@ -1623,7 +1629,10 @@ class MeetingRoomOrchestrator:
             nm[node_id] = {"started_at": _now_iso(), "seconds": 0, "tokens": 0}
         room_state["node_metrics"] = nm
         rework = str(room_state.pop("rework_instruction", "") or "").strip()
-        room_state.pop("current_work_plan", None)
+        existing_plan = room_state.get("current_work_plan")
+        if isinstance(existing_plan, dict):
+            if str(existing_plan.get("node_id") or "") != node_id:
+                room_state.pop("current_work_plan", None)
         llm_begin_kind = str(room_state.pop("pending_host_llm_begin_kind", "") or "").strip() or "start_work"
         if llm_begin_kind != "delivery_confirmed":
             llm_begin_kind = "start_work"
@@ -1950,6 +1959,44 @@ class MeetingRoomOrchestrator:
                 )
 
         ready_for_review = should_enter_node_review_gate(sid, node_id, room_rs)
+
+        try:
+            from synapse.rd_meeting.work_plan import plan_awaiting_hitl
+
+            if need_human_confirm and plan_awaiting_hitl(sid):
+                ready_for_review = False
+        except Exception:
+            pass
+
+        if (
+            need_human_confirm
+            and not tool_questionnaire
+            and host_run_fn is not None
+        ):
+            try:
+                from synapse.rd_meeting.work_plan import plan_awaiting_hitl as _plan_awaiting_hitl
+
+                if _plan_awaiting_hitl(sid):
+                    return await self._ensure_host_interactive_questionnaire(
+                        scope_type=scope_type,
+                        scope_id=sid,
+                        room_id=room_id,
+                        node_id=node_id,
+                        binding=binding,
+                        prompt=host_run_prompt,
+                        report_body=report_body,
+                        tokens_used=tokens_used,
+                        duration_seconds=int(duration),
+                        stage_id=stage_id,
+                        ticket_title=ticket_title,
+                        agent_pool=agent_pool,
+                        skipped_nodes=skipped_nodes or None,
+                        host_profile_id=host_run_profile_id,
+                        host_id=host_id,
+                        run_host=host_run_fn,
+                    )
+            except Exception:
+                pass
 
         if need_human_confirm and not ready_for_review:
             hitl_gate = extract_hitl_from_agent_output(report_body)

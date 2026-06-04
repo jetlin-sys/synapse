@@ -137,6 +137,37 @@ def test_should_enter_node_review_after_hitl_locked(monkeypatch, tmp_path):
     assert should_enter_node_review_gate(scope, node_id, rs_flag_only)
 
 
+def test_hitl_locked_blocked_when_work_plan_awaiting_hitl(monkeypatch, tmp_path):
+    scope = "plan_block_scope"
+    node_id = "req_clarify"
+    monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
+    monkeypatch.setattr(
+        "synapse.rd_meeting.validation.validate_node_archive_files",
+        lambda sid, stage, nid: __import__(
+            "synapse.rd_meeting.validation", fromlist=["NodeOutputValidation"]
+        ).NodeOutputValidation(ok=True, errors=[]),
+    )
+    rs = {
+        "hitl_locked": True,
+        "hitl_submission": {"kind": "interactive", "locked": True},
+        "intervention_kind": "interactive",
+    }
+    plan = {
+        "node_id": node_id,
+        "items": [{"id": "t1", "agent_id": "w-a"}],
+        "closing_step": {"action": "submit_hitl", "kind": "interactive", "task": "t", "reason": "r"},
+        "completed_item_ids": ["t1"],
+        "hitl_submitted": False,
+    }
+    binding = {"human_confirm": True}
+
+    monkeypatch.setattr("synapse.rd_meeting.work_plan.get_work_plan", lambda sid: plan if sid == scope else None)
+    monkeypatch.setattr("synapse.rd_meeting.hitl_lifecycle.resolve_node_binding", lambda nid, **k: binding)
+
+    assert not should_enter_node_review_after_hitl_locked(scope, node_id, rs)
+    assert not should_enter_node_review_gate(scope, node_id, rs)
+
+
 def test_record_delegation_started_clears_ready(monkeypatch):
     store: dict[str, dict] = {"deleg_scope": {READY_FOR_NODE_REVIEW_KEY: True}}
 

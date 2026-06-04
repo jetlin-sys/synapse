@@ -419,12 +419,18 @@ def mark_delegation_started(
                     delegated.append(iid)
                 break
     plan["delegated_item_ids"] = delegated
-    if plan.get("hitl_submitted"):
+    had_hitl = bool(plan.get("hitl_submitted"))
+    if had_hitl:
         plan["hitl_submitted"] = False
         completed = plan.get("completed_item_ids")
         if isinstance(completed, list) and pid:
             plan["completed_item_ids"] = [x for x in completed if str(x).strip() != pid]
     rs[ROOM_STATE_KEY] = plan
+    if had_hitl:
+        from synapse.rd_meeting.hitl_lifecycle import clear_ready_for_node_review
+
+        rs.pop("hitl_locked", None)
+        clear_ready_for_node_review(scope_id)
     save_room_state(scope_id, rs)
 
 

@@ -246,5 +246,18 @@ def test_redelegate_resets_hitl_until_batch_complete_again(
     assert plan_awaiting_hitl(meeting_scope) is False
     mark_delegation_started(session, agent_id="worker-a", plan_item_id="t1")
     assert plan_awaiting_hitl(meeting_scope) is False
+    mark_plan_hitl_submitted(meeting_scope, kind="interactive")
+    assert plan_awaiting_hitl(meeting_scope) is False
+
+    from synapse.rd_meeting.room_runtime import load_room_state
+
+    rs = load_room_state(meeting_scope) or {}
+    rs["hitl_locked"] = True
+    from synapse.rd_meeting.room_runtime import save_room_state
+
+    save_room_state(meeting_scope, rs)
+    mark_delegation_started(session, agent_id="worker-a", plan_item_id="t1")
+    rs2 = load_room_state(meeting_scope) or {}
+    assert not rs2.get("hitl_locked")
     mark_delegation_completed(session, agent_id="worker-a", plan_item_id="t1")
     assert plan_awaiting_hitl(meeting_scope) is True
