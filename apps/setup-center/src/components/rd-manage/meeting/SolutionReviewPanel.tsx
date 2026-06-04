@@ -34,6 +34,7 @@ import {
   fetchSolutionReview,
   submitSolutionReviewDecision,
   type PatchVersionItem,
+  type SolutionReviewImpactAssessment,
   type SolutionReviewPayload,
   type SplitTaskDraft,
   type SolutionReviewRepoRow,
@@ -96,13 +97,79 @@ function formatScoreBreakdownValue(value: unknown): string {
   return String(value ?? '—');
 }
 
+/** 与函数级方案模板 §1.10.1–1.10.7 列定义一致 */
+const IMPACT_ASSESSMENT_SECTIONS: {
+  key: keyof SolutionReviewImpactAssessment;
+  label: string;
+  sectionTitle: string;
+  headers: string[];
+}[] = [
+  {
+    key: 'performance',
+    label: '1.10.1 性能影响分析',
+    sectionTitle: '1.10.1 性能影响分析',
+    headers: ['变更点', '性能影响类型', '影响程度', '无法规避原因', '规避措施'],
+  },
+  {
+    key: 'functional',
+    label: '1.10.2 功能影响分析',
+    sectionTitle: '1.10.2 功能影响分析',
+    headers: ['影响类型', '影响模块', '影响说明', '影响范围', '备注'],
+  },
+  {
+    key: 'config',
+    label: '1.10.3 配置变更说明',
+    sectionTitle: '1.10.3 配置变更说明',
+    headers: ['配置项', '变更类型', '配置位置', '影响范围', '变更说明'],
+  },
+  {
+    key: 'upgrade_risk',
+    label: '1.10.4 升级风险',
+    sectionTitle: '1.10.4 升级风险',
+    headers: ['风险类型', '风险描述', '风险等级', '规避措施', '回滚预案'],
+  },
+  {
+    key: 'security',
+    label: '1.10.5 安全影响',
+    sectionTitle: '1.10.5 安全影响',
+    headers: ['安全维度', '影响说明', '影响程度', '安全措施', '备注'],
+  },
+  {
+    key: 'compatibility',
+    label: '1.10.6 兼容性影响',
+    sectionTitle: '1.10.6 兼容性影响',
+    headers: ['兼容类型', '兼容项', '当前版本', '目标版本', '兼容性评估', '说明'],
+  },
+  {
+    key: 'ui_ue',
+    label: '1.10.7 UI/UE设计',
+    sectionTitle: '1.10.7 UI/UE设计',
+    headers: ['界面元素', '变更类型', '变更说明', '设计注意事项', '验收要点'],
+  },
+];
+
 function impactTableColumns(headers: string[]): TableColumnsType<Record<string, string>> {
   return headers.map((h) => ({ title: h, dataIndex: h, key: h, ellipsis: true }));
 }
 
+function resolveTableHeaders(
+  rows: Record<string, string>[],
+  preferred: string[],
+): string[] {
+  const fromRows = new Set<string>();
+  for (const row of rows) {
+    for (const k of Object.keys(row)) {
+      if (k.trim()) fromRows.add(k.trim());
+    }
+  }
+  const ordered = preferred.filter((h) => fromRows.has(h));
+  const rest = [...fromRows].filter((h) => !ordered.includes(h));
+  return ordered.length > 0 ? [...ordered, ...rest] : preferred;
+}
+
 function tableFromRows(rows: Record<string, string>[] | undefined, headers: string[]) {
   if (!rows?.length) return null;
-  const cols = impactTableColumns(headers);
+  const cols = impactTableColumns(resolveTableHeaders(rows, headers));
   const data = rows.map((r, i) => ({ ...r, key: String(i) }));
   return <Table size="small" columns={cols} dataSource={data} pagination={false} scroll={{ x: true }} />;
 }
@@ -522,6 +589,20 @@ export function SolutionReviewPanel({
 
   const repos = payload?.func_solution_parsed?.repos ?? [];
   const impact = payload?.func_solution_parsed?.impact_assessment;
+  const impactCollapseItems = useMemo(() => {
+    if (!impact) return [];
+    return IMPACT_ASSESSMENT_SECTIONS.map((spec) => {
+      const rows = impact[spec.key];
+      if (!rows?.length) return null;
+      const table = tableFromRows(rows, spec.headers);
+      if (!table) return null;
+      return {
+        key: spec.key,
+        label: spec.label,
+        children: table,
+      };
+    }).filter((item): item is NonNullable<typeof item> => item != null);
+  }, [impact]);
   const whale = payload?.whale_review;
   const artifacts = payload?.inputs?.stage2_artifacts ?? [];
   const tasks = payload?.split_tasks_draft ?? [];
@@ -752,87 +833,25 @@ export function SolutionReviewPanel({
           )}
         </section>
 
-        {/* 影响评估 */}
+        {/* 影响评估：仅展示从函数级方案 §1.10.1–1.10.7 解析出的表格 */}
         <section className="rounded-2xl border border-amber-500/30 bg-gradient-to-br from-amber-500/[0.04] to-orange-500/[0.02] p-5">
           <SectionHeader
             icon={<Shield className="h-5 w-5 text-amber-400" />}
             title="影响评估"
-            subtitle="函数级方案 §1.10 多维度影响分析"
+            subtitle="仅展示函数级方案 §1.10.1–1.10.7 已解析内容"
             accent="amber"
           />
-          <Collapse
-            className="mt-4 [&_.ant-collapse-header]:text-foreground!"
-            defaultActiveKey={['security', 'upgrade', 'functional']}
-            items={[
-              {
-                key: 'security',
-                label: '安全影响',
-                children: tableFromRows(impact?.security, [
-                  '安全维度',
-                  '影响说明',
-                  '影响程度',
-                  '安全措施',
-                  '备注',
-                ]),
-              },
-              {
-                key: 'upgrade',
-                label: '升级风险',
-                children: tableFromRows(impact?.upgrade_risk, [
-                  '风险类型',
-                  '风险描述',
-                  '风险等级',
-                  '规避措施',
-                  '回滚预案',
-                ]),
-              },
-              {
-                key: 'functional',
-                label: '功能影响',
-                children: tableFromRows(impact?.functional, [
-                  '影响类型',
-                  '影响模块',
-                  '影响说明',
-                  '影响范围',
-                  '备注',
-                ]),
-              },
-              {
-                key: 'performance',
-                label: '性能影响',
-                children: tableFromRows(impact?.performance, [
-                  '变更点',
-                  '性能影响类型',
-                  '影响程度',
-                  '无法规避原因',
-                  '规避措施',
-                ]),
-              },
-              {
-                key: 'config',
-                label: '配置变更',
-                children: tableFromRows(impact?.config, [
-                  '配置项',
-                  '变更类型',
-                  '配置位置',
-                  '影响范围',
-                  '变更说明',
-                ]),
-              },
-              {
-                key: 'compat',
-                label: '兼容性',
-                children: tableFromRows(impact?.compatibility, [
-                  '兼容类型',
-                  '兼容项',
-                  '当前版本',
-                  '目标版本',
-                  '兼容性评估',
-                  '说明',
-                ]),
-              },
-            ]}
-          />
+          {impactCollapseItems.length > 0 ? (
+            <Collapse
+              className="mt-4 [&_.ant-collapse-header]:text-foreground!"
+              defaultActiveKey={impactCollapseItems.slice(0, 3).map((i) => i.key)}
+              items={impactCollapseItems}
+            />
+          ) : (
+            <p className="mt-4 text-sm text-muted-foreground italic">
+              未在函数级方案中解析到 §1.10 影响评估表格，请确认归档文档已按模板填写 1.10.1–1.10.7 各节。
+            </p>
+          )}
         </section>
 
         {/* 需求设计产出物（仅已纳入） */}

@@ -84,11 +84,39 @@ def _parse_md_table_rows(section_body: str) -> list[dict[str, str]]:
         if len(cells) < len(headers):
             cells.extend([""] * (len(headers) - len(cells)))
         rows.append({headers[i]: cells[i] if i < len(cells) else "" for i in range(len(headers))})
-    return rows
+    return _filter_content_rows(rows)
+
+
+def _filter_content_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """去掉模板占位行与全空行。"""
+    out: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        has_value = False
+        for val in row.values():
+            s = str(val or "").strip()
+            if not s or s in {"—", "-", "N/A", "n/a"}:
+                continue
+            if s.startswith("{{") and s.endswith("}}"):
+                continue
+            has_value = True
+            break
+        if has_value:
+            out.append(row)
+    return out
+
+
+def _section_title_matches(title: str, heading_prefix: str) -> bool:
+    t = title.strip()
+    p = heading_prefix.strip()
+    if not t or not p:
+        return False
+    return t == p or t.startswith(p) or p in t
 
 
 def _extract_section(md: str, heading_prefix: str) -> str:
-    """提取以 heading_prefix 开头的章节正文（到下一同级或更高级标题为止）。"""
+    """提取标题匹配 heading_prefix 的章节正文（到下一同级或更高级标题为止）。"""
     lines = (md or "").splitlines()
     start = -1
     level = 0
@@ -98,7 +126,7 @@ def _extract_section(md: str, heading_prefix: str) -> str:
             continue
         title = m.group(1).strip()
         lv = len(line) - len(line.lstrip("#"))
-        if start < 0 and title.startswith(heading_prefix):
+        if start < 0 and _section_title_matches(title, heading_prefix):
             start = i + 1
             level = lv
             continue
@@ -115,6 +143,91 @@ def _extract_section(md: str, heading_prefix: str) -> str:
                 end = j
                 break
     return "\n".join(lines[start:end]).strip()
+
+
+# 与 skills/whalecloud-dev-tool-doc-generate/templates/函数级方案.md §1.10.1–1.10.7 对齐
+IMPACT_SECTION_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "performance",
+        "1.10.1 性能影响分析",
+        ("变更点", "性能影响类型", "影响程度", "无法规避原因", "规避措施"),
+    ),
+    (
+        "functional",
+        "1.10.2 功能影响分析",
+        ("影响类型", "影响模块", "影响说明", "影响范围", "备注"),
+    ),
+    (
+        "config",
+        "1.10.3 配置变更说明",
+        ("配置项", "变更类型", "配置位置", "影响范围", "变更说明"),
+    ),
+    (
+        "upgrade_risk",
+        "1.10.4 升级风险",
+        ("风险类型", "风险描述", "风险等级", "规避措施", "回滚预案"),
+    ),
+    (
+        "security",
+        "1.10.5 安全影响",
+        ("安全维度", "影响说明", "影响程度", "安全措施", "备注"),
+    ),
+    (
+        "compatibility",
+        "1.10.6 兼容性影响",
+        ("兼容类型", "兼容项", "当前版本", "目标版本", "兼容性评估", "说明"),
+    ),
+    (
+        "ui_ue",
+        "1.10.7 UI/UE设计",
+        ("界面元素", "变更类型", "变更说明", "设计注意事项", "验收要点"),
+    ),
+)
+
+
+def _extract_impact_subsection(md: str, section_title: str) -> str:
+    """优先按 #### 子标题抽取；失败时在 §1.10 父章节内再匹配一次。"""
+    for prefix in (section_title, section_title.split(maxsplit=1)[0]):
+        body = _extract_section(md, prefix)
+        if body.strip():
+            return body
+    parent = _extract_section(md, "1.10 影响评估")
+    if not parent.strip():
+        return ""
+    lines = parent.splitlines()
+    start = -1
+    level = 0
+    for i, line in enumerate(lines):
+        m = _SECTION_RE.match(line.strip())
+        if not m:
+            continue
+        title = m.group(1).strip()
+        lv = len(line) - len(line.lstrip("#"))
+        if start < 0 and _section_title_matches(title, section_title):
+            start = i + 1
+            level = lv
+            continue
+        if start >= 0 and lv <= level:
+            break
+    if start < 0:
+        return ""
+    end = len(lines)
+    for j in range(start, len(lines)):
+        m = _SECTION_RE.match(lines[j].strip())
+        if m:
+            lv = len(lines[j]) - len(lines[j].lstrip("#"))
+            if lv <= level:
+                end = j
+                break
+    return "\n".join(lines[start:end]).strip()
+
+
+def parse_func_solution_impact_assessment(md: str) -> dict[str, list[dict[str, str]]]:
+    """仅解析 §1.10 影响评估（1.10.1–1.10.7 表格）。"""
+    impact: dict[str, list[dict[str, str]]] = {}
+    for key, title, _headers in IMPACT_SECTION_SPECS:
+        impact[key] = _parse_md_table_rows(_extract_impact_subsection(md, title))
+    return impact
 
 
 def parse_func_solution_md(md: str) -> dict[str, Any]:
@@ -138,19 +251,21 @@ def parse_func_solution_md(md: str) -> dict[str, Any]:
             }
         )
 
-    def _impact(key: str, section_title: str) -> list[dict[str, str]]:
-        return _parse_md_table_rows(_extract_section(md, section_title))
+    return {"repos": repos, "impact_assessment": parse_func_solution_impact_assessment(md)}
 
-    impact = {
-        "performance": _impact("1.10.1", "1.10.1 性能影响分析"),
-        "functional": _impact("1.10.2", "1.10.2 功能影响分析"),
-        "config": _impact("1.10.3", "1.10.3 配置变更说明"),
-        "upgrade_risk": _impact("1.10.4", "1.10.4 升级风险"),
-        "security": _impact("1.10.5", "1.10.5 安全影响"),
-        "compatibility": _impact("1.10.6", "1.10.6 兼容性影响"),
-        "ui_ue": _impact("1.10.7", "1.10.7 UI/UE设计"),
-    }
-    return {"repos": repos, "impact_assessment": impact}
+
+def _merge_impact_assessment(
+    prev: dict[str, Any] | None,
+    extracted: dict[str, list[dict[str, str]]],
+) -> dict[str, list[dict[str, str]]]:
+    """归档 Markdown 解析结果优先；仅当某维度无行时保留 JSON 内已有行。"""
+    out: dict[str, list[dict[str, str]]] = {}
+    prev_dict = prev if isinstance(prev, dict) else {}
+    for key, _title, _headers in IMPACT_SECTION_SPECS:
+        from_md = extracted.get(key) if isinstance(extracted.get(key), list) else []
+        from_prev = prev_dict.get(key) if isinstance(prev_dict.get(key), list) else []
+        out[key] = from_md if from_md else from_prev
+    return out
 
 
 def _func_solution_archive_path(scope_id: str) -> Path:
@@ -158,10 +273,9 @@ def _func_solution_archive_path(scope_id: str) -> Path:
 
 
 def enrich_payload_from_archive(scope_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """若 JSON 缺少解析段，尝试从归档的函数级方案.md 补全。"""
+    """从归档的函数级方案.md 补全仓库表与 §1.10 影响评估（影响评估始终尝试重解析）。"""
     parsed = payload.get("func_solution_parsed")
-    if isinstance(parsed, dict) and parsed.get("repos"):
-        return payload
+    prev = parsed if isinstance(parsed, dict) else {}
     fpath = _func_solution_archive_path(scope_id)
     if not fpath.is_file():
         return payload
@@ -171,9 +285,14 @@ def enrich_payload_from_archive(scope_id: str, payload: dict[str, Any]) -> dict[
         return payload
     extracted = parse_func_solution_md(md)
     out = dict(payload)
+    merged_repos = extracted.get("repos") if extracted.get("repos") else prev.get("repos")
+    prev_impact = prev.get("impact_assessment") if isinstance(prev.get("impact_assessment"), dict) else {}
+    ext_impact = extracted.get("impact_assessment") if isinstance(extracted.get("impact_assessment"), dict) else {}
+    merged_impact = _merge_impact_assessment(prev_impact, ext_impact)  # type: ignore[arg-type]
     out["func_solution_parsed"] = {
-        **(parsed if isinstance(parsed, dict) else {}),
-        **extracted,
+        **prev,
+        "repos": merged_repos or [],
+        "impact_assessment": merged_impact,
     }
     return out
 
