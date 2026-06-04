@@ -88,6 +88,7 @@ class AgentToolHandler:
         message = (params.get("message") or "").strip()
         reason = (params.get("reason") or "").strip()
         context = (params.get("context") or "").strip()
+        plan_item_id = (params.get("plan_item_id") or "").strip()
 
         if not agent_id:
             return "❌ agent_id is required"
@@ -124,6 +125,7 @@ class AgentToolHandler:
                 to_agent=agent_id,
                 message=isolated_message,
                 reason=reason,
+                plan_item_id=plan_item_id,
             )
             from ...core.policy_v2.prompt_hardening import wrap_external_content
 
@@ -184,6 +186,23 @@ class AgentToolHandler:
             getattr(getattr(session, "context", None), "agent_profile_id", "default") or "default"
         )
 
+        from synapse.rd_meeting.work_plan import check_delegation_allowed
+
+        session_id = (
+            getattr(session, "id", None)
+            or getattr(session, "session_id", None)
+            or getattr(self.agent, "_current_session_id", None)
+            or ""
+        )
+        for task in tasks_param:
+            if not isinstance(task, dict):
+                continue
+            aid = (task.get("agent_id") or "").strip()
+            pid = (task.get("plan_item_id") or "").strip()
+            gate_err = check_delegation_allowed(str(session_id), agent_id=aid, plan_item_id=pid)
+            if gate_err:
+                return gate_err
+
         # Detect duplicate agent_ids — auto-spawn ephemeral clones
         # to avoid two coroutines sharing the same Agent instance.
         agent_ids = [(t.get("agent_id") or "").strip() for t in tasks_param]
@@ -202,6 +221,7 @@ class AgentToolHandler:
             agent_id = (task.get("agent_id") or "").strip()
             message = (task.get("message") or "").strip()
             reason = (task.get("reason") or "").strip()
+            plan_item_id = (task.get("plan_item_id") or "").strip()
             per_task_ctx = (task.get("context") or "").strip()
             task_context = "\n\n".join(filter(None, [global_context, per_task_ctx]))
 
@@ -238,6 +258,7 @@ class AgentToolHandler:
                                 "message": message,
                                 "reason": reason,
                                 "context": task_context,
+                                "plan_item_id": plan_item_id,
                             }
                         )
                         continue
@@ -249,6 +270,7 @@ class AgentToolHandler:
                     "message": message,
                     "reason": reason,
                     "context": task_context,
+                    "plan_item_id": plan_item_id,
                 }
             )
 
@@ -259,6 +281,7 @@ class AgentToolHandler:
             display = task["display_id"]
             msg = task["message"]
             rsn = task["reason"]
+            pid = (task.get("plan_item_id") or "").strip()
             ctx = task.get("context", "")
             if not aid or not msg:
                 return display or "?", "❌ agent_id and message are required"
@@ -289,6 +312,7 @@ class AgentToolHandler:
                     message=isolated_msg,
                     reason=rsn,
                     isolated_browser=isolated_ctx,
+                    plan_item_id=pid,
                 )
                 return display, str(result)
             except BaseException as e:

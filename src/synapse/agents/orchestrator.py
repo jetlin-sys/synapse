@@ -667,7 +667,24 @@ class AgentOrchestrator:
                 f"for {agent_profile_id}"
             )
 
-        agent = await self._pool.get_or_create(session.id, profile)
+        from synapse.rd_meeting.agent_prompt import (
+            ensure_meeting_agent_configured,
+            resolve_rd_meeting_pool_session_id,
+        )
+        from synapse.rd_meeting.live import parse_rd_meeting_session
+
+        pool_session_id = resolve_rd_meeting_pool_session_id(
+            session.id, agent_profile_id, depth=depth
+        )
+        agent = await self._pool.get_or_create(pool_session_id, profile)
+
+        if parse_rd_meeting_session(session.id) is not None:
+            ensure_meeting_agent_configured(
+                agent,
+                session_id=pool_session_id,
+                agent_profile_id=agent_profile_id,
+                depth=depth,
+            )
 
         # Per-profile max_turns override → propagated to reasoning engine
         _max_turns_override: int | None = getattr(profile, "max_turns", None)
@@ -1277,6 +1294,7 @@ class AgentOrchestrator:
         depth: int = 0,
         reason: str = "",
         isolated_browser: Any = None,
+        plan_item_id: str = "",
     ) -> str:
         """
         Delegate work from one agent to another.
@@ -1289,6 +1307,29 @@ class AgentOrchestrator:
         """
         self._ensure_deps()
         logger.info(f"[Orchestrator] Delegation: {from_agent} -> {to_agent} (depth={depth})")
+
+        import time
+
+        from synapse.rd_meeting.delegation_bridge import (
+            begin_rd_meeting_delegation,
+            finish_rd_meeting_delegation,
+            handle_rd_meeting_delegation_error,
+            resolve_session_id,
+        )
+
+        session_id = resolve_session_id(session)
+        gate_err = begin_rd_meeting_delegation(
+            session_id,
+            from_agent=from_agent,
+            to_agent=to_agent,
+            reason=reason,
+            message=message,
+            plan_item_id=(plan_item_id or "").strip(),
+        )
+        if gate_err:
+            return gate_err
+
+        started = time.monotonic()
 
         # Agent Harness: Decision Trace — delegation span
         try:
@@ -1346,15 +1387,35 @@ class AgentOrchestrator:
                 session.context.handoff_events = session.context.handoff_events[
                     -_MAX_HANDOFF_EVENTS:
                 ]
-        return await self._dispatch(
-            session,
-            message,
-            to_agent,
-            depth + 1,
-            from_agent=from_agent,
-            isolated_browser=isolated_browser,
-            pre_state_key=state_key,
-        )
+        try:
+            result = await self._dispatch(
+                session,
+                message,
+                to_agent,
+                depth + 1,
+                from_agent=from_agent,
+                isolated_browser=isolated_browser,
+                pre_state_key=state_key,
+            )
+            ok = not str(result).strip().startswith("❌")
+            finish_rd_meeting_delegation(
+                session_id,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                ok=ok,
+                summary=str(result)[:500],
+                elapsed_s=time.monotonic() - started,
+            )
+            return result
+        except Exception as exc:
+            handle_rd_meeting_delegation_error(
+                session_id,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                error_text=str(exc),
+                elapsed_s=time.monotonic() - started,
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Multi-agent collaboration

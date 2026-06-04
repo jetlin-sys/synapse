@@ -834,6 +834,13 @@ class ToolExecutor:
                     tool_input=tool_input,
                     tool_result=result,
                 )
+                self._record_meeting_tool_activity(
+                    tool_name,
+                    tool_input,
+                    str(result),
+                    success=True,
+                    duration_ms=(time.monotonic() - started_at) * 1000,
+                )
                 self._record_experience(
                     tool_name,
                     tool_input,
@@ -955,6 +962,35 @@ class ToolExecutor:
             )
         except Exception:
             logger.debug("Failed to record tool experience for %s", tool_name, exc_info=True)
+
+    def _record_meeting_tool_activity(
+        self,
+        tool_name: str,
+        tool_input: Any,
+        result: str,
+        *,
+        success: bool,
+        duration_ms: float,
+    ) -> None:
+        """会议室 Agent 工具活动落盘（rd_meeting activity + live）。"""
+        agent = getattr(self, "_agent_ref", None)
+        if agent is None or not getattr(agent, "_org_context", False):
+            return
+        try:
+            from synapse.rd_meeting.agent_activity import try_record_tool_from_agent
+
+            try_record_tool_from_agent(
+                agent,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                result_preview=result,
+                success=success,
+                duration_ms=int(duration_ms),
+            )
+        except Exception:
+            logger.debug(
+                "Failed to record meeting tool activity for %s", tool_name, exc_info=True
+            )
 
     async def execute_tool_with_policy(
         self,
@@ -1655,6 +1691,44 @@ class ToolExecutor:
         """
         return None
 
+    def _rd_meeting_host_permission_bypass(
+        self, tool_name: str
+    ) -> "PermissionDecision | None":
+        """研发会议室 Host：委派/问卷类工具须自动放行，避免 policy_v2 CONFIRM 卡死派单。"""
+        if tool_name not in (
+            "delegate_to_agent",
+            "delegate_parallel",
+            "submit_meeting_work_plan",
+            "submit_hitl_questionnaire",
+            "send_agent_message",
+        ):
+            return None
+        agent = self._agent_ref
+        if agent is None or not getattr(agent, "_org_context", False):
+            return None
+        session_id = ""
+        sess = getattr(agent, "_current_session", None)
+        if sess is not None:
+            session_id = (
+                getattr(sess, "id", None) or getattr(sess, "session_id", None) or ""
+            )
+        if not session_id:
+            session_id = getattr(agent, "_current_session_id", None) or ""
+        try:
+            from synapse.rd_meeting.work_plan import is_rd_meeting_host_session
+
+            if not is_rd_meeting_host_session(str(session_id)):
+                return None
+        except Exception:
+            return None
+        from .permission import PermissionDecision
+
+        return PermissionDecision(
+            behavior="allow",
+            reason="研发会议室 Host 委派/协作工具自动放行",
+            policy_name="rd_meeting_host",
+        )
+
     def check_permission(self, tool_name: str, tool_input: dict) -> "PermissionDecision":
         """Unified permission check — mode rules + PolicyEngine + fail-closed.
 
@@ -1664,6 +1738,10 @@ class ToolExecutor:
         from .permission import PermissionDecision, check_permission
 
         self._prune_stale_confirms()
+
+        bypass = self._rd_meeting_host_permission_bypass(tool_name)
+        if bypass is not None:
+            return bypass
 
         try:
             decision = check_permission(

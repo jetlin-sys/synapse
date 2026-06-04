@@ -71,6 +71,13 @@ AGENT_TOOLS = [
                         "（已知结论、相关约束、期望输出格式等）。"
                     ),
                 },
+                "plan_item_id": {
+                    "type": "string",
+                    "description": (
+                        "研发会议室工作安排计划条目 ID（如 t1）。"
+                        "rd_meeting Host 委派前须先 submit_meeting_work_plan，委派时带上对应条目。"
+                    ),
+                },
                 "run_in_background": {
                     "type": "boolean",
                     "description": "是否后台运行。后台子代理不阻塞主代理，结果稍后可查。",
@@ -226,6 +233,10 @@ AGENT_TOOLS = [
                             "context": {
                                 "type": "string",
                                 "description": "为该子Agent提供的额外背景上下文（可选，与顶层context合并）",
+                            },
+                            "plan_item_id": {
+                                "type": "string",
+                                "description": "研发会议室工作安排计划条目 ID（与 submit_meeting_work_plan 对应）",
                             },
                         },
                         "required": ["agent_id", "message"],
