@@ -551,8 +551,8 @@ async def get_product_list(body: GetProductListRequest) -> dict:
     转调：POST /portal/ai-gateway/devspace/rpc/v3/master-data/product-list，返回码code为“9999”表示成功
     """
     return await _get_product_list(body)
-    
-async def _get_product_list(body: GetProductListRequest) -> dict: 
+
+async def _get_product_list(body: GetProductListRequest) -> dict:
     """
     内部调用：获取产品列表，支持传入产品名模糊匹配，默认获取全量列表。
     转调：POST /portal/ai-gateway/devspace/rpc/v3/master-data/product-list
@@ -570,7 +570,7 @@ async def _get_product_list(body: GetProductListRequest) -> dict:
     except httpx.RequestError as exc:
         logger.exception("调用研发云获取产品列表接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    
+
     # 检查数据格式
     try:
         raw = resp.json()
@@ -686,7 +686,7 @@ async def _get_repo_detail(body: GetRepoDetailRequest) -> dict:
 
     if resp.status_code >= 400:
         return error_response(resp.status_code, f"研发云获取代码仓库信息失败：{resp.text}")
-    
+
     # 检查数据格式
     try:
         raw = resp.json()
@@ -783,6 +783,33 @@ def _build_get_repo_detail_by_prod_branch_headers(
         "x-requested-with": "XMLHttpRequest",
         "cookie": cookies,
     }
+
+
+class ValidateRepoTokenItem(BaseModel):
+    repo_url: str = ""
+    repo_branch: str = ""
+    repo_token: str = ""
+
+
+class ValidateRepoTokensRequest(BaseModel):
+    items: list[ValidateRepoTokenItem] = Field(default_factory=list)
+
+
+@router.post("/api/dev/iwhalecloud/validate_repo_tokens")
+async def validate_repo_tokens(body: ValidateRepoTokensRequest) -> dict:
+    """批量校验仓库 Token：HTTPS 注入凭证后 git ls-remote 探测可访问性。"""
+    from synapse.rd_meeting.git_token import validate_repo_token
+
+    results: list[dict[str, object]] = []
+    for item in body.items:
+        row = await asyncio.to_thread(
+            validate_repo_token,
+            item.repo_url,
+            item.repo_branch,
+            item.repo_token,
+        )
+        results.append(row)
+    return success_response(results)
 
 
 @router.post("/api/dev/iwhalecloud/get_repo_detail_by_prod_branch")
@@ -885,7 +912,7 @@ async def _get_repo_detail_by_prod_branch(body: GetRepoDetailByProdBranchRequest
                 "moduleName": mname,
             }
         )
-    
+
     return success_response(out)
 
 
@@ -1025,11 +1052,11 @@ async def _get_module_name_list(body: GetModuleNameListRequest) -> dict:
 
     if resp.status_code >= 400:
         return error_response(resp.status_code, f"研发云获取模块列表失败：{resp.text}")
-    
+
     # 检查数据格式
     try:
         raw = resp.json()
-        # 检查返回码    
+        # 检查返回码
         if raw.get("code") != "9999":
             msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取模块列表失败"
             return error_response(502, msg, error=str(raw))
@@ -1147,7 +1174,7 @@ async def _get_product_branch_list(body: GetProductBranchListRequest) -> dict:
 
     # 提取数据
     page_data = raw.get("data") or {}
-    simplified = [  
+    simplified = [
         {
             "branchVersionId": it.get("branchVersionId"),
             "branchName": it.get("branchName"),
@@ -1430,7 +1457,7 @@ async def _get_ci_flow_execution_status(body: GetCiFlowExecutionStatusRequest) -
 
     if resp.status_code >= 400:
         return error_response(resp.status_code, f"研发云获取CI执行结果失败：{resp.text}")
-    
+
     # 检查数据格式
     try:
         raw = resp.json()
@@ -1493,7 +1520,7 @@ async def get_ci_flow_report(body: GetCiFlowReportRequest) -> dict:
     转调：POST /portal/ai-gateway/cicd/rpc/v3/flow/{flowId}/artifact/report，返回码code为“9999”表示成功
     """
     return await _get_ci_flow_report(body)
-    
+
 async def _get_ci_flow_report(body: GetCiFlowReportRequest) -> dict:
     """
     据构建流程获取最新的CI报表（直接返回上游 data）。
@@ -1699,7 +1726,7 @@ async def _get_ci_flow_build_result(body: GetCiFlowBuildResultRequest) -> dict:
     # 检查数据格式
     try:
         raw = resp.json()
-        # 检查返回码    
+        # 检查返回码
         if raw.get("code") != "9999":
             msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云获取构建结果失败"
             return error_response(502, msg, error=str(raw))
@@ -1709,7 +1736,7 @@ async def _get_ci_flow_build_result(body: GetCiFlowBuildResultRequest) -> dict:
     except ValueError:
         return error_response(502, f"研发云获取构建结果返回非 JSON：{resp.text}")
 
-    # 提取数据 
+    # 提取数据
     simplified = [
         {
             "nodeName": it.get("nodeName"),
@@ -2350,13 +2377,13 @@ async def create_feature_branch(body: CreateFeatureBranchRequest) -> dict:
     用法：传入任务单号和特性分支名称，创建特性分支。
     接口类型：研发云提供标准API接口
     返回数据格式：{
-		"productModuleId": 应用模块ID, 
-		"productModuleName": "产品模块名称", 
-		"repoId": 仓库ID, 
-		"repoName": "仓库名称", 
-		"repoUrl": "仓库URL", 
-		"branchName": "特性分支名称", 
-		"baseBranchName": "来源分支名称", 
+		"productModuleId": 应用模块ID,
+		"productModuleName": "产品模块名称",
+		"repoId": 仓库ID,
+		"repoName": "仓库名称",
+		"repoUrl": "仓库URL",
+		"branchName": "特性分支名称",
+		"baseBranchName": "来源分支名称",
 	}
     转调：POST /portal/ai-gateway/devspace/rpc/v3/task-branch/feature/create，返回码code为“9999”表示成功
     """
@@ -2412,7 +2439,7 @@ class TransferTaskStageRequest(BaseModel):
     operateUserCode: str = Field(..., description="当前操作人工号")
     taskFlowStageId: int = Field(..., description="目标状态ID")
     comments: str = Field("", description="转单备注")
-    
+
 def _build_transfer_task_stage_payload(body: TransferTaskStageRequest) -> dict:
     return {
         "ownerUserCode": body.ownerUserCode,
@@ -2914,7 +2941,7 @@ async def _get_task_list_from_demand(body: GetTaskListFromDemandRequest) -> dict
     except httpx.RequestError as exc:
         logger.exception("调用研发云根据需求单查询任务列表接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    
+
     # 检查数据格式
     try:
         raw = resp.json()
@@ -2922,12 +2949,12 @@ async def _get_task_list_from_demand(body: GetTaskListFromDemandRequest) -> dict
         if raw.get("code") != "9999":
             msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
             return error_response(502, f"{msg}", error=str(raw))
-            
+
         if not isinstance(raw.get("data"), list):
             return error_response(502, f"研发云返回数据data非列表：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云返回非 JSON：{resp.text}")
-    
+
     # 提取数据
     simplified = [
         {
@@ -3263,7 +3290,7 @@ def _build_get_flow_id_by_module_headers(csrf: str, cookies: str) -> dict:
         "x-requested-with": "XMLHttpRequest",
         "cookie": cookies,
     }
-# 
+#
 @router.post("/api/dev/iwhalecloud/get_flow_id_by_module")
 async def get_flow_id_by_module(body: GetFlowIdByModuleRequest) -> dict:
     """对外路由：根据应用模块ID查询 CI 流程ID列表（内部复用 _get_flow_id_by_module）。
@@ -3303,7 +3330,7 @@ async def get_flow_id_by_module(body: GetFlowIdByModuleRequest) -> dict:
     except httpx.RequestError as exc:
         logger.exception("调用研发云按模块查询流程ID接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    
+
     # 检查数据格式
     try:
         raw = resp.json()
@@ -3316,7 +3343,7 @@ async def get_flow_id_by_module(body: GetFlowIdByModuleRequest) -> dict:
             return error_response(502, f"研发云返回数据data.content非列表：{resp.text}")
     except ValueError:
         return error_response(502, f"研发云返回非 JSON：{resp.text}")
-    
+
     # 提取数据
     simplified = [
         {
@@ -3366,7 +3393,7 @@ async def get_task_branch_changes_content(body: GetTaskBranchChangesContentReque
     except httpx.RequestError as exc:
         logger.exception("调用研发云查询任务代码变动明细接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    
+
     # 检查数据格式
     try:
         raw = resp.json()
@@ -3374,10 +3401,10 @@ async def get_task_branch_changes_content(body: GetTaskBranchChangesContentReque
         if raw.get("code") != "9999":
             msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
             return error_response(502, f"{msg}", error=str(raw))
-            
+
     except ValueError:
         return error_response(502, f"研发云返回非 JSON：{resp.text}")
-    
+
     # 提取数据
     branch_info = raw.get("data").get("branchInfo")
     change_file_detail_list = [
@@ -3389,7 +3416,7 @@ async def get_task_branch_changes_content(body: GetTaskBranchChangesContentReque
         for it in raw.get("data").get("changeFileDetailList")
     ]
     return success_response({"branchInfo": branch_info, "changeFileDetailList": change_file_detail_list})
-    
+
 
 class GetDemandListFromProductRequest(BaseModel):
     projectId: int = Field(..., description="项目空间ID")
@@ -3512,7 +3539,7 @@ async def get_demand_list_from_product(body: GetDemandListFromProductRequest) ->
     except httpx.RequestError as exc:
         logger.exception("调用研发云按产品版本查询需求列表接口异常: %s", exc)
         return error_response(503, f"调用研发云接口异常: {exc}")
-    
+
     # 检查数据格式
     try:
         raw = resp.json()
@@ -3520,10 +3547,10 @@ async def get_demand_list_from_product(body: GetDemandListFromProductRequest) ->
         if raw.get("code") != "9999":
             msg = raw.get("finalMessage") or raw.get("msg") or raw.get("message") or "研发云执行失败"
             return error_response(502, f"{msg}", error=str(raw))
-            
+
     except ValueError:
         return error_response(502, f"研发云返回非 JSON：{resp.text}")
-    
+
     # 提取数据
     simplified = [
         {
@@ -4026,7 +4053,7 @@ async def _get_order_detail(body: GetOrderDetailRequest) -> dict:
             return error_response(502, f"{msg}", error=str(raw))
     except ValueError:
         return error_response(502, f"研发云返回非 JSON：{resp.text}")
-    
+
     # 提取数据
     taskActionDtoList = [
         {
@@ -4190,7 +4217,7 @@ def code_merge(body: CodeMergeRequest):
             page.set_default_navigation_timeout(60_000)
 
             # 访问登录页面
-            page.goto(DEV_IWHALECLOUD_BASE_URL) 
+            page.goto(DEV_IWHALECLOUD_BASE_URL)
             print("打开研发云界面成功")
 
             # 定位并填写表单
@@ -4200,14 +4227,14 @@ def code_merge(body: CodeMergeRequest):
 
             # 点击登录按钮，进入研发平台界面
             page.click('.loginBtn')
-            page.wait_for_load_state("networkidle") 
+            page.wait_for_load_state("networkidle")
             print("登录成功")
 
             # 点击任务单数，进入事务管理界面
             page.locator('span.my-todo-item-pending-count[data-type="WORK_ITEM"]').click()
-            page.wait_for_load_state("networkidle") 
+            page.wait_for_load_state("networkidle")
             print("进入事务管理界面成功")
-            
+
             # 回填 任务单号，搜索任务
             page.locator("input.task-search-text").fill(body.taskNo)
             page.locator(".search-click-task").click()
@@ -4219,21 +4246,21 @@ def code_merge(body: CodeMergeRequest):
             page.locator(f'div.task-title[data-taskno="{num}"]').click()
             page.wait_for_load_state("networkidle")
             print("进入任务详情界面成功")
-            
+
             # 点击代码分支，进入代码分支界面
             page.locator('#details-content-tabs a[href="#codeBranchTab"]').click()
             page.wait_for_load_state("networkidle")
             print("进入代码分支界面成功")
-            
+
             # 任务详情-代码分支页面-点击创建合并请求
             page.locator("button.merge-branch-btn").click()
             page.wait_for_load_state("networkidle")
             print("任务详情-代码分支页面-点击创建合并请求成功")
-            
+
             # 合并对比在 iframe 内，先等 iframe 出现再点（page.locator 无法穿透 iframe）
             _wait_git_iframe(page)
             git_frame = _git_embed_frame(page)
-            
+
             # 合并分支界面-第一次点击创建合并请求
             git_frame.locator("button.ui.button.primary.show-form").filter(has_text="创建合并请求").click()
             _wait_git_frame_network_idle(page)
@@ -4518,7 +4545,7 @@ async def delete_order_info(body: DeleteOrderInfoRequest) -> dict:
         original_len = len(existing_list)
         # 过滤掉 demand_no 匹配的需求单
         existing_list = [
-            demand for demand in existing_list 
+            demand for demand in existing_list
             if not (isinstance(demand, dict) and demand.get("demand_no") == body.demand_no)
         ]
 

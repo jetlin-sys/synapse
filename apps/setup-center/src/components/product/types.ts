@@ -445,6 +445,22 @@ export function productRepositoriesToRdRepoInfo(p: Product): RdRepoInfo[] {
   return repositoriesToRdRepoInfo(p.repositories);
 }
 
+/** 第一个未填写 Token 的仓库下标，无则 -1 */
+export function findRepositoryMissingTokenIndex(repositories: Repository[]): number {
+  return repositories.findIndex((r) => !String(r.token ?? "").trim());
+}
+
+/** Repository[] → validate_repo_tokens 请求体 */
+export function repositoriesToValidateTokenItems(
+  repositories: Repository[],
+): { repo_url: string; repo_branch: string; repo_token: string }[] {
+  return repositories.map((r) => ({
+    repo_url: r.url,
+    repo_branch: r.branch,
+    repo_token: r.token || "",
+  }));
+}
+
 /** 多路聚合：error > init > process > new > done（下标越小越「差」） */
 const UNIFIED_PRIORITY = ["error", "init", "process", "new", "done"] as const satisfies readonly UnifiedWireAnalysisState[];
 

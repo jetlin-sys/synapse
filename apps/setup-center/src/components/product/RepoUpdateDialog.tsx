@@ -8,10 +8,12 @@ import {
   defaultProdBranchForAppModuleSelection,
   filterAppModuleOptionsForRow,
   filterProdBranchOptionsForRow,
+  findRepositoryMissingTokenIndex,
   isValidRepoBranchComposite,
   patchRepositoryRepoBranchFromModuleDetail,
   productRepositoriesToRdRepoInfo,
   prodBranchRowsToOptions,
+  repositoriesToValidateTokenItems,
 } from "./types";
 import { SearchableVirtualSelect, type SearchableOption } from "./SearchableVirtualSelect";
 import { RepoBranchDerivedDisplay } from "./RepoBranchDerivedDisplay";
@@ -37,6 +39,7 @@ import {
   fetchRepoDetailByProdBranch,
   getProdProcessInfo,
   repoDetailFetchCacheKey,
+  validateRepoTokens,
 } from "@/api/rdUnifiedService";
 import type {
   ProdProcessDataPayload,
@@ -347,11 +350,32 @@ export function RepoUpdateDialog({
       //   toast.error(t("workbench.products.modal.prodBranchDuplicate"));
       //   return;
       // }
+      const missingTokenIdx = findRepositoryMissingTokenIndex(plain);
+      if (missingTokenIdx >= 0) {
+        toast.error(t("workbench.products.modal.repoTokenRequired"));
+        return;
+      }
     }
 
     setSaving(true);
     onBusyChange?.(true);
     try {
+      if (plain.length > 0) {
+        const results = await validateRepoTokens(
+          synapseApiBase,
+          repositoriesToValidateTokenItems(plain),
+        );
+        const failIdx = results.findIndex((r) => !r.valid);
+        if (failIdx >= 0) {
+          toast.error(
+            t("workbench.products.modal.repoTokenInvalid", {
+              n: failIdx + 1,
+              detail: results[failIdx]?.error || "",
+            }),
+          );
+          return;
+        }
+      }
       const temp: Product = { ...product, repositories: plain };
       await changeRepoInfo(synapseApiBase, {
         prod: product.name.trim(),
@@ -533,13 +557,16 @@ export function RepoUpdateDialog({
                     />
                   </div>
                   <div className="col-span-12 space-y-1.5">
-                    <Label className="text-xs">{t("workbench.products.modal.token")}</Label>
+                    <Label className="text-xs">
+                      {t("workbench.products.modal.token")} <span className="text-destructive">*</span>
+                    </Label>
                     <Input
                       className="h-9 text-xs"
                       type="password"
                       value={repo.token || ""}
                       onChange={(e) => updateRow(index, { token: e.target.value })}
                       placeholder={t("workbench.products.modal.tokenPlaceholder")}
+                      disabled={saving}
                     />
                   </div>
                   <div className="col-span-12 flex items-center gap-2 pt-1">
@@ -565,7 +592,9 @@ export function RepoUpdateDialog({
           </Button>
           <Button type="button" onClick={() => void handleSave()} disabled={saving || !product}>
             {saving ? <Loader2 className="size-4 animate-spin mr-2" /> : null}
-            {t("workbench.products.repoUpdateDialog.save")}
+            {saving
+              ? t("workbench.products.modal.repoTokenValidating")
+              : t("workbench.products.repoUpdateDialog.save")}
           </Button>
         </DialogFooter>
       </DialogContent>

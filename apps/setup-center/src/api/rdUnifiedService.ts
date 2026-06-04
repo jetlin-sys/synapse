@@ -1308,6 +1308,29 @@ export async function fetchProductBranchList(
   return Array.isArray(list) ? list : [];
 }
 
+/** validate_repo_tokens 单条结果 */
+export type RepoTokenValidationResult = {
+  valid: boolean;
+  error?: string;
+};
+
+/** 批量校验仓库 Token（git ls-remote，Synapse 后端） */
+export async function validateRepoTokens(
+  synapseApiBase: string,
+  items: { repo_url: string; repo_branch: string; repo_token: string }[],
+): Promise<RepoTokenValidationResult[]> {
+  return fetchSynapseJson<RepoTokenValidationResult[]>(
+    synapseApiBase,
+    "/api/dev/iwhalecloud/validate_repo_tokens",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items }),
+      signal: AbortSignal.timeout(Math.max(60_000, items.length * 35_000)),
+    },
+  );
+}
+
 /** get_repo_detail_by_prod_branch 单条；入库仓库分支为 repositoryId|destBranchName */
 export type RdRepoDetailRow = {
   repositoryId?: number | string | null;
