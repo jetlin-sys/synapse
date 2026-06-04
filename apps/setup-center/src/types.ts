@@ -492,6 +492,8 @@ export type SkillInfo = {
   skillId: string;
   name: string;
   description: string;
+  /** SKILL.md frontmatter `label`，UI 展示优先于 name */
+  label?: string | null;
   name_i18n?: Record<string, string> | null;
   description_i18n?: Record<string, string> | null;
   system: boolean;

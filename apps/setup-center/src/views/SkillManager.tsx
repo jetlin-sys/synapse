@@ -29,10 +29,16 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ModalOverlay } from "../components/ModalOverlay";
+import { isWhalecloudDevToolSkill, rdToolDisplayLabel } from "../utils/whalecloudDevToolSkill";
 
 // ─── i18n 辅助：按当前语言优先显示中文名/描述 ───
 
 function getSkillDisplayName(skill: SkillInfo, lang: string): string {
+  if (isWhalecloudDevToolSkill(skill)) {
+    return rdToolDisplayLabel(skill, lang);
+  }
+  const lab = skill.label?.replace(/\r/g, "").trim();
+  if (lab) return lab;
   const key = lang.startsWith("zh") ? "zh" : lang;
   return skill.name_i18n?.[key] || skill.name;
 }
@@ -1402,6 +1408,7 @@ export function SkillManager({
         skillId: (s.skill_id as string) || (s.name as string),
         name: s.name as string,
         description: s.description as string || "",
+        label: (s.label as string | null) || null,
         name_i18n: (s.name_i18n as Record<string, string> | null) || null,
         description_i18n: (s.description_i18n as Record<string, string> | null) || null,
         system: s.system as boolean || false,

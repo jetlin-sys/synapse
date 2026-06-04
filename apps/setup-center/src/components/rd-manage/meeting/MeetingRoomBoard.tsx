@@ -46,6 +46,7 @@ import {
   type SOPStage,
 } from '../../../rd-sop/constants';
 import { MeetingNodeDetailPanel, type MeetingNodeVisualState } from './panels/MeetingNodeDetailPanel';
+import { CrossNodeReprocessIcon } from './CrossNodeReprocessIcon';
 import {
   effectiveHumanConfirmByType,
   resolveMeetingInterventionPanel,
@@ -74,7 +75,7 @@ import {
   Globe, Clock, Coins, MoreHorizontal, CircleDashed, 
   Terminal, Code2, GitBranch, FileCode2, Play, User, Info, Network, Code, 
   TestTube, CheckSquare, Flame, TrendingUp, Loader2, AlertCircle, MessageSquareText, ClipboardCheck,
-  SkipForward, RotateCw, RefreshCw, ArrowLeft, Layers, Square,
+  SkipForward, RotateCw, ArrowLeft, Layers, Square,
   Search, PenLine, ShieldCheck, Check, Container,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -1691,15 +1692,13 @@ const InterventionDialog = ({
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
                       {canReprocessHistoricalNode(node.id, node.type) ? (
-                        <Tooltip title="重新处理（将清理本节点至当前节点之间的过程数据）">
+                        <Tooltip title="跨节点重新处理（清理本节点至当前节点之间的过程数据后，从本节点重跑）">
                           <Button
                             type="text"
                             size="small"
-                            className="!h-6 !min-w-6 !px-1 text-muted-foreground hover:!text-foreground"
+                            className="rd-cross-node-reprocess-btn !h-6 !min-w-6 !px-1 !rounded-md text-muted-foreground/75 hover:!text-cyan-300 hover:!bg-cyan-500/10 !border !border-transparent hover:!border-cyan-500/25 transition-all duration-200"
                             icon={
-                              <RefreshCw
-                                className={`h-3.5 w-3.5 ${room.reprocessing ? 'animate-spin' : ''}`}
-                              />
+                              <CrossNodeReprocessIcon spinning={room.reprocessing} />
                             }
                             loading={room.reprocessing}
                             onClick={(e) => {

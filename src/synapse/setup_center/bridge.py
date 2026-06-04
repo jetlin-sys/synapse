@@ -1024,6 +1024,9 @@ def list_skills(workspace_dir: str) -> None:
                 "skill_id": sid,
                 "name": s.name,
                 "description": s.description,
+                "label": getattr(s, "label", None) or None,
+                "name_i18n": getattr(s, "name_i18n", None) or None,
+                "description_i18n": getattr(s, "description_i18n", None) or None,
                 "system": bool(getattr(s, "system", False)),
                 "enabled": bool(getattr(s, "system", False))
                 or (external_allowlist is None)

@@ -129,6 +129,7 @@ class SkillMetadata:
 
     name: str
     description: str
+    label: str | None = None  # 可选 UI 标题（优先于 name 展示）
     version: str | None = None
     license: str | None = None
     compatibility: str | None = None
@@ -526,9 +527,16 @@ class SkillParser:
 
         approval_class = self._parse_approval_class(data, path)
 
+        label_raw = data.get("label")
+        label = None
+        if label_raw is not None:
+            cleaned = str(label_raw).replace("\r", "").strip()
+            label = cleaned or None
+
         return SkillMetadata(
             name=name,
             description=description.strip(),
+            label=label,
             version=data.get("version"),
             license=data.get("license"),
             compatibility=data.get("compatibility"),

@@ -157,7 +157,7 @@ export function isWhalecloudDevToolSkill(skill: SkillInfo): boolean {
 
 /** 研发工具等在列表/选择器中的展示名：`label` 优先，否则 name_i18n / name（调用 API 仍用 skillId） */
 export function rdToolDisplayLabel(skill: SkillInfo, lang?: string): string {
-  const lab = skill.label?.trim();
+  const lab = skill.label?.replace(/\r/g, "").trim();
   if (lab) return lab;
   const key = !lang || lang.startsWith("zh") ? "zh" : lang;
   return skill.name_i18n?.[key] || skill.name_i18n?.en || skill.name;

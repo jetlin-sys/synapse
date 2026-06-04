@@ -177,7 +177,9 @@ class SkillEntry:
     _parsed_skill: Optional["ParsedSkill"] = field(default=None, repr=False)
 
     def get_display_name(self, lang: str = "zh") -> str:
-        """按语言返回显示名称，找不到则回退到 name"""
+        """按语言返回显示名称：label 优先，其次 name_i18n，最后 name"""
+        if self.label and str(self.label).replace("\r", "").strip():
+            return str(self.label).replace("\r", "").strip()
         return self.name_i18n.get(lang, self.name)
 
     def get_display_description(self, lang: str = "zh") -> str:

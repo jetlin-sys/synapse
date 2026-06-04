@@ -859,7 +859,7 @@ export function App() {
   >([]);
   const [skillSummary, setSkillSummary] = useState<{ count: number; systemCount: number; externalCount: number } | null>(null);
   const [skillsDetail, setSkillsDetail] = useState<
-    { skill_id: string; name: string; description: string; name_i18n?: Record<string, string> | null; description_i18n?: Record<string, string> | null; system: boolean; enabled?: boolean; tool_name?: string | null; category?: string | null; path?: string | null }[] | null
+    { skill_id: string; name: string; description: string; label?: string | null; name_i18n?: Record<string, string> | null; description_i18n?: Record<string, string> | null; system: boolean; enabled?: boolean; tool_name?: string | null; category?: string | null; path?: string | null }[] | null
   >(null);
   const [skillsSelection, setSkillsSelection] = useState<Record<string, boolean>>({});
   const [skillsTouched, setSkillsTouched] = useState(false);
@@ -3153,6 +3153,9 @@ export function App() {
           skill_id: String(s?.skill_id || s?.name || ""),
           name: String(s?.name || ""),
           description: String(s?.description || ""),
+          label: s?.label ?? null,
+          name_i18n: s?.name_i18n ?? null,
+          description_i18n: s?.description_i18n ?? null,
           system: !!s?.system,
           enabled: typeof s?.enabled === "boolean" ? s.enabled : undefined,
           tool_name: s?.tool_name ?? null,

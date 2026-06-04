@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { IconBot, IconRefresh, IconPlus, IconEdit, IconTrash, IconDownload, IconUpload } from "../icons";
 import { safeFetch } from "../providers";
@@ -14,6 +14,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import type { SkillInfo } from "../types";
+import { isWhalecloudDevToolSkill, rdToolDisplayLabel } from "../utils/whalecloudDevToolSkill";
 
 type AgentProfile = {
   id: string;
@@ -42,7 +44,22 @@ type SkillItem = {
   name: string;
   enabled: boolean;
   name_i18n?: Record<string, string> | null;
+  label?: string | null;
+  toolName?: string | null;
+  category?: string | null;
 };
+
+function skillItemDisplayName(skill: SkillItem, lang: string, rdPrefix = ""): string {
+  const asInfo = skill as SkillInfo;
+  if (isWhalecloudDevToolSkill(asInfo)) {
+    const label = rdToolDisplayLabel(asInfo, lang);
+    return rdPrefix ? `${rdPrefix}${label}` : label;
+  }
+  const lab = skill.label?.replace(/\r/g, "").trim();
+  if (lab) return lab;
+  const key = lang.startsWith("zh") ? "zh" : lang;
+  return skill.name_i18n?.[key] || skill.name;
+}
 
 type ModelInfo = {
   name: string;
@@ -304,6 +321,9 @@ export function AgentManagerView({
           name: s.name,
           enabled: s.enabled !== false,
           name_i18n: s.name_i18n || null,
+          label: s.label ?? null,
+          toolName: s.tool_name ?? null,
+          category: s.category ?? null,
         })),
       );
     } catch {
@@ -539,6 +559,44 @@ export function AgentManagerView({
       return { ...prev, skills };
     });
   };
+
+  /** 人设里写了 skill id，但当前 /api/skills 未返回（常见于全局关闭后已卸载） */
+  const profileSkillIdsNotInGlobalList = useMemo(() => {
+    if (editingProfile.skills_mode === "all") return [];
+    const ids = new Set(availableSkills.map((s) => s.skillId));
+    return editingProfile.skills.filter((id) => !ids.has(id));
+  }, [editingProfile.skills_mode, editingProfile.skills, availableSkills]);
+
+  const rdSkillDisplayPrefix = t("agentManager.rdSkillDisplayPrefix", "研发技能-");
+
+  /** 研发技能置顶，同组内按展示名排序 */
+  const sortedAvailableSkills = useMemo(() => {
+    const lang = i18n.language || "zh";
+    const locale = lang.startsWith("zh") ? "zh-CN" : lang;
+    return [...availableSkills].sort((a, b) => {
+      const da = isWhalecloudDevToolSkill(a as SkillInfo) ? 0 : 1;
+      const db = isWhalecloudDevToolSkill(b as SkillInfo) ? 0 : 1;
+      if (da !== db) return da - db;
+      return skillItemDisplayName(a, lang, rdSkillDisplayPrefix).localeCompare(
+        skillItemDisplayName(b, lang, rdSkillDisplayPrefix),
+        locale,
+      );
+    });
+  }, [availableSkills, i18n.language, rdSkillDisplayPrefix]);
+
+  const filteredAvailableSkills = useMemo(() => {
+    const q = skillSearch.trim().toLowerCase();
+    if (!q) return sortedAvailableSkills;
+    const lang = i18n.language || "zh";
+    return sortedAvailableSkills.filter((skill) => {
+      const displayName = skillItemDisplayName(skill, lang, rdSkillDisplayPrefix);
+      return (
+        displayName.toLowerCase().includes(q)
+        || skill.name.toLowerCase().includes(q)
+        || skill.skillId.toLowerCase().includes(q)
+      );
+    });
+  }, [sortedAvailableSkills, skillSearch, i18n.language, rdSkillDisplayPrefix]);
 
   const handleVisibility = async (profileId: string, hidden: boolean) => {
     try {
@@ -1219,7 +1277,7 @@ export function AgentManagerView({
             </div>
 
             {/* Skills multi-select */}
-            {editingProfile.skills_mode !== "all" && availableSkills.length > 0 && (
+            {editingProfile.skills_mode !== "all" && sortedAvailableSkills.length > 0 && (
               <div className="rounded-lg border">
                 <div className="p-1.5 border-b">
                   <Input
@@ -1230,33 +1288,76 @@ export function AgentManagerView({
                   />
                 </div>
                 <div className="max-h-[200px] overflow-y-auto p-1">
-                  {availableSkills
-                    .filter((skill) => {
-                      if (!skillSearch.trim()) return true;
-                      const q = skillSearch.trim().toLowerCase();
-                      const displayName = skill.name_i18n?.[i18n.language?.startsWith("zh") ? "zh" : i18n.language || "zh"] || skill.name;
-                      return displayName.toLowerCase().includes(q) || skill.name.toLowerCase().includes(q);
-                    })
-                    .map((skill) => {
-                      const checked = editingProfile.skills.includes(skill.skillId);
-                      return (
-                        <label
-                          key={skill.skillId}
-                          className={`flex items-center gap-2.5 px-2.5 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors ${
-                            checked ? "bg-primary/8" : "hover:bg-accent/50"
-                          }`}
+                  {filteredAvailableSkills.map((skill) => {
+                    const checked = editingProfile.skills.includes(skill.skillId);
+                    const showGlobalOff = checked && !skill.enabled;
+                    const lang = i18n.language || "zh";
+                    const displayName = skillItemDisplayName(skill, lang, rdSkillDisplayPrefix);
+                    return (
+                      <label
+                        key={skill.skillId}
+                        className={`flex flex-wrap items-center gap-2 px-2.5 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors ${
+                          checked ? "bg-primary/8" : "hover:bg-accent/50"
+                        }`}
+                      >
+                        <Checkbox
+                          checked={checked}
+                          onCheckedChange={() => toggleSkill(skill.skillId)}
+                        />
+                        <span
+                          className="flex-1 min-w-0 truncate"
+                          title={skill.skillId !== displayName ? skill.skillId : undefined}
                         >
-                          <Checkbox
-                            checked={checked}
-                            onCheckedChange={() => toggleSkill(skill.skillId)}
-                          />
-                          <span className="flex-1 min-w-0 truncate">
-                            {skill.name_i18n?.[i18n.language?.startsWith("zh") ? "zh" : i18n.language || "zh"] || skill.name}
-                          </span>
-                        </label>
-                      );
-                    })}
+                          {displayName}
+                        </span>
+                        {showGlobalOff && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 text-xs font-normal text-muted-foreground border-border"
+                            title={t("agentManager.skillGloballyDisabledTag")}
+                          >
+                            {t("agentManager.skillGloballyDisabledTag")}
+                          </Badge>
+                        )}
+                      </label>
+                    );
+                  })}
                 </div>
+              </div>
+            )}
+
+            {editingProfile.skills_mode !== "all" && profileSkillIdsNotInGlobalList.length > 0 && (
+              <div className="rounded-lg border border-amber-500/35 bg-amber-500/[0.06] p-3 space-y-2">
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  {t("agentManager.profileSkillsNotLoadedHint")}
+                </p>
+                <ul className="space-y-1.5">
+                  {profileSkillIdsNotInGlobalList.map((sid) => (
+                    <li
+                      key={sid}
+                      className="flex flex-wrap items-center gap-2 text-[13px] min-w-0"
+                    >
+                      <span className="font-mono truncate flex-1 min-w-0" title={sid}>
+                        {sid}
+                      </span>
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 text-amber-800 dark:text-amber-300 border-amber-500/45"
+                      >
+                        {t("agentManager.profileSkillUnavailableTag")}
+                      </Badge>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 shrink-0"
+                        onClick={() => toggleSkill(sid)}
+                      >
+                        {t("agentManager.removeProfileSkill")}
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
 

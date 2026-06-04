@@ -174,3 +174,31 @@ def test_mtime_change_bypasses_cache_naturally(tmp_path: Path):
     # invalidate is called explicitly; that is fine.
     second_keys = set(_GLOBAL_PARSE_CACHE.keys())
     assert second_keys - first_keys, "new mtime should appear as a fresh cache key"
+
+
+def test_parse_file_reads_label_frontmatter(tmp_path: Path):
+    skill_dir = tmp_path / "whalecloud-dev-tool-demo"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        """---
+name: whalecloud-dev-tool-demo
+description: demo
+label: 演示工具
+---
+body
+""",
+        encoding="utf-8",
+    )
+    parsed = SkillParser().parse_directory(skill_dir)
+    assert parsed.metadata.label == "演示工具"
+
+
+def test_label_utf8_byte_length_regression():
+    """7 个汉字 label 为 21 UTF-8 字节；错误地按 [:20] 截断字节会损坏最后一字。"""
+    long_label = "函数级方案技能"
+    short_label = "模块功能技能"
+    assert len(long_label.encode("utf-8")) == 21
+    assert len(short_label.encode("utf-8")) == 18
+    broken = long_label.encode("utf-8")[:20].decode("utf-8", errors="replace")
+    assert broken.endswith("\ufffd") or "函数级方案技" in broken
+    assert short_label.encode("utf-8")[:20].decode("utf-8") == short_label

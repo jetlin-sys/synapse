@@ -124,6 +124,7 @@ class TestPresetSkillFixes:
             "whalecloud-dev-tool-ask-user",
             "whalecloud-dev-tool-base-scripts",
             "whalecloud-dev-tool-doc-generate",
+            "whalecloud-dev-tool-solution-review",
         ]
         assert default.skills_mode == SkillsMode.INCLUSIVE
         assert default.memory_mode == "isolated"
@@ -132,10 +133,16 @@ class TestPresetSkillFixes:
     def test_whalecloud_expert_presets_have_dev_tool_skills(self):
         from synapse.agents.presets import SYSTEM_PRESETS
         req = next(p for p in SYSTEM_PRESETS if p.id == "whalecloud-requirement-expert")
+        design = next(p for p in SYSTEM_PRESETS if p.id == "whalecloud-design-expert")
         rd = next(p for p in SYSTEM_PRESETS if p.id == "whalecloud-rd-expert")
         assert req.skills == [
             "whalecloud-dev-tool-base-scripts",
             "whalecloud-dev-tool-requirement-clarify",
+        ]
+        assert design.skills == [
+            "whalecloud-dev-tool-base-scripts",
+            "whalecloud-dev-tool-c-code-access",
+            "whalecloud-dev-tool-function-solution",
         ]
         assert rd.skills == [
             "whalecloud-dev-tool-base-scripts",

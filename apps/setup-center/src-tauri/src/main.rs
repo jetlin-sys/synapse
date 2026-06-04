@@ -5471,7 +5471,14 @@ fn run_python_module_json(
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         return Err(format!("python failed: {}\nstdout:\n{}\nstderr:\n{}", out.status, stdout, stderr));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let stdout = match String::from_utf8(out.stdout) {
+        Ok(s) => s,
+        Err(e) => {
+            let lossy_len = e.utf8_error().valid_up_to();
+            String::from_utf8_lossy(&e.as_bytes()[..lossy_len]).to_string()
+        }
+    };
+    Ok(stdout.trim().to_string())
 }
 
 #[tauri::command]
@@ -6153,18 +6160,47 @@ async fn backend_fetch(
 
     tauri::async_runtime::spawn(async move {
         let mut response = resp;
+        let mut pending_incomplete = Vec::new();
         loop {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
-                    let text = String::from_utf8_lossy(&chunk).to_string();
-                    if on_event
-                        .send(BackendFetchEvent::Chunk { text })
-                        .is_err()
-                    {
-                        break;
+                    let mut buf = std::mem::take(&mut pending_incomplete);
+                    buf.extend_from_slice(&chunk);
+
+                    let text = match String::from_utf8(buf) {
+                        Ok(s) => {
+                            pending_incomplete.clear();
+                            s
+                        }
+                        Err(e) => {
+                            let lossy_len = e.utf8_error().valid_up_to();
+                            let orig = e.into_bytes();
+                            if lossy_len == 0 && orig.len() < 4 {
+                                pending_incomplete = orig;
+                                continue;
+                            }
+                            let (valid, tail) = orig.split_at(lossy_len);
+                            pending_incomplete = tail.to_vec();
+                            String::from_utf8_lossy(valid).to_string()
+                        }
+                    };
+
+                    if !text.is_empty() {
+                        if on_event
+                            .send(BackendFetchEvent::Chunk { text })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
                 Ok(None) => {
+                    if !pending_incomplete.is_empty() {
+                        let text = String::from_utf8_lossy(&pending_incomplete).to_string();
+                        if !text.is_empty() {
+                            let _ = on_event.send(BackendFetchEvent::Chunk { text });
+                        }
+                    }
                     let _ = on_event.send(BackendFetchEvent::Done);
                     break;
                 }
