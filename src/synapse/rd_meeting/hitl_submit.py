@@ -127,6 +127,13 @@ def submit_questionnaire(
     except Exception as exc:
         logger.debug("hitl_submit activity record failed: %s", exc)
 
+    try:
+        from synapse.rd_meeting.work_plan import mark_plan_hitl_submitted
+
+        mark_plan_hitl_submitted(scope_id, kind=kind_norm)
+    except Exception as exc:
+        logger.debug("mark_plan_hitl_submitted failed: %s", exc)
+
     return {
         "scope_id": scope_id,
         "room_id": room_id,

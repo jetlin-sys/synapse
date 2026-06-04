@@ -1219,6 +1219,29 @@ def _looks_like_waiting_for_user_response(text: str) -> bool:
     return has_blocker and asks_user
 
 
+def _should_skip_verify_for_user_handoff(
+    text: str,
+    *,
+    session_id: str,
+    executed_tool_names: list[str],
+    tool_results: list[dict] | None,
+) -> bool:
+    """会议室主控未 submit_hitl 时，禁止把「待用户确认」类正文当作合法交棒。"""
+    if not _looks_like_waiting_for_user_response(text):
+        return False
+    if _has_recoverable_tool_issue(tool_results):
+        return False
+    try:
+        from synapse.rd_meeting.work_plan import is_rd_meeting_host_session
+
+        if is_rd_meeting_host_session(session_id):
+            if "submit_hitl_questionnaire" not in executed_tool_names:
+                return False
+    except Exception:
+        pass
+    return True
+
+
 def _has_recoverable_tool_issue(tool_results: list[dict] | None) -> bool:
     """Whether the latest blocker is a tool-call shape issue the model can repair."""
     for result in tool_results or []:
@@ -7997,9 +8020,18 @@ class ReasoningEngine:
                     cleaned_text, executed_tool_names, all_tool_results
                 )
                 last_user_request = ResponseHandler.get_last_user_request(original_messages)
-                if _looks_like_waiting_for_user_response(
-                    cleaned_text
-                ) and not _has_recoverable_tool_issue(all_tool_results):
+                session = getattr(self._state, "current_session", None)
+                session_id = str(
+                    getattr(session, "id", None)
+                    or getattr(session, "session_id", None)
+                    or ""
+                )
+                if _should_skip_verify_for_user_handoff(
+                    cleaned_text,
+                    session_id=session_id,
+                    executed_tool_names=executed_tool_names,
+                    tool_results=all_tool_results,
+                ):
                     logger.info(
                         "[TaskVerify] Skipping completion verify because response "
                         "hands control back to user."

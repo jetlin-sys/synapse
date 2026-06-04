@@ -38,6 +38,7 @@ class MeetingRoomToolHandler:
 
         goal_summary = str(params.get("goal_summary") or "").strip()
         items = params.get("items")
+        closing_step = params.get("closing_step")
         if not goal_summary:
             return "❌ goal_summary 不能为空"
         if not isinstance(items, list) or not items:
@@ -49,6 +50,7 @@ class MeetingRoomToolHandler:
                 session_id=str(session_id),
                 goal_summary=goal_summary,
                 items=items,
+                closing_step=closing_step if isinstance(closing_step, dict) else None,
             )
         except ValueError as exc:
             return f"❌ {exc}"
