@@ -15,7 +15,6 @@ import {
   type MeetingRoomListItem,
   type MeetingRoomLivePayload,
   type MeetingRoomConfigPayload,
-  type MeetingRoomNodeOverride,
   type MeetingRoomParticipantWire,
 } from '../../../api/meetingRoomService';
 import {
@@ -36,7 +35,6 @@ import {
 } from './MeetingAgentContextDrawer';
 import { toast } from 'sonner';
 import {
-  NODE_TYPE_LABEL,
   SOP_STAGES,
   ALL_NODES,
   stageIdForNodeId,
@@ -45,6 +43,12 @@ import {
   type SOPNode,
   type SOPStage,
 } from '../../../rd-sop/constants';
+import {
+  buildDisabledSopNodeIds,
+  getSopNodeTypeInfo,
+  resolveSopPipelineNodeState,
+  type SopPipelineNodeState,
+} from '../../../rd-sop/nodePresentation';
 import { MeetingNodeDetailPanel, type MeetingNodeVisualState } from './panels/MeetingNodeDetailPanel';
 import { CrossNodeReprocessIcon } from './CrossNodeReprocessIcon';
 import { StopNodeRunIcon } from './StopNodeRunIcon';
@@ -562,65 +566,20 @@ function mapListItemToRoom(item: MeetingRoomListItem): MeetingRoom {
   return mapDetailToRoom(item as MeetingRoomDetail);
 }
 
-function isSopNodeEnabled(
-  overrides: Record<string, MeetingRoomNodeOverride>,
-  nodeId: string,
-): boolean {
-  const v = overrides[nodeId]?.enabled;
-  if (v === undefined || v === null) return true;
-  return v !== false;
-}
-
-function buildDisabledSopNodeIds(
-  overrides: Record<string, MeetingRoomNodeOverride> | undefined,
-): Set<string> {
-  const out = new Set<string>();
-  if (!overrides) return out;
-  for (const node of ALL_NODES) {
-    if (!isSopNodeEnabled(overrides, node.id)) out.add(node.id);
-  }
-  return out;
-}
-
 const getNodeStateGlobal = (
   room: MeetingRoom,
   nodeId: string,
   disabledNodeIds?: ReadonlySet<string>,
-):
-  | 'completed'
-  | 'processing'
-  | 'error'
-  | 'human_intervention'
-  | 'pending'
-  | 'skipped'
-  | 'stopped' => {
-  const skipped = room.skippedNodeIds ?? [];
-  if (skipped.includes(nodeId)) return 'skipped';
-  if (disabledNodeIds?.has(nodeId)) return 'skipped';
-
-  const targetIndex = ALL_NODES.findIndex((n) => n.id === nodeId);
-  const currentIndex = ALL_NODES.findIndex((n) => n.id === room.currentNode);
-
-  if (targetIndex < currentIndex) return 'completed';
-  if (targetIndex > currentIndex) return 'pending';
-
-  if (room.status === 'failed') return 'error';
-  if (room.status === 'stopped') return 'stopped';
-  if (room.status === 'processing') return 'processing';
-  if (room.status === 'human_intervention') {
-    const node = ALL_NODES[targetIndex];
-    if (
-      node.type.includes('human') ||
-      node.type === 'human_multi' ||
-      node.type === 'human_start' ||
-      node.type === 'ai_exception'
-    ) {
-      return 'human_intervention';
-    }
-    return 'error';
-  }
-  return 'pending';
-};
+): SopPipelineNodeState =>
+  resolveSopPipelineNodeState(
+    {
+      currentNodeId: room.currentNode,
+      status: room.status,
+      skippedNodeIds: room.skippedNodeIds,
+      disabledNodeIds,
+    },
+    nodeId,
+  );
 
 type NodeDetailViewMode = 'live' | 'review' | 'skipped';
 
@@ -1644,27 +1603,6 @@ const InterventionDialog = ({
     setContextOpen(true);
   };
 
-  const getNodeTypeInfo = (type: NodeType) => {
-    const label = NODE_TYPE_LABEL[type] ?? '未知';
-    switch (type) {
-      case 'ai':
-        return { label, color: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-500/30' };
-      case 'human':
-      case 'human_start':
-        return { label, color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/30' };
-      case 'ai_human':
-        return { label, color: 'text-purple-400', bg: 'bg-purple-500/10 border-purple-500/30' };
-      case 'human_multi':
-        return { label, color: 'text-orange-400', bg: 'bg-orange-500/10 border-orange-500/30' };
-      case 'system':
-        return { label, color: 'text-muted-foreground', bg: 'bg-muted/10 border-border/30' };
-      case 'ai_exception':
-        return { label, color: 'text-red-400', bg: 'bg-red-500/10 border-red-500/30' };
-      default:
-        return { label, color: 'text-muted-foreground', bg: 'bg-muted/30 border-border/30' };
-    }
-  };
-
   return (
     <Modal
       title={null}
@@ -1721,7 +1659,7 @@ const InterventionDialog = ({
           <div className="flex-1 overflow-y-auto custom-scrollbar p-3 space-y-2">
             {stageNodes.map((node, idx) => {
               const state = getNodeStateGlobal(room, node.id, disabledSopNodeIds);
-              const typeInfo = getNodeTypeInfo(node.type);
+              const typeInfo = getSopNodeTypeInfo(node.type);
               const isSelected = resolvedSelectedNodeId === node.id;
               const isCurrentNode = node.id === room.currentNode;
               const isSkipped = state === 'skipped';
@@ -1895,9 +1833,9 @@ const InterventionDialog = ({
                 </Button>
               ) : null}
               {selectedNode && centerTab === 'detail' ? (
-                <div className={`${MEETING_TAB_BAR_HEIGHT} border ${getNodeTypeInfo(selectedNode.type).bg} ${getNodeTypeInfo(selectedNode.type).color}`}>
+                <div className={`${MEETING_TAB_BAR_HEIGHT} border ${getSopNodeTypeInfo(selectedNode.type).bg} ${getSopNodeTypeInfo(selectedNode.type).color}`}>
                   <Zap className="w-4 h-4" />
-                  {getNodeTypeInfo(selectedNode.type).label}
+                  {getSopNodeTypeInfo(selectedNode.type).label}
                 </div>
               ) : null}
             </div>
@@ -1952,7 +1890,7 @@ const InterventionDialog = ({
               (() => {
                 const selectedNodeState = getNodeStateGlobal(room, selectedNode.id, disabledSopNodeIds);
                 const detailViewMode = resolveNodeDetailViewMode(selectedNodeState);
-                const typeInfo = getNodeTypeInfo(selectedNode.type);
+                const typeInfo = getSopNodeTypeInfo(selectedNode.type);
 
                 return (
                   <div className="flex min-h-0 flex-1 flex-col overflow-hidden">

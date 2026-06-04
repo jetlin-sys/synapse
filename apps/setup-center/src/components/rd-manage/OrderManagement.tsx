@@ -36,7 +36,8 @@ import {
   Search,
   Banknote,
   RefreshCw,
-  ExternalLink
+  ExternalLink,
+  SkipForward,
 } from 'lucide-react';
 import {
   fetchRdManageDemands,
@@ -51,6 +52,8 @@ import {
 import {
   fetchMeetingRooms,
   fetchMeetingSummary,
+  fetchMeetingRoomConfig,
+  fetchMeetingRoomLive,
   openMeetingRoom,
   type MeetingRoomArchiveEntry,
   type MeetingSummaryPayload,
@@ -84,6 +87,13 @@ import {
   type SOPNode,
   type SOPStage,
 } from '../../rd-sop/constants';
+import {
+  buildDisabledSopNodeIds,
+  getSopNodeTypeInfo,
+  resolveSopPipelineNodeState,
+  SOP_NODE_SKIPPED_CARD_CLASS,
+  type SopPipelineRunStatus,
+} from '../../rd-sop/nodePresentation';
 
 // --- Types & Data ---
 
@@ -191,9 +201,30 @@ type NodeState =
   | 'error'
   | 'awaiting_human'
   | 'full_manual'
-  | 'pending';
+  | 'pending'
+  | 'skipped';
+
+function ticketStatusToPipeline(ticket: Ticket): SopPipelineRunStatus {
+  switch (ticket.status) {
+    case 'completed':
+      return 'completed';
+    case 'prepare':
+      return 'prepare';
+    case 'full_manual':
+      return 'full_manual';
+    case 'pending':
+      return 'pending';
+    case 'processing':
+      return ticket.sopAwaitingHuman ? 'human_intervention' : 'processing';
+    case 'error':
+      return 'failed';
+    default:
+      return 'pending';
+  }
+}
 
 function mapNodeStateForPanel(state: NodeState): MeetingNodeVisualState {
+  if (state === 'skipped') return 'pending';
   if (state === 'awaiting_human') return 'human_intervention';
   if (state === 'full_manual') return 'pending';
   if (state === 'completed' || state === 'processing' || state === 'error') return state;
@@ -569,6 +600,8 @@ export const OrderManagement: React.FC<{
   const [meetingSummaryLoading, setMeetingSummaryLoading] = useState(false);
   const [meetingSummaryErr, setMeetingSummaryErr] = useState<string | null>(null);
   const [roomScopeIndex, setRoomScopeIndex] = useState<Map<string, string>>(new Map());
+  const [disabledSopNodeIds, setDisabledSopNodeIds] = useState<Set<string>>(() => new Set());
+  const [runtimeSkippedNodeIds, setRuntimeSkippedNodeIds] = useState<string[]>([]);
 
   const [collapsedStages, setCollapsedStages] = useState<Record<number, boolean>>({});
   const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
@@ -708,6 +741,28 @@ export const OrderManagement: React.FC<{
       cancelled = true;
     };
   }, [synapseApiBase, boardDataInitialized]);
+
+  const activeMeetingRoomId = useMemo(() => {
+    if (!sopMeetingScope?.scopeId) return '';
+    const key = `${sopMeetingScope.scopeType}:${sopMeetingScope.scopeId}`;
+    return (roomScopeIndex.get(key) || meetingSummary?.room_id || '').trim();
+  }, [sopMeetingScope, roomScopeIndex, meetingSummary?.room_id]);
+
+  useEffect(() => {
+    const base = (synapseApiBase || '').trim();
+    if (!base) return;
+    let cancelled = false;
+    void fetchMeetingRoomConfig(base)
+      .then((cfg) => {
+        if (!cancelled) setDisabledSopNodeIds(buildDisabledSopNodeIds(cfg.node_overrides));
+      })
+      .catch(() => {
+        if (!cancelled) setDisabledSopNodeIds(new Set());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [synapseApiBase]);
 
   const meetingNodeMetricsById = useMemo(() => {
     const m = new Map<string, { deal_seconds: number; tokens: number }>();
@@ -913,39 +968,62 @@ export const OrderManagement: React.FC<{
     return { workItemIdTrim, matched, singleTaskMode, displayWorkItems };
   }, [modalDemand, selectedWorkItemIdForModal]);
 
-  const getNodeStateGlobal = (ticket: Ticket | null, nodeId: string): NodeState => {
-    if (!ticket) return 'pending';
-    
-    const targetNode = ALL_NODES.find(n => n.id === nodeId);
-    if (!targetNode) return 'pending';
+  const getNodeStateGlobal = useCallback(
+    (ticket: Ticket | null, nodeId: string): NodeState => {
+      if (!ticket) return 'pending';
+      if (!ALL_NODES.some((n) => n.id === nodeId)) return 'pending';
 
-    // Fallback Mock Logic
-    if (ticket.status === 'completed') return 'completed';
-    if (ticket.status === 'prepare') return 'pending';
-    if (ticket.status === 'full_manual') return 'pending';
-    if (ticket.status === 'pending') {
-      if (nodeId === 'pending') return 'processing';
-      return 'pending';
-    }
+      const pipeline = resolveSopPipelineNodeState(
+        {
+          currentNodeId: ticket.currentNode,
+          status: ticketStatusToPipeline(ticket),
+          skippedNodeIds: runtimeSkippedNodeIds,
+          disabledNodeIds: disabledSopNodeIds,
+        },
+        nodeId,
+      );
 
-    const targetIndex = ALL_NODES.findIndex(n => n.id === nodeId);
-    const currentIndex = ALL_NODES.findIndex(n => n.id === ticket.currentNode);
-
-    if (targetIndex < currentIndex) return 'completed';
-    if (targetIndex > currentIndex) return 'pending';
-
-    // Target is the current node
-    if (ticket.status === 'processing') {
-      if (ticket.sopAwaitingHuman) {
-        const node = ALL_NODES[targetIndex];
-        if (node && node.type.includes('human')) return 'awaiting_human';
+      if (pipeline === 'skipped') return 'skipped';
+      if (pipeline === 'human_intervention') {
+        const node = ALL_NODES.find((n) => n.id === nodeId);
+        if (
+          node &&
+          (node.type.includes('human') ||
+            node.type === 'human_multi' ||
+            node.type === 'human_start' ||
+            node.type === 'ai_exception')
+        ) {
+          return 'awaiting_human';
+        }
         return 'error';
       }
-      return 'processing';
+      if (pipeline === 'completed') return 'completed';
+      if (pipeline === 'processing') return 'processing';
+      if (pipeline === 'error') return 'error';
+      return 'pending';
+    },
+    [disabledSopNodeIds, runtimeSkippedNodeIds],
+  );
+
+  useEffect(() => {
+    const base = (synapseApiBase || '').trim();
+    const roomId = activeMeetingRoomId;
+    if (!base || !roomId) {
+      setRuntimeSkippedNodeIds([]);
+      return;
     }
-    if (ticket.status === 'error') return 'error';
-    return 'pending';
-  };
+    let cancelled = false;
+    void fetchMeetingRoomLive(base, roomId)
+      .then((live) => {
+        if (!cancelled) setRuntimeSkippedNodeIds(live.skipped_node_ids ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setRuntimeSkippedNodeIds([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [synapseApiBase, activeMeetingRoomId, displayTicket?.currentNode]);
 
   // Simulate real-time token consumption for processing tickets
   useEffect(() => {
@@ -998,19 +1076,10 @@ export const OrderManagement: React.FC<{
     return () => clearTimeout(timeoutId);
   }, [displayTicket?.id, displayTicket?.currentNode, displayTicket?.status]);
 
-  // Auto-collapse completed stages（最后一阶段「代码走查」不折叠，避免与进度/节点展示错位）
+  // 切换工单时清空阶段折叠状态；不再自动折叠已完成阶段（避免节点卡片被收成竖条、看不清）
   useEffect(() => {
-    if (!displayTicket) return;
-    const newCollapsed: Record<number, boolean> = {};
-    SOP_STAGES.forEach(stage => {
-      if (stage.id === LAST_PIPELINE_STAGE_ID) return;
-      const isStageCompleted = stage.nodes.every(n => getNodeStateGlobal(displayTicket, n.id) === 'completed');
-      if (isStageCompleted) {
-        newCollapsed[stage.id] = true;
-      }
-    });
-    setCollapsedStages(newCollapsed);
-  }, [displayTicket?.id, displayTicket?.currentNode]);
+    setCollapsedStages({});
+  }, [displayTicket?.id]);
 
   // Calculate Active Line Width based on DOM elements
   const measureActiveLineWidth = useCallback(() => {
@@ -1600,7 +1669,7 @@ export const OrderManagement: React.FC<{
               ))}
             </div>
           </div>
-          <div className="convSidebarList flex flex-1 flex-col gap-1 overflow-y-auto p-1">
+          <div className="rd-order-ticket-list convSidebarList flex flex-1 flex-col gap-1 overflow-y-auto p-1">
             {filteredTickets.map(ticket => {
               const renderCard = (item: Ticket | WorkItem, isWorkItem: boolean) => {
                 const isDone = ticket.status === 'completed';
@@ -1683,7 +1752,7 @@ export const OrderManagement: React.FC<{
                         );
                       }
                     }}
-                    className={`group relative mb-1 cursor-pointer overflow-hidden rounded-[10px] px-2.5 py-3 transition-[background,box-shadow] duration-150 ${
+                    className={`rd-order-ticket-card group relative mb-1 shrink-0 cursor-pointer overflow-hidden rounded-[10px] px-2.5 py-3 transition-[background,box-shadow] duration-150 ${
                       isActive 
                         ? 'bg-[rgba(37,99,235,0.09)] ring-1 ring-border' 
                         : 'hover:bg-[rgba(37,99,235,0.05)]'
@@ -1744,7 +1813,7 @@ export const OrderManagement: React.FC<{
                     </div>
                     
                     {/* Middle: Title */}
-                    <h3 className={`mb-3 line-clamp-2 pl-2 pr-10 text-sm font-medium flex items-start gap-1.5 ${isActive ? 'text-primary' : 'text-foreground'}`}>
+                    <h3 className={`mb-3 line-clamp-3 pl-2 pr-10 text-sm font-medium leading-snug flex items-start gap-1.5 ${isActive ? 'text-primary' : 'text-foreground'}`}>
                       {!isWorkItem && ticket.urgency === 'high' && (
                         <Flame className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-pulse text-destructive" />
                       )}
@@ -1808,7 +1877,7 @@ export const OrderManagement: React.FC<{
 
               if (ticket.status === 'processing' && ticket.workItems && ticket.workItems.length > 0) {
                 return (
-                  <div key={ticket.id} className="relative mb-2 mt-3 rounded-[10px] border border-dashed border-primary/40 p-1.5 pt-3">
+                  <div key={ticket.id} className="rd-order-ticket-group relative mb-2 mt-3 shrink-0 rounded-[10px] border border-dashed border-primary/40 p-1.5 pt-3">
                     <div className="absolute -top-2.5 left-2 right-2 min-w-0 truncate bg-[color:var(--panel)] px-1 text-[10px] font-medium text-primary">
                       {ticket.title}
                     </div>
@@ -1980,7 +2049,9 @@ export const OrderManagement: React.FC<{
                         const globalIndex = ALL_NODES.findIndex(n => n.id === node.id);
                         const isTop = globalIndex % 2 === 0;
                         const state = getNodeStateGlobal(displayTicket, node.id);
-                        
+                        const isSkipped = state === 'skipped';
+                        const typeInfo = getSopNodeTypeInfo(node.type);
+
                         const isHuman = node.type.includes('human') || node.type === 'ai_exception';
                         const nextNode = stage.nodes[nIdx + 1];
                         const isNextHuman = nextNode && (nextNode.type.includes('human') || nextNode.type === 'ai_exception');
@@ -2007,32 +2078,38 @@ export const OrderManagement: React.FC<{
                               ? '--'
                               : `${((nodeHash % 50 + 10) / 10).toFixed(1)}k`;
                         
-                        let cardClass = "min-h-[7.5rem] border-border bg-card/60 text-muted-foreground";
+                        let cardClass = "min-h-[9rem] h-auto border-border bg-card/60 text-muted-foreground";
                         let iconClass = "text-muted-foreground";
                         let dotClass = "bg-border border-background";
                         let lineClass = "bg-border";
                         let hoverClass = "hover:border-primary/35 hover:bg-muted/30";
 
-                        if (state === 'completed') {
-                          cardClass = "min-h-[8.5rem] border-green-500/35 bg-card/90 text-foreground";
+                        if (isSkipped) {
+                          cardClass = `min-h-[9rem] h-auto border ${SOP_NODE_SKIPPED_CARD_CLASS}`;
+                          iconClass = 'text-slate-400';
+                          dotClass = 'bg-slate-500/50 border-background';
+                          lineClass = 'bg-slate-600/40';
+                          hoverClass = '';
+                        } else if (state === 'completed') {
+                          cardClass = "min-h-[9.5rem] h-auto border-green-500/35 bg-card/90 text-foreground";
                           iconClass = "text-green-500";
                           dotClass = "bg-green-500 border-background";
                           lineClass = "bg-green-500/50";
                           hoverClass = "hover:border-green-500/50 hover:bg-muted/25";
                         } else if (state === 'processing') {
-                          cardClass = "min-h-[7.5rem] border-primary/45 bg-primary/10 text-foreground shadow-[0_0_18px_color-mix(in_srgb,var(--primary)_12%,transparent)]";
+                          cardClass = "min-h-[9rem] h-auto border-primary/45 bg-primary/10 text-foreground shadow-[0_0_18px_color-mix(in_srgb,var(--primary)_12%,transparent)]";
                           iconClass = "text-primary";
                           dotClass = "bg-primary border-background shadow-[0_0_10px_color-mix(in_srgb,var(--primary)_55%,transparent)]";
                           lineClass = "bg-primary/75";
                           hoverClass = "hover:border-primary hover:bg-primary/15";
                         } else if (state === 'error') {
-                          cardClass = "min-h-[7.5rem] border-destructive/55 bg-destructive/10 text-destructive-foreground shadow-[0_0_16px_color-mix(in_srgb,var(--destructive)_14%,transparent)]";
+                          cardClass = "min-h-[9rem] h-auto border-destructive/55 bg-destructive/10 text-destructive-foreground shadow-[0_0_16px_color-mix(in_srgb,var(--destructive)_14%,transparent)]";
                           iconClass = "text-destructive";
                           dotClass = "bg-destructive border-background shadow-[0_0_10px_color-mix(in_srgb,var(--destructive)_45%,transparent)] animate-pulse";
                           lineClass = "bg-destructive/75";
                           hoverClass = "hover:border-destructive hover:bg-destructive/15";
                         } else if (state === 'awaiting_human') {
-                          cardClass = "min-h-[7.5rem] border-amber-500/55 bg-amber-500/10 text-amber-950 shadow-[0_0_16px_rgba(245,158,11,0.12)] dark:text-amber-50";
+                          cardClass = "min-h-[9rem] h-auto border-amber-500/55 bg-amber-500/10 text-amber-950 shadow-[0_0_16px_rgba(245,158,11,0.12)] dark:text-amber-50";
                           iconClass = "text-amber-600 dark:text-amber-400";
                           dotClass = "bg-amber-500 border-background shadow-[0_0_10px_rgba(245,158,11,0.45)] animate-pulse";
                           lineClass = "bg-amber-500/75";
@@ -2040,6 +2117,13 @@ export const OrderManagement: React.FC<{
                         }
 
                         const renderPopoverContent = () => {
+                          if (isSkipped) {
+                            return (
+                              <div className="max-w-xs p-2 text-xs text-muted-foreground">
+                                该节点未在会议室配置中开启，流程将自动跳过。
+                              </div>
+                            );
+                          }
                           // Calculate duration in minutes (mock based on nodeHash)
                           const durationMinutes = isHuman ? (nodeHash % 60) + 30 : (nodeHash % 15) + 2;
                           
@@ -2196,30 +2280,46 @@ export const OrderManagement: React.FC<{
                               }}
                             >
                               <motion.div
-                                whileHover={{ scale: 1.05, y: isTop ? -5 : 5 }}
+                                whileHover={
+                                  isSkipped ? undefined : { scale: 1.05, y: isTop ? -5 : 5 }
+                                }
                                 onClick={() => handleNodeClick(node)}
-                                className={`node-card absolute left-0 z-20 flex w-full cursor-pointer flex-col rounded-xl border p-4 backdrop-blur-sm transition-all duration-300 ${cardClass} ${hoverClass} ${isTop ? 'bottom-[calc(50%+40px)]' : 'top-[calc(50%+40px)]'}`}
+                                className={`node-card absolute left-0 z-20 flex w-full shrink-0 cursor-pointer flex-col rounded-xl border p-4 backdrop-blur-sm transition-all duration-300 ${cardClass} ${hoverClass} ${isTop ? 'bottom-[calc(50%+40px)]' : 'top-[calc(50%+40px)]'}`}
                               >
-                                <div className="mb-2 flex items-start justify-between">
+                                <div className="mb-2 flex items-start justify-between gap-2">
                                   <div className="rounded-lg bg-muted/40 p-1.5">
-                                    {state === 'completed' ? <CheckCircle2 className={`w-4 h-4 ${iconClass}`} /> :
-                                     state === 'processing' ? <Loader2 className={`w-4 h-4 ${iconClass} animate-spin`} /> :
-                                     state === 'error' ? <AlertCircle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
-                                     state === 'awaiting_human' ? <AlertTriangle className={`w-4 h-4 ${iconClass} animate-pulse`} /> :
-                                     <CircleDashed className={`w-4 h-4 ${iconClass}`} />}
-                                  </div>
-                                  <div className="rounded-full border border-border bg-muted/50 px-2 py-0.5 font-mono text-[10px]">
-                                    {isHuman ? (
-                                      <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400"><User className="h-3 w-3" /> 人工</span>
-                                    ) : node.type.includes('ai') ? (
-                                      <span className="flex items-center gap-1 text-primary"><Bot className="h-3 w-3" /> AI</span>
+                                    {isSkipped ? (
+                                      <SkipForward className={`h-4 w-4 ${iconClass}`} />
+                                    ) : state === 'completed' ? (
+                                      <CheckCircle2 className={`w-4 h-4 ${iconClass}`} />
+                                    ) : state === 'processing' ? (
+                                      <Loader2 className={`w-4 h-4 ${iconClass} animate-spin`} />
+                                    ) : state === 'error' ? (
+                                      <AlertCircle className={`w-4 h-4 ${iconClass} animate-pulse`} />
+                                    ) : state === 'awaiting_human' ? (
+                                      <AlertTriangle className={`w-4 h-4 ${iconClass} animate-pulse`} />
                                     ) : (
-                                      <span className="flex items-center gap-1 text-muted-foreground"><TerminalSquare className="h-3 w-3" /> 系统</span>
+                                      <CircleDashed className={`w-4 h-4 ${iconClass}`} />
                                     )}
                                   </div>
+                                  <div className="flex shrink-0 flex-col items-end gap-1">
+                                    {isSkipped ? (
+                                      <span className="rd-meeting-node-card__skip-badge">已跳过</span>
+                                    ) : null}
+                                    <div
+                                      className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-[10px] ${typeInfo.bg}`}
+                                    >
+                                      <Zap className={`h-3 w-3 ${typeInfo.color}`} />
+                                      <span className={`font-medium ${typeInfo.color}`}>{typeInfo.label}</span>
+                                    </div>
+                                  </div>
                                 </div>
-                                <h4 className="mb-1 text-sm font-medium">{node.name}</h4>
-                                <p className="line-clamp-2 flex-1 text-[10px] leading-relaxed opacity-80">{node.desc}</p>
+                                <h4
+                                  className={`mb-1 text-sm font-medium ${isSkipped ? 'text-slate-400' : ''}`}
+                                >
+                                  {node.name}
+                                </h4>
+                                <p className="line-clamp-3 min-h-[2.75rem] text-[11px] leading-relaxed opacity-80">{node.desc}</p>
                                 
                                 {state === 'completed' && (
                                   <div className="mt-2 flex w-full items-center justify-between gap-2 border-t border-border/60 pt-2 font-mono text-[10px] text-muted-foreground">
@@ -2259,14 +2359,32 @@ export const OrderManagement: React.FC<{
       {/* Node Details Drawer */}
       <Drawer
         title={
-          <div className="flex items-center gap-3 text-foreground">
-            {selectedNode?.type.includes('ai') ? (
-               <div className="rounded-lg bg-primary/15 p-1.5"><Bot className="h-5 w-5 text-primary" /></div>
-            ) : (
-               <div className="rounded-lg bg-amber-500/15 p-1.5"><User className="h-5 w-5 text-amber-600 dark:text-amber-400" /></div>
-            )}
-            <span className="text-base font-semibold">{selectedNode?.name}</span>
-          </div>
+          selectedNode ? (
+            <div className="flex items-center gap-3 text-foreground">
+              {getNodeStateGlobal(displayTicket, selectedNode.id) === 'skipped' ? (
+                <div className="rounded-lg bg-slate-500/15 p-1.5">
+                  <SkipForward className="h-5 w-5 text-slate-400" />
+                </div>
+              ) : (
+                <div
+                  className={`rounded-lg border p-1.5 ${getSopNodeTypeInfo(selectedNode.type).bg}`}
+                >
+                  <Zap className={`h-5 w-5 ${getSopNodeTypeInfo(selectedNode.type).color}`} />
+                </div>
+              )}
+              <div className="min-w-0">
+                <span className="text-base font-semibold">{selectedNode.name}</span>
+                <div
+                  className={`mt-0.5 inline-flex items-center gap-1 text-[11px] ${getSopNodeTypeInfo(selectedNode.type).color}`}
+                >
+                  {getSopNodeTypeInfo(selectedNode.type).label}
+                  {getNodeStateGlobal(displayTicket, selectedNode.id) === 'skipped' ? (
+                    <span className="rd-meeting-node-card__skip-badge ml-1">已跳过</span>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          ) : null
         }
         placement="right"
         onClose={() => setDrawerOpen(false)}

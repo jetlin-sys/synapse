@@ -17,6 +17,23 @@
   min-width: 0;
 }
 
+/* 左侧工单列表：禁止 flex 子项被压扁，保证卡片可读高度 */
+.rdOrdersRoot .rd-order-ticket-list {
+  min-height: 0;
+}
+.rdOrdersRoot .rd-order-ticket-card,
+.rdOrdersRoot .rd-order-ticket-group {
+  flex-shrink: 0;
+}
+.rdOrdersRoot .rd-order-ticket-card {
+  min-height: 5.75rem;
+}
+
+/* 流水线节点卡片：避免在 flex 容器内高度塌陷 */
+.rdOrdersRoot .node-card {
+  flex-shrink: 0;
+}
+
 /* 研发会议室：与工单管理同样全幅铺满，并跟随 data-theme */
 .content:has(.rdMeetingRoot) {
   padding: 0 !important;
