@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { GitBranch, ChevronRight, Plus, Trash2 } from 'lucide-react';
+import { GitBranch, ChevronRight, Loader2, Plus, Trash2 } from 'lucide-react';
 import {
   Product,
   Repository,
@@ -11,8 +11,10 @@ import {
   filterProdBranchOptionsForRow,
   isValidProductTag,
   isValidRepoBranchComposite,
+  findRepositoryMissingTokenIndex,
   patchRepositoryRepoBranchFromModuleDetail,
   prodBranchRowsToOptions,
+  repositoriesToValidateTokenItems,
   sanitizeProductTagInput,
 } from "./types";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -32,6 +34,7 @@ import {
   fetchRepoDetailByProdBranch,
   fetchZcmProductList,
   repoDetailFetchCacheKey,
+  validateRepoTokens,
   type RdModuleNameItem,
   type RdRepoDetailRow,
   type RdZcmProductItem,
@@ -167,6 +170,7 @@ export function ProductModal({
 }: ProductModalProps) {
   const { t } = useTranslation();
   const [isEdit, setIsEdit] = useState(false);
+  const [submitBusy, setSubmitBusy] = useState(false);
 
   const [formState, setFormState] = useState<{
     name: string;
@@ -564,6 +568,34 @@ export function ProductModal({
           toast.error(t("workbench.products.modal.repoBranchCompositeRequired"));
           return;
         }
+        const missingTokenIdx = findRepositoryMissingTokenIndex(formState.repositories);
+        if (missingTokenIdx >= 0) {
+          toast.error(t("workbench.products.modal.repoTokenRequired"));
+          return;
+        }
+        setSubmitBusy(true);
+        try {
+          const results = await validateRepoTokens(
+            synapseApiBase,
+            repositoriesToValidateTokenItems(formState.repositories),
+          );
+          const failIdx = results.findIndex((r) => !r.valid);
+          if (failIdx >= 0) {
+            toast.error(
+              t("workbench.products.modal.repoTokenInvalid", {
+                n: failIdx + 1,
+                detail: results[failIdx]?.error || "",
+              }),
+            );
+            return;
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          toast.error(t("workbench.products.modal.repoTokenValidateFailed", { message: msg }));
+          return;
+        } finally {
+          setSubmitBusy(false);
+        }
       }
     }
 
@@ -946,8 +978,10 @@ export function ProductModal({
                             <Input className="h-8 text-xs" value={repo.purpose} onChange={(e) => updateRepo(index, "purpose", e.target.value)} placeholder={t("workbench.products.modal.purposePlaceholder")} />
                           </div>
                           <div className="col-span-6 space-y-2">
-                            <Label className="text-xs">{t("workbench.products.modal.token")}</Label>
-                            <Input className="h-8 text-xs" type="password" value={repo.token || ""} onChange={(e) => updateRepo(index, "token", e.target.value)} placeholder={t("workbench.products.modal.tokenPlaceholder")} />
+                            <Label className="text-xs">
+                              {t("workbench.products.modal.token")} <span className="text-destructive">*</span>
+                            </Label>
+                            <Input className="h-8 text-xs" type="password" value={repo.token || ""} onChange={(e) => updateRepo(index, "token", e.target.value)} placeholder={t("workbench.products.modal.tokenPlaceholder")} disabled={submitBusy} />
                           </div>
                           <div className="col-span-12 flex items-center justify-between pt-2">
                             <div className="flex items-center gap-2">
@@ -978,8 +1012,15 @@ export function ProductModal({
         </div>
 
         <DialogFooter className="px-6 py-4 border-t border-border/60 bg-muted/10">
-          <Button variant="outline" onClick={onCancel}>{t("workbench.products.modal.cancel")}</Button>
-          <Button onClick={() => void handleSubmit()}>{isEdit ? t("workbench.products.modal.update") : t("workbench.products.modal.create")}</Button>
+          <Button variant="outline" onClick={onCancel} disabled={submitBusy}>{t("workbench.products.modal.cancel")}</Button>
+          <Button onClick={() => void handleSubmit()} disabled={submitBusy}>
+            {submitBusy ? <Loader2 className="size-4 animate-spin mr-2" /> : null}
+            {submitBusy
+              ? t("workbench.products.modal.repoTokenValidating")
+              : isEdit
+                ? t("workbench.products.modal.update")
+                : t("workbench.products.modal.create")}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
