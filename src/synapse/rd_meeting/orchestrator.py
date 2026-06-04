@@ -41,10 +41,11 @@ from synapse.rd_meeting.hitl_lifecycle import (
     MAX_HOST_QUESTIONNAIRE_ATTEMPTS,
     READY_FOR_NODE_REVIEW_KEY,
     bump_clarify_round,
-    is_ready_for_node_review,
     prompt_require_interactive_questionnaire,
     reset_human_confirm_lifecycle,
     set_ready_for_node_review,
+    should_enter_node_review_after_hitl_locked,
+    should_enter_node_review_gate,
 )
 from synapse.rd_meeting.hitl_submit import (
     clear_pending_questionnaire,
@@ -1181,6 +1182,22 @@ class MeetingRoomOrchestrator:
     ) -> dict[str, Any]:
         """校验已通过但主控未交 interactive 问卷：强制重跑主控直至其生成（无系统兜底表单）。"""
         sid = scope_id.strip()
+        rs_locked = load_room_state(sid) or {}
+        if should_enter_node_review_after_hitl_locked(sid, node_id, rs_locked):
+            return await self.enter_node_review_gate(
+                scope_type=scope_type,
+                scope_id=sid,
+                room_id=room_id,
+                node_id=node_id,
+                binding=binding,
+                report_body=report_body,
+                tokens_used=tokens_used,
+                duration_seconds=duration_seconds,
+                stage_id=stage_id,
+                ticket_title=ticket_title,
+                agent_pool=agent_pool,
+                skipped_nodes=skipped_nodes,
+            )
         round_n = bump_clarify_round(sid)
         if round_n > MAX_HOST_QUESTIONNAIRE_ATTEMPTS:
             append_history_event(
@@ -1893,7 +1910,7 @@ class MeetingRoomOrchestrator:
 
         need_human_confirm = bool(binding.get("human_confirm"))
         room_rs = load_room_state(sid) or {}
-        ready_for_review = is_ready_for_node_review(room_rs)
+        ready_for_review = should_enter_node_review_gate(sid, node_id, room_rs)
 
         if need_human_confirm and not ready_for_review:
             if tool_questionnaire and tool_questionnaire.get("schema"):

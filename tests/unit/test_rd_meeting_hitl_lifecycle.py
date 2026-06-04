@@ -11,6 +11,8 @@ from synapse.rd_meeting.hitl_lifecycle import (
     reset_human_confirm_lifecycle,
     resolve_ready_for_node_review_after_hitl,
     set_ready_for_node_review,
+    should_enter_node_review_after_hitl_locked,
+    should_enter_node_review_gate,
     user_has_supplement_input,
 )
 
@@ -94,6 +96,42 @@ def test_clear_ready_for_node_review(monkeypatch):
     store[scope] = {READY_FOR_NODE_REVIEW_KEY: True}
     clear_ready_for_node_review(scope)
     assert not is_ready_for_node_review(_load(scope))
+
+
+def test_should_enter_node_review_after_hitl_locked(monkeypatch, tmp_path):
+    scope = "locked_gate_scope"
+    node_id = "req_clarify"
+    monkeypatch.setattr("synapse.rd_meeting.paths.work_root", lambda: tmp_path / "work")
+    monkeypatch.setattr(
+        "synapse.rd_meeting.validation.validate_node_archive_files",
+        lambda sid, stage, nid: __import__(
+            "synapse.rd_meeting.validation", fromlist=["NodeOutputValidation"]
+        ).NodeOutputValidation(ok=False, errors=["missing"]),
+    )
+    rs = {
+        "hitl_locked": True,
+        "hitl_submission": {"kind": "interactive", "locked": True},
+        "intervention_kind": "interactive",
+    }
+    assert not should_enter_node_review_after_hitl_locked(scope, node_id, rs)
+    assert not should_enter_node_review_gate(scope, node_id, rs)
+
+    monkeypatch.setattr(
+        "synapse.rd_meeting.validation.validate_node_archive_files",
+        lambda sid, stage, nid: __import__(
+            "synapse.rd_meeting.validation", fromlist=["NodeOutputValidation"]
+        ).NodeOutputValidation(ok=True, errors=[]),
+    )
+    assert should_enter_node_review_after_hitl_locked(scope, node_id, rs)
+    assert should_enter_node_review_gate(scope, node_id, rs)
+
+    rs_exception = {**rs, "hitl_submission": {"kind": "exception"}}
+    assert not should_enter_node_review_after_hitl_locked(scope, node_id, rs_exception)
+
+    rs_flag_only = {"room_id": "r1"}
+    assert not should_enter_node_review_gate(scope, node_id, rs_flag_only)
+    rs_flag_only[READY_FOR_NODE_REVIEW_KEY] = True
+    assert should_enter_node_review_gate(scope, node_id, rs_flag_only)
 
 
 def test_record_delegation_started_clears_ready(monkeypatch):

@@ -34,6 +34,45 @@ def is_ready_for_node_review(room_state: dict[str, Any] | None) -> bool:
     return bool(room_state.get(READY_FOR_NODE_REVIEW_KEY))
 
 
+def should_enter_node_review_after_hitl_locked(
+    scope_id: str,
+    node_id: str,
+    room_state: dict[str, Any] | None,
+) -> bool:
+    """会中问卷已提交并锁定，且约定归档 Markdown 已落盘 → 应进入结果确认门控。
+
+    弥补 ``ready_for_node_review`` 仅在问卷提交瞬间置位、委派会清标等问题。
+    """
+    if not isinstance(room_state, dict):
+        return False
+    if not room_state.get("hitl_locked"):
+        return False
+    submission = room_state.get("hitl_submission")
+    kind = ""
+    if isinstance(submission, dict):
+        kind = str(submission.get("kind") or "").strip().lower()
+    if not kind:
+        kind = str(room_state.get("intervention_kind") or "").strip().lower()
+    if kind and kind not in ("interactive", ""):
+        return False
+    sid = (scope_id or "").strip()
+    nid = (node_id or "").strip()
+    if not sid or not nid or nid == "pending":
+        return False
+    return node_archive_ready_for_review(sid, nid)
+
+
+def should_enter_node_review_gate(
+    scope_id: str,
+    node_id: str,
+    room_state: dict[str, Any] | None,
+) -> bool:
+    """节点收尾是否应进入 NodeReview（``enter_node_review_gate``）。"""
+    if is_ready_for_node_review(room_state):
+        return True
+    return should_enter_node_review_after_hitl_locked(scope_id, node_id, room_state)
+
+
 def set_ready_for_node_review(scope_id: str, ready: bool) -> None:
     sid = (scope_id or "").strip()
     if not sid:

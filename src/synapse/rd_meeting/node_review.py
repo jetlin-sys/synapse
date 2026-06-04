@@ -909,7 +909,7 @@ def save_node_review(
     pending["review_payload"] = payload
     pending.setdefault("node_id", nid)
     pending.setdefault("report_body", payload.get("report_body") or "")
-    pending.setdefault("await_confirm", True)
+    pending["await_confirm"] = True
     pending.setdefault("tokens_used", int(payload.get("metrics", {}).get("node_token_total") or 0))
     pending.setdefault("duration_seconds", int(payload.get("metrics", {}).get("node_duration_seconds") or 0))
     pending.setdefault("stage_id", int(payload.get("stage_id") or 0))
