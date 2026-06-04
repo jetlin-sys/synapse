@@ -29,17 +29,21 @@ from fastapi.responses import JSONResponse
 import synapse._ensure_utf8  # noqa: F401  # Windows UTF-8 编码保护
 
 from .auth import WebAccessConfig, create_auth_middleware
+from .middleware_setup_gate import create_setup_gate_middleware
 from .routes import (
     agents,
     bug_report,
     chat,
     chat_models,
     config,
-    dev_iwhalecloud,
+    yuque,
+    work_order_metrics,
+    gitnexus,
     meeting_rooms,
+    dev_iwhalecloud,
+    diagnostics,
     feishu_onboard,
     files,
-    gitnexus,
     health,
     hub,
     identity,
@@ -47,18 +51,23 @@ from .routes import (
     logs,
     mcp,
     memory,
+    memory_repair,
     orgs,
+    pending_approvals,
     qqbot_onboard,
     scheduler,
     sessions,
+    skill_categories,
     skills,
     token_stats,
     upload,
     wechat_onboard,
     wecom_onboard,
-    work_order_metrics,
     workspace_io,
-    yuque,
+    workspaces,
+)
+from .routes import (
+    web_search as web_search_routes,
 )
 
 try:
@@ -77,8 +86,28 @@ logger = logging.getLogger(__name__)
 # HTTP 接口访问日志（create_app 中注册中间件：入站/出站各一条，仅 /api 前缀）
 access_logger = logging.getLogger("synapse.api.access")
 
-API_HOST = os.environ.get("API_HOST", "127.0.0.1")
+
+# Default port. The actual host is decided by
+# :func:`synapse.api.host_resolution.resolve_api_host` at startup and passed
+# into :func:`start_api_server` explicitly. Do not import a module-level
+# ``API_HOST`` constant — it was removed because it captured ``os.environ``
+# at import time, which is too early (``.env`` may not be loaded yet) and
+# made the resolution logic invisible to tests.
 API_PORT = int(os.environ.get("API_PORT", "18900"))
+
+
+def get_api_host_for_health_display(app_state: Any | None = None) -> str:
+    """Best-effort answer to "which host did we bind to?" for /api/health.
+
+    Prefers the value stored on FastAPI ``app.state.actual_bind_host`` (the
+    truth, set by :func:`start_api_server` after uvicorn binds), then falls
+    back to the ``API_HOST`` env var, finally to ``127.0.0.1``.
+    """
+    if app_state is not None:
+        actual = getattr(app_state, "actual_bind_host", None)
+        if isinstance(actual, str) and actual:
+            return actual
+    return os.environ.get("API_HOST", "").strip() or "127.0.0.1"
 
 
 def is_port_free(host: str, port: int) -> bool:
@@ -144,7 +173,7 @@ def _find_docs_dist() -> Path | None:
 
 
 def _deploy_docs(data_dir: Path, app_version: str) -> Path | None:
-    """Deploy bundled docs to data/docs/v{version}/ if not already present.
+    """Deploy bundled docs to data/docs/v{version}/ and refresh same-version assets.
 
     Historical versions are never deleted so users can switch between them.
     """
@@ -158,11 +187,16 @@ def _deploy_docs(data_dir: Path, app_version: str) -> Path | None:
     docs_root = data_dir / "docs"
     version_clean = app_version.split("+")[0]
     version_dir = docs_root / f"v{version_clean}"
+    tmp_dir = docs_root / f".v{version_clean}.tmp"
 
-    if not (version_dir / "index.html").exists():
-        version_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(bundled, version_dir, dirs_exist_ok=True)
-        logger.info(f"Deployed user docs v{version_clean} → {version_dir}")
+    docs_root.mkdir(parents=True, exist_ok=True)
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    shutil.copytree(bundled, tmp_dir)
+    if version_dir.exists():
+        shutil.rmtree(version_dir)
+    tmp_dir.replace(version_dir)
+    logger.info(f"Deployed user docs v{version_clean} → {version_dir}")
 
     versions_file = docs_root / "versions.json"
     try:
@@ -242,9 +276,6 @@ def create_app(
         {"name": "反馈", "description": "Bug 报告与功能建议"},
         {"name": "WebSocket", "description": "实时事件推送"},
         {"name": "系统", "description": "根路径、关机等系统操作"},
-        {"name": "语雀", "description": "语雀知识库文档管理"},
-        {"name": "KAG知识库", "description": "KAG 知识库管理"},
-        {"name": "研发云", "description": "研发云CICD"},
     ]
 
     app = FastAPI(
@@ -288,6 +319,14 @@ def create_app(
     auth_mw = create_auth_middleware(web_access_config)
     app.middleware("http")(auth_mw)
 
+    # Setup gate runs **before** the auth middleware on the inbound side
+    # (FastAPI middleware is LIFO: added later = executed earlier). It
+    # short-circuits non-loopback requests with HTTP 428 when the web-access
+    # password has not been configured yet, so the frontend can route the
+    # user to the SetupView before any 401 noise.
+    setup_gate_mw = create_setup_gate_middleware(web_access_config)
+    app.middleware("http")(setup_gate_mw)
+
     # CORS configuration (outermost middleware — added last)
     # NOTE: allow_origins=["*"] is incompatible with allow_credentials=True per
     # the browser spec.  When no explicit origins are configured we fall back to
@@ -311,53 +350,6 @@ def create_app(
         cors_kwargs["allow_origin_regex"] = r".*"
     app.add_middleware(CORSMiddleware, **cors_kwargs)
 
-    @app.middleware("http")
-    async def _api_access_log_middleware(request: Request, call_next):
-        """按 INFO 记录 /api 接口：入站一条、出站一条（含状态码与耗时）。"""
-        path = request.url.path
-        if not path.startswith("/api"):
-            return await call_next(request)
-        # 健康检查 / 聊天占用 / 会议室 live·节点详情轮询频繁，不打访问日志
-        if (
-            path == "/api/health"
-            or path.startswith("/api/health/")
-            or path == "/api/chat/busy"
-            or path == "/api/logs/service"
-            or (
-                path.startswith("/api/dev/meeting-rooms/")
-                and (
-                    path.endswith("/live")
-                    or path.endswith("/node-review")
-                    or path.endswith("/agent-contexts")
-                )
-            )
-            or (
-                path.startswith("/api/dev/work-orders/")
-                and path.endswith("/meeting-summary")
-            )
-        ):
-            return await call_next(request)
-        access_logger.info("收到请求 %s %s", request.method, path)
-        start = time.perf_counter()
-        try:
-            response = await call_next(request)
-        except Exception:
-            access_logger.info(
-                "请求处理异常 %s %s error %.1fms",
-                request.method,
-                path,
-                (time.perf_counter() - start) * 1000,
-            )
-            raise
-        access_logger.info(
-            "请求处理完成 %s %s %s %.1fms",
-            request.method,
-            path,
-            response.status_code,
-            (time.perf_counter() - start) * 1000,
-        )
-        return response
-
     # Store references in app state
     app.state.agent = agent
     app.state.shutdown_event = shutdown_event
@@ -365,12 +357,22 @@ def create_app(
     app.state.gateway = gateway
     app.state.orchestrator = orchestrator
     app.state.agent_pool = agent_pool
+    app.state.startup_phase = "http_ready" if gateway is None else "running"
+    app.state.readiness = {
+        "phase": app.state.startup_phase,
+        "http_ready": True,
+        "im_ready": gateway is not None,
+        "ready": gateway is not None,
+    }
 
     if agent is not None:
         pm = getattr(agent, "_plugin_manager", None)
         if pm is not None:
-            pm._host_refs["api_app"] = app
-            pending = pm._host_refs.pop("_pending_plugin_routers", [])
+            # Writes go to the shared backing dict; ``_host_refs`` is a filtered
+            # read-only view for plugins (no ``__setitem__`` / ``pop``).
+            ext = pm._external_host_refs
+            ext["api_app"] = app
+            pending = ext.pop("_pending_plugin_routers", [])
             for plugin_id, router in pending:
                 try:
                     app.include_router(router, prefix=f"/api/plugins/{plugin_id}")
@@ -380,14 +382,12 @@ def create_app(
                         "Failed to mount pending routes for plugin '%s': %s", plugin_id, e
                     )
 
-            pending_ui = pm._host_refs.pop("_pending_plugin_ui_mounts", [])
+            pending_ui = ext.pop("_pending_plugin_ui_mounts", [])
             for plugin_id, ui_dist_dir in pending_ui:
                 try:
                     pm._do_mount_plugin_ui(app, plugin_id, ui_dist_dir)
                 except Exception as e:
-                    logger.warning(
-                        "Failed to mount pending UI for plugin '%s': %s", plugin_id, e
-                    )
+                    logger.warning("Failed to mount pending UI for plugin '%s': %s", plugin_id, e)
 
     # Initialize OrgManager & OrgRuntime
     from synapse.orgs.manager import OrgManager
@@ -399,6 +399,11 @@ def create_app(
     app.state.org_manager = org_manager
     org_runtime = OrgRuntime(org_manager)
     app.state.org_runtime = org_runtime
+    from synapse.orgs.command_service import OrgCommandService, set_command_service
+
+    org_command_service = OrgCommandService(org_runtime, session_manager)
+    set_command_service(org_command_service)
+    app.state.org_command_service = org_command_service
 
     # Mount routes
     app.include_router(auth_routes.router, tags=["认证"])
@@ -407,6 +412,7 @@ def create_app(
     app.include_router(chat.router, tags=["对话"])
     app.include_router(chat_models.router, tags=["模型"])
     app.include_router(config.router, tags=["配置"])
+    app.include_router(diagnostics.router, tags=["诊断"])
     app.include_router(feishu_onboard.router, tags=["飞书扫码"])
     app.include_router(qqbot_onboard.router, tags=["QQ扫码"])
     app.include_router(wechat_onboard.router, tags=["微信扫码"])
@@ -417,24 +423,27 @@ def create_app(
     app.include_router(logs.router, tags=["日志"])
     app.include_router(mcp.router, tags=["MCP"])
     app.include_router(memory.router, tags=["记忆"])
+    app.include_router(memory_repair.router, tags=["记忆修复"])
     app.include_router(scheduler.router, tags=["定时任务"])
+    app.include_router(pending_approvals.router, tags=["待审批"])
     app.include_router(sessions.router, tags=["会话"])
     app.include_router(skills.router, tags=["技能"])
+    app.include_router(skill_categories.router, tags=["技能分类"])
     app.include_router(token_stats.router, tags=["统计"])
-    app.include_router(work_order_metrics.router, tags=["工单库指标"])
     app.include_router(upload.router, tags=["文件"])
+    app.include_router(web_search_routes.router)
     app.include_router(workspace_io.router, tags=["工作区"])
+    app.include_router(workspaces.router, tags=["工作区管理"])
     app.include_router(ws_routes.router, tags=["WebSocket"])
     app.include_router(hub.router, tags=["Hub"])
     app.include_router(identity.router, tags=["身份"])
-
     app.include_router(orgs.router, tags=["组织编排"])
     app.include_router(orgs.inbox_router, tags=["组织消息中心"])
     app.include_router(yuque.router, tags=["语雀"])
     app.include_router(gitnexus.router, tags=["GitNexus"])
     app.include_router(dev_iwhalecloud.router, tags=["研发云"])
     app.include_router(meeting_rooms.router, tags=["研发会议室"])
-
+    app.include_router(work_order_metrics.router, tags=["工单库指标"])
     if plugins_routes is not None:
         app.include_router(plugins_routes.router)
 
@@ -461,6 +470,14 @@ def create_app(
     _avatar_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/api/avatars", _StaticFiles(directory=str(_avatar_dir)), name="avatars")
 
+    # NOTE: prior to SDK 0.7.0 we mounted /api/plugins/_sdk/* here to serve
+    # bootstrap.js and the shared ui-kit out of the synapse_plugin_sdk
+    # wheel. The SDK no longer ships any frontend assets — every plugin UI
+    # is now expected to be self-contained under its own ui/dist/_assets/
+    # directory (see plugins/tongyi-image and plugins/seedance-video for
+    # working examples, or plugins-archive/_shared/web-uikit/README.md for
+    # how to revive an archived plugin's UI). Do not re-add this mount.
+
     # ── Serve versioned user docs ──
     from synapse import get_version_string as _get_ver
 
@@ -472,8 +489,13 @@ def create_app(
 
         @app.get("/user-docs", include_in_schema=False)
         @app.get("/user-docs/", include_in_schema=False)
-        async def _docs_redirect():
-            return _Redirect(f"/user-docs/v{_docs_ver}/")
+        async def _docs_redirect(request: Request):
+            target = f"/user-docs/v{_docs_ver}/"
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            response = _Redirect(target)
+            response.headers["Cache-Control"] = "no-store"
+            return response
 
         app.mount(
             "/user-docs",
@@ -484,6 +506,111 @@ def create_app(
 
     # ── Serve web frontend static files ──
     _mount_web_frontend(app)
+
+    @app.on_event("startup")
+    async def _import_pending_feedback():
+        """Import any feedback records staged by Tauri while the backend was down."""
+        try:
+            from synapse.config import settings
+            home = settings.synapse_home
+        except Exception:
+            home = Path.home() / ".synapse"
+        pending = home / "pending_feedback.json"
+        if not pending.exists():
+            return
+        try:
+            import json as _json
+            records = _json.loads(pending.read_text("utf-8"))
+            if not isinstance(records, list):
+                pending.unlink(missing_ok=True)
+                return
+            from .routes import feedback_store
+            imported = 0
+            for rec in records:
+                try:
+                    await feedback_store.save_record(
+                        report_id=rec.get("reportId") or rec.get("report_id", ""),
+                        feedback_token=rec.get("feedbackToken") or rec.get("feedback_token"),
+                        title=rec.get("title", ""),
+                        report_type=rec.get("reportType") or rec.get("report_type", "bug"),
+                        contact_email=rec.get("contactEmail") or rec.get("contact_email", ""),
+                        submitted_at=rec.get("submittedAt") or rec.get("submitted_at"),
+                    )
+                    imported += 1
+                except Exception as rec_err:
+                    logger.warning("Skip bad pending feedback record: %s", rec_err)
+            pending.unlink(missing_ok=True)
+            if imported:
+                logger.info(
+                    "Imported %d pending feedback record(s) from Tauri offline staging",
+                    imported,
+                )
+        except Exception as exc:
+            logger.warning("Failed to import pending feedback: %s", exc)
+            pending.unlink(missing_ok=True)
+
+    @app.on_event("startup")
+    async def _cleanup_memory_recovery_pending():
+        try:
+            from .routes.memory_repair import _cleanup_old_recovery_pending
+
+            await asyncio.to_thread(_cleanup_old_recovery_pending)
+        except Exception as e:
+            logger.debug("[Startup] Memory recovery pending cleanup skipped: %s", e)
+
+    @app.on_event("startup")
+    async def _wire_pending_approvals_sse():
+        """C9c-2: bridge PendingApprovalsStore events to WebSocket broadcast.
+
+        The Store is policy-loop-agnostic; we install a sync hook that does
+        ``asyncio.ensure_future(broadcast_event(...))`` on the API loop. The
+        broadcast helper itself is cross-loop safe (engine_bridge), so this
+        works regardless of which loop the Store mutation happens on.
+        """
+        try:
+            from synapse.api.routes.websocket import fire_event
+            from synapse.core.pending_approvals import get_pending_approvals_store
+
+            def _hook(event_type: str, payload: dict) -> None:
+                fire_event(event_type, payload)
+
+            get_pending_approvals_store().set_event_hook(_hook)
+            logger.info("[Startup] PendingApprovals SSE hook wired")
+        except Exception as e:
+            logger.warning("[Startup] PendingApprovals SSE wire failed: %s", e)
+
+        # C17 Phase B.4：把 UIConfirmBus 的 confirm_initiated /
+        # confirm_revoked 广播绑到同一条 fire_event 通道，让多端 UI 共享
+        # confirm 生命周期信号。
+        try:
+            from synapse.api.routes.websocket import fire_event
+            from synapse.core.ui_confirm_bus import get_ui_confirm_bus
+
+            def _confirm_hook(event_type: str, payload: dict) -> None:
+                fire_event(event_type, payload)
+
+            get_ui_confirm_bus().set_broadcast_hook(_confirm_hook)
+            logger.info("[Startup] UIConfirmBus broadcast hook wired")
+        except Exception as e:
+            logger.warning("[Startup] UIConfirmBus broadcast wire failed: %s", e)
+
+        # C18 Phase A：POLICIES.yaml hot-reload。默认 disabled；用户在
+        # POLICIES.yaml 的 ``hot_reload.enabled: true`` opt-in 即生效。
+        # 失败安全：``start_hot_reloader`` 内部全 try/except，未启动也不
+        # 影响 server 启动。
+        try:
+            from synapse.core.policy_v2.hot_reload import start_hot_reloader
+
+            reloader = start_hot_reloader()
+            if reloader is not None:
+                logger.info("[Startup] PolicyHotReloader started")
+            else:
+                logger.debug(
+                    "[Startup] PolicyHotReloader not started "
+                    "(disabled or no POLICIES.yaml)"
+                )
+        except Exception as e:
+            logger.warning("[Startup] PolicyHotReloader wire failed: %s", e)
 
     @app.post("/api/shutdown", tags=["系统"])
     async def shutdown(request: Request):
@@ -566,13 +693,6 @@ def create_app(
         except Exception as e:
             logger.debug(f"[Startup] Compiler health check skipped: {e}")
 
-        try:
-            from synapse.rd_meeting.room_stop import mark_active_rooms_stopped_on_server_restart
-
-            mark_active_rooms_stopped_on_server_restart()
-        except Exception as e:
-            logger.warning("[Startup] mark meeting rooms stopped after restart failed: %s", e)
-
     @app.on_event("shutdown")
     async def _shutdown_org_runtime():
         if hasattr(app.state, "org_runtime") and app.state.org_runtime:
@@ -582,6 +702,85 @@ def create_app(
                 await to_engine(app.state.org_runtime.shutdown())
             except Exception as e:
                 logger.warning(f"OrgRuntime shutdown error: {e}")
+
+    @app.on_event("shutdown")
+    async def _shutdown_policy_hot_reloader():
+        try:
+            from synapse.core.policy_v2.hot_reload import stop_hot_reloader
+
+            stop_hot_reloader(timeout=2.0)
+        except Exception as e:
+            logger.debug("[Shutdown] PolicyHotReloader stop skipped: %s", e)
+
+    @app.on_event("shutdown")
+    async def _shutdown_memory_storage():
+        try:
+            from synapse.memory.storage import checkpoint_and_close_all_storages
+
+            await asyncio.wait_for(
+                asyncio.to_thread(checkpoint_and_close_all_storages),
+                timeout=3.0,
+            )
+        except TimeoutError:
+            logger.warning("[Shutdown] Memory checkpoint timeout (3s), proceeding")
+        except Exception as e:
+            logger.warning("[Shutdown] Memory checkpoint skipped: %s", e)
+
+    @app.on_event("startup")
+    async def _start_async_audit_writer():
+        """C22 P3-2 follow-up: wire the async audit writer to the API loop.
+
+        Without this hook the writer is dead code — ``AuditLogger.log()``
+        always sees ``get_async_audit_writer(...)`` returning ``None`` and
+        falls back to the per-row filelock sync path. After this hook the
+        same code path coalesces writes into batches transparently.
+
+        Fail-safe: any exception here logs WARNING and leaves the system
+        on the sync path; nothing downstream relies on the async writer
+        being up.
+        """
+        try:
+            from synapse.core.audit_logger import DEFAULT_AUDIT_PATH
+            from synapse.core.policy_v2.audit_writer import (
+                start_global_audit_writer,
+            )
+
+            try:
+                from synapse.core.policy_v2.global_engine import get_config_v2
+
+                cfg = get_config_v2().audit
+                path = cfg.log_path if (cfg and cfg.enabled) else None
+            except Exception:
+                path = None
+            if not path:
+                path = DEFAULT_AUDIT_PATH
+
+            await start_global_audit_writer(path)
+            logger.info("[Startup] AsyncBatchAuditWriter started for %s", path)
+        except Exception as e:
+            logger.warning(
+                "[Startup] AsyncBatchAuditWriter not started; sync fallback "
+                "remains active: %s",
+                e,
+            )
+
+    @app.on_event("shutdown")
+    async def _shutdown_async_audit_writer():
+        """Drain + stop the async audit writer.
+
+        Bounded by ``stop()``'s internal timeout (split between sentinel
+        delivery and worker drain); anything still queued past that
+        deadline is logged + dropped rather than blocking shutdown.
+        """
+        try:
+            from synapse.core.policy_v2.audit_writer import (
+                stop_global_audit_writer,
+            )
+
+            await stop_global_audit_writer()
+            logger.info("[Shutdown] AsyncBatchAuditWriter stopped")
+        except Exception as e:
+            logger.warning("[Shutdown] AsyncBatchAuditWriter stop error: %s", e)
 
     return app
 
@@ -593,7 +792,7 @@ async def start_api_server(
     gateway: Any = None,
     orchestrator: Any = None,
     agent_pool: Any = None,
-    host: str = API_HOST,
+    host: str = "127.0.0.1",
     port: int = API_PORT,
     max_retries: int = 5,
 ) -> asyncio.Task:
@@ -637,6 +836,8 @@ async def start_api_server(
         agent_pool=agent_pool,
     )
     app.state.engine_loop = engine_loop
+    app.state.actual_bind_host = host
+    app.state.actual_bind_port = port
 
     config = uvicorn.Config(
         app=app,
@@ -733,9 +934,49 @@ async def start_api_server(
             await asyncio.to_thread(api_thread.join, 5.0)
 
     proxy_task = asyncio.create_task(_proxy())
+    # Keep a handle to the app so the serve process can update late-bound
+    # runtime references such as the IM gateway after HTTP is already online.
+    proxy_task._synapse_api_app = app
     return proxy_task
 
 
 def update_agent(app: FastAPI, agent: Any) -> None:
     """Update the agent reference in the running app (e.g. after initialization)."""
     app.state.agent = agent
+
+
+def update_runtime_refs(
+    api_task: asyncio.Task | None,
+    *,
+    agent: Any = None,
+    session_manager: Any = None,
+    gateway: Any = None,
+    orchestrator: Any = None,
+    agent_pool: Any = None,
+    startup_phase: str | None = None,
+    readiness: dict[str, Any] | None = None,
+) -> bool:
+    """Update runtime references on an API server started by start_api_server().
+
+    Some dependencies, especially IM channels, may intentionally start after
+    the HTTP API so desktop clients can connect early. This keeps routes that
+    read ``request.app.state`` in sync once those late dependencies are ready.
+    """
+    app = getattr(api_task, "_synapse_api_app", None) if api_task is not None else None
+    if app is None:
+        return False
+    if agent is not None:
+        app.state.agent = agent
+    if session_manager is not None:
+        app.state.session_manager = session_manager
+    if gateway is not None:
+        app.state.gateway = gateway
+    if orchestrator is not None:
+        app.state.orchestrator = orchestrator
+    if agent_pool is not None:
+        app.state.agent_pool = agent_pool
+    if startup_phase is not None:
+        app.state.startup_phase = startup_phase
+    if readiness is not None:
+        app.state.readiness = readiness
+    return True

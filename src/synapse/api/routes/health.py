@@ -8,8 +8,12 @@ POST /api/health/check 使用 dry_run=True 模式执行只读检测，
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
+from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Request
 
@@ -18,6 +22,80 @@ from ..schemas import HealthCheckRequest, HealthResult
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_memory_repair_restart_required = False
+
+
+def mark_memory_repair_completed_restart_required() -> None:
+    """Flag the memory subsystem as 'repaired, needs restart'.
+
+    Also clears the matching entry in the cross-subsystem
+    :class:`synapse.storage.degraded.DegradedRegistry` so the unified
+    ``DegradedBanner`` stops surfacing memory as degraded (it would
+    otherwise stay yellow until the user restarts the backend, even
+    though they already took the corrective action via the
+    memory_repair flow).
+    """
+    global _memory_repair_restart_required
+    _memory_repair_restart_required = True
+    try:
+        from synapse.storage.degraded import registry as _registry
+
+        _registry.unregister("memory")
+    except Exception:
+        # Best-effort: never let registry bookkeeping break the repair flow.
+        pass
+
+
+def clear_memory_repair_restart_required() -> None:
+    global _memory_repair_restart_required
+    _memory_repair_restart_required = False
+
+
+def _memory_subsystem_status(request: Request) -> dict:
+    try:
+        agent = getattr(request.app.state, "agent", None)
+        mm = getattr(agent, "memory_manager", None) if agent is not None else None
+        if _memory_repair_restart_required or getattr(mm, "repair_completed_restart_required", False):
+            return {
+                "status": "repair_completed_restart_required",
+                "reason": None,
+                "details": "Memory database repair completed; restart backend to reopen storage.",
+                "repair_available": False,
+            }
+        if mm is not None and getattr(mm, "degraded", False):
+            return {
+                "status": "degraded",
+                "reason": getattr(mm, "degraded_reason", "unknown"),
+                "details": getattr(mm, "degraded_details", None),
+                "repair_available": True,
+            }
+        if mm is not None:
+            return {"status": "healthy", "reason": None, "details": None, "repair_available": False}
+    except Exception as e:
+        logger.debug("[Health] memory_subsystem status skipped: %s", e)
+    return {"status": "unknown", "reason": None, "details": None, "repair_available": False}
+
+
+def _read_last_shutdown_marker() -> dict:
+    try:
+        from synapse.config import settings
+
+        marker = Path(settings.project_root) / "data" / "memory" / ".last_clean_shutdown"
+        if not marker.exists():
+            return {"status": "unclean", "reason": "marker_missing"}
+        data = json.loads(marker.read_text("utf-8"))
+        current_spawn_raw = os.environ.get("SYNAPSE_SPAWN_STARTED_AT_MS")
+        marker_ts = int(data.get("ts", 0) or 0)
+        if not current_spawn_raw:
+            return {"status": "clean", **data}
+        current_spawn = int(current_spawn_raw)
+        if marker_ts and marker_ts <= current_spawn:
+            return {"status": "clean", **data}
+        return {"status": "unclean", "reason": "marker_written_after_current_spawn", **data}
+    except Exception as e:
+        logger.debug("[Health] last shutdown marker unreadable: %s", e)
+        return {"status": "unknown"}
 
 
 _lan_ip_cache: tuple[str, float] | None = None
@@ -53,6 +131,26 @@ def _safe_int(val: str, default: int) -> int:
         return int(val)
     except (ValueError, TypeError):
         return default
+
+
+def _resolve_api_host_display(request: Request) -> str:
+    """Return the host the server is actually bound to (best effort).
+
+    Prefers ``app.state.actual_bind_host`` (set by ``start_api_server``) so
+    that headless-detect / api_lan_mode users see the truth instead of the
+    env-var default.
+    """
+    actual = getattr(request.app.state, "actual_bind_host", None)
+    if isinstance(actual, str) and actual:
+        return actual
+    return os.environ.get("API_HOST", "").strip() or "127.0.0.1"
+
+
+def _resolve_api_port_display(request: Request) -> int:
+    actual = getattr(request.app.state, "actual_bind_port", None)
+    if isinstance(actual, int):
+        return actual
+    return _safe_int(os.environ.get("API_PORT", "18900"), 18900)
 
 
 _VIRTUAL_PREFIXES = (
@@ -127,11 +225,35 @@ def _get_all_lan_ips() -> list[str]:
 
 @router.get("/api/health")
 async def health(request: Request):
-    """Basic health check - returns 200 if server is running."""
+    """Basic health check - returns 200 if the HTTP API is reachable.
+
+    注意：HTTP API 可访问不等于整个后端业务已完成启动。IM 通道、晚绑定
+    gateway、后台任务可能在 HTTP 之后继续初始化。因此这里同时返回
+    ``readiness``，前端应使用 ``readiness.ready`` / ``readiness.phase`` 展示
+    "启动中 / 部分就绪 / 运行中"，而不是只看 HTTP 200。
+    """
     import os
 
     from synapse import __git_hash__, get_version_string
     from synapse import __version__ as backend_version
+
+    readiness = getattr(request.app.state, "readiness", None)
+    if not isinstance(readiness, dict):
+        gateway = getattr(request.app.state, "gateway", None)
+        readiness = {
+            "phase": getattr(request.app.state, "startup_phase", "http_ready"),
+            "http_ready": True,
+            "im_ready": gateway is not None,
+            "ready": bool(gateway is not None),
+        }
+
+    # Pull degraded subsystems from the module-level DegradedRegistry. We
+    # use the registry instead of ``app.state`` because token_tracking
+    # (daemon thread) and asset_bus (early lifespan init) register
+    # themselves before ``app.state.*`` is reliably populated. The
+    # registry snapshot is a defensive copy, so callers can mutate it
+    # freely without leaking back into the shared map.
+    from synapse.storage.degraded import registry as _degraded_registry
 
     return {
         "status": "ok",
@@ -145,9 +267,342 @@ async def health(request: Request):
         and request.app.state.agent is not None,
         "local_ip": _get_lan_ip(),
         "all_ips": _get_all_lan_ips(),
-        "api_host": os.environ.get("API_HOST", "127.0.0.1"),
-        "api_port": _safe_int(os.environ.get("API_PORT", "18900"), 18900),
+        "api_host": _resolve_api_host_display(request),
+        "api_port": _resolve_api_port_display(request),
+        "last_link_diagnostic": getattr(request.app.state, "last_link_diagnostic", None),
+        "startup_phase": readiness.get("phase", "http_ready"),
+        "readiness": readiness,
+        "memory_subsystem": _memory_subsystem_status(request),
+        "degraded_subsystems": _degraded_registry.snapshot(),
+        "last_shutdown": _read_last_shutdown_marker(),
     }
+
+
+# ---------------------------------------------------------------------------
+# C17 Phase C — Kubernetes-style /healthz + /readyz probes
+# ---------------------------------------------------------------------------
+#
+# Why a second probe family?
+#
+# Existing ``/api/health`` always returns 200 as long as the FastAPI process
+# is alive. That's useful for "is Synapse on at all?" but it tells external
+# monitors nothing about whether the agent can actually serve traffic right
+# now — Policy V2 layer might be in fallback after a malformed YAML, the
+# audit chain might be tampered, the scheduler might be deadlocked. Under
+# those conditions a load balancer / IM gateway / desktop reconnect logic
+# happily routes traffic to a degraded instance.
+#
+# ``/api/healthz`` (liveness): fixed 200 + tiny payload. Designed to be
+# polled at ≤1Hz by orchestrators. Process up → 200. Use this to decide
+# "should I restart the process?".
+#
+# ``/api/readyz`` (readiness): 200 when every internal subsystem is healthy,
+# 503 otherwise with a ``failing[]`` list. Cached for 5 seconds so a hot
+# polling client (e.g. desktop reconnect loop) can't synthesise load on
+# the chain-verify path. Detail level depends on caller:
+#   - localhost / trusted → full ``failing[].details``
+#   - remote untrusted    → only ``failing[].name`` (no path leaks)
+#
+# Borrowed shape from k8s ``readinessProbe`` + claude-code
+# ``ProcessHealth.probe()``. Implementation uses ``asyncio.shield`` so a
+# slow individual check can't block the loop indefinitely.
+
+
+_READYZ_CACHE_TTL_SECONDS = 5.0
+_readyz_cache: dict[str, Any] = {"ts": 0.0, "payload": None, "ready": False}
+_readyz_cache_lock = asyncio.Lock()
+
+
+def _is_localhost(request: Request) -> bool:
+    try:
+        from .auth import get_client_ip
+
+        trust_proxy = os.environ.get("TRUST_PROXY", "").lower() in ("1", "true", "yes")
+        ip = get_client_ip(request, trust_proxy=trust_proxy)
+    except Exception:
+        ip = getattr(request.client, "host", "") if request.client else ""
+    return ip in {"127.0.0.1", "::1", "localhost"} or (
+        isinstance(ip, str) and ip.startswith("::ffff:127.")
+    )
+
+
+async def _check_policy_engine() -> dict[str, Any] | None:
+    """Verify Policy V2 engine loaded and not in degraded fallback mode."""
+    try:
+        from synapse.core.policy_v2.global_engine import get_engine_v2
+
+        engine = get_engine_v2()
+        if engine is None:
+            return {"name": "policy_v2", "details": "engine not initialized"}
+        # Engine in LKG-fallback mode is still "ready" but warned, not 503.
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "policy_v2", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+async def _check_audit_chain() -> dict[str, Any] | None:
+    """Verify the security audit chain head is not corrupt.
+
+    We *do not* verify the entire chain on every probe (full ``verify_chain``
+    walks the entire JSONL — too slow at scale). Instead we read the tail
+    and require the bottom-most non-blank line to be parseable JSON. Full
+    verification runs only on explicit
+    ``/api/config/security/audit?verify=full``.
+
+    The path resolves through :func:`get_audit_logger` so probe + writer
+    + verifier share the same source of truth. (C17 二轮 audit 修复)
+
+    Earlier C17 hardcoded ``data/policy/audit.jsonl`` which never matched
+    the actual ``AuditConfig.log_path`` default (``data/audit/
+    policy_decisions.jsonl``) — the probe was reading a never-written file
+    and silently degrading to "OK". A vanilla install would report
+    ``audit_chain`` healthy even after the real chain file was deleted or
+    corrupted. We now use the same path the writer uses.
+
+    A second silent-OK trap is "file exists with non-zero size but the tail
+    window is all blank lines / whitespace"; this happens if the file was
+    truncated by an external editor or a half-written write. We now flag
+    those cases instead of returning None.
+    """
+    try:
+        from synapse.core.audit_logger import get_audit_logger
+
+        logger_inst = get_audit_logger()
+        if not getattr(logger_inst, "_enabled", True):
+            # Operator turned audit off on purpose — that's not a 503 case.
+            return None
+        path = Path(getattr(logger_inst, "_path", "") or "")
+        if not path or str(path) == ".":
+            return {"name": "audit_chain", "details": "audit_logger path unresolved"}
+        if not path.exists():
+            return None  # Fresh install — no audit yet, that's fine.
+
+        size = path.stat().st_size
+        if size == 0:
+            return None  # File created but no entries yet.
+
+        # Tail check: read last 8KB and try the bottom-most parseable line.
+        tail_window = min(size, 8192)
+        with path.open("rb") as f:
+            f.seek(size - tail_window)
+            tail = f.read().decode("utf-8", errors="replace").splitlines()
+        saw_content = False
+        for line in reversed(tail):
+            line = line.strip()
+            if not line:
+                continue
+            saw_content = True
+            json.loads(line)  # raises on corrupt tail
+            return None
+        if saw_content:
+            # tail had bytes but none survived strip — usually wiped file.
+            return {"name": "audit_chain", "details": "tail contains only blank lines"}
+        # No content in the tail window for a non-empty file.
+        return {"name": "audit_chain", "details": "tail window empty despite non-zero size"}
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "audit_chain", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _check_scheduler(request: Request) -> dict[str, Any] | None:
+    """Scheduler ready iff the singleton exists and ``_running`` is True."""
+    try:
+        scheduler = getattr(request.app.state, "scheduler", None)
+        if scheduler is None:
+            # Not all deployments enable scheduler — skip rather than fail.
+            return None
+        if not getattr(scheduler, "_running", False):
+            return {"name": "scheduler", "details": "scheduler not running"}
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "scheduler", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+async def _check_event_loop_lag() -> dict[str, Any] | None:
+    """Probe event loop responsiveness; >500ms → degraded."""
+    try:
+        loop = asyncio.get_running_loop()
+        ev = asyncio.Event()
+        t0 = time.monotonic()
+        loop.call_soon(ev.set)
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=2.0)
+        except TimeoutError:
+            return {"name": "event_loop", "details": "wait timed out"}
+        lag_ms = (time.monotonic() - t0) * 1000
+        if lag_ms > 500:
+            return {"name": "event_loop", "details": f"lag {lag_ms:.0f}ms"}
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "event_loop", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _check_gateway(request: Request) -> dict[str, Any] | None:
+    """Gateway is optional but, when configured, must be alive."""
+    try:
+        gateway = getattr(request.app.state, "gateway", None)
+        if gateway is None:
+            # No IM gateway configured (e.g. headless server). Not 503.
+            return None
+        if not getattr(gateway, "running", True):
+            return {"name": "gateway", "details": "gateway stopped"}
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "gateway", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+async def _compute_readiness(request: Request) -> dict[str, Any]:
+    """Run every readiness check; return ``{ready, failing, ts}``.
+
+    Each check returns ``None`` (ok) or ``{name, details}`` (failing).
+
+    NOTE: ``_check_event_loop_lag`` is intentionally *not* in the gather.
+    Lag measurement makes sense only when the loop is otherwise idle —
+    bundling it with the I/O checks (audit tail-read, policy engine
+    introspection) would let those checks' own scheduling cost show up
+    as "lag", producing false alarms under normal load. We run it after
+    everything else and treat its result as best-effort. (C17 二轮)
+    """
+    failing: list[dict[str, Any]] = []
+    results = await asyncio.gather(
+        _check_policy_engine(),
+        _check_audit_chain(),
+        return_exceptions=True,
+    )
+    for r in results:
+        if isinstance(r, dict):
+            failing.append(r)
+        elif isinstance(r, BaseException):
+            failing.append({"name": "internal", "details": f"check raised: {r}"})
+    # Sync checks (these are O(1) attribute reads).
+    for sync_check in (_check_scheduler(request), _check_gateway(request)):
+        if sync_check is not None:
+            failing.append(sync_check)
+    # Event-loop lag runs last and standalone for a clean measurement.
+    lag_result = await _check_event_loop_lag()
+    if lag_result is not None:
+        failing.append(lag_result)
+    return {
+        "ready": not failing,
+        "failing": failing,
+        "ts": time.time(),
+    }
+
+
+@router.get("/api/healthz")
+async def healthz():
+    """Liveness probe: fixed 200 + minimal payload.
+
+    Use this in orchestrator restart policies. Never returns 503 — if the
+    HTTP server can answer this, the process is alive.
+    """
+    return {"status": "ok", "ts": time.time(), "pid": os.getpid()}
+
+
+@router.get("/api/readyz")
+async def readyz(request: Request):
+    """Readiness probe: 200 when every subsystem is healthy, 503 otherwise.
+
+    Cached for 5s to keep cost bounded under hot polling. Detail level
+    depends on caller IP — only localhost gets the full ``details`` field
+    so remote callers can't fingerprint internal file paths.
+    """
+    from fastapi.responses import JSONResponse
+
+    now = time.time()
+    async with _readyz_cache_lock:
+        if (
+            _readyz_cache["payload"] is not None
+            and (now - _readyz_cache["ts"]) < _READYZ_CACHE_TTL_SECONDS
+        ):
+            payload = _readyz_cache["payload"]
+            ready = _readyz_cache["ready"]
+        else:
+            computed = await _compute_readiness(request)
+            payload = computed
+            ready = computed["ready"]
+            _readyz_cache["ts"] = computed["ts"]
+            _readyz_cache["payload"] = computed
+            _readyz_cache["ready"] = ready
+
+    # Sanitize for remote callers — drop the ``details`` strings.
+    if not _is_localhost(request):
+        sanitized = {
+            "ready": payload["ready"],
+            "failing": [{"name": f["name"]} for f in payload.get("failing", [])],
+            "ts": payload["ts"],
+        }
+        body = sanitized
+    else:
+        body = payload
+
+    return JSONResponse(content=body, status_code=200 if ready else 503)
+
+
+@router.get("/api/logs/health-summary")
+async def logs_health_summary():
+    """Aggregate repeated background warnings into a UI-friendly summary."""
+    from synapse.core.log_health import get_log_health_registry
+
+    return get_log_health_registry().summary()
+
+
+@router.get("/api/diagnostics/last-link")
+async def last_link_diagnostic(request: Request):
+    """Return the last web_fetch / browser link diagnostic for the Status panel."""
+    return getattr(request.app.state, "last_link_diagnostic", None) or {}
+
+
+@router.post("/api/diagnostics/clear-session-caches")
+async def clear_session_caches_endpoint(request: Request, conversation_id: str | None = None):
+    """User-triggered, non-destructive cache clear for the active session.
+
+    Clears: WebFetch URL cache, ReasoningEngine read-only tool cache, browser
+    navigation memory, last link diagnostic, per-conversation compression
+    summaries.
+    """
+    from synapse.core.session_caches import clear_session_caches
+
+    actual_agent = None
+    try:
+        from .chat import _get_existing_agent, _resolve_agent
+
+        agent = _get_existing_agent(request, conversation_id or "") or getattr(
+            request.app.state, "agent", None
+        )
+        actual_agent = _resolve_agent(agent) if agent else None
+    except Exception:
+        pass
+
+    cleared = clear_session_caches(actual_agent)
+    return {"ok": True, "cleared": cleared}
+
+
+@router.get("/api/diagnostics/domain-rules")
+async def domain_rules(conversation_id: str = ""):
+    """Return blocked / approved hosts for a conversation."""
+    from synapse.core.domain_allowlist import get_domain_allowlist
+
+    return {"conversation_id": conversation_id, **get_domain_allowlist().list_for(conversation_id)}
+
+
+@router.post("/api/diagnostics/domain-block")
+async def domain_block(conversation_id: str, host: str):
+    from synapse.core.domain_allowlist import get_domain_allowlist
+
+    if not conversation_id or not host:
+        return {"ok": False, "error": "conversation_id and host are required"}
+    added = get_domain_allowlist().block(conversation_id, host)
+    return {"ok": True, "changed": added, **get_domain_allowlist().list_for(conversation_id)}
+
+
+@router.post("/api/diagnostics/domain-unblock")
+async def domain_unblock(conversation_id: str, host: str):
+    from synapse.core.domain_allowlist import get_domain_allowlist
+
+    if not conversation_id or not host:
+        return {"ok": False, "error": "conversation_id and host are required"}
+    removed = get_domain_allowlist().unblock(conversation_id, host)
+    return {"ok": True, "changed": removed, **get_domain_allowlist().list_for(conversation_id)}
 
 
 def _get_llm_client(agent: object):
@@ -161,6 +616,36 @@ def _get_llm_client(agent: object):
     if brain is None:
         return None
     return getattr(brain, "_llm_client", None)
+
+
+def _probe_command_version(command: str, *args: str) -> dict[str, str | bool]:
+    import subprocess
+    import sys
+
+    from synapse.runtime_manager import resolve_toolchain_command
+
+    path = resolve_toolchain_command(command)
+    if not path:
+        return {"available": False, "path": "", "version": "unavailable"}
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 5,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run([path, *(args or ("--version",))], **kwargs)
+    except Exception as exc:
+        return {"available": False, "path": path, "version": f"probe failed: {exc}"}
+    output = (proc.stdout or proc.stderr or "").strip().splitlines()
+    return {
+        "available": proc.returncode == 0,
+        "path": path,
+        "version": output[-1] if output else f"exit {proc.returncode}",
+    }
 
 
 async def _check_endpoint_readonly(name: str, provider) -> HealthResult:
@@ -207,7 +692,7 @@ async def _check_with_timeout(name: str, provider, timeout: float = 30) -> Healt
             _check_endpoint_readonly(name, provider),
             timeout=timeout,
         )
-    except (asyncio.TimeoutError, TimeoutError):
+    except TimeoutError:
         return HealthResult(
             name=name,
             status="unhealthy",
@@ -261,8 +746,13 @@ async def diagnostics():
     import os
     import platform
     import sys
+    from pathlib import Path
 
     from synapse import __version__ as backend_version
+    from synapse.runtime_manager import (
+        get_runtime_environment_report,
+        get_workspace_dependency_cache_root,
+    )
 
     checks: list[dict] = []
 
@@ -340,6 +830,28 @@ async def diagnostics():
     failing = [c for c in checks if c["status"] not in ("pass", "warn")]
     summary = "broken" if failing else "healthy"
 
+    runtime_report = get_runtime_environment_report()
+    node_toolchain = {
+        "managed_node": runtime_report.get("toolchain_node"),
+        "managed_bin": runtime_report.get("toolchain_node_bin"),
+        "node": _probe_command_version("node"),
+        "npm": _probe_command_version("npm"),
+        "corepack": _probe_command_version("corepack"),
+        "pnpm": _probe_command_version("pnpm"),
+        "yarn": _probe_command_version("yarn"),
+        "npm_prefix": str(get_workspace_dependency_cache_root() / "npm-prefix"),
+        "npm_cache": str(get_workspace_dependency_cache_root() / "npm-cache"),
+        "corepack_home": str(get_workspace_dependency_cache_root() / "corepack"),
+        "workspace_cache": str(get_workspace_dependency_cache_root()),
+    }
+    package_paths: dict[str, str] = {}
+    for mod_name in ("synapse", "pydantic", "pydantic_core", "certifi"):
+        try:
+            mod = __import__(mod_name)
+            package_paths[mod_name] = str(Path(getattr(mod, "__file__", "") or "").resolve())
+        except Exception as exc:
+            package_paths[mod_name] = f"unavailable: {type(exc).__name__}: {exc}"
+
     return {
         "summary": summary,
         "checks": checks,
@@ -349,19 +861,33 @@ async def diagnostics():
             "runtimeType": runtime_type,
             "synapseVersion": backend_version,
             "pid": os.getpid(),
+            "runtime": runtime_report,
+            "toolchain": {
+                "python": {
+                    "app": runtime_report.get("app_python"),
+                    "agent": runtime_report.get("agent_python"),
+                    "managed": runtime_report.get("toolchain_python"),
+                    "seedPackaged": runtime_report.get("bootstrap_python_seed_packaged"),
+                    "abi": runtime_report.get("python_abi"),
+                    "wheelTag": runtime_report.get("wheel_tag"),
+                },
+                "node": {
+                    **node_toolchain,
+                    "seedPackaged": runtime_report.get("bootstrap_node_seed_packaged"),
+                },
+            },
+            "sysPrefix": sys.prefix,
+            "sysBasePrefix": sys.base_prefix,
+            "sysPathSummary": sys.path[:20],
+            "packagePaths": package_paths,
+            "envTrustSource": os.environ.get("SYNAPSE_ENV_TRUST_SOURCE", ""),
+            "subprocessSecretScrub": os.environ.get("SYNAPSE_SUBPROCESS_SECRET_SCRUB") == "1",
         },
     }
 
 
-@router.post("/api/health/check")
-async def health_check(request: Request, body: HealthCheckRequest):
-    """
-    Check health of a specific LLM endpoint or all endpoints.
-
-    Uses dry_run mode: sends a real test request but does NOT modify
-    the provider's healthy/cooldown state, ensuring no interference
-    with ongoing Agent LLM calls.
-    """
+async def _do_health_check(request: Request, body: HealthCheckRequest):
+    """共享 GET / POST 的实际探测逻辑。"""
     agent = getattr(request.app.state, "agent", None)
     if agent is None:
         return {"error": "Agent not initialized"}
@@ -373,18 +899,45 @@ async def health_check(request: Request, body: HealthCheckRequest):
     results: list[HealthResult] = []
 
     if body.endpoint_name:
-        # Check specific endpoint (with timeout)
         provider = llm_client._providers.get(body.endpoint_name)
         if not provider:
             return {"error": f"Endpoint not found: {body.endpoint_name}"}
         result = await _check_with_timeout(body.endpoint_name, provider)
         results.append(result)
     else:
-        # Check all endpoints concurrently with per-endpoint timeout
         tasks = [_check_with_timeout(name, p) for name, p in llm_client._providers.items()]
         results = list(await asyncio.gather(*tasks))
 
     return {"results": [r.model_dump() for r in results]}
+
+
+@router.post("/api/health/check")
+async def health_check_post(request: Request, body: HealthCheckRequest):
+    """
+    Check health of a specific LLM endpoint or all endpoints (POST).
+
+    Uses dry_run mode: sends a real test request but does NOT modify
+    the provider's healthy/cooldown state, ensuring no interference
+    with ongoing Agent LLM calls.
+    """
+    return await _do_health_check(request, body)
+
+
+# PR-S1: 新增 GET 版本，便于浏览器 / curl / 监控脚本一键探测，
+# 不必每次都构造 POST 请求体。endpoint_name 通过 query string 传入；
+# 不带参数则探测全部端点。
+@router.get("/api/health/check")
+async def health_check_get(request: Request, endpoint_name: str = ""):
+    """
+    Check health of a specific LLM endpoint or all endpoints (GET).
+
+    GET /api/health/check                 → 探测全部端点
+    GET /api/health/check?endpoint_name=x → 探测指定端点
+
+    与 POST /api/health/check 行为一致；前端 / 监控集成可任选其一。
+    """
+    body = HealthCheckRequest(endpoint_name=endpoint_name or None)
+    return await _do_health_check(request, body)
 
 
 @router.get("/api/health/loop")

@@ -5,6 +5,14 @@ CLI-Anything 处理器
 - cli_anything_discover: 扫描 PATH 中已安装的 cli-anything-* 工具
 - cli_anything_run: 执行 cli-anything-<app> 子命令
 - cli_anything_help: 获取工具/子命令的帮助文档
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import asyncio
@@ -14,12 +22,15 @@ import os
 import shutil
 from typing import TYPE_CHECKING, Any
 
+from ...config import settings
+from ...core.policy_v2 import ApprovalClass
+
 if TYPE_CHECKING:
     from ...core.agent import Agent
 
 logger = logging.getLogger(__name__)
 
-_CMD_TIMEOUT = 60  # seconds
+_CMD_TIMEOUT = 300  # fallback seconds; runtime value comes from settings
 _CLI_PREFIX = "cli-anything-"
 
 
@@ -27,6 +38,11 @@ class CLIAnythingHandler:
     """CLI-Anything 处理器 — 通过 CLI 控制桌面软件。"""
 
     TOOLS = ["cli_anything_discover", "cli_anything_run", "cli_anything_help"]
+    TOOL_CLASSES = {
+        "cli_anything_discover": ApprovalClass.READONLY_GLOBAL,
+        "cli_anything_run": ApprovalClass.EXEC_CAPABLE,
+        "cli_anything_help": ApprovalClass.READONLY_GLOBAL,
+    }
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
@@ -44,24 +60,30 @@ class CLIAnythingHandler:
     async def _run_cmd(
         self,
         cmd: list[str],
-        timeout: float = _CMD_TIMEOUT,
+        timeout: float | None = None,
     ) -> tuple[int, str, str]:
+        if timeout is None:
+            timeout = float(getattr(settings, "cli_command_timeout_seconds", _CMD_TIMEOUT) or 0)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout,
-            )
+            communicate = proc.communicate()
+            if timeout > 0:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    communicate,
+                    timeout=timeout,
+                )
+            else:
+                stdout_bytes, stderr_bytes = await communicate
             return (
                 proc.returncode or 0,
                 stdout_bytes.decode("utf-8", errors="replace"),
                 stderr_bytes.decode("utf-8", errors="replace"),
             )
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             try:
                 proc.kill()  # type: ignore[possibly-undefined]
             except Exception:

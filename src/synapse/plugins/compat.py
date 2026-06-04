@@ -1,4 +1,23 @@
-"""Plugin version compatibility checking."""
+"""Plugin version compatibility checking.
+
+Validates plugin manifest ``requires`` against the running system:
+
+- ``requires.synapse``  — minimum system version  (``>=1.27.0``)
+- ``requires.plugin_api`` — compatible API major     (``~1`` or ``~2``)
+- ``requires.sdk``        — minimum SDK version      (``>=0.1.0``, warn-only)
+- ``requires.python``     — minimum Python version   (``>=3.11``)
+
+Plugin API compatibility window
+-------------------------------
+The host advertises ``PLUGIN_API_VERSION = "2.0.0"`` but accepts plugins
+declaring ``plugin_api: "~1"`` as a transitional convenience: the v1 → v2
+upgrade was a soft API expansion (no breaking changes for existing
+plugins), so refusing to load v1 manifests would orphan the entire
+plugin ecosystem during the migration window. v1 plugins are loaded
+with a one-line warning so authors can upgrade at their own pace.
+``~3`` and beyond are still rejected — the window only covers the
+immediately previous major.
+"""
 
 from __future__ import annotations
 
@@ -15,24 +34,32 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_API_VERSION = "2.0.0"
 PLUGIN_UI_API_VERSION = "1.0.0"
+
 PLUGIN_API_COMPAT_WINDOW: frozenset[int] = frozenset({1, 2})
+"""Plugin API majors the current host accepts (with warnings for non-current)."""
 
 
 @dataclass
 class CompatResult:
+    """Outcome of a compatibility check."""
+
     ok: bool = True
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
 def check_compatibility(manifest: PluginManifest) -> CompatResult:
+    """Run all compatibility checks for *manifest*.
+
+    Returns a ``CompatResult`` — callers should skip loading when ``ok`` is
+    ``False`` and log any ``warnings`` regardless.
+    """
     result = CompatResult()
     requires = manifest.requires
     if not requires:
         return result
 
-    synapse_spec = requires.get("synapse", "") or requires.get("openakita", "")
-    _check_synapse(manifest.id, synapse_spec, result)
+    _check_synapse(manifest.id, requires.get("synapse", ""), result)
     _check_plugin_api(manifest.id, requires.get("plugin_api", ""), result)
     _check_sdk(manifest.id, requires.get("sdk", ""), result)
     _check_python(manifest.id, requires.get("python", ""), result)
@@ -43,10 +70,14 @@ def check_compatibility(manifest: PluginManifest) -> CompatResult:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
 def _parse_version(raw: str) -> tuple[int, ...] | None:
+    """Parse a dotted version string into a tuple of ints."""
     raw = raw.strip().lstrip("v")
-    if "," in raw:
-        raw = raw.split(",", 1)[0].strip()
     parts = []
     for seg in raw.split("."):
         seg = seg.strip()
@@ -120,8 +151,9 @@ def _check_plugin_api(plugin_id: str, spec: str, result: CompatResult) -> None:
         elif req_major[0] in PLUGIN_API_COMPAT_WINDOW:
             result.warnings.append(
                 f"Plugin '{plugin_id}' targets plugin_api ~{req_major_str} but host "
-                f"is {PLUGIN_API_VERSION}; loaded under compatibility window "
-                f"{sorted(PLUGIN_API_COMPAT_WINDOW)} — verify behaviour."
+                f"is {PLUGIN_API_VERSION}; loaded under v{current[0]} compatibility "
+                f"window — please upgrade the plugin manifest to '~{current[0]}' "
+                f"and verify behaviour."
             )
         else:
             msg = (
@@ -148,12 +180,10 @@ def _check_plugin_api(plugin_id: str, spec: str, result: CompatResult) -> None:
 
 
 def _check_sdk(plugin_id: str, spec: str, result: CompatResult) -> None:
-    if not spec:
+    """SDK version is informational — warn only."""
+    if not spec or not spec.startswith(">="):
         return
-    min_part = spec.split(",", 1)[0].strip()
-    if not min_part.startswith(">="):
-        return
-    req = _parse_version(min_part[2:])
+    req = _parse_version(spec[2:])
     if req is None:
         return
 
@@ -166,12 +196,17 @@ def _check_sdk(plugin_id: str, spec: str, result: CompatResult) -> None:
 
     if sdk is None:
         result.warnings.append(
-            f"Plugin '{plugin_id}' recommends synapse-plugin-sdk {spec}, but it is not installed"
+            f"Plugin '{plugin_id}' needs synapse-plugin-sdk {spec} but it is not "
+            f"installed. Fix it with `pip install \"synapse[plugins]\"` "
+            f"(or `pip install -e ./synapse-plugin-sdk` in monorepo dev). "
+            f"Plugins that import synapse_plugin_sdk classes will fail to "
+            f"load until this is resolved."
         )
     elif sdk < req:
         result.warnings.append(
             f"Plugin '{plugin_id}' recommends synapse-plugin-sdk {spec}, "
-            f"installed is {'.'.join(str(x) for x in sdk)}"
+            f"installed is {'.'.join(str(x) for x in sdk)}. "
+            f"Upgrade with `pip install -U synapse-plugin-sdk`."
         )
 
 
@@ -189,6 +224,7 @@ def _check_python(plugin_id: str, spec: str, result: CompatResult) -> None:
 
 
 def _check_plugin_ui_api(plugin_id: str, spec: str, result: CompatResult) -> None:
+    """Check plugin_ui_api compatibility — same logic as _check_plugin_api."""
     if not spec:
         return
 
@@ -206,7 +242,7 @@ def _check_plugin_ui_api(plugin_id: str, spec: str, result: CompatResult) -> Non
             result.warnings.append(
                 f"Plugin '{plugin_id}' requires plugin_ui_api {spec} "
                 f"(major {req_major[0]}), current UI API is {PLUGIN_UI_API_VERSION} "
-                f"(major {current[0]}) — UI may not work correctly"
+                f"(major {current[0]}) — UI will not be loaded"
             )
         elif len(req_major) > 1 and len(current) > 1 and req_major[1] > current[1]:
             result.warnings.append(
@@ -221,7 +257,7 @@ def _check_plugin_ui_api(plugin_id: str, spec: str, result: CompatResult) -> Non
         if current < req:
             result.warnings.append(
                 f"Plugin '{plugin_id}' requires plugin_ui_api {spec}, "
-                f"current is {PLUGIN_UI_API_VERSION} — UI may not work correctly"
+                f"current is {PLUGIN_UI_API_VERSION} — UI will not be loaded"
             )
     else:
         result.warnings.append(

@@ -46,6 +46,116 @@ class RetrievalCandidate:
     raw_data: dict = field(default_factory=dict)
 
 
+@dataclass
+class RetrievalInput:
+    """Sanitized retrieval input shared by all retrieval paths."""
+
+    query: str
+    recent_messages: list[dict]
+    skip: bool = False
+    skip_reason: str = ""
+
+
+class MemoryQueryPreprocessor:
+    """Cheap query cleanup and retrieval gate before any DB/LLM work."""
+
+    _INJECTION_BLOCK_PATTERNS = (
+        r"(?is)##\s*相关记忆.*?(?=\n##|\Z)",
+        r"(?is)##\s*核心记忆.*?(?=\n##|\Z)",
+        r"(?is)##\s*关系型记忆.*?(?=\n##|\Z)",
+        r"(?is)<vault-context>.*?</vault-context>",
+        r"(?is)<memory>.*?</memory>",
+        r"(?is)\[系统提示\].*?(?=\n\n|\Z)",
+    )
+    _CONTROL_ONLY = frozenset(
+        {
+            "好",
+            "好的",
+            "可以",
+            "继续",
+            "嗯",
+            "收到",
+            "ok",
+            "yes",
+            "no",
+            "stop",
+            "停止",
+            "/stop",
+            "/cancel",
+            "/abort",
+        }
+    )
+    _KEEP_SHORT_HINTS = (
+        "这个",
+        "那个",
+        "刚才",
+        "上次",
+        "继续",
+        "文件",
+        "图片",
+        ".py",
+        ".ts",
+        ".md",
+        ".json",
+    )
+
+    @classmethod
+    def prepare(
+        cls,
+        query: str,
+        recent_messages: list[dict] | None = None,
+        *,
+        max_query_chars: int = 1200,
+        max_recent: int = 4,
+    ) -> RetrievalInput:
+        cleaned = cls.clean_query(query, max_chars=max_query_chars)
+        recent = cls.clean_recent_messages(recent_messages, max_recent=max_recent)
+        skip, reason = cls.should_skip_retrieval(cleaned, recent)
+        return RetrievalInput(query=cleaned, recent_messages=recent, skip=skip, skip_reason=reason)
+
+    @classmethod
+    def clean_query(cls, query: str, *, max_chars: int = 1200) -> str:
+        text = str(query or "")
+        for pattern in cls._INJECTION_BLOCK_PATTERNS:
+            text = re.sub(pattern, " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > max_chars:
+            text = text[-max_chars:].strip()
+        return text
+
+    @classmethod
+    def clean_recent_messages(
+        cls,
+        recent_messages: list[dict] | None,
+        *,
+        max_recent: int = 4,
+        max_chars_per_message: int = 240,
+    ) -> list[dict]:
+        cleaned: list[dict] = []
+        for msg in (recent_messages or [])[-max_recent:]:
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = cls.clean_query(content, max_chars=max_chars_per_message)
+            if text:
+                cleaned.append({"role": msg.get("role", ""), "content": text})
+        return cleaned
+
+    @classmethod
+    def should_skip_retrieval(cls, query: str, recent_messages: list[dict] | None = None) -> tuple[bool, str]:
+        text = (query or "").strip()
+        if not text:
+            return True, "empty"
+        lowered = text.lower()
+        if lowered in cls._CONTROL_ONLY:
+            return True, "control_only"
+        if len(text) <= 3 and not any(h in text for h in cls._KEEP_SHORT_HINTS):
+            return True, "too_short"
+        if len(text) <= 12 and not recent_messages and not any(h in lowered for h in cls._KEEP_SHORT_HINTS):
+            return True, "short_without_context"
+        return False, ""
+
+
 class RetrievalEngine:
     """多路召回 + 重排序的记忆检索引擎"""
 
@@ -77,6 +187,39 @@ class RetrievalEngine:
         self._decompose_cache: dict[str, dict] = {}
         self._external_sources: list = []
         self._plugin_hooks = None
+        self._scope_pairs: list[tuple[str, str, str, str]] = [
+            ("user", "", "default", "default")
+        ]
+        self._focus_terms: list[str] = []
+
+    def set_focus_terms(self, terms: list[str] | None) -> None:
+        """Set task-local session focus terms used only for reranking."""
+        seen: list[str] = []
+        for term in terms or []:
+            value = str(term).strip()
+            if value and value not in seen:
+                seen.append(value)
+        self._focus_terms = seen[:12]
+
+    def set_scope_context(self, scope_pairs: list[tuple] | None = None) -> None:
+        """Set the visible memory scopes for this retrieval engine."""
+        pairs = []
+        for entry in scope_pairs or [("user", "", "default", "default")]:
+            if len(entry) >= 4:
+                scope, owner, user_id, workspace_id = entry[:4]
+            else:
+                scope, owner = entry[:2]
+                user_id, workspace_id = "default", "default"
+            norm_scope = (scope or "global").strip() or "global"
+            if norm_scope == "global":
+                norm_scope = "user"
+            norm_owner = (owner or "").strip()
+            norm_user = (user_id or "default").strip() or "default"
+            norm_workspace = (workspace_id or "default").strip() or "default"
+            pair = (norm_scope, norm_owner, norm_user, norm_workspace)
+            if pair not in pairs:
+                pairs.append(pair)
+        self._scope_pairs = pairs or [("user", "", "default", "default")]
 
     def retrieve(
         self,
@@ -91,6 +234,13 @@ class RetrievalEngine:
         Returns:
             格式化的记忆文本, 适合注入 system prompt
         """
+        prepared = MemoryQueryPreprocessor.prepare(query, recent_messages)
+        if prepared.skip:
+            logger.debug("[Retrieval] skipped (%s): %r", prepared.skip_reason, query)
+            return ""
+
+        query = prepared.query
+        recent_messages = prepared.recent_messages
         decomposed = self._decompose_query(query, recent_messages)
         search_keywords = decomposed.get("keywords", [])
         intent = decomposed.get("intent", "general")
@@ -127,6 +277,13 @@ class RetrievalEngine:
         limit: int = 20,
     ) -> list[RetrievalCandidate]:
         """Return raw ranked candidates without formatting."""
+        prepared = MemoryQueryPreprocessor.prepare(query, recent_messages)
+        if prepared.skip:
+            logger.debug("[Retrieval] skipped candidates (%s): %r", prepared.skip_reason, query)
+            return []
+
+        query = prepared.query
+        recent_messages = prepared.recent_messages
         decomposed = self._decompose_query(query, recent_messages)
         search_keywords = decomposed.get("keywords", [])
         intent = decomposed.get("intent", "general")
@@ -228,35 +385,57 @@ class RetrievalEngine:
     # ==================================================================
 
     def _search_semantic(self, query: str, limit: int = 15) -> list[RetrievalCandidate]:
-        scored_results = self.store.search_semantic_scored(query, limit=limit)
         now = datetime.now()
         candidates = []
-        for mem, raw_score in scored_results:
-            if mem.expires_at and mem.expires_at < now:
-                continue
-            relevance = max(0.0, min(1.0, raw_score))
-            candidates.append(
-                RetrievalCandidate(
-                    memory_id=mem.id,
-                    content=mem.to_markdown(),
-                    memory_type=mem.type.value,
-                    source_type="semantic",
-                    relevance=relevance,
-                    recency_score=self._compute_recency(mem.updated_at),
-                    importance_score=mem.importance_score,
-                    access_frequency_score=self._compute_access_score(mem.access_count),
-                    raw_data=mem.to_dict(),
-                )
+        seen: set[str] = set()
+        for scope, scope_owner, user_id, workspace_id in self._scope_pairs:
+            scored_results = self.store.search_semantic_scored(
+                query,
+                limit=limit,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
             )
+            for mem, raw_score in scored_results:
+                if mem.id in seen:
+                    continue
+                if mem.expires_at and mem.expires_at < now:
+                    continue
+                seen.add(mem.id)
+                relevance = max(0.0, min(1.0, raw_score))
+                candidates.append(
+                    RetrievalCandidate(
+                        memory_id=mem.id,
+                        content=mem.to_markdown(),
+                        memory_type=mem.type.value,
+                        source_type=f"semantic:{scope}",
+                        relevance=relevance,
+                        recency_score=self._compute_recency(mem.updated_at),
+                        importance_score=mem.importance_score,
+                        access_frequency_score=self._compute_access_score(mem.access_count),
+                        raw_data=mem.to_dict(),
+                    )
+                )
         return candidates
 
     def _search_episodes(self, query: str, limit: int = 5) -> list[RetrievalCandidate]:
         entities = self._extract_query_entities(query)
         episodes: list[Episode] = []
+        session_ids = [owner for scope, owner, _user, _workspace in self._scope_pairs if scope == "session" and owner]
 
         for entity in entities[:3]:
-            found = self.store.search_episodes(entity=entity, limit=3)
-            episodes.extend(found)
+            if session_ids:
+                for session_id in session_ids:
+                    found = self.store.search_episodes(
+                        entity=entity,
+                        session_id=session_id,
+                        limit=3,
+                    )
+                    episodes.extend(found)
+            else:
+                found = self.store.search_episodes(entity=entity, limit=3)
+                episodes.extend(found)
 
         candidates = []
         for ep in episodes[:limit]:
@@ -281,36 +460,48 @@ class RetrievalEngine:
         limit: int = 5,
         query: str = "",
     ) -> list[RetrievalCandidate]:
-        memories = self.store.query_semantic(min_importance=0.6, limit=limit)
         now = datetime.now()
         query_tokens = set(query.lower().split()) if query else set()
         candidates = []
-        for mem in memories:
-            if mem.expires_at and mem.expires_at < now:
-                continue
-            recency = self._compute_recency(mem.updated_at)
-            if recency < 0.3:
-                continue
-
-            relevance = 0.5
-            if query_tokens:
-                content_lower = mem.content.lower()
-                overlap = sum(1 for t in query_tokens if t in content_lower)
-                relevance = 0.2 if overlap == 0 else min(0.7, 0.3 + 0.1 * overlap)
-
-            candidates.append(
-                RetrievalCandidate(
-                    memory_id=mem.id,
-                    content=mem.to_markdown(),
-                    memory_type=mem.type.value,
-                    source_type="recent",
-                    relevance=relevance,
-                    recency_score=recency,
-                    importance_score=mem.importance_score,
-                    access_frequency_score=self._compute_access_score(mem.access_count),
-                    raw_data=mem.to_dict(),
-                )
+        seen: set[str] = set()
+        for scope, scope_owner, user_id, workspace_id in self._scope_pairs:
+            memories = self.store.query_semantic(
+                min_importance=0.6,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                limit=limit,
             )
+            for mem in memories:
+                if mem.id in seen:
+                    continue
+                if mem.expires_at and mem.expires_at < now:
+                    continue
+                recency = self._compute_recency(mem.updated_at)
+                if recency < 0.3:
+                    continue
+
+                relevance = 0.5
+                if query_tokens:
+                    content_lower = mem.content.lower()
+                    overlap = sum(1 for t in query_tokens if t in content_lower)
+                    relevance = 0.2 if overlap == 0 else min(0.7, 0.3 + 0.1 * overlap)
+
+                seen.add(mem.id)
+                candidates.append(
+                    RetrievalCandidate(
+                        memory_id=mem.id,
+                        content=mem.to_markdown(),
+                        memory_type=mem.type.value,
+                        source_type=f"recent:{scope}",
+                        relevance=relevance,
+                        recency_score=recency,
+                        importance_score=mem.importance_score,
+                        access_frequency_score=self._compute_access_score(mem.access_count),
+                        raw_data=mem.to_dict(),
+                    )
+                )
         return candidates
 
     _MEDIA_KEYWORDS = (
@@ -361,9 +552,19 @@ class RetrievalEngine:
         seen: dict[str, Attachment] = {}
 
         search_terms = self._get_attachment_search_terms(raw_query, search_keywords)
+        session_id = ""
+        for scope, owner, _user, _workspace in self._scope_pairs:
+            if scope == "session" and owner:
+                session_id = owner
+                break
+
         for term in search_terms:
             try:
-                results = self.store.search_attachments(query=term, limit=limit)
+                results = self.store.search_attachments(
+                    query=term,
+                    session_id=session_id or None,
+                    limit=limit,
+                )
                 for att in results:
                     if att.id not in seen:
                         seen[att.id] = att
@@ -548,10 +749,10 @@ class RetrievalEngine:
                 import concurrent.futures
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, think_fn(prompt, system="只输出JSON", usage_scene="decompose_query_with_llm"))
+                    future = pool.submit(asyncio.run, think_fn(prompt, system="只输出JSON"))
                     response = future.result(timeout=10)
             else:
-                response = asyncio.run(think_fn(prompt, system="只输出JSON", usage_scene="decompose_query_with_llm"))
+                response = asyncio.run(think_fn(prompt, system="只输出JSON"))
 
             text = (getattr(response, "content", None) or str(response)).strip()
 
@@ -781,6 +982,7 @@ class RetrievalEngine:
         query: str,
         persona: str | None = None,
     ) -> list[RetrievalCandidate]:
+        focus_terms = [t.lower() for t in self._focus_terms if t]
         for c in candidates:
             c.score = (
                 c.relevance * self.W_RELEVANCE
@@ -788,6 +990,11 @@ class RetrievalEngine:
                 + c.importance_score * self.W_IMPORTANCE
                 + c.access_frequency_score * self.W_ACCESS
             )
+            if focus_terms:
+                content_lower = c.content.lower()
+                focus_hits = sum(1 for term in focus_terms if term.lower() in content_lower)
+                if focus_hits:
+                    c.score *= min(1.35, 1.0 + 0.08 * focus_hits)
             if persona and persona in ("tech_expert", "jarvis"):
                 if c.memory_type in ("skill", "error"):
                     c.score *= 1.2
@@ -795,7 +1002,13 @@ class RetrievalEngine:
                 c.score *= 0.3
 
         ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
-        return [c for c in ranked if c.score >= self.MIN_RERANK_SCORE]
+        # 冷启动豁免：刚写入 1 小时内的记忆（recency_score >= 0.99 ≈ 1 小时），
+        # 即便综合分低于 MIN_RERANK_SCORE 也保留，避免新加事实被一刀切。
+        return [
+            c
+            for c in ranked
+            if c.score >= self.MIN_RERANK_SCORE or c.recency_score >= 0.99
+        ]
 
     # ==================================================================
     # Scoring Helpers
@@ -830,6 +1043,18 @@ class RetrievalEngine:
         if not candidates:
             return ""
 
+        # Fix-9：先剔除"自动复盘 / 元监控"类经验噪声（这些条目对 LLM
+        # 当前任务推理没价值，但会占用 memory_budget）。
+        candidates = self._strip_experience_noise(candidates)
+
+        # Fix-8：注入前对 ``fact`` 类型按 ``(subject, predicate)`` 去重，
+        # 同主题谓词只保留第一条（candidates 已经按综合得分降序，因此
+        # 第一条就是 score 最高且最新被访问/更新的版本）。这是一个**纯
+        # 注入层**的过滤——不删除底层任何 fact，只是不让两条互斥的同主
+        # 题事实同时出现在 system prompt 里（避免 LLM 看到"张三 35 岁 +
+        # 张三 32 岁"这种自相矛盾历史而做不必要的歧义判断）。
+        candidates = self._dedupe_facts_by_subject_predicate(candidates)
+
         lines: list[str] = []
         token_est = 0
         chars_per_token = 2.5
@@ -843,3 +1068,89 @@ class RetrievalEngine:
             token_est += line_tokens
 
         return "\n".join(lines)
+
+    # Fix-9：被识别为"元监控/自动复盘"的 source 标签集合。
+    # 这些条目通常是 daily_consolidator/auto_postmortem 等后台任务自己写
+    # 入的状态文本（路径、耗时、统计数字等），对 LLM 解决用户当前任务
+    # 几乎无信息增益，反而稀释了真正有用的 fact/preference。
+    _NOISY_EXPERIENCE_SOURCES = frozenset(
+        {
+            "auto_postmortem",
+            "auto-postmortem",
+            "system:auto_postmortem",
+            "system:daily_memory",
+            "system:memory_nudge",
+            "consolidator",
+            "daily_consolidator",
+            "self_metric",
+        }
+    )
+
+    # Fix-9：低置信度阈值。confidence < 0.6 且 memory_type ∈ {fact, experience}
+    # 的条目不进 prompt（仍可在 MemoryView 中被用户检索/合并）。
+    _MIN_INJECT_CONFIDENCE = 0.6
+
+    @classmethod
+    def _strip_experience_noise(
+        cls,
+        candidates: list[RetrievalCandidate],
+    ) -> list[RetrievalCandidate]:
+        """Drop low-signal experience/fact entries before prompt injection.
+
+        Two filters layered (no removal of underlying memory rows):
+
+        - ``source`` 命中 ``_NOISY_EXPERIENCE_SOURCES`` → 直接丢弃。
+        - ``memory_type`` ∈ {fact, experience} 且 ``confidence`` 小于
+          ``_MIN_INJECT_CONFIDENCE`` → 丢弃。其他 type（episode、attachment、
+          recent、plugin source 等）一律保留，避免误删低置信度但仍可能
+          相关的检索结果。
+        """
+        out: list[RetrievalCandidate] = []
+        for c in candidates:
+            raw = c.raw_data or {}
+            src = (raw.get("source") or "").strip().lower()
+            if src in cls._NOISY_EXPERIENCE_SOURCES:
+                continue
+            mt = (c.memory_type or "").lower()
+            if mt in ("fact", "experience"):
+                # confidence 字段可能从 raw_data 里读到（SemanticMemory.to_dict）
+                conf_raw = raw.get("confidence")
+                try:
+                    conf = float(conf_raw) if conf_raw is not None else None
+                except (TypeError, ValueError):
+                    conf = None
+                if conf is not None and conf < cls._MIN_INJECT_CONFIDENCE:
+                    continue
+            out.append(c)
+        return out
+
+    @staticmethod
+    def _dedupe_facts_by_subject_predicate(
+        candidates: list[RetrievalCandidate],
+    ) -> list[RetrievalCandidate]:
+        """Keep first occurrence per ``(subject, predicate)`` for fact memories.
+
+        Non-fact candidates (episodes, attachments, recent turns, plugin
+        sources) are passed through unchanged. ``subject``/``predicate`` come
+        from ``raw_data`` (populated by ``_search_semantic``); when missing,
+        the candidate is also passed through.
+        """
+        seen: set[tuple[str, str]] = set()
+        out: list[RetrievalCandidate] = []
+        for c in candidates:
+            if (c.memory_type or "").lower() != "fact":
+                out.append(c)
+                continue
+            raw = c.raw_data or {}
+            subj = (raw.get("subject") or "").strip().lower()
+            pred = (raw.get("predicate") or "").strip().lower()
+            if not subj:
+                # 无 subject 元数据 — 不能安全去重，放行
+                out.append(c)
+                continue
+            key = (subj, pred)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
+        return out

@@ -5,14 +5,103 @@ SKILL.md 解析器
 解析 SKILL.md 文件的 YAML frontmatter 和 Markdown body
 """
 
+import copy
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Process-wide parse cache (shared across SkillLoader instances)
+# ---------------------------------------------------------------------------
+#
+# Every Agent owns its own ``SkillLoader`` which in turn owns a fresh
+# ``SkillParser``. The historical ``self._parse_cache`` on the parser
+# instance correctly avoids re-reading + re-yamling the same SKILL.md
+# within a single agent's lifetime, but did nothing across agents — and
+# the org runtime creates a new agent per node, so each delegated task
+# would re-parse all 200+ SKILL.md files from disk.
+#
+# This module-level cache makes the parse step process-wide. Entries
+# are keyed by ``(resolved_path, mtime)`` so any on-disk edit
+# invalidates them automatically; ``invalidate_global_parse_cache`` is
+# also exposed for explicit eviction (hooked from
+# ``skills.events.notify_skills_changed`` so install / uninstall
+# events drop stale entries even if mtime is unchanged).
+#
+# Cache hits return a deep copy so downstream mutation of
+# ``ParsedSkill.metadata.category`` (see ``SkillLoader.load_skill``)
+# cannot pollute the shared object.
+_GLOBAL_PARSE_CACHE_LOCK = threading.Lock()
+_GLOBAL_PARSE_CACHE: dict[tuple[str, float], "ParsedSkill"] = {}
+_GLOBAL_PARSE_CACHE_MAX = 2000
+
+
+def _global_cache_get(key: tuple[str, float]) -> "ParsedSkill | None":
+    with _GLOBAL_PARSE_CACHE_LOCK:
+        return _GLOBAL_PARSE_CACHE.get(key)
+
+
+def _global_cache_put(key: tuple[str, float], value: "ParsedSkill") -> None:
+    with _GLOBAL_PARSE_CACHE_LOCK:
+        if len(_GLOBAL_PARSE_CACHE) >= _GLOBAL_PARSE_CACHE_MAX:
+            _GLOBAL_PARSE_CACHE.clear()
+        _GLOBAL_PARSE_CACHE[key] = value
+
+
+def invalidate_global_parse_cache(path: Path | str | None = None) -> int:
+    """Drop ``ParsedSkill`` entries from the process-wide cache.
+
+    Args:
+        path: When provided, only entries whose resolved path equals
+            ``path`` or lives under ``path``/<...> are dropped. When
+            omitted, the entire cache is cleared. This is the entry
+            point ``skills.events.notify_skills_changed`` hooks into so
+            install / uninstall / hot-reload events make the cache
+            forget previously parsed entries even when SKILL.md mtime
+            has not changed (e.g. a reinstall over the same files).
+
+    Returns:
+        The number of cache entries that were dropped.
+    """
+    import os as _os
+
+    with _GLOBAL_PARSE_CACHE_LOCK:
+        if path is None:
+            n = len(_GLOBAL_PARSE_CACHE)
+            _GLOBAL_PARSE_CACHE.clear()
+            return n
+        try:
+            target = str(Path(path).resolve())
+        except Exception:
+            return 0
+        prefix = target + _os.sep
+        keys_to_drop = [
+            k for k in list(_GLOBAL_PARSE_CACHE.keys())
+            if k[0] == target or k[0].startswith(prefix)
+        ]
+        for k in keys_to_drop:
+            _GLOBAL_PARSE_CACHE.pop(k, None)
+        return len(keys_to_drop)
+
+
+def _clone_parsed_skill_for_caller(skill: "ParsedSkill") -> "ParsedSkill":
+    """Return a deep copy of ``skill`` safe to mutate.
+
+    Downstream callers (notably ``SkillLoader.load_skill``) write to
+    ``parsed.metadata.category`` after the parser returns. If we hand
+    back the same object that lives inside ``_GLOBAL_PARSE_CACHE``
+    those edits would leak across agents. ``copy.deepcopy`` is fine
+    here — a ``ParsedSkill`` only carries the metadata dataclass,
+    short ``Path`` objects, and the markdown body string, so the copy
+    cost is ≪ a fresh YAML parse + disk read.
+    """
+    return copy.deepcopy(skill)
 
 
 @dataclass
@@ -40,8 +129,6 @@ class SkillMetadata:
 
     name: str
     description: str
-    # 可选：面向用户的短标题（研发工具等在 UI 中优先于 name 展示）
-    label: str | None = None
     version: str | None = None
     license: str | None = None
     compatibility: str | None = None
@@ -59,6 +146,8 @@ class SkillMetadata:
     supported_os: list[str] = field(default_factory=list)
     required_bins: list[str] = field(default_factory=list)
     required_env: list[str] = field(default_factory=list)
+    python_env: str = ""
+    python_dependencies: list[str] = field(default_factory=list)
 
     # 配置 schema（供 Setup Center 自动生成配置表单）
     # 每个元素: {"key": str, "label": str, "type": "text"|"secret"|"number"|"select"|"bool",
@@ -81,6 +170,12 @@ class SkillMetadata:
     # key 为语言代码 (如 "zh")，value 为该语言的显示名/描述
     name_i18n: dict[str, str] = field(default_factory=dict)
     description_i18n: dict[str, str] = field(default_factory=dict)
+
+    # C10：技能自报 ApprovalClass（policy_v2.ApprovalClass enum value，全小写）。
+    # canonical 字段名为 ``approval_class``；保留 ``risk_class`` 作 alias 一次性
+    # 接受 + WARN（plan §4.21.4 早期措辞）。值非法时降级为 None + WARN，决策回到
+    # handler / 启发式回退（与 v1 行为完全一致），不会破坏既有技能。
+    approval_class: str | None = None
 
     def get_display_name(self, lang: str = "zh") -> str:
         """按语言返回显示名称，找不到则回退到 name"""
@@ -201,25 +296,41 @@ class SkillParser:
         if not path.exists():
             raise FileNotFoundError(f"SKILL.md not found: {path}")
 
-        # F13: check mtime-based cache
+        # F13 + P7.6a: mtime-keyed cache check, instance-local first
+        # (cheap, no lock contention), then process-global so SKILL.md
+        # already parsed by a sibling Agent's SkillParser is reused
+        # without touching the disk or YAML loader.
         resolved = str(path.resolve())
         try:
             mtime = path.stat().st_mtime
         except OSError:
             mtime = 0.0
         cache_key = (resolved, mtime)
+
         cached = self._parse_cache.get(cache_key)
+        if cached is None:
+            cached = _global_cache_get(cache_key)
+            if cached is not None:
+                # Promote into the local cache so subsequent calls in
+                # this parser skip the global lock entirely.
+                self._parse_cache[cache_key] = cached
         if cached is not None:
-            return cached
+            # Hand callers a private copy — see the docstring on
+            # ``_clone_parsed_skill_for_caller`` for why this matters.
+            return _clone_parsed_skill_for_caller(cached)
 
         content = path.read_text(encoding="utf-8")
         result = self.parse_content(content, path)
 
-        # Store in cache (limit size to prevent unbounded growth)
+        # Store the FRESH-parsed object in both caches, but hand the
+        # caller a deep copy so any post-parse mutation (e.g.
+        # ``SkillLoader.load_skill`` rebinding ``metadata.category``)
+        # cannot reach the cached object and pollute future hits.
         if len(self._parse_cache) > 500:
             self._parse_cache.clear()
         self._parse_cache[cache_key] = result
-        return result
+        _global_cache_put(cache_key, result)
+        return _clone_parsed_skill_for_caller(result)
 
     def parse_content(self, content: str, path: Path) -> ParsedSkill:
         """
@@ -232,19 +343,25 @@ class SkillParser:
         Returns:
             ParsedSkill 对象
         """
-        # 解析 frontmatter
+        # 解析 frontmatter（缺失时降级而非硬失败：从目录名派生 name，正文整体作为 body）
         match = self.FRONTMATTER_PATTERN.match(content)
-        if not match:
-            raise ValueError(f"Invalid SKILL.md format: missing YAML frontmatter in {path}")
-
-        yaml_content = match.group(1)
-        body = match.group(2).strip()
-
-        # 解析 YAML
-        try:
-            data = yaml.safe_load(yaml_content) or {}
-        except yaml.YAMLError as e:
-            raise ValueError(f"Invalid YAML frontmatter in {path}: {e}")
+        if match:
+            yaml_content = match.group(1)
+            body = match.group(2).strip()
+            try:
+                data = yaml.safe_load(yaml_content) or {}
+            except yaml.YAMLError as e:
+                logger.warning(
+                    f"Invalid YAML frontmatter in {path}: {e}; falling back to filename-derived metadata"
+                )
+                data = {}
+                body = content.strip()
+        else:
+            logger.warning(
+                f"SKILL.md missing YAML frontmatter in {path}; falling back to filename-derived metadata"
+            )
+            data = {}
+            body = content.strip()
 
         # 构建元数据（body 用于 description 自动提取回退）
         metadata = self._build_metadata(data, path, body=body)
@@ -272,26 +389,34 @@ class SkillParser:
             assets_dir=assets_dir if assets_dir.exists() else None,
         )
 
+    @staticmethod
+    def _derive_name_from_path(path: Path) -> str:
+        """从 SKILL.md 所在目录派生符合规范的 kebab-case 名称作为降级值。"""
+        raw = path.parent.name or "unnamed-skill"
+        normalized = re.sub(r"[^A-Za-z0-9]+", "-", raw).strip("-").lower()
+        return normalized or "unnamed-skill"
+
     def _build_metadata(self, data: dict, path: Path, body: str = "") -> SkillMetadata:
-        """从 YAML 数据构建元数据"""
-        # 必需字段
+        """从 YAML 数据构建元数据（缺字段时降级派生，不再硬失败）"""
         name = data.get("name")
         description = data.get("description", "")
 
         if not name:
-            raise ValueError(f"Missing required 'name' field in {path}")
+            derived = self._derive_name_from_path(path)
+            logger.warning(
+                f"SKILL.md missing 'name' field in {path}; derived name from directory: '{derived}'"
+            )
+            name = derived
 
         if not description and body:
             first_para = body.split("\n\n")[0].replace("\n", " ").strip()
             description = first_para[:100] + ("..." if len(first_para) > 100 else "")
 
         if not description:
-            raise ValueError(f"Missing required 'description' field in {path}")
-
-        label_raw = data.get("label")
-        label: str | None = None
-        if label_raw is not None and str(label_raw).strip():
-            label = str(label_raw).strip()
+            logger.warning(
+                f"SKILL.md missing 'description' field in {path}; using empty description"
+            )
+            description = ""
 
         # 处理 allowed-tools (连字符转下划线)
         allowed_tools = data.get("allowed-tools", "")
@@ -337,6 +462,8 @@ class SkillParser:
         supported_os: list[str] = []
         required_bins: list[str] = []
         required_env: list[str] = []
+        python_env = ""
+        python_dependencies: list[str] = []
 
         if akita_meta:
             os_val = akita_meta.get("os", [])
@@ -353,6 +480,19 @@ class SkillParser:
                 env_val = requires.get("env", [])
                 if isinstance(env_val, list):
                     required_env = [str(e) for e in env_val]
+
+            python_val = akita_meta.get("python", {})
+            if isinstance(python_val, dict):
+                env_val = python_val.get("env", "")
+                if isinstance(env_val, str):
+                    python_env = env_val.strip()
+                deps_val = python_val.get("dependencies", [])
+                if isinstance(deps_val, list):
+                    python_dependencies = [str(dep).strip() for dep in deps_val if str(dep).strip()]
+                elif isinstance(deps_val, str):
+                    python_dependencies = [
+                        dep.strip() for dep in deps_val.splitlines() if dep.strip()
+                    ]
 
         # F1: 新字段解析
         when_to_use = str(data.get("when-to-use", "") or "")
@@ -384,10 +524,11 @@ class SkillParser:
             [str(t) for t in fbt_raw] if isinstance(fbt_raw, list) else []
         )
 
+        approval_class = self._parse_approval_class(data, path)
+
         return SkillMetadata(
             name=name,
             description=description.strip(),
-            label=label,
             version=data.get("version"),
             license=data.get("license"),
             compatibility=data.get("compatibility"),
@@ -401,6 +542,8 @@ class SkillParser:
             supported_os=supported_os,
             required_bins=required_bins,
             required_env=required_env,
+            python_env=python_env,
+            python_dependencies=python_dependencies,
             config=config,
             when_to_use=when_to_use,
             keywords=keywords,
@@ -412,7 +555,68 @@ class SkillParser:
             hooks=hooks,
             model=model if isinstance(model, str) else None,
             fallback_for_toolsets=fallback_for_toolsets,
+            approval_class=approval_class,
         )
+
+    @staticmethod
+    def _parse_approval_class(data: dict, path: Path) -> str | None:
+        """Parse ``approval_class`` (canonical) or ``risk_class`` (alias) frontmatter.
+
+        Behaviour:
+        - Both fields present and equal → return canonical (no warn).
+        - Both fields present and different → use ``approval_class``, WARN once.
+        - Only ``risk_class`` → accept as alias, WARN once (deprecation hint).
+        - Value not in :class:`ApprovalClass` enum → WARN, return ``None``
+          (classifier falls back to handler / heuristic, preserving v1 behaviour).
+        - Missing → ``None`` (no warn — vast majority of legacy SKILL.md).
+        """
+        canonical = data.get("approval_class") or data.get("approval-class")
+        alias = data.get("risk_class") or data.get("risk-class")
+
+        chosen: str | None = None
+        if canonical is not None and alias is not None and str(canonical) != str(alias):
+            logger.warning(
+                "SKILL.md %s declares both 'approval_class=%s' and 'risk_class=%s'; "
+                "using approval_class (canonical)",
+                path,
+                canonical,
+                alias,
+            )
+            chosen = str(canonical)
+        elif canonical is not None:
+            chosen = str(canonical)
+        elif alias is not None:
+            logger.warning(
+                "SKILL.md %s uses deprecated 'risk_class' field; rename to "
+                "'approval_class' to silence this warning",
+                path,
+            )
+            chosen = str(alias)
+        else:
+            return None
+
+        chosen = chosen.strip().lower()
+        if not chosen:
+            return None
+
+        # Validate against ApprovalClass enum lazily to avoid cycle at import time.
+        try:
+            from ..core.policy_v2.enums import ApprovalClass
+
+            valid = {c.value for c in ApprovalClass}
+        except Exception:
+            return chosen
+
+        if chosen not in valid:
+            logger.warning(
+                "SKILL.md %s declares unknown approval_class=%r; valid values are %s. "
+                "Falling back to handler/heuristic classification.",
+                path,
+                chosen,
+                sorted(valid),
+            )
+            return None
+        return chosen
 
     def parse_directory(self, skill_dir: Path) -> ParsedSkill:
         """

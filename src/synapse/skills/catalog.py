@@ -15,16 +15,29 @@
 - Level C (index): names only
 """
 
+import json
 import logging
+import os
+import tempfile
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .registry import SkillRegistry
 
 if TYPE_CHECKING:
+    from .categories import CategoryRegistry
     from .usage import SkillUsageTracker
 
 logger = logging.getLogger(__name__)
+
+SKILL_INSTRUCTION_ADVISORY = (
+    "Skill instructions are guidance, not hard gates. If an external skill says "
+    "MUST, required, approval, or one-question-at-a-time, treat that as a suggested "
+    "workflow: first answer or explain enough for the user's current need, then ask "
+    "only when a real decision is needed. Do not block useful work solely because a "
+    "skill requests extra confirmation."
+)
 
 
 class SkillCatalog:
@@ -34,14 +47,15 @@ class SkillCatalog:
     管理技能清单的生成和格式化，用于系统提示注入。
     """
 
-    CATALOG_TEMPLATE = """
+    CATALOG_TEMPLATE = f"""
 ## Available Skills
 
 Use `get_skill_info(skill_name)` to load full instructions when needed.
 Installed skills may come from builtin, user workspace, or project directories.
 Do not infer filesystem paths from the workspace map; `get_skill_info` is authoritative.
+{SKILL_INSTRUCTION_ADVISORY}
 
-{skill_list}
+{{skill_list}}
 """
 
     SKILL_ENTRY_TEMPLATE = "- **{name}**: {description}"
@@ -65,25 +79,33 @@ Do not infer filesystem paths from the workspace map; `get_skill_info` is author
         self,
         registry: SkillRegistry,
         usage_tracker: "SkillUsageTracker | None" = None,
+        category_registry: "CategoryRegistry | None" = None,
     ):
         self.registry = registry
+        # 注：usage_tracker 仍保留供 list_skills 工具与 UI 排序使用，
+        # 但 **不再** 影响系统提示中技能清单的展示顺序，
+        # 否则新技能（score=0）总被排到末尾，配合截断会被剔除（参考 hermes 范式）
         self._usage_tracker = usage_tracker
+        self._category_registry = category_registry
         self._lock = threading.Lock()
         self._cached_catalog: str | None = None
         self._cached_index: str | None = None
         self._cached_compact: str | None = None
+        self._cached_grouped: dict[tuple, str] = {}
+        self._snapshot_loaded: bool = False  # 单次进程启动只尝试加载一次
 
     def _list_model_visible(self, exposure_filter: str | None = None) -> list:
-        """Return enabled skills that are also visible to the model, sorted by usage.
+        """Return enabled skills that are also visible to the model.
+
+        排序：先按 ``category`` 字典序、再按 ``name`` 字典序（确定性），
+        刻意 **不** 按 usage_tracker 倒排，避免新技能因 score=0 永远排末尾
+        从而在 prompt 截断时被剔除（参考 hermes-agent 范式）。
 
         Args:
             exposure_filter: If provided, only return skills with exposure_level
                 in the specified set. Use "core" to get only core skills,
                 "core+recommended" to get core and recommended skills.
                 None returns all non-hidden skills (backward compatible).
-
-        Respects catalog_hidden: INCLUSIVE 模式下未勾选的技能不出现在 L1 目录中，
-        但仍保留在注册表中供 list_skills / get_skill_info 按需发现。
         """
         _allowed_levels = None
         if exposure_filter == "core":
@@ -99,86 +121,32 @@ Do not infer filesystem paths from the workspace map; `get_skill_info` is author
                 continue
             skills.append(s)
 
-        if self._usage_tracker:
-            scores = self._usage_tracker.get_all_scores()
-            skills.sort(key=lambda s: scores.get(s.skill_id, 0), reverse=True)
+        skills.sort(
+            key=lambda s: (
+                (s.category or "Uncategorized").lower(),
+                (s.name or "").lower(),
+            )
+        )
         return skills
 
     def generate_catalog(self, *, exposure_filter: str | None = None) -> str:
         """
-        生成已启用技能清单（disabled 和 disable_model_invocation 技能不出现在系统提示中）
+        生成已启用技能目录。
+
+        这是旧接口，仍被启动预热、技能安装/重载和若干 CLI/debug 路径调用。
+        默认必须保持目录式输出，避免这些旁路重新生成 name + description +
+        when_to_use 的长清单并进入缓存或提示词。需要按任务展开摘要时使用
+        get_grouped_compact_catalog()；需要完整说明时使用 get_skill_info。
 
         Args:
             exposure_filter: "core" | "core+recommended" | None
                 控制按 exposure_level 过滤。CONSUMER_CHAT 场景传 "core"，
                 IM_ASSISTANT 传 "core+recommended"，LOCAL_AGENT 传 None。
-
-        INCLUSIVE 模式下 catalog_hidden 的技能不出现在 L1 目录中，
-        但会附加发现提示，引导 LLM 通过 list_skills 按需加载。
         """
-        with self._lock:
-            skills = self._list_model_visible(exposure_filter=exposure_filter)
-            hidden_count = self.registry.count_catalog_hidden()
-
-            if not skills:
-                if hidden_count > 0:
-                    empty_catalog = (
-                        "\n## Available Skills\n\n"
-                        "No skills are pre-loaded for this agent profile.\n"
-                        f"However, {hidden_count} additional skill(s) are installed. "
-                        "Use `list_skills` to discover them, then `get_skill_info(skill_name)` "
-                        "to load instructions when the task requires a specific skill.\n"
-                    )
-                else:
-                    empty_catalog = (
-                        "\n## Available Skills\n\n"
-                        "No skills installed. Use the skill creation workflow to add new skills.\n"
-                    )
-                if exposure_filter is None:
-                    self._cached_catalog = empty_catalog
-                return empty_catalog
-
-            skill_entries = []
-            for skill in skills:
-                desc = skill.description or ""
-                first_line = desc.split("\n")[0].strip()
-                when = getattr(skill, "when_to_use", "") or ""
-
-                if when:
-                    entry = self._safe_format(
-                        self.SKILL_ENTRY_WITH_HINT_TEMPLATE,
-                        name=skill.name,
-                        description=first_line,
-                        when_to_use=when,
-                    )
-                else:
-                    entry = self._safe_format(
-                        self.SKILL_ENTRY_TEMPLATE,
-                        name=skill.name,
-                        description=first_line,
-                    )
-                skill_entries.append(entry)
-
-            skill_list = "\n".join(skill_entries)
-
-            if hidden_count > 0:
-                skill_list += (
-                    f"\n\n_({hidden_count} more skill(s) available — "
-                    "use `list_skills` to discover all installed skills)_"
-                )
-
-            catalog = self._safe_format(self.CATALOG_TEMPLATE, skill_list=skill_list)
-            # Only cache unfiltered results (exposure_filter=None)
-            if exposure_filter is not None:
-                return catalog
+        catalog = self.get_index_catalog(exposure_filter=exposure_filter)
+        if exposure_filter is None:
             self._cached_catalog = catalog
-
-            logger.info(
-                "Generated skill catalog with %d skills (%d hidden)",
-                len(skills),
-                hidden_count,
-            )
-            return catalog
+        return catalog
 
     def get_catalog(self, refresh: bool = False) -> str:
         """
@@ -203,15 +171,220 @@ Do not infer filesystem paths from the workspace map; `get_skill_info` is author
             self._cached_compact = result
             return result
 
+    def get_grouped_compact_catalog(
+        self,
+        *,
+        exposure_filter: str | None = None,
+        max_tokens: int = 0,
+        priority_categories: tuple[str, ...] | None = None,
+    ) -> str:
+        """生成 **按分类分组的紧凑技能清单**，用于系统提示注入。
+
+        零丢失 + 自适应压缩：
+        - 所有技能名字始终保留（保证 LLM 能发现并调用）
+        - 按分类字典序、再按 name 字典序输出（确定性，避免抖动）
+        - 分类标题展示 ``DESCRIPTION.md`` 的描述（如果有）
+
+        当 ``max_tokens > 0`` 时启用三级自适应压缩：
+        - Level B (默认): ``- **name**: when_to_use`` (描述截至 160 字符)
+        - Level B-short: 描述缩短至 80 字符（技能数 > 80 时自动触发）
+        - Level C (index): 分类 + 逗号分隔名字，无描述
+
+        当 ``priority_categories`` 非空时启用**分类优先级裁剪**（Fix-4）：
+        - 列入优先级集合的分类按 Level B/B-short 输出（保留描述）
+        - 其余分类一律降级为 Level C（仅名字），由 LLM 通过
+          ``get_skill_info`` 按需展开。这种"主线详细 + 长尾索引"
+          的混合模式可在保留全量发现能力的同时显著节省 token。
+
+        缓存：按 ``(exposure_filter, max_tokens, priority_categories)`` 维度缓存。
+        """
+        with self._lock:
+            cache_key = (
+                exposure_filter,
+                max_tokens,
+                tuple(sorted(priority_categories or ())),
+            )
+            cached = self._cached_grouped.get(cache_key)
+            if cached is not None:
+                return cached
+
+            # L2：进程首次未命中时尝试从磁盘 snapshot prime L1
+            if not self._snapshot_loaded:
+                self._snapshot_loaded = True
+                try:
+                    primed = self._load_disk_snapshot_if_valid()
+                    if primed:
+                        self._cached_grouped.update(primed)
+                        if cache_key in primed:
+                            return primed[cache_key]
+                except Exception as e:
+                    logger.debug("Skill catalog snapshot prime failed: %s", e)
+
+            skills = self._list_model_visible(exposure_filter=exposure_filter)
+            hidden_count = self.registry.count_catalog_hidden()
+
+            if not skills:
+                if hidden_count > 0:
+                    result = (
+                        "## Available Skills\n\n"
+                        "No skills pre-loaded for this profile. "
+                        f"{hidden_count} more skill(s) available — "
+                        "use `list_skills` to discover, then `get_skill_info` to load."
+                    )
+                else:
+                    result = (
+                        "## Available Skills\n\n"
+                        "No skills installed. Use the skill creation workflow to add new skills."
+                    )
+                self._cached_grouped[cache_key] = result
+                return result
+
+            grouped: dict[str, list] = {}
+            for s in skills:
+                cat = s.category or "Uncategorized"
+                grouped.setdefault(cat, []).append(s)
+
+            cat_descriptions: dict[str, str | None] = {}
+            if self._category_registry is not None:
+                try:
+                    for entry in self._category_registry.list_all():
+                        cat_descriptions[entry.name] = entry.description
+                except Exception:
+                    pass
+
+            sorted_cats = sorted(grouped.keys(), key=lambda x: x.lower())
+
+            def _render(when_max: int) -> str:
+                """渲染带描述的技能清单 (Level B)"""
+                lines: list[str] = [
+                    "## Available Skills",
+                    "",
+                    "Use `get_skill_info(skill_name)` to load full instructions when needed.",
+                    SKILL_INSTRUCTION_ADVISORY,
+                    "",
+                ]
+                for cat in sorted_cats:
+                    desc = cat_descriptions.get(cat)
+                    lines.append(f"### {cat} — {desc}" if desc else f"### {cat}")
+                    for s in grouped[cat]:
+                        when = (getattr(s, "when_to_use", "") or "").strip()
+                        if not when:
+                            when = (s.description or "").split("\n")[0].strip()
+                        when = when[:when_max]
+                        lines.append(self._safe_format(
+                            "- **{name}**: {when}",
+                            name=s.name,
+                            when=when,
+                        ))
+                    lines.append("")
+                if hidden_count > 0:
+                    lines.append(
+                        f"_({hidden_count} more skill(s) hidden by profile — "
+                        "use `list_skills` to enumerate)_"
+                    )
+                return "\n".join(lines).rstrip() + "\n"
+
+            def _render_index() -> str:
+                """渲染仅名字的紧凑清单 (Level C)"""
+                lines: list[str] = [
+                    "## Available Skills",
+                    "",
+                    "Use `get_skill_info(skill_name)` to load full instructions before using a skill.",
+                    SKILL_INSTRUCTION_ADVISORY,
+                    "",
+                ]
+                for cat in sorted_cats:
+                    names = [s.name for s in grouped[cat]]
+                    desc = cat_descriptions.get(cat)
+                    lines.append(f"### {cat} — {desc}" if desc else f"### {cat}")
+                    lines.append(", ".join(names))
+                    lines.append("")
+                if hidden_count > 0:
+                    lines.append(
+                        f"_({hidden_count} more skill(s) hidden by profile — "
+                        "use `list_skills` to enumerate)_"
+                    )
+                return "\n".join(lines).rstrip() + "\n"
+
+            def _est_tokens(text: str) -> int:
+                return max(len(text) // 4, len(text.encode("utf-8")) // 3)
+
+            def _render_mixed(when_max: int) -> str:
+                """混合模式：priority 分类用 Level B；其余用 Level C。"""
+                priority_set = {c.lower() for c in (priority_categories or ())}
+                lines: list[str] = [
+                    "## Available Skills",
+                    "",
+                    "Use `get_skill_info(skill_name)` to load full instructions when needed.",
+                    SKILL_INSTRUCTION_ADVISORY,
+                    "",
+                ]
+                for cat in sorted_cats:
+                    desc = cat_descriptions.get(cat)
+                    is_priority = cat.lower() in priority_set
+                    if is_priority:
+                        # Level B 详细
+                        lines.append(f"### {cat} — {desc}" if desc else f"### {cat}")
+                        for s in grouped[cat]:
+                            when = (getattr(s, "when_to_use", "") or "").strip()
+                            if not when:
+                                when = (s.description or "").split("\n")[0].strip()
+                            when = when[:when_max]
+                            lines.append(self._safe_format(
+                                "- **{name}**: {when}",
+                                name=s.name,
+                                when=when,
+                            ))
+                        lines.append("")
+                    else:
+                        # Level C 仅名字 — 用 (index) 后缀提示
+                        names = [s.name for s in grouped[cat]]
+                        title = f"### {cat} (index) — {desc}" if desc else f"### {cat} (index)"
+                        lines.append(title)
+                        lines.append(", ".join(names))
+                        lines.append("")
+                if hidden_count > 0:
+                    lines.append(
+                        f"_({hidden_count} more skill(s) hidden by profile — "
+                        "use `list_skills` to enumerate)_"
+                    )
+                return "\n".join(lines).rstrip() + "\n"
+
+            if max_tokens <= 0:
+                result = _render_mixed(160) if priority_categories else _render(160)
+            else:
+                if priority_categories:
+                    result = _render_mixed(160)
+                    if _est_tokens(result) > max_tokens:
+                        result = _render_mixed(80)
+                else:
+                    result = _render(160)
+                    if _est_tokens(result) > max_tokens:
+                        result = _render(80)
+                if _est_tokens(result) > max_tokens:
+                    result = _render_index()
+
+            self._cached_grouped[cache_key] = result
+            logger.debug(
+                "Generated grouped catalog: %d skills across %d categories "
+                "(~%d tokens, max_tokens=%d)",
+                len(skills),
+                len(grouped),
+                _est_tokens(result),
+                max_tokens,
+            )
+            try:
+                self._write_disk_snapshot()
+            except Exception as e:
+                logger.debug("Skill catalog snapshot write failed: %s", e)
+            return result
+
     def get_index_catalog(self, *, exposure_filter: str | None = None) -> str:
         """
         获取已启用技能的"全量索引"（仅名称，尽量短，但完整）。
 
         Args:
             exposure_filter: "core" | "core+recommended" | None
-
-        disabled、disable_model_invocation 和 catalog_hidden 技能不会出现在索引中。
-        按 system / external / plugin 三组输出。
         """
         with self._lock:
             skills = self._list_model_visible(exposure_filter=exposure_filter)
@@ -253,6 +426,7 @@ Do not infer filesystem paths from the workspace map; `get_skill_info` is author
                 "Most external skills are **instruction-only** (no pre-built scripts) "
                 "\u2014 read instructions via get_skill_info, then write code and execute via run_shell.",
                 "Only use `run_skill_script` when a skill explicitly lists executable scripts.",
+                SKILL_INSTRUCTION_ADVISORY,
             ]
 
             if system_names:
@@ -380,7 +554,7 @@ Do not infer filesystem paths from the workspace map; `get_skill_info` is author
         hint = "💡 可能有用的技能: " + ", ".join(parts)
 
         if len(hint) > max_chars:
-            hint = hint[: max_chars - 3] + "..."
+            hint = hint[:max_chars - 3] + "..."
         return hint
 
     def invalidate_cache(self) -> None:
@@ -389,14 +563,136 @@ Do not infer filesystem paths from the workspace map; `get_skill_info` is author
             self._cached_catalog = None
             self._cached_index = None
             self._cached_compact = None
+            self._cached_grouped.clear()
+        self._invalidate_disk_snapshot()
 
     @property
     def skill_count(self) -> int:
         """技能数量"""
         return self.registry.count
 
+    # ── 二层缓存：磁盘 snapshot（参考 hermes-agent） ──────────────────
+
+    @staticmethod
+    def _snapshot_path() -> Path | None:
+        """返回 ``data/.skills_prompt_snapshot.json`` 的绝对路径。"""
+        try:
+            from ..config import settings
+
+            return Path(settings.project_root) / "data" / ".skills_prompt_snapshot.json"
+        except Exception:
+            try:
+                return Path.cwd() / "data" / ".skills_prompt_snapshot.json"
+            except Exception:
+                return None
+
+    def _build_manifest(self) -> dict[str, list[int]]:
+        """收集所有 SKILL.md / DESCRIPTION.md 的 (mtime_ns, size) 作为 manifest。"""
+        manifest: dict[str, list[int]] = {}
+        seen_dirs: set[str] = set()
+        for entry in self.registry.list_all():
+            sp = getattr(entry, "skill_path", None)
+            if not sp:
+                continue
+            try:
+                p = Path(sp)
+                if p.exists():
+                    st = p.stat()
+                    manifest[str(p)] = [st.st_mtime_ns, st.st_size]
+                # 同级或上溯查找 DESCRIPTION.md（最多向上 4 层）
+                cur = p.parent
+                for _ in range(4):
+                    key = str(cur)
+                    if key in seen_dirs:
+                        break
+                    seen_dirs.add(key)
+                    desc = cur / "DESCRIPTION.md"
+                    if desc.exists():
+                        st = desc.stat()
+                        manifest[str(desc)] = [st.st_mtime_ns, st.st_size]
+                    if cur.parent == cur:
+                        break
+                    cur = cur.parent
+            except OSError:
+                continue
+        return manifest
+
+    def _load_disk_snapshot_if_valid(self) -> dict[tuple, str] | None:
+        """如果 manifest 与 snapshot 一致，返回缓存字典。
+
+        磁盘快照只存 max_tokens=0 的无预算版本（完整描述），
+        预算压缩版在内存中按需从完整版推导，不持久化。
+        """
+        path = self._snapshot_path()
+        if path is None or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        snap_manifest = data.get("manifest")
+        snap_catalogs = data.get("catalogs")
+        if not isinstance(snap_manifest, dict) or not isinstance(snap_catalogs, dict):
+            return None
+        current = self._build_manifest()
+        if current != snap_manifest:
+            return None
+        result: dict[tuple, str] = {}
+        for k, v in snap_catalogs.items():
+            if not isinstance(v, str):
+                continue
+            exposure: str | None = k if k else None
+            result[(exposure, 0)] = v
+        return result
+
+    def _write_disk_snapshot(self) -> None:
+        """原子地把 L1 缓存写入磁盘 snapshot。"""
+        path = self._snapshot_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        manifest = self._build_manifest()
+        # 只持久化 max_tokens=0 的无预算版本；预算压缩版在内存中按需推导
+        catalogs = {}
+        for (exposure, mt), v in self._cached_grouped.items():
+            if mt == 0:
+                catalogs[exposure if exposure is not None else ""] = v
+        payload = {"version": 1, "manifest": manifest, "catalogs": catalogs}
+
+        try:
+            tmp_fd, tmp_str = tempfile.mkstemp(
+                prefix=".skills_snap.", suffix=".json.tmp", dir=str(path.parent)
+            )
+            tmp_path = Path(tmp_str)
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        except OSError as e:
+            logger.debug("Snapshot write failed: %s", e)
+            try:
+                if "tmp_path" in locals() and tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+    def _invalidate_disk_snapshot(self) -> None:
+        """清空磁盘 snapshot 与 ``_snapshot_loaded`` 标记。"""
+        self._snapshot_loaded = False
+        path = self._snapshot_path()
+        if path is None:
+            return
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as e:
+            logger.debug("Snapshot delete failed: %s", e)
+
 
 def generate_skill_catalog(registry: SkillRegistry) -> str:
     """便捷函数：生成技能清单"""
     catalog = SkillCatalog(registry)
     return catalog.generate_catalog()
+

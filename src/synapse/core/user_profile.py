@@ -8,7 +8,6 @@
 - 更新 USER.md 文件
 """
 
-import json
 import logging
 import random
 from dataclasses import dataclass, field
@@ -207,7 +206,170 @@ USER_PROFILE_ITEMS = [
         priority=3,
         category="persona",
     ),
+    # === 通用消费者/运营场景 (优先级 2-3，覆盖非程序员用户) ===
+    UserProfileItem(
+        key="industry",
+        name="行业",
+        description="所处行业（如美妆/教育/电商/餐饮等）",
+        question="你目前主要在哪个行业工作？",
+        priority=2,
+        category="business",
+    ),
+    UserProfileItem(
+        key="role_in_industry",
+        name="行业角色",
+        description="在所在行业里担任的角色（如博主/运营/店主/品牌方）",
+        question="你在这个行业里主要扮演什么角色？",
+        priority=2,
+        category="business",
+    ),
+    UserProfileItem(
+        key="channels",
+        name="主要渠道",
+        description="主要运营/工作的渠道平台（如小红书/抖音/微信/淘宝）",
+        question="你主要在哪些平台上做运营或对接客户？",
+        priority=3,
+        category="business",
+    ),
+    UserProfileItem(
+        key="audience_size",
+        name="受众规模",
+        description="粉丝量/客户量/团队规模等量级描述",
+        question="你目前的粉丝/客户/团队大致是什么规模？",
+        priority=3,
+        category="business",
+    ),
+    UserProfileItem(
+        key="kpi_focus",
+        name="核心指标",
+        description="最关心的业务指标（如 GMV/复购率/CTR/留资量）",
+        question="你目前最关注哪个业务指标？",
+        priority=3,
+        category="business",
+    ),
+    # === 通用人口统计学（PR-B1，覆盖 LLM 高频回写场景） ===
+    UserProfileItem(
+        key="city",
+        name="所在城市",
+        description="用户当前所在的城市/地区",
+        question="你目前主要在哪座城市生活或工作？",
+        priority=2,
+        category="basic",
+    ),
+    UserProfileItem(
+        key="location",
+        name="详细位置",
+        description="比 city 更细粒度的位置（区/园区/校区等，可选）",
+        question="如果方便，能告诉我更具体的位置吗？",
+        priority=4,
+        category="basic",
+    ),
+    UserProfileItem(
+        key="profession",
+        name="职业",
+        description="用户的职业头衔（如 UI 设计师 / 产品经理 / 学生）",
+        question="你目前的职业是什么？",
+        priority=2,
+        category="basic",
+    ),
+    UserProfileItem(
+        key="age",
+        name="年龄",
+        description="用户年龄（数字或段位，如 32 / 30+）",
+        question="如果方便分享，可以告诉我你的年龄吗？",
+        priority=3,
+        category="basic",
+    ),
+    UserProfileItem(
+        key="birthday",
+        name="生日",
+        description="用户生日（YYYY-MM-DD 或 MM-DD）",
+        question="可以告诉我你的生日吗？方便在那天送上祝福。",
+        priority=4,
+        category="basic",
+    ),
+    UserProfileItem(
+        key="gender",
+        name="性别/称谓",
+        description="性别或希望被称呼的代词",
+        question="希望我怎么称呼你（先生/女士/直呼名字…）？",
+        priority=4,
+        category="basic",
+    ),
+    UserProfileItem(
+        key="primary_goal",
+        name="当前主要目标",
+        description="用户当前阶段最在意的目标或主线（如 找新工作 / 涨粉 / 减肥）",
+        question="你最近最重要的一件事是什么？",
+        priority=3,
+        category="basic",
+    ),
 ]
+
+
+# PR-B1：常见自然语言键名 → 白名单 key 的别名映射。
+# LLM 经常写 `update_user_profile(key="地点", value="杭州")` 而不是 `city`，
+# 没有这层映射就会走 _save_unknown_as_memory 的 profile_fallback，跨会话污染。
+USER_PROFILE_KEY_ALIASES: dict[str, str] = {
+    # city / location
+    "城市": "city",
+    "所在城市": "city",
+    "居住城市": "city",
+    "city_name": "city",
+    "current_city": "city",
+    "地点": "location",
+    "位置": "location",
+    "address": "location",
+    "区域": "location",
+    # profession
+    "职业": "profession",
+    "工作": "profession",
+    "title": "profession",
+    "job": "profession",
+    "job_title": "profession",
+    "occupation": "profession",
+    "role": "profession",
+    "user_role": "profession",
+    "agent_role_for_user": "profession",
+    # work_field 别名（已存在于白名单）
+    "行业领域": "work_field",
+    "学习领域": "work_field",
+    # age / birthday
+    "年龄": "age",
+    "岁": "age",
+    "user_age": "age",
+    "生日": "birthday",
+    "birth_day": "birthday",
+    "birth_date": "birthday",
+    "date_of_birth": "birthday",
+    # gender
+    "性别": "gender",
+    "称呼方式": "gender",
+    # primary_goal
+    "目标": "primary_goal",
+    "近期目标": "primary_goal",
+    "goal": "primary_goal",
+    "current_goal": "primary_goal",
+    # name aliases
+    "姓名": "name",
+    "昵称": "name",
+    "称呼": "name",
+    "user_name": "name",
+    "nickname": "name",
+}
+
+
+def resolve_profile_key(key: str) -> str:
+    """Map common natural-language keys to the canonical whitelist key.
+
+    Returns the original key if no alias matches; callers can then check
+    against the whitelist to decide whether to accept or reject.
+    """
+    if not key:
+        return key
+    if any(item.key == key for item in USER_PROFILE_ITEMS):
+        return key
+    return USER_PROFILE_KEY_ALIASES.get(key, key)
 
 
 @dataclass
@@ -280,20 +442,22 @@ class UserProfileManager:
 
     def _load_state(self) -> UserProfileState:
         """加载状态"""
-        if self.state_file.exists():
-            try:
-                with open(self.state_file, encoding="utf-8") as f:
-                    data = json.load(f)
+        try:
+            from synapse.utils.atomic_io import read_json_safe
+
+            data = read_json_safe(self.state_file)
+            if isinstance(data, dict):
                 return UserProfileState.from_dict(data)
-            except Exception as e:
-                logger.warning(f"Failed to load profile state: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to load profile state: {e}")
         return UserProfileState()
 
     def _save_state(self) -> None:
         """保存状态"""
         try:
-            with open(self.state_file, "w", encoding="utf-8") as f:
-                json.dump(self.state.to_dict(), f, ensure_ascii=False, indent=2)
+            from synapse.utils.atomic_io import safe_json_write
+
+            safe_json_write(self.state_file, self.state.to_dict())
         except Exception as e:
             logger.error(f"Failed to save profile state: {e}")
 
@@ -502,6 +666,14 @@ class UserProfileManager:
 - **主要语言**: 中文
 - **时区**: {get_value("timezone")}
 
+## Business / Domain
+
+- **行业**: {get_value("industry")}
+- **行业角色**: {get_value("role_in_industry")}
+- **主要渠道**: {get_value("channels")}
+- **受众规模**: {get_value("audience_size")}
+- **核心指标**: {get_value("kpi_focus")}
+
 ## Technical Stack
 
 ### Preferred Languages
@@ -591,7 +763,7 @@ class UserProfileManager:
 
         summary = f"已收集 {collected}/{total} 项用户信息\n\n"
 
-        for category in ["basic", "tech", "communication", "habits"]:
+        for category in ["basic", "tech", "communication", "habits", "business", "personal", "persona"]:
             category_items = [item for item in self.items.values() if item.category == category]
             summary += f"**{category.title()}**:\n"
             for item in category_items:

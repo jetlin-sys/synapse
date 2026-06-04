@@ -21,9 +21,114 @@ from .models import (
     OrgStatus,
     _new_id,
     _now_iso,
+    infer_agent_profile_id_for_node,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class OrgNameConflictError(ValueError):
+    """组织名字与已有组织重复时抛出。
+
+    Args:
+        name: 用户提交的、已经被占用的名字（保留原始大小写）。
+        conflict_org_id: 占用该名字的现有组织 id；REST 层据此返回 409 + 提示。
+    """
+
+    def __init__(self, name: str, conflict_org_id: str) -> None:
+        super().__init__(f"Organization name already exists: {name!r}")
+        self.name = name
+        self.conflict_org_id = conflict_org_id
+
+
+def _normalize_org_name(name: str | None) -> str:
+    """将组织名归一化，便于做 case/空白不敏感的唯一性比对。
+
+    去掉首尾空白并转小写。所有"已存在则视为重复"的判断都基于这个归一化形式，
+    用户层面则保留原始大小写。
+    """
+    return (name or "").strip().casefold()
+
+
+_LAYOUT_NODE_W = 240
+_LAYOUT_NODE_H = 100
+_LAYOUT_GAP_X = 40
+_LAYOUT_GAP_Y = 80
+
+
+def _apply_initial_tree_layout(data: dict) -> None:
+    """Assign a readable first-open layout to template-created organizations.
+
+    Built-in and user-saved templates may carry stale or overly compact
+    coordinates. Creating from a template is a fresh org, so normalize the
+    initial canvas once before persisting it.
+    """
+    nodes = data.get("nodes") or []
+    edges = data.get("edges") or []
+    if not nodes:
+        return
+
+    node_ids = [str(n.get("id") or "") for n in nodes if isinstance(n, dict) and n.get("id")]
+    node_id_set = set(node_ids)
+    if not node_id_set:
+        return
+
+    children_map: dict[str, list[str]] = {}
+    parent_set: set[str] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        if source not in node_id_set or target not in node_id_set or source == target:
+            continue
+        children_map.setdefault(source, []).append(target)
+        parent_set.add(target)
+
+    roots = [node_id for node_id in node_ids if node_id not in parent_set]
+    if not roots:
+        roots = node_ids[:1]
+
+    levels: list[list[str]] = []
+    visited: set[str] = set()
+    queue = list(roots)
+    while queue:
+        level: list[str] = []
+        next_queue: list[str] = []
+        for node_id in queue:
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            level.append(node_id)
+            for child_id in children_map.get(node_id, []):
+                if child_id not in visited:
+                    next_queue.append(child_id)
+        if level:
+            levels.append(level)
+        queue = next_queue
+
+    orphaned = [node_id for node_id in node_ids if node_id not in visited]
+    if orphaned:
+        if levels:
+            levels[-1].extend(orphaned)
+        else:
+            levels.append(orphaned)
+
+    max_level_width = max(len(level) for level in levels)
+    total_w = max_level_width * (_LAYOUT_NODE_W + _LAYOUT_GAP_X) - _LAYOUT_GAP_X
+    pos_map: dict[str, dict[str, int]] = {}
+    for level_index, level in enumerate(levels):
+        level_w = len(level) * (_LAYOUT_NODE_W + _LAYOUT_GAP_X) - _LAYOUT_GAP_X
+        offset_x = (total_w - level_w) // 2
+        for node_index, node_id in enumerate(level):
+            pos_map[node_id] = {
+                "x": offset_x + node_index * (_LAYOUT_NODE_W + _LAYOUT_GAP_X),
+                "y": level_index * (_LAYOUT_NODE_H + _LAYOUT_GAP_Y),
+            }
+
+    for node in nodes:
+        if isinstance(node, dict) and node.get("id") in pos_map:
+            node["position"] = pos_map[str(node["id"])]
 
 
 class OrgManager:
@@ -46,6 +151,14 @@ class OrgManager:
         if ".." in org_id or "/" in org_id or "\\" in org_id:
             raise ValueError(f"Invalid org_id: {org_id}")
         return self._orgs_dir / org_id
+
+    def get_org_dir(self, org_id: str) -> Path:
+        """公开版的 :pyfunc:`_org_dir`：返回组织在磁盘上的根目录。
+
+        推荐的访问路径，外部调用方（command_service / api 路由 / 插件）应该
+        通过这里而不是直接戳带前导下划线的私有方法。两者完全等价、无副作用。
+        """
+        return self._org_dir(org_id)
 
     def _org_json(self, org_id: str) -> Path:
         return self._org_dir(org_id) / "org.json"
@@ -98,8 +211,76 @@ class OrgManager:
         except FileNotFoundError:
             return None
 
+    def find_by_name(
+        self,
+        name: str,
+        *,
+        exclude_org_id: str | None = None,
+        include_archived: bool = True,
+    ) -> list[dict]:
+        """按"归一化名字"查询匹配的组织（去首尾空白、大小写不敏感）。
+
+        返回列表里每个元素和 :pyfunc:`list_orgs` 一致的摘要 dict（含 id/name/...）。
+        ``exclude_org_id`` 用于"改名时不要把自己算成重名"。
+
+        归档（ARCHIVED）默认也参与查重——归档后改名能复活老组织名容易让人困惑；
+        如果调用方明确要忽略归档，可显式传 ``include_archived=False``。
+        """
+        norm = _normalize_org_name(name)
+        if not norm:
+            return []
+        result: list[dict] = []
+        for item in self.list_orgs(include_archived=include_archived):
+            if exclude_org_id and item.get("id") == exclude_org_id:
+                continue
+            if _normalize_org_name(item.get("name", "")) == norm:
+                result.append(item)
+        return result
+
+    def resolve_id_by_name_or_id(self, query: str) -> tuple[str | None, list[dict]]:
+        """聊天/IM 端用：给一段用户输入，优先按 id 命中，否则按名字查找。
+
+        返回 ``(org_id, candidates)``：
+
+        - 用户输入恰好是已有 org 的 id（精确匹配）：``(id, [])``。
+        - 名字精确匹配且只有一个：``(id, [])``。
+        - 名字匹配多个：``(None, [候选 dict, ...])`` —— 由调用方让用户消歧。
+        - 都不匹配：``(None, [])``。
+
+        归一化规则与 :pyfunc:`find_by_name` 一致：去首尾空白、大小写不敏感。
+        """
+        q = (query or "").strip()
+        if not q:
+            return None, []
+        if self.get(q) is not None:
+            return q, []
+        matches = self.find_by_name(q)
+        if len(matches) == 1:
+            return str(matches[0].get("id") or ""), []
+        if len(matches) > 1:
+            return None, matches
+        return None, []
+
+    def _ensure_name_unique(self, name: str, *, exclude_org_id: str | None = None) -> None:
+        """重名校验入口；冲突直接抛 :class:`OrgNameConflictError`。
+
+        在 :pyfunc:`create`、:pyfunc:`update`、:pyfunc:`duplicate` 三处统一调用，
+        从根本上保证"用户在任何路径下都不可能把两个组织起成同一个名字"。
+        """
+        clean = (name or "").strip()
+        if not clean:
+            raise ValueError("Organization name is required")
+        conflicts = self.find_by_name(clean, exclude_org_id=exclude_org_id)
+        if conflicts:
+            raise OrgNameConflictError(clean, str(conflicts[0].get("id") or ""))
+
     def create(self, data: dict) -> Organization:
-        """Create a new organization from dict payload."""
+        """Create a new organization from dict payload.
+
+        Raises:
+            OrgNameConflictError: 名字与已有组织重复（大小写/空白不敏感）。
+        """
+        self._ensure_name_unique(data.get("name", ""))
         org = Organization.from_dict(data)
         if not org.id:
             org.id = _new_id("org_")
@@ -111,10 +292,21 @@ class OrgManager:
         return org
 
     def update(self, org_id: str, data: dict) -> Organization:
-        """Update an existing organization. Merges provided fields."""
+        """Update an existing organization. Merges provided fields.
+
+        Raises:
+            OrgNameConflictError: 改名时与其他组织重名。
+        """
         org = self._load(org_id)
         nodes_raw = data.pop("nodes", None)
         edges_raw = data.pop("edges", None)
+
+        if "name" in data:
+            new_name = data.get("name")
+            if isinstance(new_name, str) and _normalize_org_name(new_name) != _normalize_org_name(
+                org.name
+            ):
+                self._ensure_name_unique(new_name, exclude_org_id=org_id)
 
         for key, val in data.items():
             if key in ("id", "created_at"):
@@ -139,6 +331,8 @@ class OrgManager:
                     for key in _CONFIG_FIELDS:
                         if key in nd:
                             setattr(old, key, nd[key])
+                    if not old.agent_profile_id:
+                        old.agent_profile_id = infer_agent_profile_id_for_node(old.to_dict())
                     updated.append(old)
                 else:
                     clean = {k: v for k, v in nd.items() if k not in _RUNTIME_KEYS}
@@ -150,6 +344,23 @@ class OrgManager:
                 OrgEdge.from_dict(e) for e in edges_raw
                 if e.get("source") != e.get("target")
             ]
+
+        # 工作台节点（plugin_origin 非空）必须是叶子节点。把这一规则放在
+        # 边/节点合并完成之后做最终校验，避免任意路径(直接 PATCH 节点 / 编辑
+        # 边后保存)绕过限制。命中时抛 ValueError，由 API 层映射成 422。
+        _violations: list[str] = []
+        for n in org.nodes:
+            if not getattr(n, "plugin_origin", None):
+                continue
+            if org.get_children(n.id):
+                title = (n.role_title or n.id).strip()
+                _violations.append(f"{title}({n.id})")
+        if _violations:
+            raise ValueError(
+                "工作台节点必须是叶子节点，不允许挂下属节点："
+                + "、".join(_violations)
+                + "。请删除其下属节点或移除工作台标识后再保存。"
+            )
 
         org.updated_at = _now_iso()
         self._ensure_node_dirs(org)
@@ -188,11 +399,26 @@ class OrgManager:
         return self.update(org_id, {"status": "active"})
 
     def duplicate(self, org_id: str, new_name: str | None = None) -> Organization:
-        """Deep-copy an organization."""
+        """Deep-copy an organization.
+
+        如果 ``new_name`` 未指定，按 "<原名> (副本)" → "<原名> (副本 2)" 顺序
+        自动寻找一个未被占用的名字，避免连续复制时撞名。
+        显式传入的 ``new_name`` 不会再加后缀；若它已被占用，
+        :pyfunc:`create` 会抛 :class:`OrgNameConflictError`。
+        """
         src = self._load(org_id)
         data = src.to_dict()
         data["id"] = _new_id("org_")
-        data["name"] = new_name or f"{src.name} (副本)"
+        if new_name:
+            data["name"] = new_name
+        else:
+            base = f"{src.name} (副本)"
+            candidate = base
+            n = 2
+            while self.find_by_name(candidate):
+                candidate = f"{base} {n}"
+                n += 1
+            data["name"] = candidate
         data["status"] = OrgStatus.DORMANT.value
         data["created_at"] = _now_iso()
         data["updated_at"] = data["created_at"]
@@ -305,14 +531,38 @@ class OrgManager:
     def create_from_template(
         self, template_id: str, overrides: dict | None = None
     ) -> Organization:
+        """从模板创建组织。
+
+        名字冲突策略：
+
+        - **用户显式覆盖了 ``overrides["name"]``** → 严格使用该名字；撞名时由
+          :pyfunc:`create` 抛 :class:`OrgNameConflictError`，路由层返回 409，
+          让用户明确改个名字。
+        - **未覆盖、沿用模板自带名** → 若已被占用，自动加 ``(2)/(3)`` 后缀，
+          这样反复实例化同一个模板才不会被全局唯一约束卡住。
+        """
         tpl = self.get_template(template_id)
         if tpl is None:
             raise FileNotFoundError(f"Template not found: {template_id}")
         tpl.pop("is_template", None)
         tpl["id"] = _new_id("org_")
         tpl["status"] = OrgStatus.DORMANT.value
+        name_explicitly_overridden = bool(overrides and isinstance(overrides.get("name"), str))
         if overrides:
             tpl.update(overrides)
+        if not name_explicitly_overridden:
+            base_name = (tpl.get("name") or "").strip()
+            if base_name and self.find_by_name(base_name):
+                candidate = base_name
+                n = 2
+                while self.find_by_name(candidate):
+                    candidate = f"{base_name} ({n})"
+                    n += 1
+                tpl["name"] = candidate
+        for node in tpl.get("nodes", []) or []:
+            if isinstance(node, dict) and not node.get("agent_profile_id"):
+                node["agent_profile_id"] = infer_agent_profile_id_for_node(node)
+        _apply_initial_tree_layout(tpl)
         return self.create(tpl)
 
     def save_as_template(self, org_id: str, template_id: str | None = None) -> str:
@@ -337,17 +587,17 @@ class OrgManager:
     # ------------------------------------------------------------------
 
     def load_state(self, org_id: str) -> dict:
+        from synapse.utils.atomic_io import read_json_safe
+
         p = self._state_json(org_id)
-        if not p.is_file():
-            return {}
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = read_json_safe(p)
+        return data if isinstance(data, dict) else {}
 
     def save_state(self, org_id: str, state: dict) -> None:
+        from synapse.utils.atomic_io import safe_json_write
+
         p = self._state_json(org_id)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        safe_json_write(p, state)
 
     # ------------------------------------------------------------------
     # Internal

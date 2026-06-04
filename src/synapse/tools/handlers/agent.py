@@ -2,6 +2,14 @@
 Multi-agent handler — delegate_to_agent, spawn_agent and create_agent.
 
 Always registered (multi-agent mode is always on).
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 from __future__ import annotations
@@ -12,6 +20,8 @@ import re
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
+
+from ...core.policy_v2 import ApprovalClass
 
 if TYPE_CHECKING:
     from ...core.agent import Agent
@@ -37,6 +47,16 @@ class AgentToolHandler:
         "task_stop",
         "send_agent_message",
     ]
+
+    # C7 explicit ApprovalClass — multi-agent control plane
+    TOOL_CLASSES = {
+        "delegate_to_agent": ApprovalClass.CONTROL_PLANE,
+        "delegate_parallel": ApprovalClass.CONTROL_PLANE,
+        "spawn_agent": ApprovalClass.CONTROL_PLANE,
+        "create_agent": ApprovalClass.CONTROL_PLANE,
+        "task_stop": ApprovalClass.INTERACTIVE,
+        "send_agent_message": ApprovalClass.INTERACTIVE,
+    }
 
     def __init__(self, agent: Agent):
         self.agent = agent
@@ -68,7 +88,6 @@ class AgentToolHandler:
         message = (params.get("message") or "").strip()
         reason = (params.get("reason") or "").strip()
         context = (params.get("context") or "").strip()
-        plan_item_id = (params.get("plan_item_id") or "").strip()
 
         if not agent_id:
             return "❌ agent_id is required"
@@ -82,21 +101,6 @@ class AgentToolHandler:
         session = getattr(self.agent, "_current_session", None)
         if session is None:
             return "❌ No active session — delegation requires a session context"
-
-        session_id = (
-            getattr(session, "id", None)
-            or getattr(session, "session_id", None)
-            or getattr(self.agent, "_current_session_id", None)
-            or ""
-        )
-
-        from synapse.rd_meeting.work_plan import check_delegation_allowed, mark_delegation_started
-
-        gate_err = check_delegation_allowed(
-            str(session_id), agent_id=agent_id, plan_item_id=plan_item_id
-        )
-        if gate_err:
-            return gate_err
 
         current_agent = (
             getattr(getattr(session, "context", None), "agent_profile_id", "default") or "default"
@@ -113,24 +117,7 @@ class AgentToolHandler:
         if reason:
             isolated_message += f"\n[委派原因] {reason}"
 
-        started = time.monotonic()
         try:
-            from synapse.rd_meeting.live import (
-                record_delegation_finished,
-                record_delegation_started,
-            )
-
-            mark_delegation_started(
-                str(session_id), agent_id=agent_id, plan_item_id=plan_item_id
-            )
-            record_delegation_started(
-                str(session_id),
-                from_agent=current_agent,
-                to_agent=agent_id,
-                reason=reason,
-                task_preview=message[:280],
-                plan_item_id=plan_item_id,
-            )
             result = await orchestrator.delegate(
                 session=session,
                 from_agent=current_agent,
@@ -138,37 +125,11 @@ class AgentToolHandler:
                 message=isolated_message,
                 reason=reason,
             )
-            ok = not str(result).strip().startswith("❌")
-            record_delegation_finished(
-                str(session_id),
-                from_agent=current_agent,
-                to_agent=agent_id,
-                ok=ok,
-                summary=str(result)[:500],
-                elapsed_s=time.monotonic() - started,
-            )
-            return str(result)
+            from ...core.policy_v2.prompt_hardening import wrap_external_content
+
+            return wrap_external_content(str(result), source=f"sub_agent:{agent_id}")
         except Exception as e:
             logger.error(f"[AgentToolHandler] Delegation failed: {e}", exc_info=True)
-            try:
-                from synapse.rd_meeting.gate import schedule_delegation_failure_gate
-                from synapse.rd_meeting.live import record_delegation_finished
-
-                record_delegation_finished(
-                    str(session_id),
-                    from_agent=current_agent,
-                    to_agent=agent_id,
-                    ok=False,
-                    summary=str(e)[:500],
-                    elapsed_s=time.monotonic() - started,
-                )
-                schedule_delegation_failure_gate(
-                    str(session_id),
-                    to_agent=agent_id,
-                    error_text=str(e),
-                )
-            except Exception as live_exc:
-                logger.debug("rd_meeting delegation live hooks: %s", live_exc)
             return f"❌ Delegation to {agent_id} failed: {e}"
 
     # ------------------------------------------------------------------
@@ -223,24 +184,6 @@ class AgentToolHandler:
             getattr(getattr(session, "context", None), "agent_profile_id", "default") or "default"
         )
 
-        session_id = (
-            getattr(session, "id", None)
-            or getattr(session, "session_id", None)
-            or getattr(self.agent, "_current_session_id", None)
-            or ""
-        )
-
-        from synapse.rd_meeting.work_plan import check_delegation_allowed
-
-        for task in tasks_param:
-            if not isinstance(task, dict):
-                continue
-            aid = (task.get("agent_id") or "").strip()
-            pid = (task.get("plan_item_id") or "").strip()
-            gate_err = check_delegation_allowed(str(session_id), agent_id=aid, plan_item_id=pid)
-            if gate_err:
-                return gate_err
-
         # Detect duplicate agent_ids — auto-spawn ephemeral clones
         # to avoid two coroutines sharing the same Agent instance.
         agent_ids = [(t.get("agent_id") or "").strip() for t in tasks_param]
@@ -259,7 +202,6 @@ class AgentToolHandler:
             agent_id = (task.get("agent_id") or "").strip()
             message = (task.get("message") or "").strip()
             reason = (task.get("reason") or "").strip()
-            plan_item_id = (task.get("plan_item_id") or "").strip()
             per_task_ctx = (task.get("context") or "").strip()
             task_context = "\n\n".join(filter(None, [global_context, per_task_ctx]))
 
@@ -268,24 +210,17 @@ class AgentToolHandler:
                 if store:
                     # ALL occurrences (including the first) get ephemeral clones
                     # to avoid sharing a pool instance with previous delegations
-                    from ...agents.profile import AgentProfile, AgentType
+                    from ...agents.profile import AgentType
 
                     base = store.get(agent_id)
                     if base:
                         ts = int(time.time() * 1000)
                         idx = seen_counter[agent_id]
                         eph_id = f"ephemeral_{agent_id}_{ts}_{idx}"
-                        clone = AgentProfile(
+                        clone = base.derive(
                             id=eph_id,
                             name=f"{base.name} (分身{idx})",
-                            description=base.description,
                             type=AgentType.DYNAMIC,
-                            skills=list(base.skills),
-                            skills_mode=base.skills_mode,
-                            custom_prompt=base.custom_prompt or "",
-                            icon=base.icon or "🤖",
-                            color=base.color or "#6b7280",
-                            fallback_profile_id=base.fallback_profile_id,
                             created_by="ai_parallel_clone",
                             ephemeral=True,
                             inherit_from=agent_id,
@@ -303,7 +238,6 @@ class AgentToolHandler:
                                 "message": message,
                                 "reason": reason,
                                 "context": task_context,
-                                "plan_item_id": plan_item_id,
                             }
                         )
                         continue
@@ -315,7 +249,6 @@ class AgentToolHandler:
                     "message": message,
                     "reason": reason,
                     "context": task_context,
-                    "plan_item_id": plan_item_id,
                 }
             )
 
@@ -327,7 +260,6 @@ class AgentToolHandler:
             msg = task["message"]
             rsn = task["reason"]
             ctx = task.get("context", "")
-            pid = str(task.get("plan_item_id") or "").strip()
             if not aid or not msg:
                 return display or "?", "❌ agent_id and message are required"
 
@@ -342,30 +274,8 @@ class AgentToolHandler:
                 f"[AgentToolHandler] Parallel delegation: {current_agent} -> {aid} | reason={rsn}"
             )
 
-            session_id = (
-                getattr(session, "id", None)
-                or getattr(session, "session_id", None)
-                or getattr(self.agent, "_current_session_id", None)
-                or ""
-            )
-            started = time.monotonic()
             isolated_ctx = None
             try:
-                from synapse.rd_meeting.live import (
-                    record_delegation_finished,
-                    record_delegation_started,
-                )
-                from synapse.rd_meeting.work_plan import mark_delegation_started
-
-                mark_delegation_started(str(session_id), agent_id=display, plan_item_id=pid)
-                record_delegation_started(
-                    str(session_id),
-                    from_agent=current_agent,
-                    to_agent=aid,
-                    reason=rsn,
-                    task_preview=msg[:280],
-                    plan_item_id=pid,
-                )
                 if parent_browser and parent_browser.is_ready:
                     try:
                         isolated_ctx = await parent_browser.create_isolated_context()
@@ -380,37 +290,9 @@ class AgentToolHandler:
                     reason=rsn,
                     isolated_browser=isolated_ctx,
                 )
-                ok = not str(result).strip().startswith("❌")
-                record_delegation_finished(
-                    str(session_id),
-                    from_agent=current_agent,
-                    to_agent=aid,
-                    ok=ok,
-                    summary=str(result)[:500],
-                    elapsed_s=time.monotonic() - started,
-                )
                 return display, str(result)
             except BaseException as e:
                 logger.error(f"[AgentToolHandler] Parallel delegation to {aid} failed: {e}")
-                try:
-                    from synapse.rd_meeting.gate import schedule_delegation_failure_gate
-                    from synapse.rd_meeting.live import record_delegation_finished
-
-                    record_delegation_finished(
-                        str(session_id),
-                        from_agent=current_agent,
-                        to_agent=aid,
-                        ok=False,
-                        summary=str(e)[:500],
-                        elapsed_s=time.monotonic() - started,
-                    )
-                    schedule_delegation_failure_gate(
-                        str(session_id),
-                        to_agent=aid,
-                        error_text=str(e),
-                    )
-                except Exception as live_exc:
-                    logger.debug("rd_meeting parallel delegation live hooks: %s", live_exc)
                 return display, f"❌ Failed: {e}"
             finally:
                 if isolated_ctx and isolated_ctx is not parent_browser:
@@ -430,6 +312,8 @@ class AgentToolHandler:
         # Clean up ephemeral clones that the orchestrator didn't already clean
         self._cleanup_ephemeral_ids(ephemeral_ids, store)
 
+        from ...core.policy_v2.prompt_hardening import wrap_external_content
+
         _art_marker = "\n\n__ARTIFACT_RECEIPTS__\n"
         all_receipt_blocks: list[str] = []
         parts = []
@@ -448,7 +332,10 @@ class AgentToolHandler:
                     block = result[block_start:] if eol < 0 else result[block_start:eol]
                     all_receipt_blocks.append(block)
                     result = result[:idx] + (result[block_start + len(block) :] if eol >= 0 else "")
-                parts.append(f"## Agent: {display_id}\n{result}")
+                wrapped = wrap_external_content(
+                    result, source=f"parallel_sub_agent:{display_id}"
+                )
+                parts.append(f"## Agent: {display_id}\n{wrapped}")
         combined = "\n\n---\n\n".join(parts)
         # Re-append all receipt blocks as a single merged JSON array at the end
         if all_receipt_blocks:
@@ -507,7 +394,7 @@ class AgentToolHandler:
             getattr(getattr(session, "context", None), "agent_profile_id", "default") or "default"
         )
 
-        from ...agents.profile import AgentProfile, AgentType, SkillsMode
+        from ...agents.profile import AgentType, SkillsMode
 
         store = self._get_profile_store()
         base_profile = store.get(inherit_from) if store else None
@@ -529,7 +416,7 @@ class AgentToolHandler:
         if custom_prompt_overlay:
             merged_prompt = f"{merged_prompt}\n\n{custom_prompt_overlay}".strip()
 
-        ephemeral_profile = AgentProfile(
+        ephemeral_profile = base_profile.derive(
             id=ephemeral_id,
             name=f"{base_profile.name} (临时)",
             description=f"Inherited from {inherit_from}: {reason or message[:80]}",
@@ -537,9 +424,6 @@ class AgentToolHandler:
             skills=merged_skills,
             skills_mode=base_profile.skills_mode if merged_skills else SkillsMode.ALL,
             custom_prompt=merged_prompt,
-            icon=base_profile.icon or "🤖",
-            color=base_profile.color or "#6b7280",
-            fallback_profile_id=base_profile.fallback_profile_id,
             created_by="ai_spawn",
             ephemeral=True,
             inherit_from=inherit_from,
@@ -560,7 +444,9 @@ class AgentToolHandler:
                 message=message,
                 reason=reason or f"Spawned from {inherit_from}",
             )
-            return str(result)
+            from ...core.policy_v2.prompt_hardening import wrap_external_content
+
+            return wrap_external_content(str(result), source=f"spawn_agent:{ephemeral_id}")
         except Exception as e:
             logger.error(f"[AgentToolHandler] Spawn delegation failed: {e}", exc_info=True)
             store.remove_ephemeral(ephemeral_id)
@@ -576,6 +462,13 @@ class AgentToolHandler:
         skills = params.get("skills") or []
         custom_prompt = (params.get("custom_prompt") or "").strip()
         persistent = bool(params.get("persistent", False))
+        identity_mode = params.get("identity_mode") or "shared"
+        # Phase 2b.2：优先接受新名 `memory_isolation`，回退到旧名 `memory_mode`。
+        # 两个都给则以新名为准（与 AgentProfile.from_dict 行为一致）。
+        memory_mode = (
+            params.get("memory_isolation") or params.get("memory_mode") or "shared"
+        )
+        memory_inherit_global = params.get("memory_inherit_global", True)
 
         if not name:
             return "❌ name is required"
@@ -643,6 +536,9 @@ class AgentToolHandler:
             custom_prompt=custom_prompt,
             icon="🤖",
             color="#6b7280",
+            identity_mode=identity_mode,
+            memory_mode=memory_mode,
+            memory_inherit_global=memory_inherit_global,
             created_by="ai",
             ephemeral=is_ephemeral,
         )

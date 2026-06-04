@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _hub_unavailable_detail(store: str, message: str, guidance: str) -> dict[str, dict[str, str]]:
+    """Stable error payload for frontend offline/remote-store degradation."""
+    return {
+        "error": {
+            "code": f"{store.upper()}_UNAVAILABLE",
+            "message": message,
+            "guidance": guidance,
+        }
+    }
+
+
 def _project_root() -> Path:
     try:
         from synapse.config import settings
@@ -79,6 +90,25 @@ def _reload_skills(request) -> None:
         logger.info(f"Skills reloaded after platform install: {count} loaded")
     except Exception as e:
         logger.warning(f"Skill reload after platform install failed (non-blocking): {e}")
+
+
+async def _propagate_store_skill_install(request: Request, skill_dir: Path) -> None:
+    """Apply the same post-install consistency path as /api/skills/install."""
+    from synapse.skills.allowlist_io import upsert_skill_ids
+    from synapse.skills.events import SkillEvent
+
+    skill_id = skill_dir.name
+    try:
+        upsert_skill_ids({skill_id})
+    except Exception as e:
+        logger.warning("Failed to upsert store skill %s into skills.json: %s", skill_id, e)
+
+    try:
+        from synapse.api.routes.skills import _propagate
+
+        await _propagate(request, SkillEvent.STORE_INSTALL)
+    except Exception as e:
+        logger.warning("Store skill propagate failed (non-blocking): %s", e)
 
 
 class ExportRequest(BaseModel):
@@ -439,7 +469,11 @@ async def hub_search_agents(
         logger.warning(f"Hub search agents unavailable (remote platform may be offline): {e}")
         raise HTTPException(
             status_code=502,
-            detail="远程 Agent Store 暂不可用。本地 Agent 导入导出功能不受影响。",
+            detail=_hub_unavailable_detail(
+                "agent_store",
+                "远程 Agent Store 暂不可用。",
+                "本地 Agent 导入导出功能不受影响，可稍后重试或使用本地 .akita-agent 文件导入。",
+            ),
         )
     finally:
         await client.close()
@@ -453,7 +487,14 @@ async def hub_agent_detail(agent_id: str):
         return await client.get_detail(agent_id)
     except Exception as e:
         logger.warning(f"Hub agent detail unavailable: {e}")
-        raise HTTPException(status_code=502, detail="远程 Agent Store 暂不可用")
+        raise HTTPException(
+            status_code=502,
+            detail=_hub_unavailable_detail(
+                "agent_store",
+                "远程 Agent Store 暂不可用。",
+                "请稍后重试，或使用本地 Agent 包导入。",
+            ),
+        )
     finally:
         await client.close()
 
@@ -468,7 +509,11 @@ async def hub_install_agent(request: Request, agent_id: str, force: bool = False
         logger.warning(f"Hub download unavailable: {e}")
         raise HTTPException(
             status_code=502,
-            detail="远程 Agent Store 暂不可用，无法下载。可通过 .akita-agent 文件本地导入。",
+            detail=_hub_unavailable_detail(
+                "agent_store",
+                "远程 Agent Store 暂不可用，无法下载。",
+                "可通过 .akita-agent 文件本地导入。",
+            ),
         )
     finally:
         await client.close()
@@ -527,7 +572,11 @@ async def hub_search_skills(
         logger.warning(f"Hub search skills unavailable (remote platform may be offline): {e}")
         raise HTTPException(
             status_code=502,
-            detail="远程 Skill Store 暂不可用。本地技能管理和 skills.sh 市场不受影响。",
+            detail=_hub_unavailable_detail(
+                "skill_store",
+                "远程 Skill Store 暂不可用。",
+                "本地技能管理和 skills.sh 市场不受影响，可稍后重试。",
+            ),
         )
     finally:
         await client.close()
@@ -541,7 +590,14 @@ async def hub_skill_detail(skill_id: str):
         return await client.get_detail(skill_id)
     except Exception as e:
         logger.warning(f"Hub skill detail unavailable: {e}")
-        raise HTTPException(status_code=502, detail="远程 Skill Store 暂不可用")
+        raise HTTPException(
+            status_code=502,
+            detail=_hub_unavailable_detail(
+                "skill_store",
+                "远程 Skill Store 暂不可用。",
+                "请稍后重试，或改用技能管理中的本地/skills.sh 安装方式。",
+            ),
+        )
     finally:
         await client.close()
 
@@ -556,7 +612,11 @@ async def hub_install_skill(request: Request, skill_id: str):
         logger.warning(f"Hub skill install - cannot reach platform: {e}")
         raise HTTPException(
             status_code=502,
-            detail="远程 Skill Store 暂不可用。可在「技能管理 → 浏览市场」通过 skills.sh 安装，或使用 install_skill 从 GitHub 安装。",
+            detail=_hub_unavailable_detail(
+                "skill_store",
+                "远程 Skill Store 暂不可用，无法安装。",
+                "可在「技能管理 → 浏览市场」通过 skills.sh 安装，或使用 install_skill 从 GitHub 安装。",
+            ),
         )
 
     skill = detail.get("skill", detail)
@@ -572,7 +632,7 @@ async def hub_install_skill(request: Request, skill_id: str):
     finally:
         await client.close()
 
-    _reload_skills(request)
+    await _propagate_store_skill_install(request, skill_dir)
 
     return {
         "message": "Skill installed from Store",

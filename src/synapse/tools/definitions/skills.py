@@ -17,19 +17,38 @@ SKILLS_TOOLS = [
     {
         "name": "list_skills",
         "category": "Skills",
-        "description": "List all installed skills following Agent Skills specification. When you need to: (1) Check available skills, (2) Find skill for a task, (3) Verify skill installation.",
+        "description": "List installed skills as a compact directory. Use get_skill_info for full instructions instead of requesting verbose lists by default.",
         "detail": """列出已安装的技能（遵循 Agent Skills 规范）。
 
 **返回信息**：
 - 技能名称
-- 技能描述
+- 默认只返回极短摘要，避免把全量技能描述灌入上下文
 - 是否可自动调用
 
 **适用场景**：
 - 查看可用技能
 - 为任务查找合适的技能
-- 验证技能安装状态""",
-        "input_schema": {"type": "object", "properties": {}},
+- 验证技能安装状态
+
+**按需展开**：
+- 需要完整清单描述时传 `verbose=true`
+- 需要路径排查时传 `include_paths=true`
+- 要真正使用某个技能时，优先调用 `get_skill_info(skill_name)` 获取完整说明""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "verbose": {
+                    "type": "boolean",
+                    "description": "是否返回完整技能描述。默认 false，仅返回紧凑目录。",
+                    "default": False,
+                },
+                "include_paths": {
+                    "type": "boolean",
+                    "description": "是否包含技能目录路径。默认 false；需要排查安装位置时才打开。",
+                    "default": False,
+                },
+            },
+        },
     },
     {
         "name": "get_skill_info",
@@ -63,7 +82,7 @@ SKILLS_TOOLS = [
     {
         "name": "run_skill_script",
         "category": "Skills",
-        "description": "Execute a skill's pre-built script file. IMPORTANT: Many skills (xlsx, docx, pptx, pdf, etc.) are instruction-only — they have NO scripts. For those skills, use get_skill_info to read instructions, then write code and execute via run_shell instead.",
+        "description": "Execute a skill's pre-built script file. IMPORTANT: reusable tools must live inside the skill directory (skills/<skill-id>/SKILL.md plus scripts or modules in the same directory). Do not treat Python files in the workspace root as installed skill tools.",
         "detail": """运行技能的**预置脚本**。
 
 **⚠️ 重要提醒**：
@@ -72,7 +91,7 @@ SKILLS_TOOLS = [
 此时**不要重试 run_skill_script**，而应：
 1. 用 get_skill_info 读取技能的完整指令
 2. 按照指令编写 Python 代码
-3. 用 run_shell 执行代码
+3. 用平台命令工具执行代码（Windows 优先 run_powershell；需要 bash/POSIX 语义时用 run_shell）
 
 **适用场景**：
 - 执行技能内预置的脚本（如 recalc.py 等）
@@ -81,10 +100,19 @@ SKILLS_TOOLS = [
 **使用方法**：
 1. 先用 get_skill_info 了解可用脚本列表
 2. 仅当技能有可执行脚本时使用本工具
-3. 如果失败提示"no executable scripts"，改用 run_shell
+3. 如果失败提示"no executable scripts"，改用平台命令工具执行代码
+
+**创建可复用工具时的目录规则**：
+- 新工具必须创建为技能目录：`skills/<skill-id>/SKILL.md`
+- 可执行入口放在技能根目录或 `skills/<skill-id>/scripts/` 下
+- 入口脚本导入的 Python 模块必须放在同一个技能目录内
+- 不要把工作区根目录的 `*.py` 当成已安装技能；根目录脚本只能作为临时测试文件
 
 **配置缺失处理**：
-如果脚本因缺少配置（API Key/凭据/路径等）而失败，应主动帮用户完成配置（引导获取、写入配置文件），而不是告诉用户"缺少XX无法使用"。""",
+如果脚本因缺少配置（API Key/凭据/路径等）而失败，应主动帮用户完成配置（引导获取、写入配置文件），而不是告诉用户"缺少XX无法使用"。
+
+**Python 环境**：
+声明了 `metadata.synapse.python.dependencies` 的技能会在执行前准备独立 skill venv；未声明依赖的 Python 脚本优先使用当前 Agent 环境。""",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -160,7 +188,7 @@ SKILLS_TOOLS = [
     {
         "name": "load_skill",
         "category": "Skills",
-        "description": "Load a newly created skill from skills/ directory. Use after creating a skill with skill-creator to make it immediately available.",
+        "description": "Load a newly created skill from skills/ directory. A valid reusable tool must be a directory containing SKILL.md plus any scripts/modules it needs; do not load loose files from the workspace root.",
         "detail": """加载新创建的技能到系统中。
 
 **适用场景**：
@@ -171,10 +199,11 @@ SKILLS_TOOLS = [
 **使用流程**：
 1. 使用 skill-creator 创建 SKILL.md
 2. 保存到 skills/<skill-name>/SKILL.md
-3. 调用 load_skill 加载
-4. 技能立即可用
+3. 将脚本和被导入模块放在同一技能目录内，例如 skills/<skill-name>/scripts/main.py 和 skills/<skill-name>/helper.py
+4. 调用 load_skill 加载
+5. 技能立即可用
 
-**注意**：技能目录必须包含有效的 SKILL.md 文件""",
+**注意**：技能目录必须包含有效的 SKILL.md 文件。不要只在工作区根目录创建 `<name>.py` 后声称技能已安装。""",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -209,17 +238,22 @@ SKILLS_TOOLS = [
     {
         "name": "manage_skill_enabled",
         "category": "Skills",
-        "description": "Enable or disable external skills by updating the allowlist. Use when: (1) User asks to organize/clean up skills, (2) User wants to disable unused skills to reduce noise, (3) AI recommends enabling/disabling skills based on usage patterns.",
+        "description": "Enable or disable external skills by updating the skill external_allowlist. This is NOT the security user_allowlist and NOT an IM channel allowlist.",
         "detail": """启用或禁用外部技能。
 
 **功能**：
 - 批量设置多个技能的启用/禁用状态
-- 修改后立即生效（自动写入 data/skills.json 并热重载）
+- 修改后立即生效（自动写入 data/skills.json 的 `external_allowlist` 并热重载）
 
 **适用场景**：
 - 用户要求整理技能（禁用不常用的、启用需要的）
 - 根据工作场景调整技能集合
 - 减少技能噪声，提升响应质量
+
+**边界**：
+- 这里只管理“外部技能启用列表”
+- 不要用它处理安全策略白名单；安全工具/命令白名单在 `/api/config/security/user-allowlist`
+- 不要用它处理 IM 群/用户白名单；IM 通道配置由对应 channel 配置管理
 
 **注意**：
 - 系统技能不可禁用，仅外部技能支持

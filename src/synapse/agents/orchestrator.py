@@ -76,9 +76,45 @@ _VALID_TRANSITIONS: dict[SubAgentStatus, frozenset[SubAgentStatus]] = {
 MAX_DELEGATION_DEPTH = 5
 CHECK_INTERVAL = 3.0  # how often to poll progress (matches frontend polling)
 
-# Defaults — overridden at runtime by settings when available
-_DEFAULT_IDLE_TIMEOUT = 1200.0
+# Defaults — overridden at runtime by settings when available.
+# 默认全部 0 = 不做"agent 自检自杀"，对齐 Claude Code 哲学；卡死由用户主动停止。
+_DEFAULT_IDLE_TIMEOUT = 0  # 0 = 禁用无进展超时检测
 _DEFAULT_HARD_TIMEOUT = 0  # 0 = disabled
+
+_BUDGET_GUIDE = (
+    "\n\n提示：可以在 Synapse「配置 → 高级配置 → 长任务与上下文保护 → 任务预算」"
+    "里调整这些限制；如果想取消时长限制，把 TASK_BUDGET_DURATION 设为 0。"
+)
+_BUDGET_PAUSE_MARKERS = (
+    "任务资源预算已用尽",
+    "任务暂停（",
+)
+
+
+def _with_budget_guide(text: str, exit_reason: str = "") -> str:
+    """Append a settings path to budget-pause messages once.
+
+    Prefer the structured exit_reason; text markers only keep old budget-pause
+    payloads readable if they came from an older or non-standard path.
+    """
+    if not text:
+        return text
+    if "TASK_BUDGET_DURATION" in text or ("任务预算" in text and "高级配置" in text):
+        return text
+    is_budget_pause = exit_reason == "budget_exceeded" or any(
+        marker in text for marker in _BUDGET_PAUSE_MARKERS
+    )
+    if is_budget_pause:
+        return text.rstrip() + _BUDGET_GUIDE
+    return text
+
+
+def _delegation_notice_title(exit_reason: str) -> str:
+    if exit_reason in {"budget_exceeded", "budget_paused"}:
+        return "任务暂停通知"
+    if exit_reason in {"error", "timeout", "cancelled", "loop_terminated", "max_turns"}:
+        return "任务结束通知"
+    return "任务完成通知"
 
 
 @dataclass
@@ -114,6 +150,23 @@ class AgentHealth:
         return self.total_latency_ms / max(self.successful, 1)
 
 
+# IM 通知头中 exit_reason 的中文展示映射；让用户在通知里直接看懂状态。
+_EXIT_REASON_DISPLAY: dict[str, str] = {
+    "completed": "已完成",
+    "normal": "已完成",
+    "max_turns": "迭代上限",
+    "max_iterations": "迭代上限",
+    "timeout": "超时",
+    "error": "异常",
+    "cancelled": "已取消",
+    "loop_terminated": "循环防护中止",
+    "ask_user": "等待用户回复",
+    "verify_incomplete": "验证未完成",
+    # 预算暂停场景：用户对话历史和已有进展都已保留，回复"继续"即可让系统接力完成
+    "budget_paused": "预算暂停（可回复\"继续\"接力）",
+}
+
+
 @dataclass
 class DelegationResult:
     """Structured result from a sub-agent delegation."""
@@ -124,7 +177,8 @@ class DelegationResult:
     tools_used: list[str] = field(default_factory=list)
     artifacts: list[dict] = field(default_factory=list)
     elapsed_s: float = 0.0
-    exit_reason: str = "completed"  # "completed" | "max_turns" | "timeout" | "error" | "cancelled"
+    exit_reason: str = "completed"
+    # 取值参考 _EXIT_REASON_DISPLAY 的 key；未列出的会原样显示
 
     def to_tool_response(self) -> str:
         """Serialize for tool response with structured metadata header.
@@ -134,9 +188,11 @@ class DelegationResult:
         can make informed follow-up decisions.  The ``__ARTIFACT_RECEIPTS__``
         sentinel format is unchanged for backward compatibility.
         """
+        notice_title = _delegation_notice_title(self.exit_reason)
+        status_display = _EXIT_REASON_DISPLAY.get(self.exit_reason, self.exit_reason)
         header = (
-            f"[任务完成通知] Agent: {self.agent_id}"
-            f" | 状态: {self.exit_reason}"
+            f"[{notice_title}] Agent: {self.agent_id}"
+            f" | 状态: {status_display}"
             f" | 耗时: {self.elapsed_s}s"
         )
         if self.tools_used:
@@ -147,7 +203,7 @@ class DelegationResult:
         else:
             tools_line = "工具调用: 0 次"
 
-        parts = [header, tools_line, "", self.text]
+        parts = [header, tools_line, "", _with_budget_guide(self.text, self.exit_reason)]
         if self.artifacts:
             parts.append(
                 f"\n__ARTIFACT_RECEIPTS__{json.dumps(self.artifacts)}__ARTIFACT_RECEIPTS__"
@@ -168,7 +224,7 @@ class AgentMailbox:
     async def receive(self, timeout: float = 300.0) -> dict | None:
         try:
             return await asyncio.wait_for(self._queue.get(), timeout=timeout)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             return None
 
     async def drain_all(self) -> list[dict]:
@@ -484,7 +540,7 @@ class AgentOrchestrator:
 
             return result
 
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             health.failed += 1
             health.last_error = "timeout_idle"
             self._fallback.record_failure(agent_profile_id)
@@ -589,9 +645,9 @@ class AgentOrchestrator:
         """
         from synapse.config import settings
 
-        idle_timeout = float(
-            getattr(settings, "progress_timeout_seconds", 0) or _DEFAULT_IDLE_TIMEOUT
-        )
+        # 默认 0 = 不做"无进展超时"自检自杀（Claude Code 风格）。
+        # 仅在用户在【设置中心 → 高级设置】把 PROGRESS_TIMEOUT_SECONDS 设为非零时才生效。
+        idle_timeout = float(getattr(settings, "progress_timeout_seconds", 0) or 0)
         hard_timeout = float(getattr(settings, "hard_timeout_seconds", 0) or _DEFAULT_HARD_TIMEOUT)
 
         if self._profile_store is None or self._pool is None:
@@ -611,34 +667,7 @@ class AgentOrchestrator:
                 f"for {agent_profile_id}"
             )
 
-        pool_session_id = session.id
-        try:
-            from synapse.rd_meeting.agent_prompt import (
-                ensure_meeting_agent_configured,
-                resolve_rd_meeting_pool_session_id,
-            )
-
-            pool_session_id = resolve_rd_meeting_pool_session_id(
-                session.id,
-                agent_profile_id,
-                depth=depth,
-            )
-        except Exception as exc:
-            logger.debug("rd_meeting pool session resolve skipped: %s", exc)
-
-        agent = await self._pool.get_or_create(pool_session_id, profile)
-
-        try:
-            from synapse.rd_meeting.agent_prompt import ensure_meeting_agent_configured
-
-            ensure_meeting_agent_configured(
-                agent,
-                session_id=session.id,
-                agent_profile_id=agent_profile_id,
-                depth=depth,
-            )
-        except Exception as exc:
-            logger.debug("ensure_meeting_agent_configured skipped: %s", exc)
+        agent = await self._pool.get_or_create(session.id, profile)
 
         # Per-profile max_turns override → propagated to reasoning engine
         _max_turns_override: int | None = getattr(profile, "max_turns", None)
@@ -680,8 +709,6 @@ class AgentOrchestrator:
             "iteration": 0,
             "tools_executed": [],
             "tools_total": 0,
-            "skills_executed": [],
-            "skills_total": 0,
             "elapsed_s": 0,
             "last_progress_s": 0,
             "started_at": time.time(),
@@ -693,7 +720,6 @@ class AgentOrchestrator:
             while not task.done():
                 await asyncio.sleep(CHECK_INTERVAL)
                 elapsed = time.monotonic() - start
-                idle_s = time.monotonic() - last_progress_time
 
                 if hard_timeout > 0 and elapsed >= hard_timeout:
                     logger.warning(
@@ -712,62 +738,57 @@ class AgentOrchestrator:
                 fp = self._get_progress_fingerprint(agent, session.id, session)
                 if fp != last_fingerprint:
                     last_fingerprint = fp
-                    # 子任务结束后 agent_state 会被 reset，fingerprint 变为 (-1,"",0)；
-                    # 此时勿用空数据覆写已采集的 tools/skills。
-                    if fp[0] >= 0:
-                        last_progress_time = time.monotonic()
-                        logger.debug(
-                            f"[Orchestrator] Agent {agent_profile_id} progress: "
-                            f"iter={fp[0]}, status={fp[1]}, tools={fp[2]}, "
-                            f"elapsed={elapsed:.0f}s"
-                        )
-                        self._log_delegation(
-                            {
-                                "event": "progress",
-                                "agent": agent_profile_id,
-                                "session": str(getattr(session, "session_key", session.id)),
-                                "iter": fp[0],
-                                "status": fp[1],
-                                "tools_count": fp[2],
-                                "elapsed_s": round(elapsed),
-                            }
-                        )
-
-                        tools_list, skills_list, iter_n = self._extract_progress_from_agent(
-                            agent, session.id
-                        )
-                        _current_tool = tools_list[-1] if tools_list else ""
-
-                        _tokens_used = 0
-                        try:
-                            _re = getattr(agent, "reasoning_engine", None)
-                            if _re is not None:
-                                _tokens_used = getattr(
-                                    getattr(_re, "_budget", None), "tokens_used", 0
-                                )
-                        except Exception:
-                            pass
-
-                        self._sub_agent_states[state_key] = {
-                            **self._sub_agent_states.get(state_key, {}),
-                            "status": "running",
-                            "iteration": iter_n if iter_n > 0 else fp[0],
-                            "tools_executed": tools_list,
-                            "tools_total": len(tools_list),
-                            "skills_executed": skills_list[-20:],
-                            "skills_total": len(skills_list),
+                    last_progress_time = time.monotonic()
+                    logger.debug(
+                        f"[Orchestrator] Agent {agent_profile_id} progress: "
+                        f"iter={fp[0]}, status={fp[1]}, tools={fp[2]}, "
+                        f"elapsed={elapsed:.0f}s"
+                    )
+                    self._log_delegation(
+                        {
+                            "event": "progress",
+                            "agent": agent_profile_id,
+                            "session": str(getattr(session, "session_key", session.id)),
+                            "iter": fp[0],
+                            "status": fp[1],
+                            "tools_count": fp[2],
                             "elapsed_s": round(elapsed),
-                            "last_progress_s": round(idle_s),
-                            "current_tool_summary": _current_tool,
-                            "tokens_used": _tokens_used,
                         }
+                    )
 
-                        self._broadcast_sub_state_change(
-                            state_key, "running", self._sub_agent_states[state_key]
-                        )
-
+                # Update live sub-agent state for frontend polling
+                tools_list = self._get_tools_executed(agent, session.id, session)
                 idle_s = time.monotonic() - last_progress_time
-                if idle_s >= idle_timeout:
+
+                _current_tool = tools_list[-1] if tools_list else ""
+
+                _tokens_used = 0
+                try:
+                    _re = getattr(agent, "reasoning_engine", None)
+                    if _re is not None:
+                        _tokens_used = getattr(
+                            getattr(_re, "_budget", None), "tokens_used", 0
+                        )
+                except Exception:
+                    pass
+
+                self._sub_agent_states[state_key] = {
+                    **self._sub_agent_states.get(state_key, {}),
+                    "status": "running",
+                    "iteration": fp[0] if fp[0] >= 0 else 0,
+                    "tools_executed": tools_list[-5:],
+                    "tools_total": len(tools_list),
+                    "elapsed_s": round(elapsed),
+                    "last_progress_s": round(idle_s),
+                    "current_tool_summary": _current_tool,
+                    "tokens_used": _tokens_used,
+                }
+
+                self._broadcast_sub_state_change(
+                    state_key, "running", self._sub_agent_states[state_key]
+                )
+
+                if idle_timeout > 0 and idle_s >= idle_timeout:
                     logger.warning(
                         f"[Orchestrator] Agent {agent_profile_id} idle for "
                         f"{idle_s:.0f}s with no progress "
@@ -783,21 +804,8 @@ class AgentOrchestrator:
                     self._update_sub_state(state_key, "timeout", elapsed)
                     raise TimeoutError()
 
-            result = task.result()
-            self._refresh_sub_agent_progress_snapshot(state_key, agent, session.id)
             self._update_sub_state(state_key, "completed", time.monotonic() - start)
-            return result
-        except Exception:
-            # 委派失败时也尽量固化已执行的工具快照，供 metrics / Drawer 统计
-            try:
-                self._refresh_sub_agent_progress_snapshot(state_key, agent, session.id)
-            except Exception:
-                pass
-            if state_key in self._sub_agent_states:
-                entry = self._sub_agent_states[state_key]
-                if entry.get("status") in ("starting", "running"):
-                    entry["status"] = "failed"
-            raise
+            return task.result()
         except asyncio.CancelledError:
             if not task.done():
                 task.cancel()
@@ -892,8 +900,6 @@ class AgentOrchestrator:
                 "iteration": state_entry.get("iteration", 0),
                 "tools_executed": state_entry.get("tools_executed", []),
                 "tools_total": state_entry.get("tools_total", 0),
-                "skills_executed": state_entry.get("skills_executed", []),
-                "skills_total": state_entry.get("skills_total", 0),
                 "elapsed_s": state_entry.get("elapsed_s", 0),
                 "last_progress_s": state_entry.get("last_progress_s", 0),
                 "started_at": state_entry.get("started_at", 0),
@@ -916,79 +922,6 @@ class AgentOrchestrator:
                 logger.info(f"[Orchestrator] Cleaned up ephemeral profile: {profile_id}")
         except Exception as e:
             logger.warning(f"[Orchestrator] Failed to cleanup ephemeral {profile_id}: {e}")
-
-    @staticmethod
-    def _extract_progress_from_agent(
-        agent: Any,
-        session_id: str,
-    ) -> tuple[list[str], list[dict], int]:
-        """从 TaskState 或 react trace 提取工具 / SKILL / 迭代次数（委派子 Agent 终态快照用）。"""
-        tools = AgentOrchestrator._get_tools_executed(agent, session_id)
-        skills = AgentOrchestrator._get_skills_executed(agent, session_id)
-        iteration = 0
-
-        state = getattr(agent, "agent_state", None)
-        if state is not None:
-            task = state.get_task_for_session(session_id) if session_id else None
-            if task is None:
-                task = state.current_task
-            if task is not None:
-                iteration = int(getattr(task, "iteration", 0) or 0)
-
-        if not tools:
-            trace = getattr(agent, "_last_finalized_trace", None) or []
-            seen: list[str] = []
-            for it in trace:
-                for tc in it.get("tool_calls", []):
-                    name = str(tc.get("name") or "").strip()
-                    if name and name not in seen:
-                        seen.append(name)
-            tools = seen
-            if not iteration and trace:
-                iteration = len(trace)
-
-        return tools, skills, iteration
-
-    def _refresh_sub_agent_progress_snapshot(
-        self,
-        state_key: str,
-        agent: Any,
-        session_id: str,
-    ) -> None:
-        """在子 Agent 任务刚结束、state 尚未被前端读取前，固化 tools/skills 快照。"""
-        tools_list, skills_list, iter_n = self._extract_progress_from_agent(agent, session_id)
-        if not tools_list and not skills_list and not iter_n:
-            return
-        existing = self._sub_agent_states.get(state_key, {})
-        self._sub_agent_states[state_key] = {
-            **existing,
-            "iteration": max(int(existing.get("iteration") or 0), iter_n),
-            "tools_executed": tools_list,
-            "tools_total": max(int(existing.get("tools_total") or 0), len(tools_list)),
-            "skills_executed": skills_list[-20:],
-            "skills_total": max(int(existing.get("skills_total") or 0), len(skills_list)),
-            "current_tool_summary": tools_list[-1] if tools_list else existing.get(
-                "current_tool_summary", ""
-            ),
-        }
-
-    @staticmethod
-    def _get_skills_executed(agent: Any, session_id: str, session: Any = None) -> list[dict]:
-        """Return the list of SKILL invocations recorded by the agent in the current task.
-
-        Each item is a dict shaped like ``{"skill", "tool", "script"?, "ts"}``.
-        Empty list when the agent has no current task or never touched SKILL tools.
-        """
-        state = getattr(agent, "agent_state", None)
-        if state is None:
-            return []
-        task = state.get_task_for_session(session_id) if session_id else None
-        if task is None:
-            task = state.current_task
-        if task is None:
-            return []
-        skills = getattr(task, "skills_executed", None)
-        return list(skills) if skills else []
 
     @staticmethod
     def _get_tools_executed(agent: Any, session_id: str, session: Any = None) -> list[str]:
@@ -1103,11 +1036,28 @@ class AgentOrchestrator:
                 from synapse.config import settings as _cfg
 
                 _profile = getattr(agent, "_agent_profile", None)
-                if (
-                    _profile
-                    and getattr(_profile, "role", "worker") == "coordinator"
-                    and getattr(_cfg, "coordinator_mode_enabled", False)
-                ):
+                _profile_role = (
+                    getattr(_profile, "role", "worker") if _profile else "worker"
+                )
+                _coord_enabled = bool(getattr(_cfg, "coordinator_mode_enabled", False))
+                # Two activation paths for coordinator mode:
+                #
+                # 1. User-managed worker→coordinator profiles (existing path):
+                #    require both ``profile.role == "coordinator"`` AND the
+                #    global ``coordinator_mode_enabled`` switch.
+                #
+                # 2. Organization coordinator nodes (always-on, decoupled from
+                #    the global flag): any org node that has direct
+                #    subordinates is structurally a coordinator — its job is
+                #    to delegate, not to execute. ``runtime._create_node_agent``
+                #    sets ``_is_org_coordinator`` based on
+                #    ``bool(org.get_children(node.id))``. We force the
+                #    coordinator prompt here so the editor-in-chief / CEO /
+                #    tech-lead style roots cannot silently bypass delegation
+                #    (regression that caused root nodes to "do the work
+                #    themselves" after force_tool was relaxed).
+                _is_org_coord = bool(getattr(agent, "_is_org_coordinator", False))
+                if (_profile_role == "coordinator" and _coord_enabled) or _is_org_coord:
                     _mode = "coordinator"
             except Exception:
                 pass
@@ -1115,26 +1065,6 @@ class AgentOrchestrator:
             _start = time.time()
             exit_reason = "completed"
             try:
-                if is_sub_agent and getattr(agent, "_org_context", False):
-                    try:
-                        from synapse.rd_meeting.agent_activity import (
-                            record_input,
-                            resolve_agent_activity_binding,
-                        )
-
-                        act_binding = resolve_agent_activity_binding(agent)
-                        if act_binding:
-                            record_input(
-                                act_binding,
-                                source="host",
-                                input_kind="delegation",
-                                title="收到委派请求",
-                                summary=message[:1200],
-                            )
-                    except Exception as _in_exc:
-                        logger.debug("worker delegation input record: %s", _in_exc)
-
-                usage_scene = "sub_agent_chat" if is_sub_agent else "main_agent_chat"
                 session_messages = session.context.get_messages()
                 result = await agent.chat_with_session(
                     message=message,
@@ -1143,7 +1073,6 @@ class AgentOrchestrator:
                     session=session,
                     gateway=gateway,
                     mode=_mode,
-                    usage_scene=usage_scene,
                 )
                 # Persist sub-agent work record into parent session
                 try:
@@ -1172,6 +1101,19 @@ class AgentOrchestrator:
                             tools_used = list(dict.fromkeys(_task.tools_executed))
                 except Exception:
                     pass
+                if not tools_used and re_engine is not None:
+                    try:
+                        trace = getattr(re_engine, "_last_react_trace", None) or []
+                        trace_tools: list[str] = []
+                        for iter_entry in trace:
+                            if not isinstance(iter_entry, dict):
+                                continue
+                            for call in iter_entry.get("tool_calls") or ():
+                                if isinstance(call, dict) and call.get("name"):
+                                    trace_tools.append(str(call["name"]))
+                        tools_used = list(dict.fromkeys(trace_tools))
+                    except Exception:
+                        pass
 
                 # Forward artifact delivery receipts from sub-agent so the parent
                 # SSE stream can emit artifact events to the frontend.
@@ -1199,33 +1141,41 @@ class AgentOrchestrator:
                     logger.warning(f"[Orchestrator] Failed to forward artifact receipts: {e}")
 
                 profile = getattr(agent, "_agent_profile", None)
+
+                # 子 Agent 输出守卫：数值/统计任务但 trace 中未真实跑代码时，
+                # 在结论尾部追加 ⚠️ 数据未经代码执行验证，避免 P0 幻觉。
+                _guarded_text = result or ""
+                if is_sub_agent:
+                    try:
+                        from synapse.core.agent_output_guard import (
+                            validate_no_fabricated_numbers,
+                        )
+
+                        _triggered, _guarded_text = validate_no_fabricated_numbers(
+                            task_text=message,
+                            output_text=_guarded_text,
+                            tools_used=tools_used,
+                        )
+                        if _triggered:
+                            logger.warning(
+                                "[Orchestrator] Sub-agent output guard triggered: "
+                                "numeric task without code execution "
+                                f"(profile={getattr(profile, 'id', '?')}, tools={tools_used})"
+                            )
+                    except Exception as _guard_err:
+                        logger.debug(
+                            f"[Orchestrator] Output guard skipped (non-fatal): {_guard_err}"
+                        )
+
                 delegation_result = DelegationResult(
                     agent_id=getattr(profile, "id", "unknown"),
                     profile_id=getattr(profile, "id", "unknown"),
-                    text=result or "",
+                    text=_guarded_text,
                     tools_used=tools_used,
                     artifacts=artifacts,
                     elapsed_s=round(time.time() - _start, 2),
                     exit_reason=exit_reason,
                 )
-                if is_sub_agent and getattr(agent, "_org_context", False):
-                    try:
-                        from synapse.rd_meeting.agent_activity import (
-                            record_output,
-                            resolve_agent_activity_binding,
-                        )
-
-                        act_binding = resolve_agent_activity_binding(agent)
-                        if act_binding:
-                            record_output(
-                                act_binding,
-                                output_kind="delegation_feedback",
-                                title="协作反馈",
-                                summary=str(result or "")[:1200],
-                                detail={"tools_used": tools_used, "exit_reason": exit_reason},
-                            )
-                    except Exception as _out_exc:
-                        logger.debug("worker delegation output record: %s", _out_exc)
                 return delegation_result.to_tool_response()
             finally:
                 agent._is_sub_agent_call = False
@@ -1236,10 +1186,17 @@ class AgentOrchestrator:
     # ------------------------------------------------------------------
 
     def _persist_sub_states(self) -> None:
-        """Write _sub_agent_states to disk so they survive restarts."""
+        """Write _sub_agent_states to disk so they survive restarts.
+
+        Uses ``safe_json_write`` for atomic temp+rename + ``.bak`` backup
+        so kill -9 mid-write can't leave a half-written JSON that would
+        crash next boot.
+        """
         if self._log_dir is None:
             return
         try:
+            from synapse.utils.atomic_io import safe_json_write
+
             path = self._log_dir.parent / "sub_agent_states.json"
             snapshot = {}
             for key, state in list(self._sub_agent_states.items()):
@@ -1248,27 +1205,34 @@ class AgentOrchestrator:
                     for k, v in state.items()
                     if isinstance(v, (str, int, float, bool, list, dict, type(None)))
                 }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+            safe_json_write(path, snapshot)
         except Exception:
             logger.debug("[Orchestrator] Failed to persist sub-agent states", exc_info=True)
 
     def _load_sub_states(self) -> None:
-        """Load persisted sub-agent states from disk on startup."""
+        """Load persisted sub-agent states from disk on startup.
+
+        Uses ``read_json_safe`` which falls back to the ``.bak`` copy
+        if the primary is corrupted; outer try/except remains as a final
+        safety net.
+        """
         if self._log_dir is None:
             return
         try:
+            from synapse.utils.atomic_io import read_json_safe
+
             path = self._log_dir.parent / "sub_agent_states.json"
-            if path.exists():
-                with open(path, encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    for key, state in data.items():
-                        status = state.get("status", "")
-                        if status in ("running", "starting"):
-                            state["status"] = "interrupted"
-                        self._sub_agent_states[key] = state
-                    logger.info(f"[Orchestrator] Restored {len(data)} sub-agent states from disk")
+            data = read_json_safe(path)
+            if isinstance(data, dict):
+                for key, state in data.items():
+                    status = state.get("status", "")
+                    if status in ("running", "starting"):
+                        state["status"] = "interrupted"
+                    self._sub_agent_states[key] = state
+                logger.info(
+                    "[Orchestrator] Restored %d sub-agent states from disk",
+                    len(data),
+                )
         except Exception:
             logger.debug("[Orchestrator] Failed to load sub-agent states", exc_info=True)
 
@@ -1363,8 +1327,6 @@ class AgentOrchestrator:
             "iteration": 0,
             "tools_executed": [],
             "tools_total": 0,
-            "skills_executed": [],
-            "skills_total": 0,
             "elapsed_s": 0,
             "from_agent": from_agent,
             "reason": reason or "",
@@ -1504,10 +1466,26 @@ class AgentOrchestrator:
         self._ensure_deps()
         self._load_sub_states()
         await self._pool.start()
-        await self._task_queue.start()
+        # Delegate still uses the direct dispatch path. Keep TaskQueue explicit and
+        # stopped until an enqueue caller is wired, avoiding "No handler set" workers.
+        self._task_queue.set_handler(self._handle_queued_task)
         logger.info(
-            "[Orchestrator] Started (task_queue max_concurrent=%d)",
+            "[Orchestrator] Started (task_queue handler ready, max_concurrent=%d)",
             self._task_queue._max_concurrent,
+        )
+
+    async def _handle_queued_task(self, task) -> Any:
+        """Single future queue execution entry; currently delegates to direct dispatch."""
+        payload = task.payload or {}
+        session = payload.get("session")
+        message = payload.get("message", "")
+        if session is None:
+            raise RuntimeError("Queued task missing session")
+        return await self._dispatch(
+            session=session,
+            message=message,
+            agent_profile_id=task.agent_profile_id,
+            depth=int(payload.get("depth", 0) or 0),
         )
 
     async def shutdown(self) -> None:

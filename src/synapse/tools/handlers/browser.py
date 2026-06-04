@@ -14,15 +14,23 @@
 - browser_list_tabs / browser_switch_tab / browser_new_tab: 标签页管理
 - browser_close: 关闭浏览器
 - view_image: 查看/分析本地图片
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
-import asyncio
 import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...agents.lock_manager import LockManager
+from ...core.policy_v2 import ApprovalClass
 
 if TYPE_CHECKING:
     from ...core.agent import Agent
@@ -37,9 +45,9 @@ _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _browser_lock_manager = LockManager()
 _BROWSER_LOCK_TIMEOUT = 300.0  # seconds
 
-# Operations that mutate page state or are long-running.
-# Read-only helpers (get_content, screenshot, status, list_tabs, wait) are
-# intentionally excluded to avoid blocking during page-mutating operations.
+# Operations that depend on the shared current page.
+# get_content/screenshot are read-only, but they must not overlap with
+# navigation; otherwise one agent can read another agent's current tab.
 _LOCKED_BROWSER_OPS = frozenset(
     {
         "browser_navigate",
@@ -47,6 +55,8 @@ _LOCKED_BROWSER_OPS = frozenset(
         "browser_type",
         "browser_scroll",
         "browser_execute_js",
+        "browser_get_content",
+        "browser_screenshot",
         "browser_new_tab",
         "browser_switch_tab",
         "browser_close",
@@ -77,6 +87,25 @@ class BrowserHandler:
         "browser_close",
         "view_image",
     ]
+
+    # C7 explicit ApprovalClass — 浏览器是真实执行环境，写入 cookie / 执行 JS
+    # 都属于 EXEC_CAPABLE；只读类（截图/列 tab）归 READONLY_GLOBAL
+    TOOL_CLASSES = {
+        "browser_open": ApprovalClass.EXEC_CAPABLE,
+        "browser_navigate": ApprovalClass.EXEC_CAPABLE,
+        "browser_click": ApprovalClass.EXEC_CAPABLE,
+        "browser_type": ApprovalClass.EXEC_CAPABLE,
+        "browser_scroll": ApprovalClass.EXEC_LOW_RISK,
+        "browser_wait": ApprovalClass.EXEC_LOW_RISK,
+        "browser_execute_js": ApprovalClass.EXEC_CAPABLE,
+        "browser_get_content": ApprovalClass.READONLY_GLOBAL,
+        "browser_screenshot": ApprovalClass.READONLY_GLOBAL,
+        "browser_list_tabs": ApprovalClass.READONLY_GLOBAL,
+        "browser_switch_tab": ApprovalClass.EXEC_LOW_RISK,
+        "browser_new_tab": ApprovalClass.EXEC_LOW_RISK,
+        "browser_close": ApprovalClass.EXEC_LOW_RISK,
+        "view_image": ApprovalClass.READONLY_GLOBAL,
+    }
 
     # browser_get_content 默认最大字符数
     CONTENT_DEFAULT_MAX_LENGTH = 32000
@@ -115,7 +144,9 @@ class BrowserHandler:
 
         result = await self._dispatch_with_lock(actual_tool_name, params)
 
-        if result.get("success"):
+        if actual_tool_name == "browser_get_content" and result.get("success"):
+            output = self._format_get_content_result(result, params)
+        elif result.get("success"):
             output = f"✅ {result.get('result', 'OK')}"
         else:
             output = f"❌ {result.get('error', '未知错误')}"
@@ -144,7 +175,7 @@ class BrowserHandler:
                 timeout=_BROWSER_LOCK_TIMEOUT,
             ):
                 return await self._dispatch(tool_name, params)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             current_holder = await _browser_lock_manager.get_holder("tool:browser")
             logger.warning(
                 f"[Browser] Lock timeout for {tool_name} (holder={current_holder}, waiter={holder})"
@@ -169,17 +200,37 @@ class BrowserHandler:
                 await manager.stop()
                 return {"success": True, "result": "Browser closed"}
             elif tool_name == "browser_navigate":
-                return await pw.navigate(params.get("url", ""))
+                result = await pw.navigate(params.get("url", ""))
+                if result.get("success"):
+                    self.agent._last_browser_navigate_url = params.get("url", "")
+                return result
             elif tool_name == "browser_screenshot":
-                return await pw.screenshot(
+                result = await pw.screenshot(
                     full_page=params.get("full_page", False),
                     path=params.get("path"),
                 )
+                if result.get("success"):
+                    result["source"] = await self._capture_page_source(manager)
+                return result
             elif tool_name == "browser_get_content":
-                return await pw.get_content(
+                result = await pw.get_content(
                     selector=params.get("selector"),
                     format=params.get("format", "text"),
                 )
+                if result.get("success"):
+                    source = await self._capture_page_source(manager)
+                    expected_url = params.get("expected_url") or getattr(
+                        self.agent, "_last_browser_navigate_url", ""
+                    )
+                    if expected_url and source.get("current_url") != expected_url:
+                        source["warning"] = (
+                            "当前浏览器页面与预期 URL 不一致，可能是页面跳转或其他任务改变了当前页。"
+                        )
+                        source["expected_url"] = expected_url
+                    result["source"] = source
+                    result["selector"] = params.get("selector")
+                    result["format"] = params.get("format", "text")
+                return result
             elif tool_name == "browser_click":
                 return await pw.click(
                     selector=params.get("selector"),
@@ -221,17 +272,95 @@ class BrowserHandler:
             if "closed" in error_str.lower() or "target" in error_str.lower():
                 logger.warning("[Browser] Browser/page closed detected, resetting state")
                 await manager.reset_state()
+                self.agent._browser_user_closed = True
                 return {
                     "success": False,
                     "error": "浏览器连接已断开（可能被用户关闭）。\n"
-                    "【重要】状态已重置，请直接调用 browser_open 重新启动浏览器，无需先调用 browser_close。",
+                    "【重要】不要自动重新打开前台浏览器。请先向用户说明浏览器已关闭，"
+                    "只有在用户明确确认继续后，才能调用 browser_open 并传入 "
+                    '{"user_confirmed": true} 重新启动。',
                 }
 
             return {"success": False, "error": error_str}
 
+    @staticmethod
+    async def _capture_page_source(manager: Any) -> dict[str, Any]:
+        """Return the actual page URL/title for provenance display."""
+        source: dict[str, Any] = {"current_url": "", "title": ""}
+        page = getattr(manager, "page", None)
+        if not page:
+            return source
+        try:
+            source["current_url"] = getattr(page, "url", "") or ""
+        except Exception:
+            source["current_url"] = ""
+        try:
+            source["title"] = await page.title()
+        except Exception:
+            source["title"] = ""
+        return source
+
+    @staticmethod
+    def _format_get_content_result(result: dict[str, Any], params: dict[str, Any]) -> str:
+        source = result.get("source") if isinstance(result.get("source"), dict) else {}
+        current_url = source.get("current_url", "")
+        title = source.get("title", "")
+        expected_url = source.get("expected_url", "")
+        warning = source.get("warning", "")
+        selector = result.get("selector", params.get("selector"))
+        fmt = result.get("format", params.get("format", "text"))
+        content = result.get("result", "OK")
+        source_payload = {
+            "tool_name": "browser_get_content",
+            "requested_url": expected_url or current_url,
+            "final_url": current_url,
+            "hostname": "",
+            "redirected": bool(expected_url and current_url and expected_url != current_url),
+            "from_cache": False,
+            "status": "ok",
+            "hint": warning,
+        }
+        try:
+            from urllib.parse import urlparse
+
+            source_payload["hostname"] = urlparse(current_url or expected_url).hostname or ""
+        except Exception:
+            pass
+
+        import json
+
+        lines = [
+            f"[SYNAPSE_SOURCE] {json.dumps(source_payload, ensure_ascii=False, sort_keys=True)}",
+            "✅ Browser content read",
+            f"Current URL: {current_url or 'unknown'}",
+            f"Title: {title or 'unknown'}",
+            f"Selector: {selector or 'document'}",
+            f"Format: {fmt}",
+        ]
+        if expected_url:
+            lines.append(f"Expected URL: {expected_url}")
+        if warning:
+            lines.append(f"Warning: {warning}")
+        lines.append("")
+        lines.append(str(content))
+        return "\n".join(lines)
+
     async def _handle_open(self, manager: Any, params: dict) -> dict:
         """处理 browser_open（合并了状态查询功能）。"""
         visible = params.get("visible", True)
+        if (
+            getattr(self.agent, "_browser_user_closed", False)
+            and visible
+            and not params.get("user_confirmed")
+        ):
+            return {
+                "success": False,
+                "error": (
+                    "浏览器之前已被用户关闭。为避免在用户未确认时重新打开前台浏览器，"
+                    "本次启动已被拦截。请先询问用户是否继续；用户确认后再调用 "
+                    'browser_open({"visible": true, "user_confirmed": true})。'
+                ),
+            }
 
         if manager.is_ready and manager.context and manager.page:
             try:
@@ -243,22 +372,31 @@ class BrowserHandler:
                     logger.info(f"Browser mode change requested: visible={visible}, restarting...")
                     await manager.stop()
                 else:
+                    result_data = self._build_open_status_result(
+                        status="already_running",
+                        manager=manager,
+                        tab_count=len(all_pages),
+                        current_url=current_url,
+                        current_title=current_title,
+                    )
                     return {
                         "success": True,
-                        "result": {
-                            "is_open": True,
-                            "status": "already_running",
-                            "visible": manager.visible,
-                            "tab_count": len(all_pages),
-                            "current_tab": {"url": current_url, "title": current_title},
-                            "using_user_chrome": manager.using_user_chrome,
-                            "message": f"浏览器已在{'可见' if manager.visible else '后台'}模式运行，"
-                            f"共 {len(all_pages)} 个标签页",
-                        },
+                        "result": result_data,
                     }
             except Exception as e:
                 logger.warning(f"[Browser] Browser connection lost: {e}, resetting state")
                 await manager.reset_state()
+                self.agent._browser_user_closed = True
+                if visible and not params.get("user_confirmed"):
+                    return {
+                        "success": False,
+                        "error": (
+                            "浏览器连接已断开（可能被用户关闭）。为避免在用户未确认时"
+                            "重新打开前台浏览器，本次启动已被拦截。请先询问用户是否继续；"
+                            "用户确认后再调用 "
+                            'browser_open({"visible": true, "user_confirmed": true})。'
+                        ),
+                    }
         elif manager.is_ready:
             logger.warning("[Browser] Incomplete browser state, resetting")
             await manager.reset_state()
@@ -266,6 +404,8 @@ class BrowserHandler:
         success = await manager.start(visible=visible)
 
         if success:
+            if params.get("user_confirmed") or not visible:
+                self.agent._browser_user_closed = False
             current_url = manager.page.url if manager.page else None
             current_title = None
             tab_count = 0
@@ -277,15 +417,13 @@ class BrowserHandler:
             except Exception:
                 pass
 
-            result_data: dict[str, Any] = {
-                "is_open": True,
-                "status": "started",
-                "visible": manager.visible,
-                "tab_count": tab_count,
-                "current_tab": {"url": current_url, "title": current_title},
-                "using_user_chrome": manager.using_user_chrome,
-                "message": f"浏览器已启动 ({'可见模式' if manager.visible else '后台模式'})",
-            }
+            result_data = self._build_open_status_result(
+                status="started",
+                manager=manager,
+                tab_count=tab_count,
+                current_url=current_url,
+                current_title=current_title,
+            )
 
             try:
                 from ..browser.chrome_finder import detect_chrome_devtools_mcp
@@ -355,6 +493,48 @@ class BrowserHandler:
                 "error": error_msg,
             }
 
+    @staticmethod
+    def _build_open_status_result(
+        *,
+        status: str,
+        manager: Any,
+        tab_count: int,
+        current_url: str | None,
+        current_title: str | None,
+    ) -> dict[str, Any]:
+        """Build a precise browser-open status without claiming desktop foreground.
+
+        ``manager.visible`` means the Playwright session is headed (not headless).
+        It does not prove that an OS desktop window is visible or focused to the
+        user, which was the root cause of #470.
+        """
+        headed = bool(getattr(manager, "visible", False))
+        mode = "有界面自动化模式" if headed else "后台自动化模式"
+        action = "已连接" if status == "already_running" else "已启动"
+        visibility_note = (
+            "`visible/headed` 仅表示浏览器自动化不是 headless；"
+            "尚未验证系统桌面窗口是否可见或处于前台。"
+        )
+
+        return {
+            "is_open": True,
+            "automation_ready": True,
+            "status": status,
+            # Keep existing key for compatibility; new callers should prefer `headed`.
+            "visible": headed,
+            "headed": headed,
+            "desktop_window_visible": None,
+            "foreground_verified": None,
+            "tab_count": tab_count,
+            "current_tab": {"url": current_url, "title": current_title},
+            "using_user_chrome": getattr(manager, "using_user_chrome", False),
+            "visibility_note": visibility_note,
+            "message": (
+                f"浏览器自动化会话{action}（{mode}），共 {tab_count} 个标签页。"
+                "如用户看不到窗口，请使用桌面窗口/截图工具验证并切换到前台。"
+            ),
+        }
+
     def _maybe_truncate(self, output: str, params: dict) -> str:
         """browser_get_content 的智能截断。"""
         max_length = params.get("max_length", self.CONTENT_DEFAULT_MAX_LENGTH)
@@ -383,23 +563,21 @@ class BrowserHandler:
     # ── view_image / screenshot 多模态支持 ────────────
 
     def _model_supports_vision(self) -> bool:
-        """检查当前 LLM 是否支持 vision（图片输入）。"""
-        try:
-            from ...llm.capabilities import get_provider_slug_from_base_url, infer_capabilities
+        """检查当前 LLM 路由是否存在可用 vision 端点。
 
+        工具层只决定是否值得返回图片内容；最终发给哪个端点、是否需要
+        降级，由 LLMClient 在发送前统一处理。
+        """
+        try:
             brain = getattr(self.agent, "brain", None)
             if not brain:
                 return False
-            model = getattr(brain, "model_name", "") or ""
-            base_url = ""
             llm_client = getattr(brain, "_llm_client", None)
-            if llm_client:
-                base_url = getattr(llm_client, "base_url", "") or ""
-            provider = get_provider_slug_from_base_url(base_url) if base_url else None
-            caps = infer_capabilities(model, provider)
-            return caps.get("vision", False)
+            if llm_client and hasattr(llm_client, "has_any_endpoint_with_capability"):
+                return bool(llm_client.has_any_endpoint_with_capability("vision"))
         except Exception:
             return False
+        return False
 
     @staticmethod
     def _load_image_as_base64(path_str: str) -> tuple[str, str, int, int] | None:
@@ -497,6 +675,47 @@ class BrowserHandler:
         return f"✅ 图片: {path_str} ({w}x{h})\n\n{description}"
 
     @staticmethod
+    def _is_unhelpful_vision_text(text: str) -> bool:
+        lowered = text.lower()
+        markers = (
+            "无法直接查看",
+            "无法看到",
+            "没有看到任何图片",
+            "不能查看图片",
+            "看不到图片",
+            "unable to view",
+            "can't view",
+            "cannot view",
+            "cannot see the image",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _vision_unavailable_message() -> str:
+        return (
+            "[图片分析未完成]\n"
+            "图片文件已读取，但当前没有可用的视觉模型端点来理解截图内容。"
+            "请继续使用 desktop_window、desktop_inspect、desktop_find_element、日志读取、"
+            "文件搜索或 PowerShell 命令把界面状态转成文本后再判断；"
+            "如果任务必须读取屏幕文字或图像细节，请配置带 vision 能力的模型端点。"
+        )
+
+    @staticmethod
+    def _vision_endpoint_available() -> bool:
+        try:
+            from ...llm.client import get_default_client
+
+            client = get_default_client()
+            providers = getattr(client, "_providers", {})
+            for provider in providers.values():
+                config = getattr(provider, "config", None)
+                if config and config.has_capability("vision") and provider.is_healthy:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
     async def _download_and_load_image(url: str) -> tuple[str, str, int, int] | None:
         """下载 HTTP(S) 图片到临时文件并加载为 base64。"""
         import tempfile
@@ -551,6 +770,9 @@ class BrowserHandler:
         question: str = "",
     ) -> str:
         """使用 VL 模型对图片进行文字描述（当主模型不支持 vision 时的降级方案）。"""
+        if not self._vision_endpoint_available():
+            return self._vision_unavailable_message()
+
         try:
             from ...llm.client import get_default_client
             from ...llm.types import ImageBlock, ImageContent, Message, TextBlock
@@ -571,12 +793,15 @@ class BrowserHandler:
             if response.content:
                 for block in response.content:
                     if hasattr(block, "text"):
-                        return f"[图片分析结果]\n{block.text}"
+                        text = block.text
+                        if self._is_unhelpful_vision_text(text):
+                            return self._vision_unavailable_message()
+                        return f"[图片分析结果]\n{text}"
 
             return "[图片分析] 无法获取描述"
         except Exception as e:
             logger.warning(f"[view_image] VL fallback failed: {e}")
-            return f"[图片分析失败: {e}]\n提示: 当前模型不支持图片输入，建议切换到支持 vision 的模型（如 qwen-vl-plus）。"
+            return f"[图片分析失败: {e}]\n{self._vision_unavailable_message()}"
 
     def _try_embed_screenshot(self, result: dict) -> list | None:
         """尝试将 browser_screenshot 的结果嵌入图片内容。

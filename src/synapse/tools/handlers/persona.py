@@ -6,11 +6,21 @@
 - update_persona_trait: 更新偏好特质
 - toggle_proactive: 开关活人感
 - get_persona_profile: 获取人格配置
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any
+
+from ...core.policy_v2 import ApprovalClass
 
 if TYPE_CHECKING:
     from ...core.agent import Agent
@@ -52,6 +62,14 @@ class PersonaHandler:
         "toggle_proactive",
         "get_persona_profile",
     ]
+
+    # C7 explicit ApprovalClass — persona 切换是 control plane operation
+    TOOL_CLASSES = {
+        "switch_persona": ApprovalClass.CONTROL_PLANE,
+        "update_persona_trait": ApprovalClass.MUTATING_SCOPED,
+        "toggle_proactive": ApprovalClass.CONTROL_PLANE,
+        "get_persona_profile": ApprovalClass.READONLY_GLOBAL,
+    }
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
@@ -167,36 +185,10 @@ class PersonaHandler:
 
         self.agent.persona_manager.add_trait(trait)
 
-        # 同时写入记忆系统（按 dimension 去重：同 dimension 只保留最新值）
         if hasattr(self.agent, "memory_manager") and self.agent.memory_manager:
-            from ...memory.types import Memory, MemoryPriority, MemoryType
+            from ...core.persona import persist_trait_to_memory
 
-            mm = self.agent.memory_manager
-            store = getattr(mm, "store", None)
-
-            # 查找同 dimension 已有记忆，更新而非新建
-            if store:
-                existing = store.query_semantic(memory_type="persona_trait", limit=50)
-                for old in existing:
-                    if old.content.startswith(f"{dimension}="):
-                        store.update_semantic(
-                            old.id,
-                            {
-                                "content": f"{dimension}={preference}",
-                                "importance_score": max(old.importance_score, trait.confidence),
-                            },
-                        )
-                        return f"✅ 已更新人格偏好: {dimension} = {preference} (来源: {source})"
-
-            memory = Memory(
-                type=MemoryType.PERSONA_TRAIT,
-                priority=MemoryPriority.LONG_TERM,
-                content=f"{dimension}={preference}",
-                source=source,
-                tags=[f"dimension:{dimension}", f"preference:{preference}"],
-                importance_score=trait.confidence,
-            )
-            mm.add_memory(memory)
+            persist_trait_to_memory(self.agent.memory_manager, trait)
 
         return f"✅ 已更新人格偏好: {dimension} = {preference} (来源: {source})"
 

@@ -46,6 +46,34 @@ def _get_scheduler(request: Request):
     return None
 
 
+# Fix-15：单一权威 — API 层校验复用 scheduler._naming，避免规则双写漂移。
+from synapse.scheduler._naming import (
+    FORBIDDEN_TOKENS as _TASK_NAME_FORBIDDEN,  # noqa: F401  (保持向后兼容导入)
+)
+from synapse.scheduler._naming import validate_task_name as _validate_task_name  # noqa: E402
+
+
+def _agent_profile_exists(agent_profile_id: str) -> bool:
+    """Return whether an AgentProfile id is known to the system."""
+    from synapse.agents.presets import SYSTEM_PRESETS
+    from synapse.agents.profile import get_profile_store
+
+    if any(p.id == agent_profile_id for p in SYSTEM_PRESETS):
+        return True
+    try:
+        return get_profile_store().get(agent_profile_id) is not None
+    except Exception:
+        logger.debug("Failed to validate agent profile %r", agent_profile_id, exc_info=True)
+        return False
+
+
+def _normalize_agent_profile_id(agent_profile_id: str | None) -> str:
+    profile_id = (agent_profile_id or "default").strip() or "default"
+    if _agent_profile_exists(profile_id):
+        return profile_id
+    raise ValueError(f"Unknown agent_profile_id: {profile_id}")
+
+
 class TaskCreateRequest(BaseModel):
     name: str
     task_type: str = "reminder"  # reminder | task
@@ -55,6 +83,7 @@ class TaskCreateRequest(BaseModel):
     prompt: str = ""
     channel_id: str | None = None
     chat_id: str | None = None
+    agent_profile_id: str | None = None
     enabled: bool = True
 
 
@@ -67,6 +96,7 @@ class TaskUpdateRequest(BaseModel):
     prompt: str | None = None
     channel_id: str | None = None
     chat_id: str | None = None
+    agent_profile_id: str | None = None
     enabled: bool | None = None
 
 
@@ -118,6 +148,10 @@ async def create_task(request: Request, body: TaskCreateRequest):
 
     from synapse.scheduler.task import ScheduledTask, TaskSource, TaskType, TriggerType
 
+    _ok, _err = _validate_task_name(body.name)
+    if not _ok:
+        return JSONResponse(status_code=422, content={"error": _err})
+
     try:
         trigger_type = TriggerType(body.trigger_type)
     except ValueError:
@@ -132,6 +166,11 @@ async def create_task(request: Request, body: TaskCreateRequest):
             status_code=422, content={"error": f"Invalid task_type: {body.task_type}"}
         )
 
+    try:
+        agent_profile_id = _normalize_agent_profile_id(body.agent_profile_id)
+    except ValueError as e:
+        return JSONResponse(status_code=422, content={"error": str(e)})
+
     description = body.reminder_message or body.prompt or body.name
     task = ScheduledTask.create(
         name=body.name,
@@ -145,6 +184,7 @@ async def create_task(request: Request, body: TaskCreateRequest):
     task.task_source = TaskSource.MANUAL
     task.channel_id = body.channel_id or None
     task.chat_id = body.chat_id or None
+    task.agent_profile_id = agent_profile_id
     task.enabled = body.enabled
 
     try:
@@ -169,6 +209,9 @@ async def update_task(request: Request, task_id: str, body: TaskUpdateRequest):
     updates: dict = {}
 
     if body.name is not None:
+        _ok, _err = _validate_task_name(body.name)
+        if not _ok:
+            return JSONResponse(status_code=422, content={"error": _err})
         updates["name"] = body.name
     if body.reminder_message is not None:
         updates["reminder_message"] = body.reminder_message
@@ -178,6 +221,11 @@ async def update_task(request: Request, task_id: str, body: TaskUpdateRequest):
         updates["channel_id"] = body.channel_id or None
     if body.chat_id is not None:
         updates["chat_id"] = body.chat_id or None
+    if body.agent_profile_id is not None:
+        try:
+            updates["agent_profile_id"] = _normalize_agent_profile_id(body.agent_profile_id)
+        except ValueError as e:
+            return JSONResponse(status_code=422, content={"error": str(e)})
 
     if body.task_type is not None:
         from synapse.scheduler.task import TaskType
@@ -201,6 +249,13 @@ async def update_task(request: Request, task_id: str, body: TaskUpdateRequest):
 
     if body.trigger_config is not None:
         updates["trigger_config"] = body.trigger_config
+
+    if task_id == "system_daily_memory" and (
+        "trigger_type" in updates or "trigger_config" in updates
+    ):
+        metadata = dict(task.metadata or {})
+        metadata["user_custom_trigger"] = True
+        updates["metadata"] = metadata
 
     if updates.get("name") or updates.get("reminder_message") or updates.get("prompt"):
         updates["description"] = (
@@ -277,19 +332,23 @@ async def toggle_task(request: Request, task_id: str):
 
 @router.post("/api/scheduler/tasks/{task_id}/trigger")
 async def trigger_task(request: Request, task_id: str):
-    """Trigger a task to run immediately."""
+    """Trigger a task to run in the background (non-blocking).
+
+    立即返回 execution_id，避免 LLM 调用 / 大模型推理阻塞 HTTP 请求超时。
+    """
     scheduler = _get_scheduler(request)
     if scheduler is None:
         return JSONResponse(status_code=503, content={"error": "Agent not initialized"})
 
-    from synapse.core.engine_bridge import to_engine
-
-    execution = await to_engine(scheduler.trigger_now(task_id))
-    if execution is None:
+    execution_id = scheduler.trigger_in_background(task_id)
+    if execution_id is None:
         return JSONResponse(status_code=404, content={"error": "Task not found or trigger failed"})
 
     _notify_scheduler_change("trigger")
-    return {"status": "ok", "execution": execution.to_dict()}
+    return JSONResponse(
+        status_code=202,
+        content={"status": "accepted", "execution_id": execution_id},
+    )
 
 
 @router.get("/api/scheduler/executions")

@@ -12,7 +12,6 @@ Telegram 适配器
 import asyncio
 import contextlib
 import html as _html
-import json
 import logging
 import os
 import secrets
@@ -128,19 +127,22 @@ class TelegramPairingManager:
 
     def _load_paired_users(self) -> dict:
         """加载已配对用户"""
-        if self.paired_file.exists():
-            try:
-                with open(self.paired_file, encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to load paired users: {e}")
+        from synapse.utils.atomic_io import read_json_safe
+
+        try:
+            data = read_json_safe(self.paired_file)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            logger.warning(f"Failed to load paired users: {e}")
         return {}
 
     def _save_paired_users(self) -> None:
         """保存已配对用户"""
+        from synapse.utils.atomic_io import safe_json_write
+
         try:
-            with open(self.paired_file, "w", encoding="utf-8") as f:
-                json.dump(self.paired_users, f, ensure_ascii=False, indent=2)
+            safe_json_write(self.paired_file, self.paired_users)
         except Exception as e:
             logger.error(f"Failed to save paired users: {e}")
 
@@ -346,6 +348,11 @@ class TelegramAdapter(ChannelAdapter):
         self._seen_update_ids: OrderedDict[int, None] = OrderedDict()
         self._seen_update_ids_max = 500
 
+        # 安全确认回调 token 映射：Telegram callback_data 最长 64 字节，
+        # 无法承载完整 confirm_id，因此用短 token 间接引用真实 confirm_id。
+        self._sec_cb_tokens: OrderedDict[str, str] = OrderedDict()
+        self._sec_cb_tokens_max = 500
+
         # 思考占位消息：session_key -> (chat_id_int, message_id)
         self._thinking_cards: dict[str, tuple[int, int]] = {}
         # 流式输出状态
@@ -476,7 +483,7 @@ class TelegramAdapter(ChannelAdapter):
                 BotCommand("priority", "调整模型优先级"),
                 BotCommand("restore", "恢复默认模型"),
                 BotCommand("thinking", "深度思考模式 (on/off/auto)"),
-                BotCommand("thinking_depth", "思考深度 (low/medium/high)"),
+                BotCommand("thinking_depth", "思考深度 (low/medium/high/max)"),
                 BotCommand("chain", "思维链进度推送 (on/off)"),
                 BotCommand("cancel", "取消当前操作"),
                 BotCommand("restart", "终极重启服务"),
@@ -672,12 +679,15 @@ class TelegramAdapter(ChannelAdapter):
         with contextlib.suppress(Exception):
             await query.answer()
 
-        # Security confirmation callbacks: sec_<decision>_<confirm_id>
+        # Security confirmation callbacks: sec_<decision>_<token>
+        # token 是 _alloc_sec_callback_token 分配的短 id，通过 _sec_cb_tokens 反查真实 confirm_id。
+        # 历史兼容：若 token 查不到，则按原样视为 confirm_id（处理重启后残留的未回收按钮）。
         if data.startswith("sec_"):
             parts = data.split("_", 2)
             if len(parts) >= 3:
                 decision_key = parts[1]
-                confirm_id = parts[2]
+                confirm_raw = parts[2]
+                confirm_id = self._sec_cb_tokens.get(confirm_raw, confirm_raw)
                 decision_map = {
                     "allow": "allow_once",
                     "session": "allow_session",
@@ -687,9 +697,9 @@ class TelegramAdapter(ChannelAdapter):
                 }
                 decision = decision_map.get(decision_key, "deny")
                 try:
-                    from synapse.core.policy import get_policy_engine
+                    from synapse.core.policy_v2 import apply_resolution
 
-                    get_policy_engine().resolve_ui_confirm(confirm_id, decision)
+                    apply_resolution(confirm_id, decision)
                     logger.info(f"[Telegram] Security decision: {decision} for {confirm_id[:8]}")
                 except Exception as e:
                     logger.warning(f"[Telegram] Security callback failed: {e}")
@@ -1369,6 +1379,78 @@ class TelegramAdapter(ChannelAdapter):
             text = text.replace(f"\x00INLINE{i}\x00", f"<code>{_html.escape(code)}</code>")
 
         return text
+
+    def _alloc_sec_callback_token(self, confirm_id: str) -> str:
+        tok = secrets.token_hex(8)
+        self._sec_cb_tokens[tok] = confirm_id
+        while len(self._sec_cb_tokens) > self._sec_cb_tokens_max:
+            self._sec_cb_tokens.popitem(last=False)
+        return tok
+
+    def build_simple_card(
+        self,
+        title: str,
+        content: str,
+        buttons: list[dict] | None = None,
+    ) -> dict:
+        """构建安全确认等场景的 InlineKeyboard（与 gateway.send_security_confirm 对接）。"""
+        _import_telegram()
+        IB = telegram.InlineKeyboardButton
+        IKM = telegram.InlineKeyboardMarkup
+
+        action_to_key = {
+            "security_allow": "allow",
+            "security_deny": "deny",
+            "security_allow_session": "session",
+            "security_allow_always": "always",
+            "security_sandbox": "sandbox",
+        }
+        row: list[Any] = []
+        keyboard_rows: list[list[Any]] = []
+        for btn in buttons or []:
+            raw = btn.get("value", "")
+            if isinstance(raw, dict):
+                action = str(raw.get("action", ""))
+                cid = str(raw.get("confirm_id", "") or "")
+            else:
+                action = str(raw) if raw else ""
+                cid = ""
+            key = action_to_key.get(action)
+            if not key or not cid:
+                continue
+            tok = self._alloc_sec_callback_token(cid)
+            cb = f"sec_{key}_{tok}"
+            row.append(IB(btn.get("text", ""), callback_data=cb))
+            if len(row) >= 2:
+                keyboard_rows.append(row)
+                row = []
+        if row:
+            keyboard_rows.append(row)
+        text_body = f"{title}\n\n{content}"
+        return {"text": text_body, "reply_markup": IKM(keyboard_rows)}
+
+    async def send_card(
+        self,
+        chat_id: str,
+        card: dict,
+        *,
+        reply_to: str | None = None,
+    ) -> str:
+        """发送带内联键盘的文本消息（卡片场景）。"""
+        _import_telegram()
+        if not self._bot:
+            raise RuntimeError("Telegram bot not started")
+        kw: dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "text": card.get("text", ""),
+            "reply_markup": card.get("reply_markup"),
+        }
+        if reply_to:
+            with contextlib.suppress(ValueError, TypeError):
+                kw["reply_to_message_id"] = int(str(reply_to))
+        msg = await self._bot.send_message(**kw)
+        mid = getattr(msg, "message_id", None)
+        return str(mid) if mid is not None else ""
 
     async def send_message(self, message: OutgoingMessage) -> str:
         """发送消息"""

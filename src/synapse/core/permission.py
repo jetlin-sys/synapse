@@ -290,43 +290,62 @@ def check_permission(
                 decision_chain=chain,
             )
 
-    # Step 2: PolicyEngine（仅 agent 模式 / mode 规则放行后）
+    # Step 2: PolicyEngine v2（C6 起决策走 v2，C8b-6a 后直接消费 v2 类型）
+    #
+    # 调用链：evaluate_via_v2 → policy_v2.global_engine.get_engine_v2()
+    #     → PolicyEngineV2.evaluate_tool_call → PolicyDecisionV2(action, reason, ...)
+    #
+    # 通过 ``adapter._V2_TO_V1_DECISION`` 做语义映射（DEFER→"confirm" 降级 + 标准
+    # 4 档），以及 ``_build_policy_name`` 抽 chain 末尾步骤名。这两个 helper 是
+    # adapter 层的语义契约，未来 PermissionDecision 完全 v2 化时一起搬迁。
     try:
-        from .policy import get_policy_engine
+        from .policy_v2.adapter import (
+            V2_TO_V1_DECISION,
+            build_metadata_for_legacy_callers,
+            build_policy_name,
+            evaluate_via_v2,
+        )
 
-        pe = get_policy_engine()
-        pr = pe.assert_tool_allowed(tool_name, tool_input)
+        decision = evaluate_via_v2(tool_name, tool_input, mode=mode)
+        _behavior = V2_TO_V1_DECISION[decision.action]
+        _policy_label = build_policy_name(decision)
         chain.append(
             {
-                "layer": "policy_engine",
-                "decision": pr.decision.value,
-                "policy": pr.policy_name,
+                "layer": "policy_engine_v2",
+                "decision": _behavior,
+                "policy": _policy_label,
             }
         )
         return PermissionDecision(
-            behavior=pr.decision.value,
-            reason=pr.reason,
-            reason_detail=f"policy={pr.policy_name}",
-            policy_name=pr.policy_name,
-            metadata=pr.metadata,
+            behavior=_behavior,
+            reason=decision.reason,
+            reason_detail=f"policy={_policy_label}",
+            policy_name=_policy_label,
+            metadata=build_metadata_for_legacy_callers(decision),
             decision_chain=chain,
         )
     except Exception as e:
-        chain.append({"layer": "policy_engine", "error": str(e)})
+        # adapter 自身已 fail-closed 包过一层（engine 异常→DENY 危险/ALLOW 安全），
+        # 这里捕获的是 import 级 / 调用前置异常（极罕见）。继续保留 v1 一致语义。
+        chain.append({"layer": "policy_engine_v2", "error": str(e)})
         if _should_fail_closed(tool_name):
-            logger.error(f"[Permission] PolicyEngine unavailable, fail-closed for {tool_name}: {e}")
+            logger.error(
+                f"[Permission] PolicyEngineV2 unavailable, fail-closed for {tool_name}: {e}"
+            )
             return PermissionDecision(
                 behavior="deny",
                 reason="安全策略暂时不可用，已阻止高风险操作，请稍后重试。",
-                reason_detail=f"PolicyEngine not available for risky tool: {e}",
-                policy_name="PolicyEngineUnavailable",
+                reason_detail=f"PolicyEngineV2 not available for risky tool: {e}",
+                policy_name="PolicyEngineV2Unavailable",
                 decision_chain=chain,
             )
-        logger.warning(f"[Permission] PolicyEngine unavailable, fail-open for safe read path: {e}")
+        logger.warning(
+            f"[Permission] PolicyEngineV2 unavailable, fail-open for safe read path: {e}"
+        )
         return PermissionDecision(
             behavior="allow",
             reason="",
-            reason_detail=f"PolicyEngine not available: {e}",
+            reason_detail=f"PolicyEngineV2 not available: {e}",
             decision_chain=chain,
         )
 
@@ -392,7 +411,11 @@ PLAN_MODE_RULESET: Ruleset = from_config(
     {
         "*": "deny",
         "read": "allow",
-        "edit": {"*": "deny", "data/plans/*.md": "allow"},
+        "edit": {
+            "*": "deny",
+            "data/plans/*.md": "allow",
+            "data\\plans\\*.md": "allow",
+        },
         "run_shell": "deny",
         "create_plan_file": "allow",
         "exit_plan_mode": "allow",
@@ -430,7 +453,6 @@ ASK_MODE_RULESET: Ruleset = from_config(
         "web_search": "allow",
         "news_search": "allow",
         "search_memory": "allow",
-        "add_memory": "allow",
         "get_memory_stats": "allow",
         "list_recent_tasks": "allow",
         "trace_memory": "allow",
@@ -458,18 +480,31 @@ ASK_MODE_RULESET: Ruleset = from_config(
 COORDINATOR_MODE_RULESET: Ruleset = from_config(
     {
         "*": "deny",
+        # Generic multi-agent delegation (non-org mode)
         "delegate_to_agent": "allow",
         "delegate_parallel": "allow",
         "spawn_agent": "allow",
         "create_agent": "allow",
         "task_stop": "allow",
         "send_agent_message": "allow",
+        # Organization mode delegation / coordination tools.
+        # Without this glob, an org coordinator node entering coordinator mode
+        # would have *every* org_* call denied (regression: 5/9), defeating
+        # the whole point of the mode for org roots like editor-in-chief.
+        # ``org_*`` is the canonical prefix for tools defined in
+        # ``src/synapse/orgs/tools.py`` and is only available to nodes that
+        # have an ``_org_context``; non-org agents never see these tools.
+        "org_*": "allow",
+        # Lightweight planning / todo helpers (coordinator can plan its own
+        # delegation flow but not run files or shell commands directly).
         "create_todo": "allow",
         "update_todo_step": "allow",
         "get_todo_status": "allow",
         "complete_todo": "allow",
         "create_plan_file": "allow",
         "exit_plan_mode": "allow",
+        # Read-only / observational tools the coordinator legitimately needs
+        # to make routing decisions.
         "web_search": "allow",
         "news_search": "allow",
         "search_memory": "allow",

@@ -58,7 +58,9 @@ def _try_import_mcp() -> bool:
         MCP_SDK_AVAILABLE = True
     except ImportError:
         MCP_SDK_AVAILABLE = False
-        logger.warning("MCP SDK not installed. Run: pip install mcp")
+        logger.warning(
+            "MCP SDK not installed. Synapse will install it into the isolated channel-deps runtime."
+        )
         return False
 
     try:
@@ -89,9 +91,25 @@ def _auto_install_mcp() -> bool:
     try:
         import subprocess
 
-        exe = sys.executable
+        from synapse.runtime_manager import (
+            apply_runtime_pip_environment,
+            get_agent_python_executable,
+            get_channel_deps_dir,
+            get_python_executable,
+            inject_module_paths_runtime,
+        )
+
+        exe = get_agent_python_executable() or get_python_executable()
+        if not exe:
+            logger.warning(
+                "[MCP] No managed Python runtime is available for MCP SDK auto-install; "
+                "run Setup Center -> Python Environment -> Repair."
+            )
+            return False
+        target_dir = get_channel_deps_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
         mirrors = [
-            ("pypi", [exe, "-m", "pip", "install", "mcp", "--quiet"]),
+            ("pypi", [exe, "-m", "pip", "install", "--target", str(target_dir), "mcp", "--quiet"]),
             (
                 "tuna",
                 [
@@ -99,6 +117,8 @@ def _auto_install_mcp() -> bool:
                     "-m",
                     "pip",
                     "install",
+                    "--target",
+                    str(target_dir),
                     "mcp",
                     "--quiet",
                     "-i",
@@ -112,6 +132,8 @@ def _auto_install_mcp() -> bool:
                     "-m",
                     "pip",
                     "install",
+                    "--target",
+                    str(target_dir),
                     "mcp",
                     "--quiet",
                     "-i",
@@ -126,9 +148,14 @@ def _auto_install_mcp() -> bool:
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    env=apply_runtime_pip_environment(python_executable=exe),
                 )
                 if result.returncode == 0:
                     logger.info("[MCP] Auto-installed MCP SDK via %s", label)
+                    target_str = str(target_dir)
+                    if target_str not in sys.path:
+                        sys.path.append(target_str)
+                    inject_module_paths_runtime()
                     return _try_import_mcp()
             except Exception as e:
                 logger.debug("[MCP] Install via %s failed: %s", label, e)
@@ -183,6 +210,10 @@ class MCPTool:
     name: str
     description: str
     input_schema: dict = field(default_factory=dict)
+    # C10：MCP 协议 2024-11+ ``tool.annotations`` 字段透传。
+    # 解析阶段不做 ApprovalClass 校验（懒校验在 ``MCPClient.get_tool_class``）；
+    # 协议升级 / 厂商扩展加新字段不会破坏 dataclass。
+    annotations: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -220,6 +251,20 @@ class MCPServerConfig:
     url: str = ""  # streamable_http / sse 模式使用
     headers: dict[str, str] = field(default_factory=dict)
     cwd: str = ""  # stdio 模式的工作目录（为空则继承父进程）
+
+    # C15 §17.3 R4-13 / R5-21
+    # ----------------------------------------------------------------
+    # ``trust_level`` 控制 PolicyEngineV2 是否采信 MCP server
+    # ``tool.annotations.approval_class`` 的自报值：
+    #
+    # - ``"default"``（默认 + 历史配置）：自报 class 与 prefix/exact-name
+    #   启发式取严格度大者，防止 server 声明 ``readonly_global`` 但实际
+    #   暴露 ``delete_*`` 类工具。
+    # - ``"trusted"``：operator 在 setup-center 显式标记后采信自报。
+    #
+    # JSON schema 兼容：旧 mcp_servers.json 无本字段时 dataclass 默认值
+    # ``"default"`` 自动套用 —— 比 v1 行为更保守，不存在向后回归。
+    trust_level: str = "default"
 
 
 @dataclass
@@ -301,6 +346,7 @@ class MCPClient:
                     transport=transport,
                     url=server_data.get("url", ""),
                     headers=server_data.get("headers", {}),
+                    trust_level=str(server_data.get("trust_level", "default")),
                 )
                 self.add_server(config)
 
@@ -327,9 +373,9 @@ class MCPClient:
             if not ensure_mcp_sdk():
                 msg = (
                     "MCP SDK 未安装且自动安装失败。\n"
-                    "请在 Synapse 的 Python 环境中手动安装:\n"
-                    f"  {sys.executable} -m pip install mcp\n"
-                    "安装后重启 Synapse 即可生效。"
+                    "Synapse 会把 MCP SDK 安装到隔离的 channel-deps 运行时，"
+                    "不会要求你污染宿主 Python。\n"
+                    "请前往「设置中心 → Python 环境」点击「一键修复」，修复后重启 Synapse。"
                 )
                 logger.error(msg)
                 return MCPConnectResult(success=False, error=msg)
@@ -373,6 +419,7 @@ class MCPClient:
     @staticmethod
     def _resolve_command(config: MCPServerConfig) -> str | None:
         """在子进程实际使用的 PATH / cwd 下查找命令，避免误判 'not found'。"""
+        from ..runtime_manager import resolve_toolchain_command
         from ..utils.path_helper import which_command
 
         cmd = config.command
@@ -388,11 +435,23 @@ class MCPClient:
         if config.env:
             search_path = config.env.get("PATH") or config.env.get("Path")
 
-        found = which_command(cmd, extra_path=search_path)
+        if search_path:
+            found = which_command(cmd, extra_path=search_path)
+            if found:
+                return found
+
+        # 3) Synapse-managed Node/npm/npx should satisfy built-in MCP servers
+        # even when the host system PATH does not expose those commands.
+        found = resolve_toolchain_command(cmd)
         if found:
             return found
 
-        # 3) 如果有 cwd，也在 cwd 下做一次绝对搜索
+        # 4) Host command lookup, including macOS login-shell PATH fallback.
+        found = which_command(cmd)
+        if found:
+            return found
+
+        # 5) 如果有 cwd，也在 cwd 下做一次绝对搜索
         if config.cwd:
             candidate = Path(config.cwd) / cmd
             if candidate.is_file():
@@ -414,7 +473,7 @@ class MCPClient:
         Returns:
             (command, args) 如果需要适配；否则 None。
         """
-        from ..runtime_env import IS_FROZEN, get_python_executable
+        from ..runtime_env import get_app_python_executable
 
         if not (
             config.command in ("python", "python3")
@@ -424,10 +483,7 @@ class MCPClient:
         ):
             return None
 
-        if IS_FROZEN:
-            return (sys.executable, ["run-mcp-module", config.args[1], *config.args[2:]])
-
-        py = get_python_executable() or sys.executable
+        py = get_app_python_executable() or sys.executable
         py_path = Path(py)
         if py_path.name.lower() not in ("python.exe", "python3.exe", "python", "python3"):
             for candidate_name in ("python.exe", "python3.exe", "python", "python3"):
@@ -438,8 +494,8 @@ class MCPClient:
 
         return (py, ["-m", config.args[1], *config.args[2:]])
 
-    _CONNECT_TIMEOUT: int = 30
-    _CALL_TIMEOUT: int = 60
+    _CONNECT_TIMEOUT: int = 60
+    _CALL_TIMEOUT: int = 0
 
     def _load_timeouts(self) -> None:
         """从配置加载超时参数（settings → 环境变量 → 默认值）"""
@@ -450,6 +506,18 @@ class MCPClient:
             self._CALL_TIMEOUT = settings.mcp_timeout
         except Exception:
             pass
+
+    async def _await_operation(self, awaitable: Any) -> Any:
+        """Await an MCP operation with the configured call timeout.
+
+        ``mcp_timeout=0`` means no call-level timeout. Connection setup still
+        uses ``mcp_connect_timeout`` so dead servers fail fast, while long MCP
+        tools can finish naturally.
+        """
+        timeout = max(0, int(self._CALL_TIMEOUT or 0))
+        if timeout <= 0:
+            return await awaitable
+        return await asyncio.wait_for(awaitable, timeout=timeout)
 
     async def _connect_stdio(self, server_name: str, config: MCPServerConfig) -> MCPConnectResult:
         """通过 stdio 连接到 MCP 服务器"""
@@ -463,7 +531,7 @@ class MCPClient:
                 " ".join(args),
             )
         else:
-            command = config.command
+            command = self._resolve_command(config) or config.command
             args = list(config.args)
             # 连接前二次解析：如果 args 中有相对路径且 cwd 已知，尝试解析
             if config.cwd:
@@ -476,9 +544,11 @@ class MCPClient:
 
         # macOS GUI 应用的 PATH 不含 Homebrew/NVM/Volta 等用户工具路径，
         # 需要通过 login shell 获取完整 PATH 传递给 MCP 子进程
+        from synapse.runtime_manager import build_user_subprocess_environment
+
         from ..utils.path_helper import get_macos_enriched_env
 
-        subprocess_env: dict | None = dict(config.env) if config.env else None
+        subprocess_env: dict | None = build_user_subprocess_environment(config.env or {})
         subprocess_env = get_macos_enriched_env(subprocess_env)
 
         # Windows PyInstaller: _internal/ 目录下的 python.exe 是裸解释器,
@@ -533,7 +603,7 @@ class MCPClient:
             tool_count = len(self.list_tools(server_name))
             logger.info(f"Connected to MCP server via stdio: {server_name} ({tool_count} tools)")
             return MCPConnectResult(success=True, tool_count=tool_count)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             stderr_hint = self._try_capture_stdio_stderr(stdio_cm)
             msg = (
                 f"连接超时（{self._CONNECT_TIMEOUT}s）。"
@@ -576,13 +646,22 @@ class MCPClient:
         try:
             kwargs: dict[str, Any] = {"url": config.url}
             if config.headers:
-                import httpx as _httpx
+                # New MCP SDK (>=1.8) accepts `headers` directly;
+                # older versions used `http_client` with a pre-built httpx client.
+                import inspect as _inspect
 
-                _managed_http_client = _httpx.AsyncClient(
-                    headers=config.headers,
-                    timeout=_httpx.Timeout(self._CONNECT_TIMEOUT),
-                )
-                kwargs["http_client"] = _managed_http_client
+                _sig = _inspect.signature(streamablehttp_client)
+                if "headers" in _sig.parameters:
+                    kwargs["headers"] = config.headers
+                    kwargs["timeout"] = float(self._CONNECT_TIMEOUT)
+                else:
+                    import httpx as _httpx
+
+                    _managed_http_client = _httpx.AsyncClient(
+                        headers=config.headers,
+                        timeout=_httpx.Timeout(self._CONNECT_TIMEOUT),
+                    )
+                    kwargs["http_client"] = _managed_http_client
             http_cm = streamablehttp_client(**kwargs)
             read, write, _ = await asyncio.wait_for(
                 http_cm.__aenter__(),
@@ -613,7 +692,7 @@ class MCPClient:
                 f"Connected to MCP server via streamable HTTP: {server_name} ({config.url}, {tool_count} tools)"
             )
             return MCPConnectResult(success=True, tool_count=tool_count)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             msg = f"HTTP 连接超时（{self._CONNECT_TIMEOUT}s）。URL: {config.url}"
             logger.error(f"Timeout connecting to {server_name} via streamable HTTP")
             await self._cleanup_cms(client_cm, http_cm)
@@ -674,7 +753,7 @@ class MCPClient:
                 f"Connected to MCP server via SSE: {server_name} ({config.url}, {tool_count} tools)"
             )
             return MCPConnectResult(success=True, tool_count=tool_count)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             msg = f"SSE 连接超时（{self._CONNECT_TIMEOUT}s）。URL: {config.url}"
             logger.error(f"Timeout connecting to {server_name} via SSE")
             await self._cleanup_cms(client_cm, sse_cm)
@@ -701,10 +780,20 @@ class MCPClient:
         # 获取工具
         tools_result = await client.list_tools()
         for tool in tools_result.tools:
+            annotations_raw = getattr(tool, "annotations", None) or {}
+            if hasattr(annotations_raw, "model_dump"):
+                annotations = annotations_raw.model_dump(exclude_none=True)
+            elif hasattr(annotations_raw, "dict"):
+                annotations = annotations_raw.dict()
+            elif isinstance(annotations_raw, dict):
+                annotations = dict(annotations_raw)
+            else:
+                annotations = {}
             self._tools[f"{server_name}:{tool.name}"] = MCPTool(
                 name=tool.name,
                 description=tool.description or "",
                 input_schema=tool.inputSchema or {},
+                annotations=annotations,
             )
 
         # 获取资源（可选）
@@ -787,6 +876,7 @@ class MCPClient:
             self._prompts = {
                 k: v for k, v in self._prompts.items() if not k.startswith(f"{server_name}:")
             }
+            self._invalidate_policy_classifier_cache()
             logger.info(f"Disconnected from MCP server: {server_name}")
 
     @staticmethod
@@ -942,6 +1032,7 @@ class MCPClient:
         self._tools = {k: v for k, v in self._tools.items() if not k.startswith(prefix)}
         self._resources = {k: v for k, v in self._resources.items() if not k.startswith(prefix)}
         self._prompts = {k: v for k, v in self._prompts.items() if not k.startswith(prefix)}
+        self._invalidate_policy_classifier_cache()
 
         result = await self.connect(server_name)
         if result.success:
@@ -976,7 +1067,8 @@ class MCPClient:
                 return MCPCallResult(
                     success=False,
                     error=(
-                        f"MCP SDK 未安装且自动安装失败。请运行: {sys.executable} -m pip install mcp"
+                        "MCP SDK 未安装且自动安装失败。请前往「设置中心 → Python 环境」点击「一键修复」；"
+                        "Synapse 会安装到隔离的 channel-deps 运行时。"
                     ),
                 )
 
@@ -1009,10 +1101,7 @@ class MCPClient:
                         error=f"Invalid connection for server: {server_name}",
                     )
 
-                result = await asyncio.wait_for(
-                    client.call_tool(tool_name, arguments),
-                    timeout=self._CALL_TIMEOUT,
-                )
+                result = await self._await_operation(client.call_tool(tool_name, arguments))
 
                 content = self._extract_content(result.content)
 
@@ -1093,10 +1182,7 @@ class MCPClient:
                         success=False,
                         error=f"Invalid connection for server: {server_name}",
                     )
-                result = await asyncio.wait_for(
-                    client.read_resource(uri),
-                    timeout=self._CALL_TIMEOUT,
-                )
+                result = await self._await_operation(client.read_resource(uri))
 
                 content = []
                 for item in result.contents:
@@ -1167,10 +1253,7 @@ class MCPClient:
                         success=False,
                         error=f"Invalid connection for server: {server_name}",
                     )
-                result = await asyncio.wait_for(
-                    client.get_prompt(prompt_name, arguments or {}),
-                    timeout=self._CALL_TIMEOUT,
-                )
+                result = await self._await_operation(client.get_prompt(prompt_name, arguments or {}))
 
                 messages = []
                 for msg in result.messages:
@@ -1227,6 +1310,7 @@ class MCPClient:
         self._tools = {k: v for k, v in self._tools.items() if not k.startswith(prefix)}
         self._resources = {k: v for k, v in self._resources.items() if not k.startswith(prefix)}
         self._prompts = {k: v for k, v in self._prompts.items() if not k.startswith(prefix)}
+        self._invalidate_policy_classifier_cache()
 
     async def reset(self) -> None:
         """断开所有连接并清空全部状态（用于重载配置）"""
@@ -1240,6 +1324,24 @@ class MCPClient:
         self._tools.clear()
         self._resources.clear()
         self._prompts.clear()
+        self._invalidate_policy_classifier_cache()
+
+    @staticmethod
+    def _invalidate_policy_classifier_cache() -> None:
+        """C10: 通知 PolicyEngineV2 classifier LRU 缓存失效。
+
+        MCP server 注册 / 断开 / 重置都会改变 ``mcp_lookup`` 的返回值，
+        若 classifier 已经为同名工具缓存过旧的 base classification（典型
+        现场：reset → 旧 server 的 readonly tool 让位给新 server 的
+        destructive tool），下次 classify 会拿到陈旧 (klass, source)。
+        引擎未初始化或 classifier 没有 invalidate 方法时静默 no-op。
+        """
+        try:
+            from ..core.policy_v2.global_engine import invalidate_classifier_cache
+
+            invalidate_classifier_cache()
+        except Exception as exc:
+            logger.debug("MCP classifier invalidate skipped: %s", exc)
 
     def list_servers(self) -> list[str]:
         """列出所有配置的服务器"""
@@ -1277,12 +1379,129 @@ class MCPClient:
             server_name = key.split(":")[0]
             schemas.append(
                 {
-                    "name": f"mcp_{server_name}_{tool.name}".replace("-", "_"),
+                    "name": self._format_tool_name(server_name, tool.name),
                     "description": f"[MCP:{server_name}] {tool.description}",
                     "input_schema": tool.input_schema,
                 }
             )
         return schemas
+
+    @staticmethod
+    def _format_tool_name(server_name: str, tool_name: str) -> str:
+        """LLM-facing 工具名归一规则。
+
+        与 ``get_tool_schemas`` 必须保持一致——任何分歧都会让
+        ``ApprovalClassifier`` 的 mcp_lookup 查不到。集中在一处也方便
+        ``get_tool_class`` 反向解析。
+        """
+        return f"mcp_{server_name}_{tool_name}".replace("-", "_")
+
+    def get_tool_class(
+        self, tool_name: str
+    ) -> tuple[Any, Any] | None:
+        """C10：MCP 工具 → ApprovalClass 查表（PolicyEngineV2 ``mcp_lookup``）。
+
+        识别策略（按 MCP 协议 2024-11+ ``tool.annotations``）：
+        1. ``annotations.risk_class`` / ``annotations.approval_class``：直接
+           当 :class:`ApprovalClass` 值（必须 lowercase，与 enum value 一致）。
+        2. ``annotations.destructiveHint=True`` → ``DESTRUCTIVE``
+        3. ``annotations.openWorldHint=True`` 且 ``readOnlyHint=False`` →
+           ``MUTATING_GLOBAL``
+        4. ``annotations.readOnlyHint=True`` → ``READONLY_SCOPED``
+
+        多个 server 暴露同名工具 / 多种 hint 同时命中时取严
+        （``most_strict``）。命中失败返回 ``None``，让 classifier 走启发式
+        回退（与现有 v1 行为一致——绝大多数 MCP server 当前没填 hints）。
+
+        C15 §17.3 strictness rule
+        -------------------------
+        Each candidate is post-processed by
+        :func:`policy_v2.declared_class_trust.compute_effective_class`
+        using the originating server's :pyattr:`MCPServerConfig.trust_level`.
+        Untrusted servers (the default) cannot smuggle a too-lax class
+        through ``annotations.approval_class`` — the heuristic floor
+        will still apply. ``destructiveHint`` / ``readOnlyHint`` derived
+        candidates are exempt: those reflect MCP-protocol-level
+        annotations the server runtime sets, not a self-reported
+        ``approval_class``, so they were never the smuggling vector.
+        """
+        try:
+            from ..core.policy_v2.declared_class_trust import (
+                compute_effective_class,
+                infer_mcp_declared_trust,
+            )
+            from ..core.policy_v2.enums import (
+                ApprovalClass,
+                DecisionSource,
+                most_strict,
+            )
+        except Exception:
+            return None
+
+        candidates: list[tuple[Any, Any]] = []
+        for key, tool in self._tools.items():
+            server_name = key.split(":", 1)[0]
+            exposed = self._format_tool_name(server_name, tool.name)
+            if exposed != tool_name:
+                continue
+
+            ann = tool.annotations or {}
+
+            explicit = ann.get("approval_class") or ann.get("risk_class")
+            if isinstance(explicit, str):
+                try:
+                    declared = ApprovalClass(explicit.strip().lower())
+                except ValueError:
+                    logger.warning(
+                        "MCP tool '%s' declares unknown approval_class=%r in annotations; "
+                        "falling back to hint-based inference",
+                        exposed,
+                        explicit,
+                    )
+                else:
+                    # C15: gate the self-declared class by the originating
+                    # server's trust_level before adding to candidates.
+                    # Heuristic check runs against ``tool.name`` (the
+                    # server-side identifier — e.g. ``delete_all``), NOT
+                    # the namespaced exposed form (``mcp_<server>_<tool>``)
+                    # because the latter always starts with ``mcp_`` and
+                    # would never trip a heuristic prefix.
+                    server_cfg = self._servers.get(server_name)
+                    server_trust = getattr(server_cfg, "trust_level", None)
+                    mcp_trust = infer_mcp_declared_trust(
+                        server_trust_level=server_trust
+                    )
+                    try:
+                        effective, src = compute_effective_class(
+                            tool.name,
+                            declared,
+                            mcp_trust,
+                            source=DecisionSource.MCP_ANNOTATION,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        effective, src = declared, DecisionSource.MCP_ANNOTATION
+                    candidates.append((effective, src))
+                    continue  # explicit 优先，hints 不再叠加
+
+            destructive = ann.get("destructiveHint")
+            read_only = ann.get("readOnlyHint")
+            open_world = ann.get("openWorldHint")
+            if destructive is True:
+                candidates.append(
+                    (ApprovalClass.DESTRUCTIVE, DecisionSource.MCP_ANNOTATION)
+                )
+            elif open_world is True and read_only is not True:
+                candidates.append(
+                    (ApprovalClass.MUTATING_GLOBAL, DecisionSource.MCP_ANNOTATION)
+                )
+            elif read_only is True:
+                candidates.append(
+                    (ApprovalClass.READONLY_SCOPED, DecisionSource.MCP_ANNOTATION)
+                )
+
+        if not candidates:
+            return None
+        return most_strict(candidates)
 
 
 # 全局客户端

@@ -25,6 +25,30 @@ from .user import UserManager
 logger = logging.getLogger(__name__)
 
 
+# PR-N1: session id 安全字符白名单。
+# 允许字母 / 数字 / 下划线 / 连字符 / 冒号 / 点 / 管道（IM 平台常用 chat:user 形式），
+# 拒绝任何控制字符、路径分隔符、引号、HTML 元字符、Unicode 不可打印字符。
+# 长度上限 256 字符，避免 sqlite WHERE 子句被滥用拖慢查询。
+import re as _re
+
+_SESSION_ID_SAFE_RE = _re.compile(r"^[A-Za-z0-9_\-:.|@/]{1,256}$")
+_SESSION_ID_FORBIDDEN_FRAGMENTS = (
+    "..", "\x00", "\r", "\n", "\t", "<", ">", '"', "'", "`",
+    "\\", "//", "%00", "<script", "${", "{{",
+)
+
+
+def _is_safe_session_id(value: str) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    if len(value) > 256:
+        return False
+    if not _SESSION_ID_SAFE_RE.match(value):
+        return False
+    low = value.lower()
+    return all(frag not in low for frag in _SESSION_ID_FORBIDDEN_FRAGMENTS)
+
+
 class SessionManager:
     """
     会话管理器
@@ -80,6 +104,9 @@ class SessionManager:
         # 可选：从外部存储（SQLite）加载 turns 的回调，用于崩溃恢复时回填
         # 签名: (safe_session_id: str) -> list[dict]  (每个 dict 含 role, content, timestamp)
         self._turn_loader = None
+        # PR-D3：可选：写 turn 到 SQLite 的回调（与 _turn_loader 平行）
+        # 签名: (safe_session_id, turn_index, role, content, metadata) -> None
+        self._turn_writer = None
 
         # 会话是否已从磁盘加载完毕（API 层用此判断 ready 语义）
         self._sessions_loaded = False
@@ -87,16 +114,80 @@ class SessionManager:
         # 加载持久化的会话
         self._load_sessions()
 
+    @staticmethod
+    def build_session_key(
+        channel: str,
+        chat_id: str,
+        user_id: str,
+        thread_id: str | None = None,
+        *,
+        bot_instance_id: str | None = None,
+    ) -> str:
+        """Build the canonical route key for a conversation.
+
+        ``bot_instance_id`` is the first isolation boundary. It falls back to
+        channel so legacy callers and persisted sessions keep their old keys.
+        """
+        namespace = (bot_instance_id or channel or "").strip() or channel
+        key = f"{namespace}:{chat_id}:{user_id}"
+        if thread_id:
+            key += f":{thread_id}"
+        return key
+
     async def start(self) -> None:
         """启动会话管理器"""
         self._running = True
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._save_task = asyncio.create_task(self._save_loop())
+
+        # PR-D2: 启动时（如果 turn_loader 已绑定）异步触发一次 backfill，
+        # 把 SQLite 里的最近 turn 回填到内存 session。
+        try:
+            from ..core.feature_flags import is_enabled as _ff_enabled
+
+            should_backfill = _ff_enabled("session_backfill_on_start_v1")
+        except Exception:
+            should_backfill = False
+        if should_backfill and self._turn_loader is not None:
+            try:
+                import threading
+
+                def _run() -> None:
+                    try:
+                        n = self.backfill_sessions_from_store()
+                        if n:
+                            logger.info(
+                                f"[SessionManager] auto-backfill restored {n} turns"
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[SessionManager] auto-backfill failed: {exc}"
+                        )
+
+                threading.Thread(
+                    target=_run, name="sm-backfill", daemon=True
+                ).start()
+            except Exception as exc:
+                logger.debug(f"[SessionManager] auto-backfill spawn failed: {exc}")
+
         logger.info("SessionManager started")
 
     def mark_dirty(self) -> None:
-        """标记会话数据已修改，需要保存"""
+        """标记会话数据已修改，等待防抖保存（最多 _save_delay_seconds）。
+
+        适用于非关键状态变更（元数据、配置切换等）。
+        关键消息（对话内容）应使用 persist()。
+        """
         self._dirty = True
+
+    def persist(self) -> None:
+        """标记脏 + 立即持久化（用于对话消息等关键数据）。#374
+
+        统一的"确保写盘"语义，供所有通道（Desktop / IM）在
+        assistant 回复完成后调用。调用方无需关心 mark_dirty + flush 细节。
+        """
+        self._dirty = False
+        self._save_sessions()
 
     def _dispatch_hook_fire_and_forget(self, hook_name: str, **kwargs) -> None:
         """Dispatch a plugin hook from sync context (best-effort, non-blocking)."""
@@ -122,17 +213,42 @@ class SessionManager:
             logger.warning("Plugin hook task failed: %s", exc)
 
     def flush(self) -> None:
-        """立即保存所有待写入的会话（绕过防抖延迟）"""
+        """立即保存所有待写入的会话（绕过防抖延迟）。
+
+        低级 API，优先使用 persist()。
+        """
         if self._dirty:
             self._dirty = False
             self._save_sessions()
 
     def set_turn_loader(self, loader) -> None:
-        """设置 turn_loader 回调（延迟绑定，Agent 初始化完成后调用）"""
+        """设置 turn_loader 回调（延迟绑定，Agent 初始化完成后调用）。
+
+        PR-D2：绑定本身不再触发 backfill，避免在测试 / 命令行场景下
+        立即起后台线程消费"首屏 backfill"窗口；真正的自动回填发生在
+        ``SessionManager.start()``（API server 启动时）和 ``get_session``
+        命中已有 session 时（hydrate-on-demand）。
+        """
         self._turn_loader = loader
+
+    def set_turn_writer(self, writer) -> None:
+        """设置 turn_writer 回调（PR-D3）。
+
+        ``writer(safe_session_id, turn_index, role, content, metadata)`` 在
+        ``Session.add_message`` 成功后被同步调用，best-effort 写入
+        SqliteTurnStore；任何异常都仅以 DEBUG 记录，不影响主流程。
+
+        与 ``set_turn_loader`` 一致：绑定本身不触发 backfill；自动 backfill
+        在 ``SessionManager.start()`` 里按 feature flag 启动一次。
+        """
+        self._turn_writer = writer
 
     def backfill_sessions_from_store(self) -> int:
         """用 turn_loader 回填所有 session 中可能缺失的消息（崩溃恢复）。
+
+        对比 sessions.json 和 SQLite conversation_turns 表，
+        将 SQLite 中比 sessions.json 更新的消息回填到 session 上下文中。
+        保留原始时间戳以保证消息顺序正确。
 
         Returns:
             回填的总 turn 数
@@ -156,10 +272,15 @@ class SessionManager:
                 if not newer and not session.context.messages and db_turns:
                     newer = db_turns
                 for t in newer:
-                    session.context.add_message(
-                        role=t["role"],
-                        content=t.get("content", ""),
-                    )
+                    ts = t.get("timestamp", "")
+                    msg = {"role": t["role"], "content": t.get("content", "")}
+                    if ts:
+                        msg["timestamp"] = ts
+                    with session.context._msg_lock:
+                        last = session.context.messages[-1] if session.context.messages else None
+                        if last and last.get("role") == msg["role"] and last.get("content") == msg["content"]:
+                            continue
+                        session.context.messages.append(msg)
                 if newer:
                     total_backfilled += len(newer)
                     logger.info(
@@ -197,6 +318,7 @@ class SessionManager:
         chat_id: str,
         user_id: str,
         thread_id: str | None = None,
+        bot_instance_id: str | None = None,
         create_if_missing: bool = True,
         config: SessionConfig | None = None,
         chat_type: str = "private",
@@ -220,13 +342,18 @@ class SessionManager:
         Returns:
             Session 或 None
         """
-        session_key = f"{channel}:{chat_id}:{user_id}"
-        if thread_id:
-            session_key += f":{thread_id}"
+        session_key = self.build_session_key(
+            channel,
+            chat_id,
+            user_id,
+            thread_id,
+            bot_instance_id=bot_instance_id,
+        )
 
         with self._sessions_lock:
             if session_key in self._sessions:
                 session = self._sessions[session_key]
+                self._attach_manager(session)
                 session.touch()
                 return session
 
@@ -237,11 +364,13 @@ class SessionManager:
             # double-check：另一个线程可能已抢先恢复或创建
             if session_key in self._sessions:
                 session = self._sessions[session_key]
+                self._attach_manager(session)
                 session.touch()
                 return session
 
             if recovered is not None:
                 self._sessions[session_key] = recovered
+                self._attach_manager(recovered)
                 recovered.touch()
                 logger.info(
                     f"Recovered session from disk: {session_key} "
@@ -259,8 +388,10 @@ class SessionManager:
                     chat_type=chat_type,
                     display_name=display_name,
                     chat_name=chat_name,
+                    bot_instance_id=bot_instance_id,
                 )
                 self._sessions[session_key] = session
+                self._attach_manager(session)
                 logger.info(f"Created new session: {session_key}")
                 self._dispatch_hook_fire_and_forget(
                     "on_session_start", session=session, session_key=session_key
@@ -268,6 +399,13 @@ class SessionManager:
                 return session
 
         return None
+
+    def _attach_manager(self, session: "Session") -> None:
+        """让 session 持有对 manager 的弱引用，便于按需触发 backfill。"""
+        try:
+            session._manager = self  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     def _try_recover_session_from_disk(self, session_key: str) -> "Session | None":
         """尝试从 sessions.json 中恢复指定 session_key 的会话。
@@ -287,10 +425,66 @@ class SessionManager:
                 session = Session.from_dict(item)
                 if session.session_key == session_key and not session.is_expired():
                     self._clean_large_content_in_messages(session.context.messages)
+                    self._hydrate_from_store(session, max_turns=50)
                     return session
             except Exception:
                 continue
         return None
+
+    def _hydrate_from_store(self, session: "Session", *, max_turns: int = 50) -> None:
+        """PR-D2：从 SQLite 把最近 N 条 turn 回填到 ``session.context.messages``。
+
+        - 仅在 turn_loader 已绑定且 feature flag 启用时生效
+        - 通过 (role, content, timestamp) 去重，不影响已有内存数据
+        - 任何异常仅 WARN，绝不抛出（恢复路径必须健壮）
+        """
+        if not self._turn_loader:
+            return
+        try:
+            from ..core.feature_flags import is_enabled as _ff_enabled
+
+            if not _ff_enabled("session_backfill_on_start_v1"):
+                return
+        except Exception:
+            return
+
+        try:
+            import re
+
+            safe_id = session.session_key.replace(":", "__")
+            safe_id = re.sub(r'[/\\+=%?*<>|"\x00-\x1f]', "_", safe_id)
+            db_turns = self._turn_loader(safe_id) or []
+        except Exception as exc:
+            logger.debug(f"[SessionManager] hydrate from store failed: {exc}")
+            return
+
+        if not db_turns:
+            return
+
+        db_turns = list(db_turns)[-max_turns:]
+        existing_keys = {
+            (m.get("role"), m.get("content"), m.get("timestamp"))
+            for m in (session.context.messages or [])
+        }
+        appended = 0
+        for turn in db_turns:
+            if not isinstance(turn, dict):
+                continue
+            key = (turn.get("role"), turn.get("content"), turn.get("timestamp"))
+            if key in existing_keys:
+                continue
+            session.context.messages.append(dict(turn))
+            existing_keys.add(key)
+            appended += 1
+        if appended:
+            try:
+                session.context.messages.sort(key=lambda m: m.get("timestamp") or "")
+            except Exception:
+                pass
+            logger.info(
+                f"[SessionManager] hydrated {appended} turns into restored "
+                f"session {session.session_key}"
+            )
 
     def get_session_by_id(self, session_id: str) -> Session | None:
         """通过 session_id 获取会话"""
@@ -310,6 +504,7 @@ class SessionManager:
         chat_type: str = "private",
         display_name: str = "",
         chat_name: str = "",
+        bot_instance_id: str | None = None,
     ) -> Session:
         """创建新会话"""
         # 合并配置
@@ -321,6 +516,7 @@ class SessionManager:
             channel=channel,
             chat_id=chat_id,
             user_id=user_id,
+            bot_instance_id=bot_instance_id or channel,
             thread_id=thread_id,
             config=session_config,
             chat_type=chat_type,
@@ -332,7 +528,7 @@ class SessionManager:
         session.context.memory_scope = f"session_{session.id}"
 
         # 更新通道注册表（持久记录 channel→chat_id 映射，不受 session 过期影响）
-        self._update_channel_registry(channel, chat_id, user_id)
+        self._update_channel_registry(channel, chat_id, user_id, bot_instance_id=bot_instance_id)
 
         return session
 
@@ -485,11 +681,28 @@ class SessionManager:
                 logger.error(f"Error in save loop: {e}")
 
     def _load_sessions(self) -> None:
-        """从文件加载会话，主文件失败时自动回退到 .bak 备份。"""
+        """从文件加载会话，主文件失败时自动回退到 .tmp / .bak 备份。"""
         sessions_file = self.storage_path / "sessions.json"
         backup_file = self.storage_path / "sessions.json.bak"
+        temp_file = self.storage_path / "sessions.json.tmp"
 
         data = self._try_load_sessions_file(sessions_file)
+
+        if data is None and temp_file.exists():
+            logger.warning(
+                "Main sessions.json failed or missing, recovering from .tmp "
+                "(likely crash during atomic save)"
+            )
+            data = self._try_load_sessions_file(temp_file)
+            if data is not None:
+                try:
+                    if sessions_file.exists():
+                        sessions_file.unlink()
+                    temp_file.rename(sessions_file)
+                    logger.info("Recovered sessions.json from .tmp successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to promote .tmp to sessions.json: {e}")
+
         if data is None and backup_file.exists():
             logger.warning("Main sessions.json failed or missing, trying .bak backup")
             data = self._try_load_sessions_file(backup_file)
@@ -500,10 +713,23 @@ class SessionManager:
 
         skipped_expired = 0
         skipped_error = 0
+        skipped_invalid_id = 0
+        invalid_id_samples: list[str] = []
         for item in data:
             try:
                 if not isinstance(item, dict):
                     skipped_error += 1
+                    continue
+                # PR-N1: 启动迁移——sessions.json 偶尔会因为旧版本 / 上游 IM
+                # 平台的怪 ID（含路径分隔符 / 控制字符 / >256 字符）写进来，
+                # Windows 路径下还可能炸 SQLite 路径拼接。这里在加载阶段直接拒
+                # 绝并采样最多 5 个写到 logs，便于事后审计；前端最终展示时仍
+                # 须做 escapeHtml，避免 XSS（见 ChatView 已有 escape）。
+                _candidate_id = str(item.get("session_key") or item.get("id") or "")
+                if not _is_safe_session_id(_candidate_id):
+                    skipped_invalid_id += 1
+                    if len(invalid_id_samples) < 5:
+                        invalid_id_samples.append(_candidate_id[:64])
                     continue
                 session = Session.from_dict(item)
                 if not session.is_expired() and session.state != SessionState.CLOSED:
@@ -531,6 +757,7 @@ class SessionManager:
                     self._channel_registry[session.channel] = {
                         "chat_id": session.chat_id,
                         "user_id": session.user_id,
+                        "bot_instance_id": session.bot_instance_id or session.channel,
                         "last_seen": session_ts,
                     }
             except Exception as e:
@@ -545,6 +772,10 @@ class SessionManager:
             parts.append(f"skipped {skipped_expired} expired")
         if skipped_error:
             parts.append(f"skipped {skipped_error} errors")
+        if skipped_invalid_id:
+            parts.append(
+                f"skipped {skipped_invalid_id} invalid_id (samples={invalid_id_samples})"
+            )
         logger.info(f"{parts[0]}" + (f" ({', '.join(parts[1:])})" if len(parts) > 1 else ""))
 
         self._sessions_loaded = True
@@ -665,7 +896,14 @@ class SessionManager:
         except Exception as e:
             logger.warning(f"Failed to save channel registry: {e}")
 
-    def _update_channel_registry(self, channel: str, chat_id: str, user_id: str) -> None:
+    def _update_channel_registry(
+        self,
+        channel: str,
+        chat_id: str,
+        user_id: str,
+        *,
+        bot_instance_id: str | None = None,
+    ) -> None:
         """
         更新通道注册表
 
@@ -685,14 +923,23 @@ class SessionManager:
 
         # 更新或追加
         found = False
+        namespace = bot_instance_id or channel
         for item in entry:
-            if item.get("chat_id") == chat_id:
+            if item.get("chat_id") == chat_id and item.get("bot_instance_id", channel) == namespace:
                 item["user_id"] = user_id
+                item["bot_instance_id"] = namespace
                 item["last_seen"] = now
                 found = True
                 break
         if not found:
-            entry.append({"chat_id": chat_id, "user_id": user_id, "last_seen": now})
+            entry.append(
+                {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "bot_instance_id": namespace,
+                    "last_seen": now,
+                }
+            )
 
         # 按 last_seen 排序，保留最近 20 条
         entry.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
@@ -788,10 +1035,11 @@ class SessionManager:
         user_id: str,
         role: str,
         content: str,
+        bot_instance_id: str | None = None,
         **metadata,
     ) -> Session:
         """添加消息到会话"""
-        session = self.get_session(channel, chat_id, user_id)
+        session = self.get_session(channel, chat_id, user_id, bot_instance_id=bot_instance_id)
         session.add_message(role, content, **metadata)
         self.mark_dirty()  # 标记需要保存
         return session
@@ -802,9 +1050,16 @@ class SessionManager:
         chat_id: str,
         user_id: str,
         limit: int | None = None,
+        bot_instance_id: str | None = None,
     ) -> list[dict]:
         """获取会话历史"""
-        session = self.get_session(channel, chat_id, user_id, create_if_missing=False)
+        session = self.get_session(
+            channel,
+            chat_id,
+            user_id,
+            bot_instance_id=bot_instance_id,
+            create_if_missing=False,
+        )
         if session:
             return session.context.get_messages(limit)
         return []
@@ -814,9 +1069,16 @@ class SessionManager:
         channel: str,
         chat_id: str,
         user_id: str,
+        bot_instance_id: str | None = None,
     ) -> bool:
         """清空会话历史"""
-        session = self.get_session(channel, chat_id, user_id, create_if_missing=False)
+        session = self.get_session(
+            channel,
+            chat_id,
+            user_id,
+            bot_instance_id=bot_instance_id,
+            create_if_missing=False,
+        )
         if session:
             session.context.clear_messages()
             self.mark_dirty()  # 标记需要保存
@@ -830,9 +1092,16 @@ class SessionManager:
         user_id: str,
         key: str,
         value: Any,
+        bot_instance_id: str | None = None,
     ) -> bool:
         """设置会话变量"""
-        session = self.get_session(channel, chat_id, user_id, create_if_missing=False)
+        session = self.get_session(
+            channel,
+            chat_id,
+            user_id,
+            bot_instance_id=bot_instance_id,
+            create_if_missing=False,
+        )
         if session:
             session.context.set_variable(key, value)
             self.mark_dirty()  # 标记需要保存
@@ -846,9 +1115,16 @@ class SessionManager:
         user_id: str,
         key: str,
         default: Any = None,
+        bot_instance_id: str | None = None,
     ) -> Any:
         """获取会话变量"""
-        session = self.get_session(channel, chat_id, user_id, create_if_missing=False)
+        session = self.get_session(
+            channel,
+            chat_id,
+            user_id,
+            bot_instance_id=bot_instance_id,
+            create_if_missing=False,
+        )
         if session:
             return session.context.get_variable(key, default)
         return default

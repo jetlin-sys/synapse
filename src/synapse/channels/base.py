@@ -15,18 +15,28 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import ClassVar
 
+from ..core.log_health import record_health_event
 from .types import MediaFile, OutgoingMessage, UnifiedMessage
 
 logger = logging.getLogger(__name__)
 
 # Windows 文件名非法字符 (: * ? " < > |)
 _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_UNSAFE_INSTANCE_RE = re.compile(r'[^A-Za-z0-9_.:@-]+')
 
 
 def sanitize_filename(name: str) -> str:
     """将文件名中的非法字符替换为下划线，确保跨平台兼容。"""
     safe = _UNSAFE_FILENAME_RE.sub("_", name)
     return safe.strip(". ") or "download"
+
+
+def sanitize_bot_instance_id(value: str) -> str:
+    """Normalize a bot instance id for session keys and storage paths."""
+    raw = (value or "").strip()
+    safe = _UNSAFE_INSTANCE_RE.sub("_", raw)
+    safe = safe.strip("._:-@")
+    return safe[:128] or "unknown"
 
 
 # 回调类型定义
@@ -84,10 +94,21 @@ class ChannelAdapter(ABC):
             self.bot_id = bot_id
         else:
             self.bot_id = self.channel_name
+        self.bot_instance_id = self._build_bot_instance_id()
         self.agent_profile_id = agent_profile_id
 
     def has_capability(self, name: str) -> bool:
         return self.capabilities.get(name, False)
+
+    def _build_bot_instance_id(self) -> str:
+        """Return the stable namespace used to isolate sessions for this bot."""
+        channel = sanitize_bot_instance_id(str(self.channel_name or "unknown"))
+        if ":" in channel:
+            return channel
+        bot = sanitize_bot_instance_id(str(getattr(self, "bot_id", "") or ""))
+        if bot and bot != channel:
+            return f"{self.channel_type}:{bot}"
+        return channel
 
     @property
     def channel_type(self) -> str:
@@ -260,6 +281,13 @@ class ChannelAdapter(ABC):
 
     def _report_failure(self, reason: str) -> None:
         """通知网关本适配器已致命失败（认证错误等），使状态面板正确反映离线。"""
+        record_health_event(
+            "im",
+            f"{self.channel_name}:fatal_failure",
+            reason,
+            severity="error",
+            suggestion="该 IM 适配器已进入降级/离线状态，请检查机器人凭据、网络和平台权限。",
+        )
         if self._failure_callback:
             try:
                 self._failure_callback(self.channel_name, reason)

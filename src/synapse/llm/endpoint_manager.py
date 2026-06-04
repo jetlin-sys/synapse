@@ -19,7 +19,18 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_ENDPOINT_LISTS = ("endpoints", "compiler_endpoints", "stt_endpoints")
+_ENDPOINT_LISTS = (
+    "endpoints",
+    "compiler_endpoints",
+    "stt_endpoints",
+    # "relay_endpoints" holds shared relay / aggregator targets that
+    # plugins (happyhorse-video, tongyi-image, avatar-studio, ...)
+    # can reference by name instead of re-pasting base_url + api_key
+    # per plugin. Capability metadata (capabilities=["image"|"video"|
+    # "audio"|"tts"]) tells the UI which plugins can pick which relay.
+    # Reuses the same probe / save / toggle code path as LLM endpoints.
+    "relay_endpoints",
+)
 
 
 def _strip_bom(raw: bytes) -> bytes:
@@ -135,9 +146,9 @@ class EndpointManager:
     所有对 .env 和 llm_endpoints.json 的写操作都必须经过这里。
     """
 
-    def __init__(self, workspace_dir: Path):
+    def __init__(self, workspace_dir: Path, *, config_path: Path | None = None):
         self._ws_dir = Path(workspace_dir)
-        self._json_path = self._ws_dir / "data" / "llm_endpoints.json"
+        self._json_path = Path(config_path) if config_path else (self._ws_dir / "data" / "llm_endpoints.json")
         self._env_path = self._ws_dir / ".env"
         self._lock = threading.Lock()
 
@@ -159,6 +170,7 @@ class EndpointManager:
         api_key: str | None = None,
         endpoint_type: str = "endpoints",
         expected_version: str | None = None,
+        original_name: str | None = None,
     ) -> dict:
         """Save or update an endpoint atomically.
 
@@ -167,10 +179,6 @@ class EndpointManager:
         """
         if endpoint_type not in _ENDPOINT_LISTS:
             raise ValueError(f"Invalid endpoint_type: {endpoint_type}")
-
-        name = endpoint.get("name", "").strip()
-        if not name:
-            raise ValueError("Endpoint must have a name")
 
         with self._lock:
             config, version = self._read_json_versioned()
@@ -181,45 +189,139 @@ class EndpointManager:
                     current_version=version,
                 )
 
-            ep_list = config.get(endpoint_type, [])
-            existing = next((e for e in ep_list if e.get("name") == name), None)
-
-            # Resolve api_key_env
-            if api_key is not None:
-                env_var = self._resolve_env_var(endpoint, existing, config)
-
-                # If this env_var is shared with other endpoints and the key
-                # value is DIFFERENT, allocate a new unique env_var for this
-                # endpoint to avoid overwriting others.
-                other_users = self._find_endpoints_using_env_var(config, env_var, exclude_name=name)
-                if other_users:
-                    env = _parse_env(_read_text_robust(self._env_path))
-                    old_val = env.get(env_var, "")
-                    if old_val and old_val != api_key:
-                        env_var = self._allocate_unique_env_var(endpoint, config)
-
-                # Write .env first (prefer losing an orphan key over losing endpoint data)
-                self._write_env_key(env_var, api_key)
-                os.environ[env_var] = api_key
-            else:
-                env_var = (
-                    existing.get("api_key_env", "") if existing else endpoint.get("api_key_env", "")
-                )
-
-            endpoint["api_key_env"] = env_var
-
-            # Upsert into endpoint list
-            if existing:
-                idx = ep_list.index(existing)
-                ep_list[idx] = {**existing, **endpoint}
-            else:
-                ep_list.append(endpoint)
-
-            ep_list.sort(key=lambda e: (int(e.get("priority", 999)), e.get("name", "")))
-            config[endpoint_type] = ep_list
+            saved = self._save_endpoint_locked(
+                config=config,
+                endpoint=endpoint,
+                api_key=api_key,
+                endpoint_type=endpoint_type,
+                original_name=original_name,
+            )
             self._write_json(config)
 
-            return endpoint
+            return saved
+
+    def save_endpoints(
+        self,
+        endpoints: list[dict],
+        api_key: str | None = None,
+        endpoint_type: str = "endpoints",
+        expected_version: str | None = None,
+    ) -> list[dict]:
+        """Save multiple endpoints in one coordinated write.
+
+        Batch imports share one API key environment variable by default.  This
+        keeps "import models from one provider" as a single configuration action
+        instead of creating one env var per model.
+        """
+        if endpoint_type not in _ENDPOINT_LISTS:
+            raise ValueError(f"Invalid endpoint_type: {endpoint_type}")
+        if not endpoints:
+            raise ValueError("No endpoints to save")
+
+        with self._lock:
+            config, version = self._read_json_versioned()
+
+            if expected_version and expected_version != version:
+                raise ConflictError(
+                    "配置已被其他会话修改，请刷新后重试",
+                    current_version=version,
+                )
+
+            shared_env_var = None
+            if api_key is not None:
+                first = dict(endpoints[0])
+                first_name = str(first.get("name") or "").strip()
+                existing = next(
+                    (
+                        e
+                        for e in config.get(endpoint_type, [])
+                        if e.get("name") == first_name
+                    ),
+                    None,
+                )
+                shared_env_var = self._resolve_env_var(first, existing, config)
+                other_users = self._find_endpoints_using_env_var(
+                    config,
+                    shared_env_var,
+                    exclude_name=first_name,
+                )
+                if other_users:
+                    env = _parse_env(_read_text_robust(self._env_path))
+                    old_val = env.get(shared_env_var, "")
+                    if old_val and old_val != api_key:
+                        shared_env_var = self._allocate_unique_env_var(first, config)
+                self._write_env_key(shared_env_var, api_key)
+                os.environ[shared_env_var] = api_key
+
+            saved: list[dict] = []
+            for endpoint in endpoints:
+                item = dict(endpoint)
+                if shared_env_var:
+                    item["api_key_env"] = shared_env_var
+                saved.append(
+                    self._save_endpoint_locked(
+                        config=config,
+                        endpoint=item,
+                        api_key=None,
+                        endpoint_type=endpoint_type,
+                    )
+                )
+
+            self._write_json(config)
+            return saved
+
+    def _save_endpoint_locked(
+        self,
+        *,
+        config: dict,
+        endpoint: dict,
+        api_key: str | None,
+        endpoint_type: str,
+        original_name: str | None = None,
+    ) -> dict:
+        """Upsert one endpoint into an already locked, mutable config dict."""
+        name = str(endpoint.get("name") or "").strip()
+        if not name:
+            raise ValueError("Endpoint must have a name")
+        endpoint["name"] = name
+        lookup_name = (original_name or name).strip()
+
+        ep_list = config.get(endpoint_type, [])
+        existing = next((e for e in ep_list if e.get("name") == lookup_name), None)
+        if lookup_name != name and any(e.get("name") == name for e in ep_list):
+            raise ValueError(f"Endpoint with name '{name}' already exists")
+
+        if api_key is not None:
+            env_var = self._resolve_env_var(endpoint, existing, config)
+            other_users = self._find_endpoints_using_env_var(
+                config,
+                env_var,
+                exclude_name=lookup_name,
+            )
+            if other_users:
+                env = _parse_env(_read_text_robust(self._env_path))
+                old_val = env.get(env_var, "")
+                if old_val and old_val != api_key:
+                    env_var = self._allocate_unique_env_var(endpoint, config)
+
+            self._write_env_key(env_var, api_key)
+            os.environ[env_var] = api_key
+        else:
+            env_var = existing.get("api_key_env", "") if existing else endpoint.get("api_key_env", "")
+
+        endpoint["api_key_env"] = env_var
+
+        if existing:
+            idx = ep_list.index(existing)
+            saved = {**existing, **endpoint}
+            ep_list[idx] = saved
+        else:
+            saved = endpoint
+            ep_list.append(saved)
+
+        ep_list.sort(key=lambda e: (int(e.get("priority", 999)), e.get("name", "")))
+        config[endpoint_type] = ep_list
+        return saved
 
     def delete_endpoint(
         self,
@@ -265,6 +367,105 @@ class EndpointManager:
         config = self._read_json()
         return config.get(endpoint_type, [])
 
+    def sync_endpoint_models(
+        self,
+        name: str,
+        endpoint_type: str = "endpoints",
+        *,
+        timeout: float = 15.0,
+    ) -> dict:
+        """Probe a relay endpoint's actual model catalog and persist it.
+
+        Looks up the endpoint by name, fetches its catalog via
+        :func:`synapse.llm.model_probe.probe_models`, writes the
+        result into ``supported_models`` / ``models_synced_at`` on the
+        endpoint, and returns a small status dict the API/UI can
+        render directly. Failures populate ``models_sync_error``
+        instead of raising — the user always sees the previous
+        catalog plus a clear last-error string, never an empty list
+        plus an exception traceback.
+
+        Returns::
+
+            {
+                "ok": bool,
+                "name": str,
+                "model_count": int,
+                "models": list[str],
+                "synced_at": float | None,
+                "error": str | None,   # user-facing if ok=False
+            }
+        """
+        from time import time as _now
+
+        from .model_probe import (
+            ProbeError,
+            probe_models,
+        )
+
+        if endpoint_type not in _ENDPOINT_LISTS:
+            raise ValueError(f"Invalid endpoint_type: {endpoint_type}")
+
+        with self._lock:
+            config, _ = self._read_json_versioned()
+            ep_list = config.get(endpoint_type, [])
+            target = next((e for e in ep_list if e.get("name") == name), None)
+            if target is None:
+                raise KeyError(f"endpoint {name!r} not found in {endpoint_type}")
+
+            env = _parse_env(_read_text_robust(self._env_path))
+            api_key = ""
+            env_var = target.get("api_key_env") or ""
+            if env_var:
+                api_key = env.get(env_var) or os.environ.get(env_var, "")
+            if not api_key:
+                api_key = target.get("api_key", "") or ""
+
+            base_url = str(target.get("base_url") or "")
+            api_type = str(target.get("api_type") or "")
+            provider = str(target.get("provider") or "")
+
+            error_msg: str | None = None
+            models: list[str] = []
+            try:
+                models = probe_models(
+                    api_type=api_type,
+                    base_url=base_url,
+                    api_key=api_key,
+                    provider=provider,
+                    timeout=timeout,
+                )
+            except ProbeError as exc:
+                error_msg = exc.user_message
+                logger.info(
+                    "sync_endpoint_models name=%s status=err msg=%s",
+                    name,
+                    exc,
+                )
+
+            now_ts = _now()
+            if error_msg is None:
+                target["supported_models"] = models
+                target["models_synced_at"] = now_ts
+                # Clear any stale error message on a successful sync.
+                target.pop("models_sync_error", None)
+            else:
+                # Preserve previous supported_models list (do not wipe);
+                # only refresh the timestamp + error so the UI shows
+                # "last attempted at HH:MM, last success was earlier".
+                target["models_sync_error"] = error_msg
+                target.setdefault("models_synced_at", None)
+
+            self._write_json(config)
+            return {
+                "ok": error_msg is None,
+                "name": name,
+                "model_count": len(models),
+                "models": list(models),
+                "synced_at": target.get("models_synced_at"),
+                "error": error_msg,
+            }
+
     def get_all_config(self) -> dict:
         """Read the entire llm_endpoints.json content."""
         return self._read_json()
@@ -295,6 +496,88 @@ class EndpointManager:
                     }
                 )
         return result
+
+    # ------------------------------------------------------------------
+    # Granular operations (toggle / reorder / settings)
+    # ------------------------------------------------------------------
+
+    def toggle_endpoint(
+        self,
+        name: str,
+        endpoint_type: str = "endpoints",
+    ) -> dict:
+        """Toggle the ``enabled`` flag for an endpoint. Returns the updated entry."""
+        if endpoint_type not in _ENDPOINT_LISTS:
+            raise ValueError(f"Invalid endpoint_type: {endpoint_type}")
+
+        with self._lock:
+            config = self._read_json()
+            ep_list = config.get(endpoint_type, [])
+
+            target = None
+            for ep in ep_list:
+                if ep.get("name") == name:
+                    target = ep
+                    break
+
+            if target is None:
+                raise ValueError(f"Endpoint '{name}' not found in {endpoint_type}")
+
+            target["enabled"] = not target.get("enabled", True)
+            config[endpoint_type] = ep_list
+            self._write_json(config)
+            return dict(target)
+
+    def reorder_endpoints(
+        self,
+        ordered_names: list[str],
+        endpoint_type: str = "endpoints",
+    ) -> list[dict]:
+        """Reorder endpoints by assigning incremental ``priority`` values.
+
+        Endpoints whose names are in *ordered_names* get priority 10, 20, ...
+        in the given order.  Any endpoints not listed keep their original
+        relative order and are appended after the listed ones.
+        """
+        if endpoint_type not in _ENDPOINT_LISTS:
+            raise ValueError(f"Invalid endpoint_type: {endpoint_type}")
+
+        with self._lock:
+            config = self._read_json()
+            ep_list = config.get(endpoint_type, [])
+
+            by_name: dict[str, dict] = {ep.get("name", ""): ep for ep in ep_list}
+            result: list[dict] = []
+            step = 10
+
+            for i, name in enumerate(ordered_names, 1):
+                if name in by_name:
+                    ep = by_name.pop(name)
+                    ep["priority"] = i * step
+                    result.append(ep)
+
+            for ep in ep_list:
+                name = ep.get("name", "")
+                if name in by_name:
+                    ep["priority"] = (len(ordered_names) + len(result) + 1) * step
+                    result.append(ep)
+                    by_name.pop(name, None)
+
+            config[endpoint_type] = result
+            self._write_json(config)
+            return result
+
+    def update_settings(self, settings: dict) -> dict:
+        """Merge *settings* into the top-level ``settings`` key of the config."""
+        with self._lock:
+            config = self._read_json()
+            existing = config.get("settings", {})
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(settings)
+            config["settings"] = existing
+            self._write_json(config)
+            return existing
 
     # ------------------------------------------------------------------
     # File I/O with atomic write + backup

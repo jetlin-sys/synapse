@@ -19,6 +19,7 @@ ALWAYS_LOAD_TOOLS: frozenset[str] = frozenset(
         "list_directory",
         "grep",
         "glob",
+        "move_file",
         "delete_file",
         # PowerShell（Windows 核心）
         "run_powershell",
@@ -29,8 +30,6 @@ ALWAYS_LOAD_TOOLS: frozenset[str] = frozenset(
         # 代理委派
         "delegate_to_agent",
         "delegate_parallel",
-        "submit_meeting_work_plan",
-        "submit_hitl_questionnaire",
         # MCP 入口（prompt 中 MCP Catalog 引导用户调用，必须常驻）
         "call_mcp_tool",
         "list_mcp_servers",
@@ -39,6 +38,21 @@ ALWAYS_LOAD_TOOLS: frozenset[str] = frozenset(
         "update_todo_step",
         "get_todo_status",
         "complete_todo",
+        # Fix-10：高频调度 / 记忆 / 网络工具提到首轮。
+        # 这些工具在专业用户日常会话中调用频率极高（"提醒我..." /
+        # "记住..." / "搜一下..."），把它们留在 deferred 会强制 LLM 多走
+        # 一轮 get_tool_info → 在 19 轮探索测试里这种额外 round-trip
+        # 单独贡献了 ≥6 万 token 的浪费。promote 后约多 800 token system
+        # prompt，但消除了反复的 schema 拉取。
+        "schedule_task",
+        "list_scheduled_tasks",
+        "cancel_scheduled_task",
+        "search_memory",
+        "add_memory",
+        "web_search",
+        "web_fetch",
+        # 用户档案（"我叫 X" / "我是 Y" 的高频更新路径）
+        "update_user_profile",
     }
 )
 
@@ -55,7 +69,9 @@ DEFER_CATEGORIES: frozenset[str] = frozenset(
         "Config",
         "Agent Hub",
         "Skill Store",
-        "Profile",
+        # "Profile" 已移除：用户档案/记忆是消费者首轮高频路径，
+        # 延迟加载导致首轮 update_user_profile 必失败（progressive disclosure
+        # 两轮往返），与产品体验相悖。详见 _exploratory_test_report_20260418.md。
         "Plugin",
         "Org Setup",
         "OpenCLI",

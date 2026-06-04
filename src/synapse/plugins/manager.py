@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
 import importlib.util
+import inspect
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+from ..core.log_health import record_health_event
 from .api import PluginAPI, PluginBase
+from .asset_bus import AssetBus
 from .compat import check_compatibility
 from .hooks import HookRegistry
 from .manifest import ManifestError, PluginManifest, parse_manifest
 from .sandbox import PluginErrorTracker
+from .sdk_loader import ensure_plugin_sdk_on_path
 from .state import PluginState
 
 logger = logging.getLogger(__name__)
@@ -24,6 +30,7 @@ UNLOAD_TIMEOUT = 5.0
 _ALLOWED_HOST_REFS = frozenset(
     {
         "api_app",
+        "asset_bus",
         "brain",
         "channel_registry",
         "external_retrieval_sources",
@@ -39,6 +46,76 @@ _ALLOWED_HOST_REFS = frozenset(
         "tool_registry",
     }
 )
+
+
+class _LiveFilteredHostRefs:
+    """Dict-like view that exposes a whitelisted subset of an external dict.
+
+    宿主把 ``host_refs`` 传给 ``PluginManager`` 后，仍然可以继续往同一个
+    dict 里追加（典型场景：API server 启动时还没初始化 gateway，加载完
+    plugin 之后才把 gateway 注入），所以我们必须**共享同一个 dict 对象**。
+    与此同时，plugin 只允许看到 ``_ALLOWED_HOST_REFS`` 列出的字段。
+
+    这个轻量 wrapper 把 ``get/__contains__/__iter__/setdefault/keys/items``
+    都委托给 external dict，但每次访问都会先按白名单过滤。它故意**不**实现
+    完整 ``MutableMapping`` 协议，避免 plugin 误以为可以往里写 ``brain``
+    之类的字段——写操作仍走宿主代码。
+    """
+
+    __slots__ = ("_external", "_allowlist")
+
+    def __init__(self, external: dict[str, Any], allowlist: frozenset[str]) -> None:
+        self._external = external
+        self._allowlist = allowlist
+
+    @staticmethod
+    def _is_internal_key(key: object) -> bool:
+        """Bookkeeping keys (``_pending_plugin_routers`` / ``_ui_event_handlers``)
+        prefixed with ``_`` are treated as internal storage and bypass the
+        allowlist — plugins can read/write them across calls without us having
+        to whitelist every new bookkeeping field."""
+        return isinstance(key, str) and key.startswith("_")
+
+    def _is_visible(self, key: object) -> bool:
+        return key in self._allowlist or self._is_internal_key(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if not self._is_visible(key):
+            return default
+        return self._external.get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        if not self._is_visible(key):
+            raise KeyError(key)
+        return self._external[key]
+
+    def __contains__(self, key: object) -> bool:
+        return self._is_visible(key) and key in self._external
+
+    def __iter__(self):
+        return (k for k in self._external if self._is_visible(k))
+
+    def keys(self):
+        return [k for k in self._external if self._is_visible(k)]
+
+    def items(self):
+        return [(k, self._external[k]) for k in self._external if self._is_visible(k)]
+
+    def values(self):
+        return [self._external[k] for k in self._external if self._is_visible(k)]
+
+    def setdefault(self, key: str, default: Any) -> Any:
+        # ``setdefault`` 用于宿主自身（PluginManager 内部）记账型字段，例如
+        # ``_pending_plugin_routers``——这些字段不在白名单里、也不暴露给
+        # plugin，所以这里直接落到 external dict，调用方负责自己 keep state。
+        return self._external.setdefault(key, default)
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def __repr__(self) -> str:
+        visible = {k: self._external.get(k) for k in self.keys()}
+        return f"_LiveFilteredHostRefs({visible!r})"
 
 
 class PluginManager:
@@ -57,9 +134,37 @@ class PluginManager:
         state_path: Path | None = None,
         host_refs: dict[str, Any] | None = None,
     ) -> None:
+        # Make ``synapse_plugin_sdk`` importable for plugin code before
+        # any plugin entry module is exec'd. In a pip-installed deployment
+        # this is a no-op (SDK already on sys.path); in monorepo / bundled
+        # builds it injects the local source tree.
+        ensure_plugin_sdk_on_path()
+
         self._plugins_dir = plugins_dir
         self._state_path = state_path or (plugins_dir.parent / "plugin_state.json")
-        self._host_refs = self._filter_host_refs(host_refs or {})
+
+        # Asset Bus: a single shared SQLite registry living next to the
+        # plugin state file (i.e. settings.data_dir / asset_bus.db when the
+        # standard layout is used). The host owns the connection so plugins
+        # never see the DB path. See docs/asset-bus.md.
+        asset_bus_path = self._state_path.parent / "asset_bus.db"
+        self._asset_bus = AssetBus(asset_bus_path)
+
+        # Inject ourselves into host_refs BEFORE wiring up the live view so
+        # the bus is available to plugins via host_refs.get("asset_bus").
+        #
+        # PR-late-wiring 修复：以前这里是 ``dict(host_refs or {})``，PluginManager
+        # 拿到的是一个**复制**，宿主在 plugin 加载之后才把 ``gateway`` /
+        # ``brain`` 等 wire 进来时，PluginAPI 永远看不到。现在改成共享同一份
+        # external dict，并通过 ``_LiveFilteredHostRefs`` 在 PluginAPI 边界上
+        # 实施白名单过滤，保证 (a) live-binding 生效；(b) plugin 仍然只能看到
+        # ``_ALLOWED_HOST_REFS`` 列出的字段。
+        external_host_refs: dict[str, Any] = (
+            host_refs if host_refs is not None else {}
+        )
+        external_host_refs.setdefault("asset_bus", self._asset_bus)
+        self._external_host_refs = external_host_refs
+        self._host_refs = _LiveFilteredHostRefs(external_host_refs, _ALLOWED_HOST_REFS)
 
         self._state = PluginState.load(self._state_path)
         self._error_tracker = PluginErrorTracker()
@@ -68,6 +173,12 @@ class PluginManager:
 
         self._loaded: dict[str, _LoadedPlugin] = {}
         self._failed: dict[str, str] = {}
+        # 失败冷却：记录每个 plugin id 上次加载失败时的 monotonic 时间戳。
+        # ``load_all`` 在 60s 内对同一 plugin 不会再次尝试加载，避免反复刷
+        # ERROR（典型现场：某 plugin 顶层 import 因 numpy / ffmpeg 等环境
+        # 问题崩溃，每次 load_all/auto-restart 都打一行长 traceback）。
+        # 用户主动 ``reload_plugin`` 会重置该时间戳。
+        self._failed_at: dict[str, float] = {}
 
     @staticmethod
     def _filter_host_refs(host_refs: dict[str, Any]) -> dict[str, Any]:
@@ -83,6 +194,27 @@ class PluginManager:
     @property
     def hook_registry(self) -> HookRegistry:
         return self._hook_registry
+
+    @property
+    def asset_bus(self) -> AssetBus:
+        """Read-only access to the host AssetBus (used by API routes/tests)."""
+        return self._asset_bus
+
+    async def purge_plugin_assets(self, plugin_id: str) -> int:
+        """Remove every asset owned by ``plugin_id`` from the Asset Bus.
+
+        Called by the uninstall HTTP route after the on-disk plugin
+        directory is gone, so the bus does not accumulate orphan rows
+        whose owner no longer exists. Safe to call when the plugin had
+        never published anything (returns 0).
+        """
+        try:
+            return await self._asset_bus.sweep_owner(plugin_id)
+        except Exception as e:
+            logger.warning(
+                "purge_plugin_assets failed for '%s': %s", plugin_id, e
+            )
+            return 0
 
     @property
     def loaded_count(self) -> int:
@@ -101,6 +233,73 @@ class PluginManager:
     def state(self) -> PluginState:
         return self._state
 
+    def get_tool_class(
+        self, tool_name: str
+    ) -> tuple[Any, Any] | None:
+        """C10：插件工具 → ApprovalClass 查表（PolicyEngineV2 ``plugin_lookup``）。
+
+        遍历**已加载且未禁用**的插件，匹配 ``manifest.tool_classes`` 里
+        与 ``tool_name`` 完全相同的键。多个插件声明同一工具名时取严
+        （``ApprovalClass.most_strict``），与 classifier 多源叠加规则一致。
+
+        值不在 ``ApprovalClass`` 枚举内时静默忽略（manifest 解析时已经
+        归一为 lowercase string，但开发者仍可能拼错），不抛异常——绝
+        不让一个坏 manifest 拖垮 PolicyEngine 启动。
+        """
+        try:
+            from ..core.policy_v2.declared_class_trust import (
+                DeclaredClassTrust,
+                compute_effective_class,
+            )
+            from ..core.policy_v2.enums import (
+                ApprovalClass,
+                DecisionSource,
+                most_strict,
+            )
+        except Exception:
+            return None
+
+        candidates: list[tuple[Any, Any]] = []
+        for plugin_id, lp in self._loaded.items():
+            if not self._state.is_enabled(plugin_id):
+                continue
+            klass_str = lp.manifest.tool_classes.get(tool_name)
+            if not klass_str:
+                continue
+            try:
+                klass = ApprovalClass(klass_str)
+            except ValueError:
+                logger.warning(
+                    "Plugin '%s' declares unknown approval_class=%r for tool '%s'; ignored",
+                    plugin_id,
+                    klass_str,
+                    tool_name,
+                )
+                continue
+            effective, source = compute_effective_class(
+                tool_name,
+                klass,
+                DeclaredClassTrust.DEFAULT,
+                source=DecisionSource.PLUGIN_PREFIX,
+            )
+            candidates.append((effective, source))
+        if not candidates:
+            return None
+        return most_strict(candidates)
+
+    def plugin_allows_param_mutation(self, plugin_id: str, tool_name: str) -> bool:
+        """C10：插件是否被允许在 ``on_before_tool_use`` 修改 ``tool_input``。
+
+        ``tool_executor`` 在派发 hook 前后做 deep-diff，发现 params 被改
+        但插件未在 manifest.mutates_params 列出该工具时，diff 会被还原
+        且写一条 audit。在 manifest 列出时，diff 被强制保留并落 jsonl
+        审计——R2-12 的强制审计载体。
+        """
+        lp = self._loaded.get(plugin_id)
+        if lp is None:
+            return False
+        return tool_name in lp.manifest.mutates_params
+
     # --- Version checking ---
 
     @staticmethod
@@ -108,11 +307,30 @@ class PluginManager:
         """Check plugin compatibility (system version, API version, Python, SDK)."""
         result = check_compatibility(manifest)
         for w in result.warnings:
-            logger.warning(w)
+            if record_health_event(
+                "plugin",
+                f"{manifest.id}:compat_warning",
+                w,
+                suggestion="插件兼容性警告已聚合；详情可在插件管理页查看。",
+            ):
+                logger.warning(w)
         for e in result.errors:
-            logger.error(e)
+            if record_health_event(
+                "plugin",
+                f"{manifest.id}:compat_error",
+                e,
+                severity="error",
+                suggestion="插件与当前 Synapse/API 版本不兼容，请升级插件或禁用它。",
+            ):
+                logger.error(e)
         if not result.ok:
-            logger.warning("Plugin '%s' skipped due to compatibility errors", manifest.id)
+            if record_health_event(
+                "plugin",
+                f"{manifest.id}:skipped_compat",
+                "skipped due to compatibility errors",
+                suggestion="插件已降级为跳过加载，避免持续刷屏。",
+            ):
+                logger.warning("Plugin '%s' skipped due to compatibility errors", manifest.id)
         return result.ok
 
     # --- Discovery ---
@@ -167,6 +385,14 @@ class PluginManager:
 
         Each plugin is loaded in its own try/except with a timeout.
         Failures are logged and tracked, never propagated.
+
+        Note: the Asset Bus is opened lazily on first publish/consume —
+        we deliberately do NOT eager-init it here. Eager init would
+        spawn an aiosqlite worker thread for every PluginManager
+        instance (including the dozens of test fixtures that never
+        touch the bus), and the thread leaks if the test loop closes
+        before ``shutdown()`` runs. Lazy init keeps the cost where the
+        usage is.
         """
         plugin_dirs = self._discover_plugins()
         if not plugin_dirs:
@@ -180,7 +406,14 @@ class PluginManager:
                 manifest = parse_manifest(plugin_dir)
                 parsed.append((plugin_dir, manifest))
             except ManifestError as e:
-                logger.error("Skipping %s: %s", plugin_dir.name, e)
+                if record_health_event(
+                    "plugin",
+                    f"{plugin_dir.name}:manifest",
+                    str(e),
+                    severity="error",
+                    suggestion="请检查 plugin.json/manifest 字段是否完整且 JSON 格式正确。",
+                ):
+                    logger.error("Skipping %s: %s", plugin_dir.name, e)
                 self._failed[plugin_dir.name] = str(e)
 
         sorted_plugins, cyclic_ids = self._topological_sort(parsed)
@@ -189,8 +422,25 @@ class PluginManager:
             logger.error("Plugin '%s' %s", cid, msg)
             self._failed[cid] = msg
 
+        # 失败冷却阈值：若某 plugin 在 _failed_at 中且距上次失败 < 该阈值，
+        # 跳过本次加载，仅打一条 debug 日志，避免反复刷 traceback。
+        _PLUGIN_FAILURE_COOLDOWN_SEC = 60.0
+        _now_mono = time.monotonic()
+
         for plugin_dir, manifest in sorted_plugins:
             if not self._check_synapse_version(manifest):
+                continue
+
+            _last_failed = self._failed_at.get(manifest.id)
+            if (
+                _last_failed is not None
+                and (_now_mono - _last_failed) < _PLUGIN_FAILURE_COOLDOWN_SEC
+            ):
+                logger.debug(
+                    "Plugin '%s' in failure cooldown (%.1fs remaining), skipping load",
+                    manifest.id,
+                    _PLUGIN_FAILURE_COOLDOWN_SEC - (_now_mono - _last_failed),
+                )
                 continue
 
             if not self._state.is_enabled(manifest.id):
@@ -230,20 +480,89 @@ class PluginManager:
                     timeout=manifest.load_timeout,
                 )
                 logger.info("Plugin '%s' v%s loaded", manifest.id, manifest.version)
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 msg = f"load timeout ({manifest.load_timeout}s)"
                 logger.error("Plugin '%s' %s, skipped", manifest.id, msg)
                 self._failed[manifest.id] = msg
+                self._failed_at[manifest.id] = time.monotonic()
                 self._state.record_error(manifest.id, msg)
+                self._record_failure_jsonl(manifest.id, "TimeoutError", msg, "")
             except Exception as e:
-                msg = f"{type(e).__name__}: {e}"
-                logger.error("Plugin '%s' failed to load: %s", manifest.id, msg, exc_info=True)
+                if (
+                    isinstance(e, ModuleNotFoundError)
+                    and getattr(e, "name", "") == "synapse_plugin_sdk"
+                ):
+                    msg = (
+                        "synapse_plugin_sdk is not installed. "
+                        "Run `pip install \"synapse[plugins]\"` (production) or "
+                        "`pip install -e ./synapse-plugin-sdk` (monorepo dev), "
+                        "then reload this plugin."
+                    )
+                    logger.error(
+                        "Plugin '%s' failed to load: %s", manifest.id, msg
+                    )
+                elif isinstance(e, ModuleNotFoundError):
+                    msg = self._format_missing_module_error(manifest, plugin_dir, e)
+                    logger.error(
+                        "Plugin '%s' failed to load: %s",
+                        manifest.id,
+                        msg,
+                        exc_info=True,
+                    )
+                else:
+                    msg = f"{type(e).__name__}: {e}"
+                    logger.error(
+                        "Plugin '%s' failed to load: %s",
+                        manifest.id,
+                        msg,
+                        exc_info=True,
+                    )
                 self._failed[manifest.id] = msg
+                self._failed_at[manifest.id] = time.monotonic()
                 self._state.record_error(manifest.id, msg)
+                # PR-P1: 把失败原因 + traceback 落到 jsonl，便于事后排查回放，
+                # 也让前端 PluginManagerView 能展示"上次加载失败 N 个，原因..."。
+                import traceback as _tb
+                self._record_failure_jsonl(
+                    manifest.id, type(e).__name__, msg, _tb.format_exc()
+                )
 
         self._refresh_skill_catalog()
         self._reload_llm_registries()
         self._save_state()
+
+    @staticmethod
+    def _format_missing_module_error(
+        manifest: PluginManifest,
+        plugin_dir: Path,
+        exc: ModuleNotFoundError,
+    ) -> str:
+        """Explain plugin import failures in terms users can act on.
+
+        Raw ``ModuleNotFoundError`` is especially confusing in packaged
+        builds because source-mode venvs often have the dependency already.
+        This keeps the host diagnosis focused on the existing install paths
+        instead of inventing another dependency manager.
+        """
+        missing = getattr(exc, "name", "") or str(exc)
+        deps_dir = plugin_dir / "deps"
+        module_dir = Path.home() / ".synapse" / "modules" / manifest.id / "site-packages"
+        pip_specs: list[str] = []
+        try:
+            from .installer import _parse_pip_specs
+
+            pip_specs = _parse_pip_specs(manifest.requires)
+        except Exception:
+            pip_specs = []
+
+        declared = f" declared requires.pip={pip_specs!r};" if pip_specs else ""
+        return (
+            f"ModuleNotFoundError: missing module {missing!r} while loading plugin "
+            f"{manifest.id!r}.{declared} checked plugin deps={deps_dir}; "
+            f"optional module path={module_dir}. Reinstall the plugin to run host "
+            "requires.pip, or use the plugin's dependency/settings panel if it "
+            "ships an in-plugin bootstrap."
+        )
 
     def _reload_llm_registries(self) -> None:
         """Notify LLM registries to pick up plugin-provided providers."""
@@ -255,11 +574,29 @@ class PluginManager:
             logger.debug("LLM registry reload skipped: %s", e)
 
     async def _load_single(self, manifest: PluginManifest, plugin_dir: Path) -> None:
+        # 幂等防护：如果同一 plugin_id 已经在 _loaded 里，再调一次 _load_single
+        # 会造成两件糟糕的事：(1) 重复执行 on_load，重新 boot SQLite / DashScope
+        # client / 后台轮询协程，撕掉前一份还在用的状态；(2) handler_registry
+        # 里出现 "工具名冲突" warning，因为同一 plugin tool 被 register 两次。
+        # 真正想"换一份新的 on_load 状态"的调用方应该走 reload_plugin（它会
+        # 先 unload_plugin 把 _loaded 表 pop 掉再走这里），所以这里看到
+        # 已 loaded 直接 no-op + WARN 是安全的退路。
+        existing = self._loaded.get(manifest.id)
+        if existing is not None:
+            logger.warning(
+                "Plugin '%s' is already loaded (v%s); skipping duplicate "
+                "_load_single. Use reload_plugin() to force a re-init.",
+                manifest.id,
+                existing.manifest.version,
+            )
+            return
+
         state_entry = self._state.ensure_entry(manifest.id)
         granted = self._resolve_permissions(manifest, state_entry.granted_permissions)
         state_entry.granted_permissions = granted
 
-        data_dir = plugin_dir
+        data_dir = self._plugins_dir.parent / "plugin_data" / manifest.id
+        data_dir.mkdir(parents=True, exist_ok=True)
         api = PluginAPI(
             plugin_id=manifest.id,
             manifest=manifest,
@@ -269,15 +606,62 @@ class PluginManager:
             hook_registry=self._hook_registry,
         )
 
+        # Pre-seed pending_permissions so the management UI can show an
+        # "approve" prompt the moment the plugin is installed/reloaded,
+        # instead of waiting for the user to first trigger a feature, hit
+        # an opaque "service unavailable" error, and only THEN realising
+        # they need to grant a permission. Without this, _pending_permissions
+        # is populated only as a side-effect of failed _check_permission()
+        # calls inside route handlers, which means manifest-declared but
+        # not-yet-approved permissions stay invisible until you stumble onto
+        # the gated code path. (Discovered via tongyi-image's brain.access:
+        # users got "LLM 不可用" with no hint that a permission was missing.)
+        from .manifest import BASIC_PERMISSIONS
+
+        granted_set = set(granted)
+        for perm in manifest.permissions:
+            if perm in BASIC_PERMISSIONS:
+                continue
+            if perm not in granted_set:
+                api._pending_permissions.add(perm)
+
         plugin_instance: PluginBase | None = None
         module_name = ""
         sys_path_entry = ""
+        deps_path_entry = ""
+        imported_modules: set[str] = set()
+
+        # Surface missing pip deps loudly during plugin load instead of letting
+        # the user discover them via an opaque ``ModuleNotFoundError`` 30 seconds
+        # into a task. We only WARN — a plugin may still register routes / UI
+        # without its pip deps, with feature-level errors guiding the user.
+        if manifest.plugin_type == "python":
+            try:
+                from .installer import _parse_pip_specs, deps_appear_installed
+
+                pip_specs = _parse_pip_specs(manifest.requires)
+                if pip_specs and not deps_appear_installed(plugin_dir, manifest.requires):
+                    logger.warning(
+                        "Plugin '%s' declares pip deps %s but %s is empty. "
+                        "Run reinstall to trigger install_pip_deps, or place "
+                        "the wheels under ~/.synapse/modules/%s/site-packages/.",
+                        manifest.id,
+                        pip_specs,
+                        plugin_dir / "deps",
+                        manifest.id,
+                    )
+            except Exception:
+                pass
 
         try:
             if manifest.plugin_type == "python":
-                plugin_instance, module_name, sys_path_entry = self._load_python_plugin(
-                    manifest, plugin_dir
-                )
+                (
+                    plugin_instance,
+                    module_name,
+                    sys_path_entry,
+                    deps_path_entry,
+                    imported_modules,
+                ) = self._load_python_plugin(manifest, plugin_dir)
                 plugin_instance.on_load(api)
                 self._try_load_plugin_skill(manifest, plugin_dir, api)
             elif manifest.plugin_type == "mcp":
@@ -295,7 +679,15 @@ class PluginManager:
             plugin_dir=plugin_dir,
             module_name=module_name,
             sys_path_entry=sys_path_entry,
+            deps_path_entry=deps_path_entry,
+            imported_modules=imported_modules,
         )
+        entry = self._state.get_entry(manifest.id)
+        if entry is None or not entry.pending_update_path:
+            self._state.mark_loaded(manifest.id)
+        else:
+            entry.loaded = True
+        self._save_state()
 
         plugin_pending = api._host.pop("_pending_plugin_routers", [])
         if plugin_pending:
@@ -308,23 +700,24 @@ class PluginManager:
         if manifest.has_ui:
             self._mount_plugin_ui(manifest, plugin_dir)
 
-    def _mount_plugin_ui(self, manifest: PluginManifest, plugin_dir: Path) -> None:
+    def _mount_plugin_ui(
+        self, manifest: PluginManifest, plugin_dir: Path
+    ) -> None:
+        """Mount plugin UI static files to the FastAPI app."""
         assert manifest.ui is not None
         ui_entry = manifest.ui.entry
         ui_dist_dir = (plugin_dir / ui_entry).parent
         if not ui_dist_dir.is_dir():
             logger.warning(
                 "Plugin '%s' declares UI but dist dir '%s' not found, skipping UI mount",
-                manifest.id,
-                ui_dist_dir,
+                manifest.id, ui_dist_dir,
             )
             return
         index_file = plugin_dir / ui_entry
         if not index_file.is_file():
             logger.warning(
                 "Plugin '%s' UI entry '%s' not found, skipping UI mount",
-                manifest.id,
-                ui_entry,
+                manifest.id, ui_entry,
             )
             return
 
@@ -366,11 +759,23 @@ class PluginManager:
 
     def _load_python_plugin(
         self, manifest: PluginManifest, plugin_dir: Path
-    ) -> tuple[PluginBase, str, str]:
+    ) -> tuple[PluginBase, str, str, str, set[str]]:
         """Load a Python plugin module.
 
-        Returns (instance, module_name, sys_path_entry) so the caller can
-        record them for cleanup on unload.
+        Returns ``(instance, module_name, sys_path_entry, deps_path_entry,
+        imported_modules)``.
+
+        ``imported_modules`` lists submodules newly registered in
+        ``sys.modules`` whose source file lives under ``plugin_dir`` — so the
+        unloader can purge them and avoid stale-module reuse on reinstall.
+
+        ``deps_path_entry`` is ``<plugin_dir>/deps/`` when that directory
+        exists (created by ``installer.install_pip_deps`` from
+        ``requires.pip``). It is appended (not inserted) to ``sys.path`` so
+        plugin-private third-party packages become importable, while
+        PyInstaller's bundled stdlib / pydantic on the front of the path
+        keeps winning over any plugin-local copy — the same precaution
+        ``runtime_env.inject_module_paths`` takes for ``~/.synapse/modules``.
         """
         entry_path = plugin_dir / manifest.entry
         if not entry_path.exists():
@@ -390,6 +795,73 @@ class PluginManager:
             sys.path.insert(0, plugin_dir_str)
             added_to_path = True
 
+        deps_dir = plugin_dir / "deps"
+        deps_dir_str = str(deps_dir)
+        deps_added_to_path = False
+        if deps_dir.is_dir() and deps_dir_str not in sys.path:
+            sys.path.append(deps_dir_str)
+            deps_added_to_path = True
+
+        try:
+            plugin_dir_resolved = plugin_dir.resolve()
+        except OSError:
+            plugin_dir_resolved = plugin_dir
+
+        # Isolate plugin-local submodules from cross-plugin sys.modules
+        # collisions. Many plugins ship a top-level ``task_manager.py`` (or
+        # ``providers.py``) and import it as ``from task_manager import X``.
+        # The first plugin to load wins ``sys.modules['task_manager']``;
+        # later plugins doing the same bare import would receive the cached
+        # module from a sibling plugin and raise ``ImportError`` for any
+        # class that doesn't exist there. Before exec'ing this plugin,
+        # evict any ``sys.modules`` entry whose name matches a top-level
+        # file/pkg in this plugin's directory but whose source file lives
+        # elsewhere — so the new plugin's bare imports resolve to its own
+        # files via ``sys.path``. Already-loaded sibling plugins keep
+        # working because they hold direct object references; they would
+        # only be affected by *late* re-imports of their own submodules,
+        # which is not a pattern Synapse plugins use.
+        plugin_local_names: set[str] = set()
+        try:
+            for child in plugin_dir.iterdir():
+                if (
+                    child.is_file()
+                    and child.suffix == ".py"
+                    and child.stem != "__init__"
+                ):
+                    plugin_local_names.add(child.stem)
+                elif child.is_dir() and (child / "__init__.py").is_file():
+                    plugin_local_names.add(child.name)
+        except OSError:
+            pass
+
+        for name in plugin_local_names:
+            existing = sys.modules.get(name)
+            if existing is None:
+                continue
+            mod_file = getattr(existing, "__file__", None) or ""
+            if not mod_file:
+                # Namespace packages / built-ins have no __file__; assume
+                # they don't belong to this plugin and leave them alone.
+                continue
+            try:
+                belongs = Path(mod_file).resolve().is_relative_to(
+                    plugin_dir_resolved
+                )
+            except (OSError, ValueError):
+                belongs = False
+            if not belongs:
+                sys.modules.pop(name, None)
+                logger.debug(
+                    "Plugin '%s' shadowing top-level module '%s' "
+                    "previously from %s",
+                    manifest.id,
+                    name,
+                    mod_file,
+                )
+
+        pre_modules = set(sys.modules.keys())
+
         try:
             spec.loader.exec_module(module)
         except Exception:
@@ -399,30 +871,70 @@ class PluginManager:
                     sys.path.remove(plugin_dir_str)
                 except ValueError:
                     pass
+            if deps_added_to_path:
+                try:
+                    sys.path.remove(deps_dir_str)
+                except ValueError:
+                    pass
             raise
+
+        # Collect plugin-local submodules pulled into sys.modules during exec.
+        imported_modules: set[str] = set()
+        for new_name in set(sys.modules.keys()) - pre_modules:
+            if new_name == module_name:
+                continue
+            mod = sys.modules.get(new_name)
+            mod_file = getattr(mod, "__file__", None) or ""
+            if not mod_file:
+                continue
+            try:
+                if Path(mod_file).resolve().is_relative_to(plugin_dir_resolved):
+                    imported_modules.add(new_name)
+            except (OSError, ValueError):
+                continue
 
         plugin_class = getattr(module, "Plugin", None)
         if plugin_class is None:
             sys.modules.pop(module_name, None)
+            for m in imported_modules:
+                sys.modules.pop(m, None)
             if added_to_path:
                 try:
                     sys.path.remove(plugin_dir_str)
+                except ValueError:
+                    pass
+            if deps_added_to_path:
+                try:
+                    sys.path.remove(deps_dir_str)
                 except ValueError:
                     pass
             raise AttributeError(f"Plugin module {entry_path} must export a 'Plugin' class")
 
         if not (isinstance(plugin_class, type) and issubclass(plugin_class, PluginBase)):
             sys.modules.pop(module_name, None)
+            for m in imported_modules:
+                sys.modules.pop(m, None)
             if added_to_path:
                 try:
                     sys.path.remove(plugin_dir_str)
+                except ValueError:
+                    pass
+            if deps_added_to_path:
+                try:
+                    sys.path.remove(deps_dir_str)
                 except ValueError:
                     pass
             raise TypeError(
                 f"Plugin.Plugin must be a subclass of PluginBase, got {type(plugin_class)}"
             )
 
-        return plugin_class(), module_name, plugin_dir_str if added_to_path else ""
+        return (
+            plugin_class(),
+            module_name,
+            plugin_dir_str if added_to_path else "",
+            deps_dir_str if deps_added_to_path else "",
+            imported_modules,
+        )
 
     def _load_mcp_plugin(self, manifest: PluginManifest, plugin_dir: Path, api: PluginAPI) -> None:
         config_path = plugin_dir / manifest.entry
@@ -637,34 +1149,235 @@ class PluginManager:
 
     # --- Unloading ---
 
+    @staticmethod
+    async def _invoke_on_unload(instance: PluginBase, plugin_id: str) -> None:
+        """Run ``on_unload`` supporting both sync and async signatures.
+
+        CRITICAL design note (do NOT regress to running sync handlers in a
+        worker thread with a temporary loop):
+
+        Most legacy plugins do:
+
+            def on_unload(self):
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._client.close())   # httpx
+                loop.create_task(self._tm.close())       # aiosqlite
+
+        ``self._client`` / ``self._tm`` were created on the **main** event
+        loop during ``on_load``. Awaiting their ``close()`` from a different
+        loop raises ``Future attached to a different loop`` (or silently
+        deadlocks), leaving the underlying file handles / sockets open —
+        which is what causes Windows ``WinError 32`` on the subsequent
+        rmtree. So the sync handler MUST run inline on the main loop's task,
+        and any ``loop.create_task(...)`` it issues MUST be drained on the
+        same main loop.
+        """
+        handler = instance.on_unload
+        loop = asyncio.get_running_loop()
+
+        if inspect.iscoroutinefunction(handler):
+            before = set(asyncio.all_tasks(loop))
+            try:
+                await asyncio.wait_for(handler(), timeout=UNLOAD_TIMEOUT)
+            finally:
+                # Even if the coroutine raises/timeouts, drain anything it
+                # scheduled (mirrors the sync path).
+                after = set(asyncio.all_tasks(loop))
+                new_tasks = {t for t in (after - before) if not t.done()}
+                if new_tasks:
+                    try:
+                        await asyncio.wait(new_tasks, timeout=UNLOAD_TIMEOUT)
+                    except Exception as e:
+                        logger.debug(
+                            "Plugin '%s' drain async-on_unload tasks error: %s",
+                            plugin_id,
+                            e,
+                        )
+            return
+
+        # Sync handler — run inline so create_task() targets the main loop.
+        before = set(asyncio.all_tasks(loop))
+        result: Any = None
+        try:
+            result = handler()
+        except Exception as e:
+            logger.warning("Plugin '%s' sync on_unload raised: %s", plugin_id, e)
+
+        # Defensive: a sync def that returns a coroutine (mistakenly
+        # forgotten ``async``) — await it instead of leaking the coroutine.
+        if inspect.iscoroutine(result):
+            try:
+                await asyncio.wait_for(result, timeout=UNLOAD_TIMEOUT)
+            except Exception as e:
+                logger.warning(
+                    "Plugin '%s' on_unload-returned coroutine error: %s",
+                    plugin_id,
+                    e,
+                )
+
+        # Drain any tasks the handler scheduled on the main loop.
+        after = set(asyncio.all_tasks(loop))
+        new_tasks = {t for t in (after - before) if not t.done()}
+        if new_tasks:
+            try:
+                await asyncio.wait(new_tasks, timeout=UNLOAD_TIMEOUT)
+            except Exception as e:
+                logger.debug(
+                    "Plugin '%s' drain sync-on_unload tasks error: %s",
+                    plugin_id,
+                    e,
+                )
+
     async def unload_plugin(self, plugin_id: str) -> bool:
+        # Clear any prior failure record. Both "previously loaded then
+        # unloaded" and "never successfully loaded" must drop the
+        # ``_failed`` entry — otherwise stale errors keep showing in the
+        # plugin manager UI long after the user removed the plugin.
+        had_failure = self._failed.pop(plugin_id, None) is not None
+
         loaded = self._loaded.pop(plugin_id, None)
         if loaded is None:
-            return False
+            # Nothing to tear down, but if we just cleared a failure row
+            # let the caller know the operation actually changed state.
+            return had_failure
 
+        # 1. Plugin's own on_unload — best effort, never blocks the rest.
         try:
             if loaded.instance:
-                await asyncio.wait_for(
-                    asyncio.to_thread(loaded.instance.on_unload),
-                    timeout=UNLOAD_TIMEOUT,
-                )
+                await self._invoke_on_unload(loaded.instance, plugin_id)
         except (TimeoutError, Exception) as e:
             logger.warning("Plugin '%s' on_unload error: %s", plugin_id, e)
 
-        loaded.api._cleanup()
+        # 2. Cancel framework-tracked background tasks, then run async/sync
+        #    capability cleanup (routes, hooks, MCP, etc.) on the main loop.
+        try:
+            await loaded.api.aclose()
+        except Exception as e:
+            logger.warning("Plugin '%s' aclose error: %s", plugin_id, e)
 
+        # 2b. Sweep up "stray" tasks the plugin scheduled itself — e.g.
+        #     ``asyncio.get_event_loop().create_task(self._poll_loop())`` from
+        #     on_load, which never went through ``api.spawn_task`` and is
+        #     therefore invisible to ``_cancel_spawned_tasks``. We identify
+        #     them by checking whether their coroutine's source module belongs
+        #     to this plugin (main module + tracked submodules). Without this,
+        #     a polling task continues to use the plugin's httpx/SQLite
+        #     connections after unload, which keeps the Windows file handles
+        #     open and breaks the subsequent rmtree.
+        try:
+            await self._cancel_stray_plugin_tasks(plugin_id, loaded)
+        except Exception as e:
+            logger.debug("Plugin '%s' stray-task sweep error: %s", plugin_id, e)
+
+        # 3. Drop plugin module and its plugin-local submodules so a reinstall
+        #    or hot-reload sees fresh code (and releases SQLite/HTTP file handles).
         if loaded.module_name:
             sys.modules.pop(loaded.module_name, None)
+        for mod_name in list(loaded.imported_modules):
+            sys.modules.pop(mod_name, None)
         if loaded.sys_path_entry:
             try:
                 sys.path.remove(loaded.sys_path_entry)
             except ValueError:
                 pass
+        if loaded.deps_path_entry:
+            try:
+                sys.path.remove(loaded.deps_path_entry)
+            except ValueError:
+                pass
+
+        # 4. Force GC — some C-extensions (sqlite3, ssl) only release OS
+        #    handles when their Python wrapper is collected. We do TWO passes
+        #    with a brief yield in between because aiosqlite + httpx tend to
+        #    have one layer of cyclic refs through their connection pools.
+        try:
+            gc.collect()
+            await asyncio.sleep(0)
+            gc.collect()
+        except Exception:
+            pass
 
         self._unload_plugin_skills(loaded)
+        self._unmount_plugin_ui(plugin_id)
+
+        # C10: this plugin's manifest.tool_classes contributions are gone, so
+        # the ApprovalClassifier's LRU cache may hold stale (klass, source)
+        # entries for those tool names. Broadcast a clear so the next
+        # classification falls through the lookup chain again. Cheap and
+        # idempotent — engine may not exist yet (in which case it's a no-op).
+        try:
+            from ..core.policy_v2.global_engine import invalidate_classifier_cache
+
+            invalidate_classifier_cache()
+        except Exception as exc:
+            logger.debug("Plugin '%s' classifier invalidate skipped: %s", plugin_id, exc)
 
         logger.info("Plugin '%s' unloaded", plugin_id)
         return True
+
+    @staticmethod
+    async def _cancel_stray_plugin_tasks(
+        plugin_id: str, loaded: _LoadedPlugin
+    ) -> None:
+        """Cancel & await any task whose coroutine lives in a plugin module.
+
+        This is a safety net for plugins that bypass ``api.spawn_task`` and
+        use ``asyncio.create_task`` directly (very common in third-party
+        code). Without canceling these, they keep referencing the plugin's
+        ``httpx.AsyncClient`` / ``aiosqlite.Connection`` and prevent file
+        handle release.
+        """
+        plugin_modules: set[str] = set(loaded.imported_modules)
+        if loaded.module_name:
+            plugin_modules.add(loaded.module_name)
+        if not plugin_modules:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        stray: list[asyncio.Task[Any]] = []
+        for t in asyncio.all_tasks(loop):
+            if t.done():
+                continue
+            coro = t.get_coro()
+            # The reliable way to get a coroutine's module is via the frame
+            # globals — coro.__module__ is almost always ``None`` for
+            # ``async def`` functions, and ``cr_code.co_filename`` would
+            # require a path-to-module mapping we don't keep.
+            mod: str | None = None
+            frame = getattr(coro, "cr_frame", None)
+            if frame is not None:
+                f_globals = getattr(frame, "f_globals", None) or {}
+                mod = f_globals.get("__name__")
+            if not isinstance(mod, str):
+                continue
+            # Match exact module name or ``<plugin>.<sub>`` prefix; avoid
+            # over-collecting siblings like ``foo_bar`` when plugin is ``foo``.
+            if mod in plugin_modules or any(
+                mod.startswith(pm + ".") for pm in plugin_modules
+            ):
+                stray.append(t)
+
+        if not stray:
+            return
+
+        logger.info(
+            "Plugin '%s': cancelling %d stray task(s) created outside spawn_task",
+            plugin_id,
+            len(stray),
+        )
+        for t in stray:
+            t.cancel()
+        # Suppress CancelledError surfacing to the gather/wait result.
+        try:
+            await asyncio.wait(stray, timeout=UNLOAD_TIMEOUT)
+        except Exception as e:
+            logger.debug(
+                "Plugin '%s' awaiting stray task cancellation: %s", plugin_id, e
+            )
 
     async def disable_plugin(self, plugin_id: str, reason: str = "user") -> None:
         self._state.disable(plugin_id, reason)
@@ -720,6 +1433,37 @@ class PluginManager:
         except Exception as e:
             logger.error("Failed to save plugin state: %s", e)
 
+    def _record_failure_jsonl(
+        self,
+        plugin_id: str,
+        error_type: str,
+        message: str,
+        traceback_str: str,
+    ) -> None:
+        """PR-P1: 把单个插件加载失败追加到 plugin_failures.jsonl。
+
+        每行一个 JSON 对象 {ts, plugin_id, error_type, message, traceback}.
+        traceback 截断到 8 KB，避免一个炸链插件把日志文件撑爆。
+        前端 PluginManagerView 可以读这个文件展示"上次启动失败 N 个，原因..."
+        """
+        try:
+            import json as _json
+            from datetime import datetime
+
+            log_path = self._state_path.parent / "plugin_failures.jsonl"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "ts": datetime.now().isoformat(),
+                "plugin_id": plugin_id,
+                "error_type": error_type,
+                "message": message[:2000],
+                "traceback": (traceback_str or "")[:8192],
+            }
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.debug(f"[PluginManager] _record_failure_jsonl failed: {exc}")
+
     # --- Query ---
 
     def get_loaded(self, plugin_id: str) -> _LoadedPlugin | None:
@@ -745,6 +1489,7 @@ class PluginManager:
                     "review_status": lp.manifest.review_status,
                     "granted_permissions": granted,
                     "pending_permissions": pending,
+                    "health": self._error_tracker.health_snapshot(lp.manifest.id),
                 }
             )
         return result
@@ -793,36 +1538,52 @@ class PluginManager:
                 return
 
         self._failed.pop(plugin_id, None)
+        # 用户主动 reload 视作"想再试一次"，清除失败冷却时间戳。
+        self._failed_at.pop(plugin_id, None)
         try:
             await asyncio.wait_for(
                 self._load_single(manifest, plugin_dir),
                 timeout=manifest.load_timeout,
             )
             logger.info("Plugin '%s' reloaded after permission grant", plugin_id)
+            # C10: reloaded plugin's manifest.tool_classes may have changed
+            # (typical reload trigger is permission grant — but author may have
+            # also tweaked approval_class for a tool). Invalidate so next
+            # classify() picks up the new declaration instead of the cache.
+            try:
+                from ..core.policy_v2.global_engine import (
+                    invalidate_classifier_cache,
+                )
+
+                invalidate_classifier_cache()
+            except Exception as exc:
+                logger.debug(
+                    "Plugin '%s' post-reload classifier invalidate skipped: %s",
+                    plugin_id,
+                    exc,
+                )
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             logger.error("Plugin '%s' reload failed: %s", plugin_id, msg)
             self._failed[plugin_id] = msg
+            self._failed_at[plugin_id] = time.monotonic()
         self._save_state()
 
-    def list_failed(self) -> dict[str, str]:
-        return dict(self._failed)
-
-    def get_plugin_logs(self, plugin_id: str, lines: int = 100) -> str:
-        loaded = self._loaded.get(plugin_id)
-        if loaded is not None:
-            log_dir = loaded.plugin_dir / "logs"
-        else:
-            found = self._find_plugin_dir(plugin_id)
-            log_dir = (found / "logs") if found else (self._plugins_dir / plugin_id / "logs")
-
-        log_file = log_dir / f"{plugin_id}.log"
-        if not log_file.exists():
-            return f"No logs found for plugin '{plugin_id}'"
-
-        all_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        tail = all_lines[-lines:]
-        return "\n".join(tail)
+    def _unmount_plugin_ui(self, plugin_id: str) -> None:
+        """Remove the plugin UI static-file mount from the FastAPI app."""
+        app = self._host_refs.get("api_app")
+        if app is None:
+            return
+        mount_path = f"/api/plugins/{plugin_id}/ui"
+        mount_name = f"plugin-ui-{plugin_id}"
+        try:
+            app.routes[:] = [
+                r for r in app.routes
+                if not (hasattr(r, "name") and r.name == mount_name)
+            ]
+            logger.debug("Unmounted plugin UI '%s' at %s", plugin_id, mount_path)
+        except Exception as e:
+            logger.debug("Plugin '%s' UI unmount error: %s", plugin_id, e)
 
     def list_ui_plugins(self) -> list[dict]:
         """Return metadata for all loaded plugins that have a UI."""
@@ -841,25 +1602,89 @@ class PluginManager:
                 except OSError:
                     version = ""
                 icon_url = f"/api/plugins/{lp.manifest.id}/ui/{ui.icon}{version}"
-            result.append(
-                {
-                    "id": lp.manifest.id,
-                    "title": ui.title or lp.manifest.name,
-                    "title_i18n": dict(ui.title_i18n) if ui.title_i18n else {},
-                    "icon_url": icon_url,
-                    "sidebar_group": ui.sidebar_group,
-                    "sandbox": ui.sandbox,
-                    "enabled": True,
-                    "status": "loaded",
-                }
-            )
+            result.append({
+                "id": lp.manifest.id,
+                "title": ui.title or lp.manifest.name,
+                "title_i18n": dict(ui.title_i18n) if ui.title_i18n else {},
+                "icon_url": icon_url,
+                "sidebar_group": ui.sidebar_group,
+                "sandbox": ui.sandbox,
+                "enabled": True,
+                "status": "loaded",
+            })
         return result
+
+    def list_failed(self) -> dict[str, str]:
+        return dict(self._failed)
+
+    def list_failed_with_health(self) -> dict[str, dict]:
+        """Return failed plugins with their health snapshots.
+
+        Backward-compat companion to :meth:`list_failed`: existing callers
+        keep using the simple ``dict[str, str]`` signature, while the
+        management UI can opt-in to richer info (auto-disabled flag,
+        recent timeout/exception counts, last_success_at).
+        """
+        out: dict[str, dict] = {}
+        for plugin_id, error in self._failed.items():
+            out[plugin_id] = {
+                "error": error,
+                "health": self._error_tracker.health_snapshot(plugin_id),
+            }
+        return out
+
+    def forget_failure(self, plugin_id: str) -> bool:
+        """Drop ``plugin_id`` from the in-memory failure registry.
+
+        Returns ``True`` if there was an entry to remove. Used by the
+        uninstall route as a defensive cleanup so the UI's "load failure"
+        section never displays ghost entries for plugins whose code dir
+        no longer exists.
+        """
+        return self._failed.pop(plugin_id, None) is not None
+
+    async def shutdown(self) -> None:
+        """Release host-owned resources (Asset Bus connection).
+
+        Plugin instances are torn down via :meth:`unload_plugin`; this
+        method only handles host singletons that outlive any single
+        plugin. Safe to call multiple times.
+        """
+        try:
+            await self._asset_bus.close()
+        except Exception as e:
+            logger.warning("AssetBus close error: %s", e)
+
+    def get_plugin_logs(self, plugin_id: str, lines: int = 100) -> str:
+        loaded = self._loaded.get(plugin_id)
+        if loaded is not None:
+            log_dir = loaded.api._data_dir / "logs"
+        else:
+            data_dir = self._plugins_dir.parent / "plugin_data" / plugin_id
+            log_dir = data_dir / "logs"
+
+        log_file = log_dir / f"{plugin_id}.log"
+        if not log_file.exists():
+            return f"No logs found for plugin '{plugin_id}'"
+
+        all_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = all_lines[-lines:]
+        return "\n".join(tail)
 
 
 class _LoadedPlugin:
     """Internal record for a loaded plugin."""
 
-    __slots__ = ("manifest", "api", "instance", "plugin_dir", "module_name", "sys_path_entry")
+    __slots__ = (
+        "manifest",
+        "api",
+        "instance",
+        "plugin_dir",
+        "module_name",
+        "sys_path_entry",
+        "deps_path_entry",
+        "imported_modules",
+    )
 
     def __init__(
         self,
@@ -869,6 +1694,8 @@ class _LoadedPlugin:
         plugin_dir: Path,
         module_name: str = "",
         sys_path_entry: str = "",
+        deps_path_entry: str = "",
+        imported_modules: set[str] | None = None,
     ) -> None:
         self.manifest = manifest
         self.api = api
@@ -876,3 +1703,10 @@ class _LoadedPlugin:
         self.plugin_dir = plugin_dir
         self.module_name = module_name
         self.sys_path_entry = sys_path_entry
+        # Plugin-private third-party deps dir (``<plugin_dir>/deps``) appended
+        # to ``sys.path`` at load. Empty string when the plugin declares no
+        # ``requires.pip`` (or the install hasn't happened yet).
+        self.deps_path_entry = deps_path_entry
+        # Submodules imported by the plugin from its own directory; cleared on unload
+        # so reinstall picks up fresh code instead of cached stale modules.
+        self.imported_modules: set[str] = imported_modules or set()

@@ -14,33 +14,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
 SYSTEM_PRESETS: list[AgentProfile] = [
     # ── 通用基础 ──────────────────────────────────────────────────────
     AgentProfile(
         id="default",
-        name="小鲸",
-        description="通用助手；外部技能请在「核心技能」中勾选，仅对这些技能暴露能力目录",
+        name="小秋",
+        description="通用全能助手，拥有所有技能",
         type=AgentType.SYSTEM,
-        skills=[
-            "whalecloud-dev-tool-ask-user",
-            "whalecloud-dev-tool-base-scripts",
-            "whalecloud-dev-tool-doc-generate",
-            "whalecloud-dev-tool-solution-review",
-        ],
-        skills_mode=SkillsMode.INCLUSIVE,
+        skills=[],
+        skills_mode=SkillsMode.ALL,
         custom_prompt="",
-        icon="🐋",
+        icon="🐕",
         color="#4A90D9",
         category="general",
         fallback_profile_id=None,
         created_by="system",
-        memory_mode="isolated",
-        memory_inherit_global=True,
-        name_i18n={"zh": "小鲸", "en": "Synapse"},
+        name_i18n={"zh": "小秋", "en": "Akita"},
         description_i18n={
-            "zh": "通用助手；外部技能请在「核心技能」中勾选，仅对这些技能暴露能力目录",
-            "en": "General assistant; enable external skills in Core Skills to expose them in the catalog",
+            "zh": "通用全能助手，拥有所有技能",
+            "en": "General-purpose assistant with all skills",
         },
     ),
     # ── 内容创作 ──────────────────────────────────────────────────────
@@ -63,6 +55,8 @@ SYSTEM_PRESETS: list[AgentProfile] = [
             "jimliu/baoyu-skills@baoyu-format-markdown",
         ],
         skills_mode=SkillsMode.INCLUSIVE,
+        tools=["filesystem", "memory", "skills", "research"],
+        tools_mode="inclusive",
         custom_prompt=(
             "你是自媒体内容创作专家。擅长为小红书、微信公众号、抖音等平台撰写爆款文案。"
             "根据平台特点调整文风：小红书注重种草和视觉吸引，公众号注重深度和阅读体验，"
@@ -182,6 +176,8 @@ SYSTEM_PRESETS: list[AgentProfile] = [
             "synapse/skills@translate-pdf",
         ],
         skills_mode=SkillsMode.INCLUSIVE,
+        tools=["filesystem", "skills", "memory"],
+        tools_mode="inclusive",
         custom_prompt=(
             "你是办公文档处理专家。优先使用文档相关工具处理用户需求。"
             "如果用户需求超出文档处理范围，建议用户切换到通用助手。"
@@ -544,6 +540,8 @@ SYSTEM_PRESETS: list[AgentProfile] = [
             "synapse/skills@changelog-generator",
         ],
         skills_mode=SkillsMode.INCLUSIVE,
+        tools=["filesystem", "memory", "skills", "mcp"],
+        tools_mode="inclusive",
         custom_prompt=(
             "你是编程开发助手。优先帮助用户编写代码、调试问题、管理 Git 仓库。"
             "对于非编程任务，建议用户切换到合适的专用助手。"
@@ -613,9 +611,14 @@ SYSTEM_PRESETS: list[AgentProfile] = [
             "synapse/skills@canvas-design",
         ],
         skills_mode=SkillsMode.INCLUSIVE,
+        tools=["filesystem", "memory", "skills", "research"],
+        tools_mode="inclusive",
         custom_prompt=(
-            "你是数据分析专家。擅长数据清洗、统计分析、图表可视化。"
-            "优先使用 Python/pandas 等工具处理数据。"
+            "你是数据分析专家。擅长数据清洗、统计分析、图表可视化。\n"
+            "**所有数值结论（均值/标准差/概率/模拟结果等）必须由 Python 代码产出**：\n"
+            "先用 write_file 写脚本，再用平台命令工具执行 python"
+            "（Windows 用 run_powershell，其他环境用 run_shell），以工具 stdout 为准。\n"
+            "禁止凭经验估算数字；若无法执行代码，明确告知用户并停止，不要编造结果。"
         ),
         icon="📊",
         color="#2980B9",
@@ -691,97 +694,6 @@ SYSTEM_PRESETS: list[AgentProfile] = [
             "en": "System design, architecture diagrams, tech stack selection",
         },
     ),
-    AgentProfile(
-        id="whalecloud-requirement-expert",
-        name="浩鲸需求分析专家",
-        description="浩鲸需求分析专家，擅长需求拆解与分析",
-        type=AgentType.SYSTEM,
-        skills=[
-            "whalecloud-dev-tool-base-scripts",
-            "whalecloud-dev-tool-requirement-clarify",
-        ],
-        skills_mode=SkillsMode.INCLUSIVE,
-        custom_prompt="你是浩鲸需求分析专家。擅长需求拆解与分析。",
-        icon="🎯",
-        color="#4A90D9",
-        category="devops",
-        fallback_profile_id="default",
-        created_by="system",
-        name_i18n={"zh": "浩鲸需求分析专家", "en": "WhaleCloud Requirement Expert"},
-        description_i18n={"zh": "浩鲸需求分析专家，擅长需求拆解与分析", "en": "WhaleCloud Requirement Expert"},
-    ),
-    AgentProfile(
-        id="whalecloud-design-expert",
-        name="浩鲸产品设计专家",
-        description="浩鲸产品设计专家，擅长产品架构与UI/UX设计",
-        type=AgentType.SYSTEM,
-        skills=[
-            "whalecloud-dev-tool-base-scripts",
-            "whalecloud-dev-tool-c-code-access",
-            "whalecloud-dev-tool-function-solution",
-        ],
-        skills_mode=SkillsMode.INCLUSIVE,
-        custom_prompt="你是浩鲸产品设计专家。擅长产品架构与UI/UX设计。",
-        icon="🎨",
-        color="#9B59B6",
-        category="devops",
-        fallback_profile_id="default",
-        created_by="system",
-        name_i18n={"zh": "浩鲸产品设计专家", "en": "WhaleCloud Design Expert"},
-        description_i18n={"zh": "浩鲸产品设计专家，擅长产品架构与UI/UX设计", "en": "WhaleCloud Design Expert"},
-    ),
-    AgentProfile(
-        id="whalecloud-rd-expert",
-        name="浩鲸产品研发专家",
-        description="浩鲸产品研发专家，擅长代码编写与系统实现",
-        type=AgentType.SYSTEM,
-        skills=[
-            "whalecloud-dev-tool-base-scripts",
-            "whalecloud-dev-tool-c-code-access",
-            "whalecloud-dev-tool-module-function",
-        ],
-        skills_mode=SkillsMode.INCLUSIVE,
-        custom_prompt="你是浩鲸产品研发专家。擅长代码编写与系统实现。",
-        icon="💻",
-        color="#27AE60",
-        category="devops",
-        fallback_profile_id="default",
-        created_by="system",
-        name_i18n={"zh": "浩鲸产品研发专家", "en": "WhaleCloud R&D Expert"},
-        description_i18n={"zh": "浩鲸产品研发专家，擅长代码编写与系统实现", "en": "WhaleCloud R&D Expert"},
-    ),
-    AgentProfile(
-        id="whalecloud-test-expert",
-        name="浩鲸产品测试专家",
-        description="浩鲸产品测试专家，擅长自动化测试与用例编写",
-        type=AgentType.SYSTEM,
-        skills=[],
-        skills_mode=SkillsMode.INCLUSIVE,
-        custom_prompt="你是浩鲸产品测试专家。擅长自动化测试与用例编写。",
-        icon="🧪",
-        color="#E67E22",
-        category="devops",
-        fallback_profile_id="default",
-        created_by="system",
-        name_i18n={"zh": "浩鲸产品测试专家", "en": "WhaleCloud Test Expert"},
-        description_i18n={"zh": "浩鲸产品测试专家，擅长自动化测试与用例编写", "en": "WhaleCloud Test Expert"},
-    ),
-    AgentProfile(
-        id="whalecloud-qa-expert",
-        name="浩鲸质量管控专家",
-        description="浩鲸质量管控专家，擅长流程规范与质量评估",
-        type=AgentType.SYSTEM,
-        skills=[],
-        skills_mode=SkillsMode.INCLUSIVE,
-        custom_prompt="你是浩鲸质量管控专家。擅长流程规范与质量评估。",
-        icon="🛡️",
-        color="#E74C3C",
-        category="devops",
-        fallback_profile_id="default",
-        created_by="system",
-        name_i18n={"zh": "浩鲸质量管控专家", "en": "WhaleCloud QA Expert"},
-        description_i18n={"zh": "浩鲸质量管控专家，擅长流程规范与质量评估", "en": "WhaleCloud QA Expert"},
-    ),
 ]
 
 
@@ -813,14 +725,11 @@ def deploy_system_presets(store: ProfileStore) -> int:
                     or existing.category != preset.category
                     or sorted(existing.tools) != sorted(preset.tools)
                     or existing.tools_mode != preset.tools_mode
-                    or existing.skills_mode != preset.skills_mode
-                    or existing.memory_mode != preset.memory_mode
-                    or existing.memory_inherit_global != preset.memory_inherit_global
                 )
                 if needs_upgrade:
                     data = existing.to_dict()
-                    data["skills_mode"] = preset.skills_mode.value
                     data["skills"] = preset.skills
+                    data["skills_mode"] = preset.skills_mode.value
                     data["category"] = preset.category
                     data["tools"] = preset.tools
                     data["tools_mode"] = preset.tools_mode
@@ -828,8 +737,6 @@ def deploy_system_presets(store: ProfileStore) -> int:
                     data["mcp_mode"] = preset.mcp_mode
                     data["plugins"] = preset.plugins
                     data["plugins_mode"] = preset.plugins_mode
-                    data["memory_mode"] = preset.memory_mode
-                    data["memory_inherit_global"] = preset.memory_inherit_global
                     updated = AgentProfile.from_dict(data)
                     store._cache[preset.id] = updated
                     store._persist(updated)

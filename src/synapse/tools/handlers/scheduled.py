@@ -8,11 +8,21 @@
 - update_scheduled_task: 更新任务
 - trigger_scheduled_task: 立即触发
 - query_task_executions: 查询执行历史
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
+
+from ...core.policy_v2 import ApprovalClass
 
 if TYPE_CHECKING:
     from ...core.agent import Agent
@@ -32,6 +42,16 @@ class ScheduledHandler:
         "query_task_executions",
     ]
 
+    # C7 explicit ApprovalClass — scheduling = control plane mutation
+    TOOL_CLASSES = {
+        "schedule_task": ApprovalClass.CONTROL_PLANE,
+        "list_scheduled_tasks": ApprovalClass.READONLY_GLOBAL,
+        "cancel_scheduled_task": ApprovalClass.CONTROL_PLANE,
+        "update_scheduled_task": ApprovalClass.CONTROL_PLANE,
+        "trigger_scheduled_task": ApprovalClass.CONTROL_PLANE,
+        "query_task_executions": ApprovalClass.READONLY_GLOBAL,
+    }
+
     def __init__(self, agent: "Agent"):
         self.agent = agent
 
@@ -43,6 +63,16 @@ class ScheduledHandler:
         from ...scheduler import get_active_scheduler
 
         return get_active_scheduler()
+
+    def _current_agent_profile_id(self) -> str:
+        """Best-effort profile id for chat-created scheduled tasks."""
+        session = getattr(self.agent, "_current_session", None)
+        context = getattr(session, "context", None)
+        if context is not None:
+            profile_id = getattr(context, "agent_profile_id", None)
+            if profile_id:
+                return profile_id
+        return getattr(self.agent, "_agent_profile_id", "default") or "default"
 
     async def handle(self, tool_name: str, params: dict[str, Any]) -> str:
         """处理工具调用"""
@@ -149,6 +179,7 @@ class ScheduledHandler:
             user_id=user_id,
             channel_id=channel_id,
             chat_id=chat_id,
+            agent_profile_id=self._current_agent_profile_id(),
             task_source=TaskSource.CHAT,
         )
         task.silent = bool(params.get("silent", False))

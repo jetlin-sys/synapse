@@ -187,15 +187,152 @@ class ShellTool:
         timeout: int = 60,
         shell: bool = True,
     ):
-        self.default_cwd = default_cwd or os.getcwd()
+        # default_cwd 优先级：调用方指定 > settings.project_root > os.getcwd()。
+        # os.getcwd() 在 Windows 守护进程 / 自启动场景下经常落到 C:\Windows\System32，
+        # 导致 shell 命令找不到用户工程文件。
+        if default_cwd:
+            cwd_str = default_cwd
+        else:
+            try:
+                from ..config import settings as _settings
+
+                cwd_str = str(_settings.project_root)
+            except Exception:
+                cwd_str = os.getcwd()
+
+        if not os.path.isdir(cwd_str):
+            logger.warning(
+                f"[ShellTool] default_cwd does not exist or is not a directory: {cwd_str!r}, "
+                f"falling back to os.getcwd()"
+            )
+            cwd_str = os.getcwd()
+
+        self.default_cwd = cwd_str
         self.timeout = timeout
         self.shell = shell
         self._is_windows = sys.platform == "win32"
         self._oem_encoding: str | None = None
+        self.runtime_env_mode = "shared"
+        self.execution_env_spec = None
+
+    def _apply_runtime_environment(self, env: dict[str, str]) -> dict[str, str]:
+        spec = getattr(self, "execution_env_spec", None)
+        if spec is not None:
+            try:
+                from ..runtime_manager import apply_execution_environment, ensure_execution_env
+
+                return apply_execution_environment(env, ensure_execution_env(spec))
+            except Exception as exc:
+                logger.warning("Falling back to shared agent Python env: %s", exc)
+        try:
+            from ..runtime_manager import apply_agent_python_environment
+
+            return apply_agent_python_environment(env)
+        except Exception:
+            return env
 
     # ------------------------------------------------------------------
     # 进程清理（Windows 安全杀死进程树）
     # ------------------------------------------------------------------
+
+    # v1.27.15 (S2 P2-8): soft-kill grace and partial-drain caps.
+    # Tuned so a cancelled `ls -R /` still surfaces enough head-of-output
+    # to be useful in the abort marker, without unbounded memory cost.
+    _SOFT_KILL_GRACE_S = 1.5
+    _PARTIAL_DRAIN_CAP_BYTES = 64 * 1024  # 64KB per stream
+    _PARTIAL_DRAIN_TIMEOUT_S = 0.25
+
+    async def _soft_kill_then_hard(
+        self, process: asyncio.subprocess.Process
+    ) -> None:
+        """Try a polite SIGINT/Ctrl-C first, then hard-kill if needed.
+
+        v1.27.15 (S2 P2-8).  Previously cancel went straight to
+        ``taskkill /T /F`` / ``process.kill()`` which sends SIGKILL —
+        the child gets no chance to flush stdout or release file
+        handles.  A polite SIGINT lets well-behaved programs print
+        their pending output and exit cleanly, so the abort marker
+        can actually surface "what the tool was doing when we cut it
+        off".  Falls back to the existing hard kill after a 1.5s
+        grace.
+
+        On Windows we don't have a clean way to forward Ctrl-C to a
+        detached process from the parent's event loop, so we go
+        straight to ``_kill_process_tree`` — taskkill /T /F is still
+        more reliable than the asyncio default for Windows process
+        trees (the original reason ``_kill_process_tree`` exists).
+        """
+        if process.returncode is not None:
+            return
+
+        if self._is_windows:
+            # No reliable SIGINT path on Windows without Job Objects;
+            # rely on the existing tree-kill.  ``communicate`` will
+            # naturally surface whatever was already in the pipe.
+            await self._kill_process_tree(process)
+            return
+
+        try:
+            import signal as _signal
+
+            process.send_signal(_signal.SIGINT)
+        except Exception as exc:
+            logger.debug("send_signal(SIGINT) failed pid=%s: %s", process.pid, exc)
+            await self._kill_process_tree(process)
+            return
+
+        try:
+            await asyncio.wait_for(
+                process.wait(), timeout=self._SOFT_KILL_GRACE_S
+            )
+            return
+        except TimeoutError:
+            logger.info(
+                "Soft kill grace (%.1fs) elapsed, escalating to tree kill pid=%s",
+                self._SOFT_KILL_GRACE_S,
+                process.pid,
+            )
+            await self._kill_process_tree(process)
+
+    async def _drain_partial_output(
+        self, process: asyncio.subprocess.Process
+    ) -> dict:
+        """Best-effort drain of any data still buffered in stdout/stderr pipes.
+
+        v1.27.15 (S2 P2-8).  Called after ``_soft_kill_then_hard`` —
+        the polite signal may have triggered a final flush from the
+        child.  We read up to ``_PARTIAL_DRAIN_CAP_BYTES`` per stream
+        with a tight timeout so this never hangs the abort path.
+
+        Returns a dict ``{stdout, stderr, returncode, reason}`` ready
+        to be JSON-serialised into a CancelledError args slot or a
+        cancel marker.  Always returns valid keys (empty strings on
+        failure) so callers don't need to guard.
+        """
+        out_buf = b""
+        err_buf = b""
+        try:
+            if process.stdout is not None:
+                out_buf = await asyncio.wait_for(
+                    process.stdout.read(self._PARTIAL_DRAIN_CAP_BYTES),
+                    timeout=self._PARTIAL_DRAIN_TIMEOUT_S,
+                )
+        except (TimeoutError, Exception) as exc:  # noqa: BLE001
+            logger.debug("partial stdout drain skipped: %s", exc)
+        try:
+            if process.stderr is not None:
+                err_buf = await asyncio.wait_for(
+                    process.stderr.read(self._PARTIAL_DRAIN_CAP_BYTES),
+                    timeout=self._PARTIAL_DRAIN_TIMEOUT_S,
+                )
+        except (TimeoutError, Exception) as exc:  # noqa: BLE001
+            logger.debug("partial stderr drain skipped: %s", exc)
+        return {
+            "stdout": self._decode_output(out_buf),
+            "stderr": self._decode_output(err_buf),
+            "returncode": process.returncode,
+            "reason": "cancelled",
+        }
 
     async def _kill_process_tree(self, process: asyncio.subprocess.Process) -> None:
         """杀死进程及其所有子进程，然后带超时地等待退出。
@@ -417,20 +554,9 @@ class ShellTool:
         except Exception:
             pass
 
-        # 打包模式：将外置 Python 目录 prepend 到子进程 PATH，
-        # 使 `python script.py` 自动找到正确解释器
-        try:
-            from ..runtime_env import IS_FROZEN, get_python_executable
-
-            if IS_FROZEN:
-                _ext_py = get_python_executable()
-                if _ext_py:
-                    from pathlib import Path
-
-                    _py_dir = str(Path(_ext_py).parent)
-                    cmd_env["PATH"] = _py_dir + os.pathsep + cmd_env.get("PATH", "")
-        except Exception:
-            pass
+        # Dual runtime: prefer the current AgentProfile env when configured,
+        # otherwise keep the historical shared agent tools venv.
+        cmd_env = self._apply_runtime_environment(cmd_env)
 
         # Windows 命令编码处理
         original_command = command
@@ -472,13 +598,46 @@ class ShellTool:
             return result
 
         except asyncio.CancelledError:
-            # 三路竞速 cancel/skip：立即杀掉子进程，实时中断
-            logger.warning(f"Command cancelled, killing subprocess: {original_command[:200]}")
+            # v1.27.15 (S2 P2-8): soft-kill-then-hard + drain partial.
+            # Previously: SIGKILL immediately → user's abort marker said
+            # "[interrupted]" with zero context for what the shell was
+            # doing.  Now we send SIGINT first (POSIX), give 1.5s for the
+            # child to flush, then read whatever's still in the stdout
+            # pipe and attach it to the CancelledError args so the
+            # caller can fold it into the preempt marker.  Falls back
+            # to the existing tree kill on Windows / timeout / signal
+            # failure — so this is strictly additive.
+            logger.warning(
+                "Command cancelled, soft-killing subprocess: %s",
+                original_command[:200],
+            )
+            partial_payload: dict = {}
             if process and process.returncode is None:
-                await self._kill_process_tree(process)
-            raise  # 重新抛出，让上层三路竞速逻辑处理
+                try:
+                    await self._soft_kill_then_hard(process)
+                except Exception as _exc:  # pragma: no cover - defensive
+                    logger.debug("soft kill failed: %s", _exc)
+                try:
+                    partial_payload = await self._drain_partial_output(process)
+                except Exception as _exc:  # pragma: no cover - defensive
+                    logger.debug("partial drain failed: %s", _exc)
+                if partial_payload and (
+                    partial_payload.get("stdout") or partial_payload.get("stderr")
+                ):
+                    logger.info(
+                        "Shell cancel partial: cmd=%r stdout=%d stderr=%d",
+                        original_command[:100],
+                        len(partial_payload.get("stdout", "")),
+                        len(partial_payload.get("stderr", "")),
+                    )
+            # Re-raise to honor asyncio cancel contract.  The partial
+            # snapshot rides as the first arg of the CancelledError;
+            # most upstream handlers ignore args and just re-raise,
+            # which is fine — callers that want partial can do
+            # ``except asyncio.CancelledError as ce: ce.args[0]``.
+            raise asyncio.CancelledError(partial_payload or "shell_cancelled") from None
 
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             logger.error(f"Command timed out after {cmd_timeout}s")
             if process and process.returncode is None:
                 await self._kill_process_tree(process)
@@ -512,18 +671,7 @@ class ShellTool:
                 cmd_env["PATH"] = _shell_path
         except Exception:
             pass
-        try:
-            from ..runtime_env import IS_FROZEN, get_python_executable
-
-            if IS_FROZEN:
-                _ext_py = get_python_executable()
-                if _ext_py:
-                    from pathlib import Path
-
-                    _py_dir = str(Path(_ext_py).parent)
-                    cmd_env["PATH"] = _py_dir + os.pathsep + cmd_env.get("PATH", "")
-        except Exception:
-            pass
+        cmd_env = self._apply_runtime_environment(cmd_env)
 
         # Windows 命令编码处理
         if self._is_windows and self._needs_powershell(command):
@@ -555,20 +703,34 @@ class ShellTool:
         return result.success
 
     async def pip_install(self, package: str) -> CommandResult:
-        """使用 pip 安装包（PyInstaller 兼容：使用 runtime_env 获取正确的 Python 解释器）"""
-        from synapse.runtime_env import IS_FROZEN, get_python_executable
+        """Install packages into the agent tools venv."""
+        import shlex
 
-        py = get_python_executable()
-        if py:
-            return await self.run(f'"{py}" -m pip install {package}')
-        if IS_FROZEN:
+        packages = shlex.split(package) if isinstance(package, str) else [str(package)]
+        spec = getattr(self, "execution_env_spec", None)
+        if spec is not None:
+            try:
+                from synapse.runtime_manager import ensure_execution_env, get_pip_install_args
+
+                ensured = ensure_execution_env(spec)
+                cmd = [str(ensured.python_path), *get_pip_install_args(packages)]
+            except Exception as exc:
+                return CommandResult(returncode=-1, stdout="", stderr=str(exc))
+        else:
+            from synapse.runtime_manager import get_agent_pip_command
+
+            cmd = get_agent_pip_command(packages)
+        if not cmd:
             return CommandResult(
                 returncode=-1,
                 stdout="",
-                stderr="未找到可用的 Python 解释器，无法执行 pip install。"
-                "请前往「设置中心 → Python 环境」使用「一键修复」。",
+                stderr=(
+                    "Agent Python 环境不可用，无法执行 pip install。"
+                    "请在设置中心重试创建 Synapse runtime。"
+                ),
             )
-        return await self.run(f"pip install {package}")
+
+        return await self.run(" ".join(shlex.quote(part) for part in cmd))
 
     async def npm_install(self, package: str, global_: bool = False) -> CommandResult:
         """使用 npm 安装包"""

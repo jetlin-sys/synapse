@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,12 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# (event_kind, payload)
+# - kind="upsert", payload=SemanticMemory  (post-save or post-update, fresh state)
+# - kind="delete", payload=memory_id (str)
+StoreObserver = Callable[[str, Any], None]
 
 
 class UnifiedStore:
@@ -58,6 +66,61 @@ class UnifiedStore:
         if self.search.backend_type != "fts5":
             self._fts5_fallback = FTS5Backend(self.db)
 
+        # Observer list — any code that wants to mirror semantic-memory state
+        # (e.g. MemoryManager._memories cache) registers here. Observers are
+        # invoked synchronously after the DB write commits, but *outside* of
+        # MemoryStorage's lock; each observer is responsible for its own
+        # thread-safety. Exceptions in one observer never affect the write or
+        # other observers.
+        self._observers: list[StoreObserver] = []
+        self._observer_lock = threading.Lock()
+
+    # ======================================================================
+    # Observer hooks
+    # ======================================================================
+
+    def register_observer(self, fn: StoreObserver) -> None:
+        """Register a callback fired after every committed semantic write.
+
+        Callable signature: ``fn(kind, payload)`` where ``kind`` is
+        ``"upsert"`` (payload is the persisted ``SemanticMemory``) or
+        ``"delete"`` (payload is the deleted ``memory_id`` string).
+
+        Registrations are additive; no de-duplication. Caller owns lifecycle
+        (there is no ``unregister`` because the only producer of observers is
+        ``MemoryManager``, which lives for the process).
+        """
+        with self._observer_lock:
+            self._observers.append(fn)
+
+    def _fire(self, kind: str, payload: Any) -> None:
+        """Snapshot observers under lock, then invoke each without holding it."""
+        with self._observer_lock:
+            observers = tuple(self._observers)
+        for fn in observers:
+            try:
+                fn(kind, payload)
+            except Exception as exc:  # noqa: BLE001 - observers must never break writes
+                logger.debug(
+                    "[UnifiedStore] observer %s raised on %s: %s",
+                    getattr(fn, "__qualname__", repr(fn)),
+                    kind,
+                    exc,
+                )
+
+    @staticmethod
+    def _is_active_dict(memory: dict) -> bool:
+        if memory.get("superseded_by"):
+            return False
+        expires_at = memory.get("expires_at")
+        if expires_at:
+            try:
+                if datetime.fromisoformat(expires_at) < datetime.now():
+                    return False
+            except Exception:
+                return False
+        return True
+
     # ======================================================================
     # Semantic Memory
     # ======================================================================
@@ -65,13 +128,17 @@ class UnifiedStore:
     def save_semantic(
         self,
         memory: SemanticMemory,
-        scope: str = "global",
+        scope: str = "user",
         scope_owner: str = "",
+        user_id: str = "default",
+        workspace_id: str = "default",
         *,
         skip_dedup: bool = False,
     ) -> str:
         memory.scope = scope
         memory.scope_owner = scope_owner
+        memory.user_id = user_id or "default"
+        memory.workspace_id = workspace_id or "default"
 
         if not skip_dedup and memory.content and len(memory.content.strip()) > 10:
             try:
@@ -79,6 +146,8 @@ class UnifiedStore:
                     memory.content,
                     scope,
                     scope_owner,
+                    memory.user_id,
+                    memory.workspace_id,
                 )
                 if dup_id:
                     logger.debug(
@@ -102,6 +171,10 @@ class UnifiedStore:
                 "tags": memory.tags,
             },
         )
+        # Cache mirrors (MemoryManager._memories) and any other downstream
+        # state get synced via this fire. Dedup short-circuit above returns
+        # before this point intentionally — duplicates do not change cache.
+        self._fire("upsert", memory)
         return memory.id
 
     def _check_semantic_duplicate(
@@ -109,19 +182,41 @@ class UnifiedStore:
         content: str,
         scope: str,
         scope_owner: str,
+        user_id: str,
+        workspace_id: str,
     ) -> str | None:
         """Return existing memory ID if *content* is near-duplicate, else None."""
         core = content.strip()[:100].lower()
-        hits = self.search.search(core, limit=5)
+        hits = self.search.search(
+            core,
+            limit=5,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
         if not hits and self._fts5_fallback is not None:
-            hits = self._fts5_fallback.search(core, limit=5)
+            hits = self._fts5_fallback.search(
+                core,
+                limit=5,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
         for mid, _score in hits:
             existing = self.db.get_memory(mid)
             if not existing:
                 continue
+            if not self._is_active_dict(existing):
+                continue
             if (existing.get("scope") or "global") != scope:
                 continue
             if (existing.get("scope_owner") or "") != scope_owner:
+                continue
+            if (existing.get("user_id") or "default") != user_id:
+                continue
+            if (existing.get("workspace_id") or "default") != workspace_id:
                 continue
             ec = (existing.get("content") or "").strip().lower()
             if core[:80] in ec or ec[:80] in core:
@@ -130,10 +225,13 @@ class UnifiedStore:
 
     def update_semantic(self, memory_id: str, updates: dict) -> bool:
         ok = self.db.update_memory(memory_id, updates)
-        if ok and "content" in updates:
+        if not ok:
+            return False
+        reindex_fields = {"content", "type", "priority", "importance_score", "tags"}
+        if reindex_fields.intersection(updates):
             self.search.delete(memory_id)
             mem = self.db.get_memory(memory_id)
-            if mem:
+            if mem and self._is_active_dict(mem):
                 self.search.add(
                     memory_id,
                     mem["content"],
@@ -144,11 +242,35 @@ class UnifiedStore:
                         "tags": mem.get("tags", []),
                     },
                 )
-        return ok
+        # Re-fetch as SemanticMemory so observers see the new state. If the
+        # update marked the row as superseded / expired, the active-only fetch
+        # returns None and we fire ``delete`` instead — observers treat both
+        # as "this id is no longer visible".
+        fresh = self.get_semantic(memory_id)
+        if fresh is not None:
+            self._fire("upsert", fresh)
+        else:
+            self._fire("delete", memory_id)
+        return True
 
     def delete_semantic(self, memory_id: str) -> bool:
         self.search.delete(memory_id)
-        return self.db.delete_memory(memory_id)
+        ok = self.db.delete_memory(memory_id)
+        if ok:
+            self._fire("delete", memory_id)
+        return ok
+
+    def cleanup_expired(self) -> int:
+        expired_ids = self.db.get_expired_memory_ids()
+        count = self.db.cleanup_expired()
+        for memory_id in expired_ids:
+            self.search.delete(memory_id)
+            # Each expired row is gone from DB & search; tell observers so
+            # they stop returning ghosts. count may be < len(expired_ids) on
+            # partial cleanups but firing per-id is still correct (no-op for
+            # observers if the id was already absent).
+            self._fire("delete", memory_id)
+        return count
 
     def bump_access(self, memory_ids: list[str]) -> None:
         """Batch-increment access_count for memories confirmed useful by LLM."""
@@ -164,9 +286,11 @@ class UnifiedStore:
                 },
             )
 
-    def get_semantic(self, memory_id: str) -> SemanticMemory | None:
+    def get_semantic(self, memory_id: str, *, include_inactive: bool = False) -> SemanticMemory | None:
         d = self.db.get_memory(memory_id)
         if d is None:
+            return None
+        if not include_inactive and not self._is_active_dict(d):
             return None
         self.db.update_memory(
             memory_id,
@@ -182,8 +306,11 @@ class UnifiedStore:
         query: str,
         limit: int = 10,
         filter_type: str | None = None,
-        scope: str = "global",
+        scope: str = "user",
         scope_owner: str = "",
+        user_id: str = "default",
+        workspace_id: str = "default",
+        include_inactive: bool = False,
     ) -> list[SemanticMemory]:
         scored = self.search_semantic_scored(
             query,
@@ -191,6 +318,9 @@ class UnifiedStore:
             filter_type=filter_type,
             scope=scope,
             scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            include_inactive=include_inactive,
         )
         return [mem for mem, _score in scored]
 
@@ -199,47 +329,125 @@ class UnifiedStore:
         query: str,
         limit: int = 10,
         filter_type: str | None = None,
-        scope: str = "global",
+        scope: str = "user",
         scope_owner: str = "",
+        user_id: str = "default",
+        workspace_id: str = "default",
+        include_inactive: bool = False,
     ) -> list[tuple[SemanticMemory, float]]:
-        """Like search_semantic but also returns the raw similarity score."""
-        results = self.search.search(query, limit=limit * 3, filter_type=filter_type)
-        if not results and self._fts5_fallback is not None:
-            results = self._fts5_fallback.search(query, limit=limit * 3, filter_type=filter_type)
+        """Like search_semantic but also returns the raw similarity score.
+
+        当主搜索后端（如 Chroma）启用时，**始终**额外 union 一次 FTS5 结果，
+        避免向量索引尚未补全/异步未刷新时新写入的记忆被静默漏掉。按 id 去重后
+        取最高分，FTS5 结果保留原始分数（FTS5 backend 输出已落在 [0,1]）。
+        """
+        primary = self.search.search(
+            query,
+            limit=limit * 3,
+            filter_type=filter_type,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        merged: dict[str, float] = {mid: float(s) for mid, s in primary}
+
+        if self._fts5_fallback is not None:
+            try:
+                fts_results = self._fts5_fallback.search(
+                    query,
+                    limit=limit * 3,
+                    filter_type=filter_type,
+                    scope=scope,
+                    scope_owner=scope_owner,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                )
+                for mid, s in fts_results:
+                    prev = merged.get(mid)
+                    fs = float(s)
+                    if prev is None or fs > prev:
+                        merged[mid] = fs
+            except Exception as _e:
+                logger.debug(f"[UnifiedStore] FTS5 union skipped (non-fatal): {_e}")
+
+        ordered = sorted(merged.items(), key=lambda kv: kv[1], reverse=True)
 
         scored: list[tuple[SemanticMemory, float]] = []
-        for memory_id, score in results:
+        for memory_id, score in ordered:
             d = self.db.get_memory(memory_id)
             if d:
+                if not include_inactive and not self._is_active_dict(d):
+                    continue
                 d_scope = d.get("scope") or "global"
                 d_owner = d.get("scope_owner") or ""
-                if d_scope == scope and d_owner == scope_owner:
+                d_user = d.get("user_id") or "default"
+                d_workspace = d.get("workspace_id") or "default"
+                if (
+                    d_scope == scope
+                    and d_owner == scope_owner
+                    and d_user == user_id
+                    and d_workspace == workspace_id
+                ):
                     scored.append((SemanticMemory.from_dict(d), float(score)))
                     if len(scored) >= limit:
                         break
         return scored
 
     def query_semantic(self, **kwargs: Any) -> list[SemanticMemory]:
+        include_inactive = bool(kwargs.pop("include_inactive", False))
+        kwargs.setdefault("active_only", not include_inactive)
         rows = self.db.query(**kwargs)  # scope/scope_owner pass through via kwargs
         return [SemanticMemory.from_dict(r) for r in rows]
 
     def find_similar(
-        self, subject: str, predicate: str, scope: str = "global", scope_owner: str = ""
+        self,
+        subject: str,
+        predicate: str,
+        scope: str = "user",
+        scope_owner: str = "",
+        user_id: str = "default",
+        workspace_id: str = "default",
     ) -> SemanticMemory | None:
         """Find existing memory with same subject+predicate for update detection."""
-        rows = self.db.query(subject=subject, scope=scope, scope_owner=scope_owner, limit=10)
+        rows = self.db.query(
+            subject=subject,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            limit=10,
+        )
         for row in rows:
             if row.get("predicate", "").lower() == predicate.lower():
                 return SemanticMemory.from_dict(row)
         query = f"{subject} {predicate}"
-        results = self.search.search(query, limit=5)
+        results = self.search.search(
+            query,
+            limit=5,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
         for mid, score in results:
             if score > 0.8:
                 d = self.db.get_memory(mid)
-                if d and d.get("subject", "").lower() == subject.lower():
+                if (
+                    d
+                    and self._is_active_dict(d)
+                    and d.get("subject", "").lower() == subject.lower()
+                ):
                     d_scope = d.get("scope") or "global"
                     d_owner = d.get("scope_owner") or ""
-                    if d_scope == scope and d_owner == scope_owner:
+                    d_user = d.get("user_id") or "default"
+                    d_workspace = d.get("workspace_id") or "default"
+                    if (
+                        d_scope == scope
+                        and d_owner == scope_owner
+                        and d_user == user_id
+                        and d_workspace == workspace_id
+                    ):
                         return SemanticMemory.from_dict(d)
         return None
 
@@ -248,14 +456,43 @@ class UnifiedStore:
         memory_type: str | None = None,
         scope: str | None = None,
         scope_owner: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        include_inactive: bool = False,
     ) -> int:
-        return self.db.count(memory_type, scope=scope, scope_owner=scope_owner)
+        return self.db.count(
+            memory_type,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            active_only=not include_inactive,
+        )
 
     def load_all_memories(
-        self, scope: str = "global", scope_owner: str = ""
+        self,
+        scope: str | None = None,
+        scope_owner: str | None = None,
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        include_inactive: bool = False,
     ) -> list[SemanticMemory]:
-        rows = self.db.load_all(scope=scope, scope_owner=scope_owner)
+        rows = self.db.load_all(
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            active_only=not include_inactive,
+        )
         return [SemanticMemory.from_dict(r) for r in rows]
+
+    def query_paged(self, **kwargs: Any) -> tuple[list[SemanticMemory], int]:
+        """Paginated query delegating to storage.query_paged()."""
+        include_inactive = bool(kwargs.pop("include_inactive", False))
+        kwargs.setdefault("active_only", not include_inactive)
+        rows, total = self.db.query_paged(**kwargs)
+        return [SemanticMemory.from_dict(r) for r in rows], total
 
     # ======================================================================
     # Episode Memory
@@ -273,8 +510,17 @@ class UnifiedStore:
         rows = self.db.search_episodes(**kwargs)
         return [Episode.from_dict(r) for r in rows]
 
-    def get_recent_episodes(self, days: int = 7, limit: int = 10) -> list[Episode]:
-        return self.search_episodes(days=days, limit=limit)
+    def get_recent_episodes(
+        self,
+        days: int = 7,
+        limit: int = 10,
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> list[Episode]:
+        return self.search_episodes(
+            days=days, limit=limit, user_id=user_id, workspace_id=workspace_id
+        )
 
     def update_episode(self, episode_id: str, updates: dict) -> bool:
         return self.db.update_episode(episode_id, updates)
@@ -292,6 +538,75 @@ class UnifiedStore:
 
     def save_scratchpad(self, scratchpad: Scratchpad) -> None:
         self.db.save_scratchpad(scratchpad.to_dict())
+
+    # ======================================================================
+    # Session Tenants (v4) — lifecycle 反查租户用
+    # ======================================================================
+
+    def upsert_session_tenant(
+        self, session_id: str, user_id: str, workspace_id: str
+    ) -> None:
+        self.db.upsert_session_tenant(session_id, user_id, workspace_id)
+
+    def get_session_tenant(self, session_id: str) -> tuple[str, str] | None:
+        return self.db.get_session_tenant(session_id)
+
+    def list_known_tenants(self) -> list[tuple[str, str]]:
+        return self.db.list_known_tenants()
+
+    def iter_owned_session_ids(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str | None = None,
+    ) -> list[str]:
+        return self.db.iter_owned_session_ids(user_id=user_id, workspace_id=workspace_id)
+
+    def migrate_workspace_id(
+        self,
+        *,
+        from_workspace_id: str,
+        to_workspace_id: str,
+        user_id: str,
+        scope: str = "user",
+    ) -> int:
+        return self.db.migrate_workspace_id(
+            from_workspace_id=from_workspace_id,
+            to_workspace_id=to_workspace_id,
+            user_id=user_id,
+            scope=scope,
+        )
+
+    def record_scope_audit(
+        self,
+        memory_id: str,
+        *,
+        old_scope: str,
+        new_scope: str,
+        reason: str,
+        old_user_id: str = "",
+        new_user_id: str = "",
+        migration_version: str = "runtime",
+    ) -> None:
+        self.db.record_scope_audit(
+            memory_id,
+            old_scope=old_scope,
+            new_scope=new_scope,
+            reason=reason,
+            old_user_id=old_user_id,
+            new_user_id=new_user_id,
+            migration_version=migration_version,
+        )
+
+    # ======================================================================
+    # _schema_meta 通用键值（持久化 sentinel 用）
+    # ======================================================================
+
+    def get_meta(self, key: str) -> str | None:
+        return self.db.get_meta(key)
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.db.set_meta(key, value)
 
     # ======================================================================
     # Conversation Turns

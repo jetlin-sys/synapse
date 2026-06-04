@@ -28,6 +28,7 @@
 如果没有 detail 字段，则 fallback 到 description。
 """
 
+import difflib
 import logging
 from collections import OrderedDict
 
@@ -47,6 +48,7 @@ CATALOG_EXCLUDED_TOOLS = tuple(
             "write_file",
             "edit_file",
             "list_directory",
+            "move_file",
             "ask_user",
             "glob",
             "web_search",
@@ -93,7 +95,33 @@ class ToolCatalog:
 Missing a capability? Search installed skills -> search web -> install or create -> continue task.
 Never tell user "I can't do this" — acquire the capability and proceed.
 
-Use `get_tool_info(tool_name)` to see full parameters before calling.
+Use `tool_search(query="...")` to discover full parameters of deferred tools
+(标有 [DEFERRED] 的工具). Calling them directly is allowed and will auto-promote,
+but with full schema you'll fill arguments more reliably.
+
+{tool_list}
+"""
+
+    # PR-R1: 中文版 catalog header。
+    # 当 settings.prompt_lang == "zh" 时使用此模板，避免中文用户在中文 system prompt
+    # 中突然出现一段英文 header，看起来不一致 + 模型可能因此误判主语言。
+    CATALOG_TEMPLATE_ZH = """
+## 可用系统工具
+
+### 工具选择优先级
+1. **已安装的 Skill** — 先检查 skills/ 目录
+2. **MCP 服务工具** — 通过 MCP 协议接入的外部能力
+3. **Shell 命令** — 系统命令和脚本
+4. **临时脚本** — write_file + run_shell 处理一次性任务
+5. **搜索 + 安装** — 从 GitHub 等源查找并安装新能力
+6. **创建 Skill** — 用 skill-creator 沉淀长期可复用的能力
+
+### 能力扩展协议
+缺能力时：先查已安装 Skill → 再搜网络 → 安装或自建 → 继续任务。
+不要对用户说"做不到" —— 先获取能力，再继续推进。
+
+调用 `tool_search(query="...")` 获取标有 [DEFERRED] 的工具的完整参数描述；
+直接调用也允许（会自动升级到完整信息），但拿到完整 schema 后参数填写更可靠。
 
 {tool_list}
 """
@@ -184,6 +212,7 @@ Use `get_tool_info(tool_name)` to see full parameters before calling.
         self,
         exclude_high_freq: bool = True,
         deferred_tools: set[str] | None = None,
+        lang: str | None = None,
     ) -> str:
         """
         生成工具清单（Level 1）
@@ -254,10 +283,26 @@ Use `get_tool_info(tool_name)` to see full parameters before calling.
                 category_sections.append(section)
 
         tool_list = "\n".join(category_sections)
-        catalog = self._safe_format(self.CATALOG_TEMPLATE, tool_list=tool_list)
-        self._cached_catalog = catalog
+        # PR-R1: 按 prompt_lang 切换 header 模板。
+        # lang 取值：None=按 settings.prompt_lang 自动；"zh"/"en"=显式指定。
+        # 缺省回退到英文模板，保持与历史行为一致。
+        _lang = (lang or "").lower()
+        if not _lang:
+            try:
+                from ..config import settings
+                _lang = (getattr(settings, "prompt_lang", "") or "").lower()
+            except Exception:
+                _lang = ""
+        template = self.CATALOG_TEMPLATE_ZH if _lang.startswith("zh") else self.CATALOG_TEMPLATE
+        catalog = self._safe_format(template, tool_list=tool_list)
+        # 仅在使用默认（auto）时写缓存，显式 lang 调用走一次性路径，
+        # 避免缓存被中文版污染影响后续英文调用。
+        if not lang:
+            self._cached_catalog = catalog
 
-        logger.info(f"Generated tool catalog with {len(self._tools)} tools")
+        logger.info(
+            f"Generated tool catalog with {len(self._tools)} tools (lang={_lang or 'auto'})"
+        )
         return catalog
 
     def get_direct_tool_schemas(self) -> list[dict]:
@@ -357,6 +402,47 @@ Use `get_tool_info(tool_name)` to see full parameters before calling.
                 groups.setdefault(cat, set()).add(name)
         return groups
 
+    def get_index_catalog(self, exclude_high_freq: bool = True) -> str:
+        """Generate a minimal index-only catalog (category + tool names, no descriptions).
+
+        Used for CONSUMER_CHAT / SMALL tier / early turns where a full catalog
+        wastes tokens.  All tool names remain visible so the LLM can still
+        discover them via ``tool_search`` or direct invocation.
+        """
+        if not self._tools:
+            return ""
+
+        categories: OrderedDict[str, list[str]] = OrderedDict()
+        for name in sorted(self._tools):
+            if exclude_high_freq and name in _CATALOG_EXCLUDED_SET:
+                continue
+            tool = self._tools[name]
+            cat = tool.get("category") or infer_category(name)
+            if not cat and name in self._tool_sources:
+                cat = "Plugin"
+            cat = cat or "Other"
+            categories.setdefault(cat, []).append(name)
+
+        lines: list[str] = ["## Available System Tools (index)"]
+        emitted: set[str] = set()
+        for cat in self.CATEGORY_ORDER:
+            if cat not in categories:
+                continue
+            display = self.CATEGORY_DISPLAY_NAMES.get(cat, cat)
+            lines.append(f"**{display}**: {', '.join(categories[cat])}")
+            emitted.add(cat)
+        for cat, names in categories.items():
+            if cat in emitted:
+                continue
+            display = self.CATEGORY_DISPLAY_NAMES.get(cat, cat)
+            lines.append(f"**{display}**: {', '.join(names)}")
+
+        lines.append(
+            "\nUse `tool_search(query=\"...\")` to discover full parameters "
+            "before calling any tool above."
+        )
+        return "\n".join(lines)
+
     def get_catalog(
         self,
         refresh: bool = False,
@@ -393,6 +479,19 @@ Use `get_tool_info(tool_name)` to see full parameters before calling.
         """
         tool = self._tools.get(tool_name)
         if not tool:
+            # Fix-10：fuzzy 重定向 — 处理 LLM 把工具名写成
+            # ``schedule-task``/``ScheduleTask``/``schedule task`` 等常见
+            # 拼写偏差的情况，避免无谓的 not-found 往返。
+            redirected = self._resolve_tool_alias(tool_name)
+            if redirected and redirected != tool_name:
+                tool = self._tools.get(redirected)
+                if tool:
+                    return {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "input_schema": tool.get("input_schema", {}),
+                        "_resolved_from": tool_name,
+                    }
             return None
 
         return {
@@ -400,6 +499,46 @@ Use `get_tool_info(tool_name)` to see full parameters before calling.
             "description": tool.get("description", ""),
             "input_schema": tool.get("input_schema", {}),
         }
+
+    def _resolve_tool_alias(self, tool_name: str) -> str | None:
+        """Try common spelling variants of ``tool_name`` against ``_tools``.
+
+        Variants tried (in order):
+          1. lowercased
+          2. hyphen → underscore  (``schedule-task`` → ``schedule_task``)
+          3. underscore → hyphen
+          4. snake_case from camelCase / PascalCase
+          5. spaces → underscore  (``schedule task`` → ``schedule_task``)
+
+        Returns the first variant present in ``_tools``, or ``None``.
+        """
+        if not tool_name:
+            return None
+        candidates: list[str] = []
+
+        def _push(value: str | None) -> None:
+            if value and value not in candidates and value != tool_name:
+                candidates.append(value)
+
+        lower = tool_name.lower()
+        _push(lower)
+        _push(lower.replace("-", "_"))
+        _push(lower.replace("_", "-"))
+        _push(lower.replace(" ", "_"))
+        _push(lower.replace(" ", "-"))
+
+        # camelCase / PascalCase → snake_case
+        snake_chars: list[str] = []
+        for i, ch in enumerate(tool_name):
+            if ch.isupper() and i > 0:
+                snake_chars.append("_")
+            snake_chars.append(ch.lower())
+        _push("".join(snake_chars))
+
+        for cand in candidates:
+            if cand in self._tools:
+                return cand
+        return None
 
     def get_tool_info_formatted(self, tool_name: str) -> str:
         """
@@ -414,13 +553,27 @@ Use `get_tool_info(tool_name)` to see full parameters before calling.
             格式化的工具信息字符串
         """
         tool = self._tools.get(tool_name)
+        resolved_from: str | None = None
         if not tool:
-            return f"❌ Tool not found: {tool_name}"
+            redirected = self._resolve_tool_alias(tool_name)
+            if redirected:
+                tool = self._tools.get(redirected)
+                if tool:
+                    resolved_from = tool_name
+                    tool_name = redirected
+        if not tool:
+            return self._format_tool_not_found(tool_name)
 
         deferred = getattr(self, "_deferred_tools", set())
         is_deferred = tool_name in deferred
 
         output = f"# Tool: {tool['name']}\n\n"
+
+        if resolved_from:
+            output += (
+                f"_⚠️ 你查询的是 `{resolved_from}`，已自动重定向到正式名 "
+                f"`{tool['name']}`。后续调用请使用下划线小写形式。_\n\n"
+            )
 
         if is_deferred:
             output += (
@@ -515,6 +668,45 @@ Use `get_tool_info(tool_name)` to see full parameters before calling.
 
         return output
 
+    def _format_tool_not_found(self, tool_name: str) -> str:
+        """生成 tool-not-found 的引导式提示。
+
+        - 若本节点存在相近名工具（difflib 相似度 >= 0.5），列出建议；
+        - 否则提示该工具不可用、不必再探查，并指引使用 org_* 工具。
+
+        建议来源严格限定 self._tools.keys()，因此只会建议本节点真实可用的工具，
+        不会把全局工具表里不可用的名字回灌进来。
+        """
+        available = list(self._tools.keys())
+        suggestions = difflib.get_close_matches(
+            tool_name, available, n=3, cutoff=0.5,
+        )
+
+        org_tool_count = sum(1 for n in available if n.startswith("org_"))
+        only_org = (org_tool_count > 0 and org_tool_count == len(available))
+
+        lines = [f"❌ Tool not found: {tool_name}"]
+        if suggestions:
+            lines.append(
+                "可能的相近工具（来自本节点当前可用工具集）："
+                + ", ".join(suggestions)
+            )
+            lines.append(
+                f"如需详情请用 get_tool_info('{suggestions[0]}') 查看。"
+            )
+        elif only_org:
+            lines.append(
+                "本节点当前仅可使用 org_* 组织协作工具。"
+                f"工具 '{tool_name}' 不会出现在此节点，请停止探查；"
+                "请改用 org_delegate_task / org_send_message / org_submit_deliverable 等组织工具完成协作。"
+            )
+        else:
+            lines.append(
+                f"工具 '{tool_name}' 不在本节点的可用工具集合中，请勿继续探查。"
+                "可用工具清单已在系统提示中列出，按其中的工具名调用即可。"
+            )
+        return "\n".join(lines)
+
     def _format_params(self, params: dict) -> str:
         """格式化参数为 JSON 字符串"""
         import json
@@ -595,3 +787,4 @@ Use `get_tool_info(tool_name)` to see full parameters before calling.
 def create_tool_catalog(tools: list[dict]) -> ToolCatalog:
     """便捷函数：创建工具目录"""
     return ToolCatalog(tools)
+

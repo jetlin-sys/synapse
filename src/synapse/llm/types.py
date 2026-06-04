@@ -8,6 +8,7 @@ LLM 统一类型定义
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from urllib.parse import urlparse
 
 _OPENAI_ENDPOINT_SUFFIXES = (
     "/chat/completions",
@@ -240,12 +241,15 @@ class ToolUseBlock(ContentBlock):
             self.input = normalize_tool_input(self.name, self.input)
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "type": "tool_use",
             "id": self.id,
             "name": self.name,
             "input": self.input,
         }
+        if self.provider_extra:
+            d["provider_extra"] = self.provider_extra
+        return d
 
 
 @dataclass
@@ -422,7 +426,7 @@ class LLMRequest:
     max_tokens: int = 0  # 0=不限制（OpenAI 不发送该参数；Anthropic 使用端点配置值或兜底 16384）
     temperature: float = 1.0
     enable_thinking: bool = False
-    thinking_depth: str | None = None  # 思考深度: 'low'/'medium'/'high'
+    thinking_depth: str | None = None  # 思考深度: 'low'/'medium'/'high'/'max'
     stop_sequences: list[str] | None = None
     extra_params: dict | None = None  # 额外参数（如 enable_thinking 等）
 
@@ -452,7 +456,9 @@ class LLMResponse:
     model: str
     reasoning_content: str | None = None  # Kimi 专用：思考内容
     endpoint_name: str = ""  # 实际处理此请求的端点名称（由 LLMClient 填充）
-    usage_scene: str = "unknown"
+    # PR-C2: 当从非标准字段恢复 content 时记录来源（如 "message.reasoning_content"）。
+    # endpoint_manager 见此字段视为"已自愈"，不再触发 30s cooldown。
+    recovered_from: str = ""
 
     @property
     def text(self) -> str:
@@ -488,6 +494,51 @@ class LLMResponse:
         }
 
 
+DEFAULT_CONTEXT_WINDOW = 200000
+LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW = 4096
+_LOCAL_PROVIDER_SLUGS = {"local", "localai", "lmstudio", "ollama"}
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def is_local_endpoint_config(provider: str = "", base_url: str = "") -> bool:
+    """Return True for local OpenAI-compatible runtimes such as LM Studio/Ollama/LocalAI."""
+    provider_slug = (provider or "").strip().lower()
+    if provider_slug in _LOCAL_PROVIDER_SLUGS:
+        return True
+
+    try:
+        parsed = urlparse(base_url or "")
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        host = ""
+    return host in _LOCAL_HOSTS
+
+
+def normalize_context_window(
+    value: int | str | None,
+    *,
+    provider: str = "",
+    base_url: str = "",
+) -> int:
+    """Normalize endpoint context windows.
+
+    Hosted providers keep the broad historical default. Local runtimes often
+    expose 4K/8K GGUF models; treating a missing value as 200K causes the
+    prompt/tool budgeter to overload them before it can recover.
+    """
+    is_local = is_local_endpoint_config(provider, base_url)
+    try:
+        ctx = int(value) if value is not None and value != "" else 0
+    except (TypeError, ValueError):
+        ctx = 0
+
+    if is_local and (ctx <= 0 or ctx == DEFAULT_CONTEXT_WINDOW):
+        return LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW
+    if ctx <= 0:
+        return DEFAULT_CONTEXT_WINDOW
+    return ctx
+
+
 @dataclass
 class EndpointConfig:
     """端点配置"""
@@ -501,7 +552,7 @@ class EndpointConfig:
     model: str = ""  # 模型名称
     priority: int = 1  # 优先级 (越小越优先)
     max_tokens: int = 0  # 最大输出 tokens (0=不限制，使用模型默认上限)
-    context_window: int = 200000  # 上下文窗口大小 (输入+输出总 token 上限)，配置缺失时的兜底值
+    context_window: int = DEFAULT_CONTEXT_WINDOW  # 上下文窗口大小 (输入+输出总 token 上限)
     timeout: int = 180  # 超时时间 (秒)
     capabilities: list[str] | None = None  # 能力列表
     extra_params: dict | None = None  # 额外参数
@@ -513,10 +564,39 @@ class EndpointConfig:
     price_currency: str = "CNY"  # 价格货币单位
     enabled: bool = True  # 是否启用 (false=停用，不参与调用但保留配置)
     stream_only: bool = False  # 仅流式模式 (某些中转站/relay 要求 stream=true)
+    # ── Relay/Aggregator capability discovery ──────────────────────────
+    # When the user points an endpoint at a relay station (oneapi /
+    # new-api / yunwu / private gateway), the upstream model catalog
+    # often differs from the official provider's. ``supported_models``
+    # caches the result of GET /v1/models (or the equivalent for
+    # Anthropic / DashScope) so the UI can grey out models the relay
+    # does not actually carry, and ``LLMClient`` can skip endpoints
+    # whose configured ``model`` is not in their own catalog instead of
+    # surfacing an opaque 404 to the user.
+    # An empty list means "never probed" — treat as "allow any" so we
+    # do not break upgrades from older configs.
+    supported_models: list[str] | None = None
+    models_synced_at: float | None = None  # epoch seconds of last sync
+    models_sync_error: str | None = None  # last sync error (kept for UI)
+    # ── Directed fallback chain ────────────────────────────────────────
+    # When ``fallback_enabled`` is True and ``fallback_endpoint`` names
+    # another endpoint in the same llm_endpoints.json, that endpoint is
+    # promoted to be tried immediately after this one (instead of the
+    # next priority-sorted entry). Lets the user express "if my yunwu
+    # relay fails, prefer official Anthropic" without juggling priorities
+    # against the other ten endpoints. Disabled by default so legacy
+    # configs are unaffected.
+    fallback_endpoint: str | None = None
+    fallback_enabled: bool = False
 
     def __post_init__(self):
         if self.capabilities is None:
             self.capabilities = ["text"]
+        self.context_window = normalize_context_window(
+            self.context_window,
+            provider=self.provider,
+            base_url=self.base_url,
+        )
 
     def has_capability(self, capability: str) -> bool:
         """检查是否有某种能力
@@ -556,6 +636,26 @@ class EndpointConfig:
 
         return False
 
+    def supports_model(self, model: str) -> bool:
+        """Return True when this endpoint's relay/upstream catalog
+        contains ``model`` (or when no catalog has ever been probed —
+        we then assume the user knows what they typed and let the
+        upstream answer).
+
+        Comparison is case-insensitive and tolerant of leading/trailing
+        whitespace. We do NOT split on ``/`` because some relays use
+        prefixed names like ``anthropic/claude-3.5-sonnet`` verbatim.
+        """
+        if not model:
+            return True
+        if not self.supported_models:
+            # Never probed — be permissive so existing configs don't
+            # silently lose endpoints after an upgrade. ``sync_models``
+            # populates the list when the user clicks "Sync".
+            return True
+        target = model.strip().lower()
+        return any((m or "").strip().lower() == target for m in self.supported_models)
+
     def get_api_key(self) -> str | None:
         """获取 API Key (优先使用直接存储的 key，然后从环境变量获取)"""
         import os
@@ -577,10 +677,20 @@ class EndpointConfig:
         pricing_tiers 格式: [{"max_input": N, "input_price": P, "output_price": P}, ...]
         price 为每百万 token 的价格。max_input=-1 表示无上限。
         按 max_input 升序匹配，取第一个 input_tokens <= max_input 的档位。
+
+        Fix-5：当 endpoint 自身没有配置 ``pricing_tiers`` 时，回退到内置
+        价格表（按 provider+model 模糊匹配）。**仍然找不到** 时返回 ``0.0``，
+        但调用方应优先使用 ``calculate_cost_or_none`` 拿到 ``None``，UI 上
+        渲染为 "-" 而不是误导性的 "0"。
         """
         tiers = self.pricing_tiers
         if not tiers:
-            return 0.0
+            from .pricing import lookup_builtin_price
+
+            fallback = lookup_builtin_price(self.provider, self.model)
+            if fallback is None:
+                return 0.0
+            tiers = [fallback]
         sorted_tiers = sorted(
             tiers,
             key=lambda t: (
@@ -601,6 +711,40 @@ class EndpointConfig:
         cost = (input_tokens * ip + output_tokens * op + cache_read_tokens * crp) / 1_000_000
         return round(cost, 8)
 
+    def calculate_cost_or_none(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int = 0,
+    ) -> float | None:
+        """Like ``calculate_cost`` but returns ``None`` (instead of 0.0) when
+        no pricing source — neither user-configured nor built-in — is
+        available for this endpoint. UIs should render ``None`` as "-" so
+        users aren't misled into thinking the model is free.
+        """
+        if self.pricing_tiers:
+            return self.calculate_cost(input_tokens, output_tokens, cache_read_tokens)
+        from .pricing import lookup_builtin_price
+
+        if lookup_builtin_price(self.provider, self.model) is None:
+            return None
+        return self.calculate_cost(input_tokens, output_tokens, cache_read_tokens)
+
+    def get_effective_pricing(self) -> dict | None:
+        """Return the price tier currently used for this endpoint (Fix-5).
+
+        Resolution order: user ``pricing_tiers[0]`` → built-in table →
+        ``None`` (unknown). Used by ``GET /api/llm/pricing/effective``.
+        """
+        if self.pricing_tiers:
+            tier = dict(self.pricing_tiers[0])
+            tier.setdefault("source", "user")
+            tier.setdefault("currency", self.price_currency)
+            return tier
+        from .pricing import lookup_builtin_price
+
+        return lookup_builtin_price(self.provider, self.model)
+
     @classmethod
     def from_dict(cls, data: dict) -> "EndpointConfig":
         return cls(
@@ -613,7 +757,11 @@ class EndpointConfig:
             model=data.get("model", ""),
             priority=data.get("priority", 1),
             max_tokens=data.get("max_tokens", 0),
-            context_window=data.get("context_window", 200000),
+            context_window=normalize_context_window(
+                data.get("context_window"),
+                provider=data.get("provider", ""),
+                base_url=data.get("base_url", ""),
+            ),
             timeout=data.get("timeout", 180),
             capabilities=data.get("capabilities"),
             extra_params=data.get("extra_params"),
@@ -623,6 +771,19 @@ class EndpointConfig:
             price_currency=data.get("price_currency", "CNY"),
             enabled=data.get("enabled", True),
             stream_only=data.get("stream_only", False),
+            supported_models=(
+                list(data["supported_models"])
+                if isinstance(data.get("supported_models"), list)
+                else None
+            ),
+            models_synced_at=data.get("models_synced_at"),
+            models_sync_error=data.get("models_sync_error"),
+            fallback_endpoint=(
+                str(data["fallback_endpoint"]).strip()
+                if data.get("fallback_endpoint")
+                else None
+            ),
+            fallback_enabled=bool(data.get("fallback_enabled", False)),
         )
 
     def to_dict(self) -> dict:
@@ -658,6 +819,16 @@ class EndpointConfig:
             result["enabled"] = False
         if self.stream_only:
             result["stream_only"] = True
+        if self.supported_models:
+            result["supported_models"] = list(self.supported_models)
+        if self.models_synced_at is not None:
+            result["models_synced_at"] = self.models_synced_at
+        if self.models_sync_error:
+            result["models_sync_error"] = self.models_sync_error
+        if self.fallback_endpoint:
+            result["fallback_endpoint"] = self.fallback_endpoint
+        if self.fallback_enabled:
+            result["fallback_enabled"] = True
         return result
 
 
@@ -665,9 +836,16 @@ class EndpointConfig:
 class LLMError(Exception):
     """LLM 相关错误基类"""
 
-    def __init__(self, message: str = "", *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status_code: int | None = None,
+        raw_body: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.raw_body = raw_body
 
 
 class UnsupportedMediaError(LLMError):
@@ -679,9 +857,16 @@ class UnsupportedMediaError(LLMError):
 class AllEndpointsFailedError(LLMError):
     """所有端点都失败"""
 
-    def __init__(self, message: str, *, is_structural: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        is_structural: bool = False,
+        error_categories: "set[str] | None" = None,
+    ):
         super().__init__(message)
         self.is_structural = is_structural
+        self.error_categories: set[str] = error_categories or set()
 
 
 class ConfigurationError(LLMError):

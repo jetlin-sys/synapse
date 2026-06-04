@@ -4,6 +4,14 @@ PlanHandler 类 + create_todo_handler 工厂函数
 从 plan.py 拆分而来，负责：
 - PlanHandler 类（工具调用处理、plan 文件持久化、进度展示）
 - create_todo_handler 工厂函数
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import json
@@ -13,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...core.policy_v2 import ApprovalClass
 from .todo_state import (
     _session_handlers,
     force_close_plan,
@@ -43,13 +52,37 @@ class PlanHandler:
         "exit_plan_mode",
     ]
 
+    # C7 explicit ApprovalClass — todo / plan 都是 agent 内部状态机
+    TOOL_CLASSES = {
+        "create_todo": ApprovalClass.EXEC_LOW_RISK,
+        "update_todo_step": ApprovalClass.EXEC_LOW_RISK,
+        "get_todo_status": ApprovalClass.READONLY_GLOBAL,
+        "complete_todo": ApprovalClass.EXEC_LOW_RISK,
+        "create_plan_file": ApprovalClass.MUTATING_SCOPED,
+        "exit_plan_mode": ApprovalClass.INTERACTIVE,
+    }
+
     def __init__(self, agent: "Agent"):
         self.agent = agent
         self.current_todo: dict | None = None
         self._todos_by_session: dict[str, dict] = {}
-        self.plan_dir = Path("data/plans")
+        self.plan_dir = self._resolve_plan_dir()
         self.plan_dir.mkdir(parents=True, exist_ok=True)
         self._store = TodoStore(self.plan_dir / "todo_store.json")
+
+    @staticmethod
+    def _resolve_plan_dir() -> Path:
+        """Resolve the plan storage directory under the configured data_dir.
+
+        Falls back to ``./data/plans`` if settings cannot be imported (early
+        import order during tests / CLI bootstrap).
+        """
+        try:
+            from ...config import settings
+
+            return Path(settings.data_dir) / "plans"
+        except Exception:
+            return Path("data/plans")
 
     def _get_conversation_id(self) -> str:
         return (
@@ -544,16 +577,36 @@ class PlanHandler:
 
         用于 Plan 模式下生成结构化的计划文件。
         """
-        name = params.get("name", "Untitled Plan")
+        name = (
+            params.get("name")
+            or params.get("plan_name")
+            or params.get("title")
+            or params.get("plan_title")
+            or "Untitled Plan"
+        )
         overview = params.get("overview", "")
         todos = params.get("todos", [])
-        body = params.get("body", "")
+        body = params.get("body") or params.get("content") or params.get("markdown") or ""
+        if not todos and params.get("steps") is not None:
+            todos = params.get("steps", [])
 
         if isinstance(todos, str):
             try:
                 todos = json.loads(todos)
             except (json.JSONDecodeError, TypeError):
                 return "❌ todos 参数格式错误，需要 JSON 数组"
+        if not isinstance(todos, list):
+            return "❌ todos 参数格式错误，需要 JSON 数组"
+        todos = self._normalize_plan_todos(todos)
+        if not todos:
+            todos = self._parse_plan_todos_from_markdown(body or overview)
+        if not todos:
+            return (
+                "❌ 无法创建空 Plan：请提供 todos 数组，或在 overview/body 中写明编号步骤"
+                "（例如：1. 调研现状\\n2. 制定方案\\n3. 验证回归）。"
+            )
+        if not str(body or overview).strip():
+            body = self._render_plan_body_from_todos(name, overview, todos)
 
         import hashlib as _hashlib
 
@@ -665,10 +718,80 @@ class PlanHandler:
 
         return (
             f"✅ Plan 文件已创建: {plan_file}\n\n"
-            f"包含 {len(todos)} 个步骤。\n\n"
+            f"包含 {len(todos)} 个步骤。文件大小 {plan_file.stat().st_size} bytes。\n\n"
             f"⚠️ 下一步：请调用 exit_plan_mode 通知用户规划完成。\n"
             f"不要尝试执行计划中的任何步骤 — 用户需要先审批计划。"
         )
+
+    @staticmethod
+    def _normalize_plan_todos(todos: list) -> list[dict]:
+        normalized: list[dict] = []
+        for idx, todo in enumerate(todos, start=1):
+            if isinstance(todo, str):
+                content = todo.strip()
+                if content:
+                    normalized.append({
+                        "id": f"step_{idx}",
+                        "content": content[:512],
+                        "status": "pending",
+                    })
+                continue
+            if not isinstance(todo, dict):
+                continue
+            content = (
+                todo.get("content")
+                or todo.get("description")
+                or todo.get("task")
+                or todo.get("title")
+                or ""
+            )
+            content = str(content).strip()
+            if not content:
+                continue
+            normalized.append({
+                "id": todo.get("id") or f"step_{idx}",
+                "content": content[:512],
+                "status": todo.get("status", "pending"),
+            })
+        return normalized
+
+    @staticmethod
+    def _render_plan_body_from_todos(name: str, overview: str, todos: list[dict]) -> str:
+        lines = [f"# {name}", ""]
+        if overview:
+            lines.extend([str(overview).strip(), ""])
+        lines.append("## 执行步骤")
+        for idx, todo in enumerate(todos, start=1):
+            lines.append(f"{idx}. {todo.get('content', '').strip()}")
+        return "\n".join(lines).strip() + "\n"
+
+    @staticmethod
+    def _parse_plan_todos_from_markdown(text: str) -> list[dict]:
+        """Extract simple numbered/checkbox plan steps from markdown text."""
+        if not text or not str(text).strip():
+            return []
+        import re
+
+        todos: list[dict] = []
+        for line in str(text).splitlines():
+            raw = line.strip()
+            match = re.match(r"^(?:[-*]\s+\[[ xX]\]\s+|[-*]\s+|\d+[\.)、]\s+)(.+)$", raw)
+            if not match and raw.startswith("|") and raw.endswith("|"):
+                cells = [c.strip() for c in raw.strip("|").split("|")]
+                if len(cells) >= 2 and cells[0] and cells[0].isdigit():
+                    match = re.match(r"^(.+)$", cells[1])
+            if not match:
+                continue
+            content = match.group(1).strip()
+            content = re.sub(r"^\*\*(.+?)\*\*\s*[:：-]?\s*", r"\1", content).strip()
+            if not content:
+                continue
+            todos.append({
+                "id": f"step_{len(todos) + 1}",
+                "content": content[:512],
+                "status": "pending",
+            })
+        return todos
 
     async def _exit_plan_mode(self, params: dict) -> str:
         """Exit Plan mode — OpenCode-style mode switch.

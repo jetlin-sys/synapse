@@ -309,8 +309,6 @@ class Brain:
                     max_tokens=max_tokens,
                 )
                 self._compiler_on_success()
-                # add usage scene to response
-                response.usage_scene = "compiler_think"
                 self._record_usage(response)
                 result = self._llm_response_to_response(response)
                 self._dump_llm_request(system, messages, [], caller="compiler_think")
@@ -341,8 +339,6 @@ class Brain:
             enable_thinking=False,
             max_tokens=_fallback_max,
         )
-        # add usage scene to response
-        response.usage_scene = "compiler_think"
         self._record_usage(response)
         req_id = self._dump_llm_request(system, messages, [], caller="compiler_think")
         self._dump_llm_response(
@@ -357,7 +353,6 @@ class Brain:
         prompt: str,
         system: str | None = None,
         max_tokens: int = 2048,
-        usage_scene: str = "unknown",
     ) -> Response:
         """
         轻量级思考：优先使用 compiler 端点。
@@ -416,11 +411,140 @@ class Brain:
         self._dump_llm_response(
             response, caller=f"think_lightweight_{client_name}", request_id=req_id
         )
-        # add usage scene to response
-        response.usage_scene = usage_scene
 
         self._record_usage(response)
         return self._llm_response_to_response(response)
+
+    async def think_lightweight_stream(
+        self,
+        prompt: str,
+        system: str | None = None,
+        max_tokens: int = 2048,
+        enable_thinking: bool = False,
+        thinking_depth: str | None = None,
+    ):
+        """流式版 think_lightweight：yield reasoning_engine 风格的高层事件字典。
+
+        与 :meth:`think_lightweight` 同样优先 compiler 端点、失败回退主端点；
+        但全程通过 LLMClient.chat_stream 把 token 增量推给调用方，让 IM 通道
+        的 fast-reply 也能呈现"打字机"流式效果。
+
+        Yields:
+            ``{"type": "text_delta", "content": "..."}``
+            ``{"type": "thinking_delta", "content": "..."}``
+            ``{"type": "thinking_end", "duration_ms": int}``
+            ``{"type": "done"}``
+            ``{"type": "error", "message": str}``（仅严重失败时）
+        """
+        # 延迟导入避免与 stream_accumulator 形成循环依赖
+        from .stream_accumulator import StreamAccumulator
+
+        messages = [Message(role="user", content=[TextBlock(text=prompt)])]
+        sys_prompt = system or ""
+
+        req_id = self._dump_llm_request(
+            sys_prompt, messages, [], caller="think_lightweight_stream"
+        )
+
+        async def _stream_via(client: LLMClient, label: str):
+            """从 *client* 的 chat_stream 转发 raw 事件，并用 StreamAccumulator 翻译为高层事件。
+
+            返回 (yielded_text: bool, response: LLMResponse | None) 给上层决定是否回退。
+            """
+            acc = StreamAccumulator()
+            yielded_text = False
+            try:
+                async for raw in client.chat_stream(
+                    messages=messages,
+                    system=sys_prompt,
+                    enable_thinking=enable_thinking,
+                    thinking_depth=thinking_depth,
+                    max_tokens=max_tokens,
+                ):
+                    if isinstance(raw, dict) and raw.get("type") == "endpoint_meta":
+                        continue
+                    for high in acc.feed(raw):
+                        ht = high.get("type")
+                        if ht in ("text_delta", "thinking_delta", "thinking_end"):
+                            if ht == "text_delta":
+                                yielded_text = True
+                            yield ("event", high)
+            except Exception as exc:
+                yield ("error", exc)
+                return
+            decision = acc.build_decision()
+            yield ("done", decision)
+            logger.info(
+                f"[LLM] think_lightweight_stream completed via {label} endpoint "
+                f"(yielded_text={yielded_text})"
+            )
+
+        use_compiler = self._compiler_available()
+        primary_client = self._compiler_client if use_compiler else self._llm_client
+        primary_label = "compiler" if use_compiler else "main"
+
+        any_text_yielded = False
+        compiler_failed_exc: Exception | None = None
+
+        async for kind, payload in _stream_via(primary_client, primary_label):
+            if kind == "event":
+                evt = payload
+                if evt.get("type") == "text_delta":
+                    any_text_yielded = True
+                yield evt
+            elif kind == "error":
+                compiler_failed_exc = payload
+                if use_compiler:
+                    self._compiler_on_failure(str(payload))
+                break
+            elif kind == "done":
+                if use_compiler:
+                    self._compiler_on_success()
+                self._dump_llm_response(
+                    None,
+                    caller=f"think_lightweight_stream_{primary_label}",
+                    request_id=req_id,
+                )
+                yield {"type": "done"}
+                return
+
+        # 失败回退：仅当 compiler 链路报错且主端点尚未被使用时
+        if compiler_failed_exc is not None and use_compiler:
+            if any_text_yielded:
+                # 已经向用户吐了部分文本，不能切端点造成内容前后不一致；直接报错收尾
+                logger.warning(
+                    f"[LLM] think_lightweight_stream: compiler failed mid-stream "
+                    f"({compiler_failed_exc}), no fallback (text already yielded)"
+                )
+                yield {"type": "error", "message": str(compiler_failed_exc)[:300]}
+                yield {"type": "done"}
+                return
+            logger.warning(
+                f"[LLM] think_lightweight_stream: compiler failed ({compiler_failed_exc}), "
+                "falling back to main endpoint"
+            )
+            async for kind, payload in _stream_via(self._llm_client, "main_fallback"):
+                if kind == "event":
+                    yield payload
+                elif kind == "error":
+                    logger.error(
+                        f"[LLM] think_lightweight_stream: main fallback also failed: {payload}"
+                    )
+                    yield {"type": "error", "message": str(payload)[:300]}
+                    yield {"type": "done"}
+                    return
+                elif kind == "done":
+                    self._dump_llm_response(
+                        None,
+                        caller="think_lightweight_stream_main_fallback",
+                        request_id=req_id,
+                    )
+                    yield {"type": "done"}
+                    return
+
+        if compiler_failed_exc is not None and not use_compiler:
+            yield {"type": "error", "message": str(compiler_failed_exc)[:300]}
+            yield {"type": "done"}
 
     def _llm_response_to_response(self, llm_response: LLMResponse) -> Response:
         """将 LLMResponse 转换为向后兼容的 Response"""
@@ -430,13 +554,14 @@ class Brain:
             if isinstance(block, TextBlock):
                 text_parts.append(block.text)
             elif isinstance(block, ToolUseBlock):
-                tool_calls.append(
-                    {
-                        "id": block.id,
-                        "name": block.name,
-                        "input": block.input,
-                    }
-                )
+                d: dict = {
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                }
+                if block.provider_extra:
+                    d["provider_extra"] = block.provider_extra
+                tool_calls.append(d)
         return Response(
             content="\n".join(text_parts),
             tool_calls=tool_calls,
@@ -516,7 +641,7 @@ class Brain:
 
         Args:
             use_thinking: 是否使用 thinking 模式
-            thinking_depth: 思考深度 ('low'/'medium'/'high'/None)
+            thinking_depth: 思考深度 ('low'/'medium'/'high'/'max'/None)
             **kwargs: Anthropic 格式参数 (messages, system, tools, max_tokens)
 
         Returns:
@@ -530,7 +655,6 @@ class Brain:
         system = kwargs.get("system", "")
         llm_tools = self._convert_tools_to_llm(kwargs.get("tools", []))
         max_tokens = kwargs.get("max_tokens", self.max_tokens)
-        usage_scene = kwargs.get("usage_scene", "unknown")
 
         # 调试输出：保存完整请求到文件
         req_id = self._dump_llm_request(system, llm_messages, llm_tools, caller="messages_create")
@@ -567,9 +691,6 @@ class Brain:
         # 保存响应到调试文件
         self._dump_llm_response(response, caller="messages_create", request_id=req_id)
 
-        # add usage scene to response
-        response.usage_scene = usage_scene
-
         # 记录 token 用量
         self._record_usage(response)
 
@@ -596,7 +717,6 @@ class Brain:
         llm_tools = self._convert_tools_to_llm(kwargs.get("tools", []))
         max_tokens = kwargs.get("max_tokens", self.max_tokens)
         conversation_id = kwargs.get("conversation_id")
-        usage_scene = kwargs.get("usage_scene", "unknown")
 
         logger.info(
             f"[Brain] messages_create_async called: msg_count={len(llm_messages)}, "
@@ -624,18 +744,26 @@ class Brain:
             )
             _choices = getattr(response, "choices", None) or []
             _content = getattr(response, "content", None) or []
+            _out_tokens = response.usage.output_tokens if hasattr(response, "usage") else 0
+            _reasoning = bool(getattr(response, "reasoning_content", None))
+            _ = _choices  # reserved for upcoming choice-level diagnostics
             logger.info(
                 f"[Brain] messages_create_async success: "
-                f"choices={len(_choices)}, content_blocks={len(_content)}"
+                f"content_blocks={len(_content)}, tokens_out={_out_tokens}, "
+                f"has_reasoning={_reasoning}, endpoint={getattr(response, 'endpoint_name', '?')}"
             )
+            if not _content and _out_tokens > 0:
+                logger.warning(
+                    f"[Brain] ⚠️ EMPTY CONTENT with {_out_tokens} output tokens! "
+                    f"enable_thinking={use_thinking}, model={getattr(response, 'model', '?')}, "
+                    f"reasoning_content_len={len(response.reasoning_content) if response.reasoning_content else 0}, "
+                    f"stop_reason={getattr(response, 'stop_reason', '?')}"
+                )
         except Exception as e:
             logger.error(f"[Brain] messages_create_async FAILED: {type(e).__name__}: {e}")
             raise
 
         self._dump_llm_response(response, caller="messages_create_async", request_id=req_id)
-
-        # add usage scene to response
-        response.usage_scene = usage_scene
 
         # 记录 token 用量
         self._record_usage(response)
@@ -729,7 +857,6 @@ class Brain:
                 cache_creation_tokens=usage.cache_creation_input_tokens,
                 cache_read_tokens=usage.cache_read_input_tokens,
                 estimated_cost=cost,
-                usage_scene=response.usage_scene,
             )
         except Exception as e:
             logger.debug(f"[Brain] _record_usage failed (non-fatal): {e}")
@@ -794,6 +921,7 @@ class Brain:
                                     id=part.get("id", ""),
                                     name=part.get("name", ""),
                                     input=part.get("input", {}),
+                                    provider_extra=part.get("provider_extra"),
                                 )
                             )
 
@@ -977,7 +1105,13 @@ class Brain:
 
         result: list[Tool] = []
         skipped = 0
+        duplicate_names: list[str] = []
+        seen_names: set[str] = set()
         deferred = 0
+        promoted = 0
+        always_available = 0
+        schema_budget = self._resolve_api_tools_schema_budget()
+        schema_tokens = 0
         for tool in tools:
             name = tool.get("name", "")
             description = tool.get("detail") or tool.get("description", "")
@@ -994,23 +1128,46 @@ class Brain:
             if not name:
                 skipped += 1
                 continue
+            if name in seen_names:
+                duplicate_names.append(name)
+                continue
+            seen_names.add(name)
+
+            tool_payload_tokens = 0
+            if schema:
+                try:
+                    tool_payload_tokens = max(
+                        1,
+                        len(
+                            json.dumps(
+                                {"name": name, "description": description, "input_schema": schema},
+                                ensure_ascii=False,
+                                default=str,
+                            )
+                        )
+                        // 4,
+                    )
+                except Exception:
+                    tool_payload_tokens = 200
+
+            if not is_deferred and schema_budget > 0 and schema_tokens + tool_payload_tokens > schema_budget:
+                is_deferred = True
 
             if is_deferred:
-                short_desc = description.split("\n")[0][:200] if description else ""
-                result.append(
-                    Tool(
-                        name=name,
-                        description=(
-                            f"[DEFERRED] {short_desc} — "
-                            "Do NOT call this tool directly. "
-                            'You must first call tool_search(query="...") to load '
-                            "its full parameters, then call it in the NEXT turn."
-                        ),
-                        input_schema={"type": "object", "properties": {}},
-                    )
-                )
+                # Deferred tools are completely omitted from the API tools list.
+                # They remain visible in the system prompt's textual catalog
+                # (with [deferred] annotation) so the LLM can still discover
+                # them via tool_search or direct invocation (auto-promoted).
+                # This saves ~150 tokens per deferred tool compared to
+                # sending a stub entry with an empty schema.
                 deferred += 1
+                continue
             else:
+                if tool.get("_always_available"):
+                    always_available += 1
+                if tool.get("_promoted"):
+                    promoted += 1
+                schema_tokens += tool_payload_tokens
                 result.append(
                     Tool(
                         name=name,
@@ -1027,14 +1184,61 @@ class Brain:
                 len(tools),
                 len(result),
             )
+        if duplicate_names:
+            logger.warning(
+                "[Brain] _convert_tools_to_llm: removed %d duplicate tool definition(s): %s",
+                len(duplicate_names),
+                sorted(set(duplicate_names)),
+            )
         if deferred:
-            logger.debug(
-                "[Brain] defer_loading: %d/%d tools deferred (schema omitted)",
+            logger.info(
+                "[Brain] defer_loading: deferred=%d total=%d schema_tokens~%d budget=%d "
+                "always_available=%d promoted=%d",
                 deferred,
+                len(tools),
+                schema_tokens,
+                schema_budget,
+                always_available,
+                promoted,
+            )
+        else:
+            logger.debug(
+                "[Brain] API tools schema_tokens~%d budget=%d count=%d total=%d "
+                "always_available=%d promoted=%d",
+                schema_tokens,
+                schema_budget,
                 len(result),
+                len(tools),
+                always_available,
+                promoted,
             )
 
         return result if result else None
+
+    def _resolve_api_tools_schema_budget(self) -> int:
+        """Scale API tool schema budget to the active model context window."""
+        configured = int(getattr(settings, "api_tools_schema_budget_tokens", 12000) or 0)
+        if configured <= 0:
+            return configured
+
+        ctx = 0
+        try:
+            info = self.get_current_model_info()
+            endpoint_name = info.get("name", "")
+            for ep in getattr(getattr(self, "_llm_client", None), "endpoints", []):
+                if ep.name == endpoint_name:
+                    ctx = int(getattr(ep, "context_window", 0) or 0)
+                    break
+        except Exception:
+            ctx = 0
+
+        if ctx <= 0:
+            return configured
+        if ctx < 8000:
+            return min(configured, max(800, int(ctx * 0.25)))
+        if ctx < 32000:
+            return min(configured, max(2000, int(ctx * 0.20)))
+        return configured
 
     def _convert_response_to_anthropic(self, response: LLMResponse) -> AnthropicMessage:
         """将 LLMClient Response 转换为 Anthropic Message
@@ -1097,7 +1301,7 @@ class Brain:
         }
         stop_reason = stop_reason_map.get(response.stop_reason, "end_turn")
 
-        return AnthropicMessage(
+        msg = AnthropicMessage(
             id=response.id,
             type="message",
             role="assistant",
@@ -1110,6 +1314,14 @@ class Brain:
                 output_tokens=response.usage.output_tokens,
             ),
         )
+        # 透传端点信息供 reasoning_engine 检测 failover / thinking 降级
+        if hasattr(response, 'endpoint_name'):
+            msg.endpoint_name = response.endpoint_name  # type: ignore[attr-defined]
+        if hasattr(response, '_failover_from'):
+            msg._failover_from = response._failover_from  # type: ignore[attr-defined]
+        if hasattr(response, '_thinking_fallback'):
+            msg._thinking_fallback = response._thinking_fallback  # type: ignore[attr-defined]
+        return msg
 
     # ========================================================================
     # 高级方法：think（向后兼容）
@@ -1123,7 +1335,7 @@ class Brain:
         tools: list[ToolParam] | None = None,
         max_tokens: int | None = None,
         thinking_depth: str | None = None,
-        usage_scene: str = "unknown",
+        enable_thinking: bool | None = None,
     ) -> Response:
         """
         发送思考请求到 LLM（通过 LLMClient）
@@ -1134,7 +1346,9 @@ class Brain:
             system: 系统提示词
             tools: 可用工具列表
             max_tokens: 最大输出 token（不传则使用 self.max_tokens）
-            thinking_depth: 思考深度 ('low'/'medium'/'high'/None)
+            thinking_depth: 思考深度 ('low'/'medium'/'high'/'max'/None)
+            enable_thinking: 是否启用思考；None=沿用全局开关；True/False=本次显式覆盖
+                （辅助任务如记忆抽取/总结请显式传 False，避免 thinking 浪费）
 
         Returns:
             Response 对象
@@ -1163,21 +1377,23 @@ class Brain:
             sys_prompt, llm_messages, llm_tools, caller="_chat_with_llm_client"
         )
 
+        # 思考开关：调用方可显式覆盖；否则沿用全局
+        _thinking_flag = (
+            self.is_thinking_enabled() if enable_thinking is None else bool(enable_thinking)
+        )
+
         # 调用 LLMClient
         response = await self._llm_client.chat(
             messages=llm_messages,
             system=sys_prompt,
             tools=llm_tools,
             max_tokens=max_tokens or self.max_tokens,
-            enable_thinking=self.is_thinking_enabled(),
+            enable_thinking=_thinking_flag,
             thinking_depth=thinking_depth,
         )
 
         # 保存响应到调试文件
         self._dump_llm_response(response, caller="_chat_with_llm_client", request_id=req_id)
-
-        # add usage scene to response
-        response.usage_scene = usage_scene
 
         self._record_usage(response)
 
@@ -1227,6 +1443,8 @@ class Brain:
             request_id: 请求 ID，用于关联对应的 response 文件
         """
         try:
+            if not getattr(settings, "llm_debug_enabled", True):
+                return uuid.uuid4().hex[:8]
             debug_dir = settings.project_root / "data" / "llm_debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1311,20 +1529,23 @@ class Brain:
             # 记录日志并在 token 数量过大时发出警告
             token_detail = f"system={estimated_system_tokens}, messages={estimated_messages_tokens}, tools={estimated_tools_tokens}"
             if total_estimated_tokens > 50000:
-                logger.warning(
+                logger.debug(
                     f"[LLM DEBUG] ⚠️ Very large context! Estimated {total_estimated_tokens} tokens ({token_detail})"
                 )
             elif total_estimated_tokens > 30000:
-                logger.warning(
+                logger.debug(
                     f"[LLM DEBUG] Large context: {total_estimated_tokens} tokens ({token_detail})"
                 )
             else:
-                logger.info(
+                logger.debug(
                     f"[LLM DEBUG] Request saved: {total_estimated_tokens} tokens ({token_detail})"
                 )
 
-            # 清理超过 3 天的旧调试文件
-            self._cleanup_old_debug_files(debug_dir, max_age_days=3)
+            self._cleanup_old_debug_files(
+                debug_dir,
+                max_age_days=getattr(settings, "llm_debug_retention_days", 3),
+                max_size_mb=getattr(settings, "llm_debug_max_size_mb", 512),
+            )
 
             return request_id
 
@@ -1342,6 +1563,8 @@ class Brain:
             request_id: 对应的请求 ID（用于关联 request 文件）
         """
         try:
+            if not getattr(settings, "llm_debug_enabled", True):
+                return
             debug_dir = settings.project_root / "data" / "llm_debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1371,6 +1594,10 @@ class Brain:
             }
             if self._trace_context:
                 debug_data["context"] = dict(self._trace_context)
+            # 原始响应诊断（CONTENT LOST 时由 provider 附加）
+            _raw_diag = getattr(response, "_raw_diagnostic", None)
+            if _raw_diag:
+                debug_data["raw_diagnostic"] = _raw_diag
 
             with open(debug_file, "w", encoding="utf-8") as f:
                 json.dump(debug_data, f, ensure_ascii=False, indent=2, default=str)
@@ -1382,7 +1609,7 @@ class Brain:
             tool_count = sum(1 for b in content_blocks if b.get("type") == "tool_use")
             in_tokens = debug_data["llm_response"]["usage"]["input_tokens"]
             out_tokens = debug_data["llm_response"]["usage"]["output_tokens"]
-            logger.info(
+            logger.debug(
                 f"[LLM DEBUG] Response saved: text_len={text_len}, tool_calls={tool_count}, "
                 f"tokens_in={in_tokens}, tokens_out={out_tokens} (request_id={request_id})"
             )
@@ -1411,14 +1638,15 @@ class Brain:
                     if isinstance(tc.input, dict)
                     else str(tc.input)
                 )
-                blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": tc.id,
-                        "name": tc.name,
-                        "input": input_str,
-                    }
-                )
+                d: dict = {
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.name,
+                    "input": input_str,
+                }
+                if getattr(tc, "provider_extra", None):
+                    d["provider_extra"] = tc.provider_extra
+                blocks.append(d)
             return blocks
 
         # Anthropic Message 格式
@@ -1454,42 +1682,68 @@ class Brain:
                     if isinstance(inp, dict)
                     else str(inp)
                 )
-                blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": bid,
-                        "name": name,
-                        "input": input_str,
-                    }
+                d2: dict = {
+                    "type": "tool_use",
+                    "id": bid,
+                    "name": name,
+                    "input": input_str,
+                }
+                extra = (
+                    block.get("provider_extra") if isinstance(block, dict)
+                    else getattr(block, "provider_extra", None)
                 )
+                if extra:
+                    d2["provider_extra"] = extra
+                blocks.append(d2)
             else:
                 blocks.append({"type": str(block_type), "raw": str(block)})
 
         return blocks
 
-    def _cleanup_old_debug_files(self, debug_dir: Path, max_age_days: int = 7) -> None:
-        """清理超过指定天数的旧调试文件（request + response）。"""
+    def _cleanup_old_debug_files(
+        self,
+        debug_dir: Path,
+        max_age_days: int = 7,
+        max_size_mb: int = 512,
+    ) -> None:
+        """清理超过指定天数或目录体积上限的调试文件（request + response）。"""
         try:
-            import os
             from datetime import timedelta
 
             cutoff_time = datetime.now() - timedelta(days=max_age_days)
             deleted_count = 0
+            remaining: list[tuple[float, int, Path]] = []
 
             for pattern in ("llm_request_*.json", "llm_response_*.json"):
                 for file in debug_dir.glob(pattern):
                     try:
-                        mtime = datetime.fromtimestamp(os.path.getmtime(file))
+                        stat = file.stat()
+                        mtime = datetime.fromtimestamp(stat.st_mtime)
                         if mtime < cutoff_time:
                             file.unlink()
                             deleted_count += 1
+                        else:
+                            remaining.append((stat.st_mtime, stat.st_size, file))
+                    except Exception:
+                        pass
+
+            if max_size_mb > 0:
+                max_bytes = max_size_mb * 1024 * 1024
+                total_bytes = sum(size for _, size, _ in remaining)
+                for _, size, file in sorted(remaining, key=lambda item: item[0]):
+                    if total_bytes <= max_bytes:
+                        break
+                    try:
+                        file.unlink()
+                        total_bytes -= size
+                        deleted_count += 1
                     except Exception:
                         pass
 
             if deleted_count > 0:
                 logger.debug(
                     f"[LLM DEBUG] Cleaned up {deleted_count} old debug files "
-                    f"(older than {max_age_days} days)"
+                    f"(retention={max_age_days} days, max_size={max_size_mb} MB)"
                 )
 
         except Exception as e:
@@ -1548,6 +1802,7 @@ class Brain:
         hours: float = 12,
         reason: str = "",
         conversation_id: str | None = None,
+        policy: str = "prefer",
     ) -> tuple[bool, str]:
         """
         临时切换到指定模型
@@ -1561,7 +1816,7 @@ class Brain:
             (成功, 消息)
         """
         return self._llm_client.switch_model(
-            endpoint_name, hours, reason, conversation_id=conversation_id
+            endpoint_name, hours, reason, conversation_id=conversation_id, policy=policy
         )
 
     def get_fallback_model(self, conversation_id: str | None = None) -> str:
@@ -1671,7 +1926,7 @@ class Brain:
 
 请以 Markdown 格式输出计划。"""
 
-        response = await self.think(prompt, context, usage_scene="plan")
+        response = await self.think(prompt, context)
         return response.content
 
     async def generate_code(
@@ -1694,7 +1949,7 @@ class Brain:
 
 只输出代码，不要解释。"""
 
-        response = await self.think(prompt, context, usage_scene="generate_code")
+        response = await self.think(prompt, context)
 
         # 提取代码块
         code = response.content
@@ -1736,7 +1991,7 @@ class Brain:
     "prevention": "预防措施"
 }}"""
 
-        response = await self.think(prompt, usage_scene="analyze_error")
+        response = await self.think(prompt)
 
         import json
 

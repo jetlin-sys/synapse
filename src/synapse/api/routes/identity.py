@@ -75,15 +75,6 @@ def _identity_dir() -> Path:
     return settings.identity_path
 
 
-def _resolve_file(name: str) -> Path:
-    """Resolve a relative identity file name to an absolute path, with traversal guard."""
-    identity = _identity_dir()
-    target = (identity / name).resolve()
-    if not str(target).startswith(str(identity.resolve())):
-        raise HTTPException(400, "Path traversal not allowed")
-    return target
-
-
 # Persona files that must not be removed via API (shipped presets + system overlay).
 _PROTECTED_PERSONA_SLUGS = frozenset(
     {
@@ -115,6 +106,17 @@ def _sanitize_persona_upload_filename(raw: str) -> str:
     if len(name) > 240:
         raise HTTPException(400, "文件名过长")
     return name
+
+
+
+
+def _resolve_file(name: str) -> Path:
+    """Resolve a relative identity file name to an absolute path, with traversal guard."""
+    identity = _identity_dir()
+    target = (identity / name).resolve()
+    if not str(target).startswith(str(identity.resolve())):
+        raise HTTPException(400, "Path traversal not allowed")
+    return target
 
 
 def _get_agent(request: Request):
@@ -353,6 +355,8 @@ async def delete_identity_file(name: str, request: Request):
     return {"deleted": True, "name": name}
 
 
+
+
 @router.post("/validate")
 async def validate_file(req: ValidateRequest):
     """Validate file content without saving."""
@@ -547,7 +551,13 @@ async def import_persona_file(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(400, "文件名不能为空")
 
-    safe_name = _sanitize_persona_upload_filename(file.filename)
+    fname = file.filename
+    if not fname.endswith(".md"):
+        fname = fname + ".md"
+
+        safe_name = _sanitize_persona_upload_filename(file.filename)
+    if safe_name.startswith(".") or "/" in safe_name or "\\" in safe_name:
+        raise HTTPException(400, "非法文件名")
 
     content_bytes = await file.read()
     try:

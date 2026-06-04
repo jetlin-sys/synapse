@@ -11,12 +11,22 @@ IM 通道处理器
 - 通过 gateway/adapter 发送消息，不依赖 Session 类的发送方法
 - 各 adapter 实现统一接口，新增 IM 平台只需实现 ChannelAdapter 基类
 - 对于平台不支持的功能（如某些平台不支持语音），返回友好提示
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+
+from ...core.policy_v2 import ApprovalClass
 
 if TYPE_CHECKING:
     from ...channels.base import ChannelAdapter
@@ -53,6 +63,19 @@ class IMChannelHandler:
         "get_recent_messages",
     ]
 
+    # C7 explicit ApprovalClass — deliver = sends to user (interactive);
+    # everything else is read-only IM metadata
+    TOOL_CLASSES = {
+        "deliver_artifacts": ApprovalClass.INTERACTIVE,
+        "get_voice_file": ApprovalClass.READONLY_GLOBAL,
+        "get_image_file": ApprovalClass.READONLY_GLOBAL,
+        "get_chat_history": ApprovalClass.READONLY_GLOBAL,
+        "get_chat_info": ApprovalClass.READONLY_GLOBAL,
+        "get_user_info": ApprovalClass.READONLY_GLOBAL,
+        "get_chat_members": ApprovalClass.READONLY_GLOBAL,
+        "get_recent_messages": ApprovalClass.READONLY_GLOBAL,
+    }
+
     def __init__(self, agent: "Agent"):
         self.agent = agent
 
@@ -71,7 +94,34 @@ class IMChannelHandler:
             return False
 
     @staticmethod
-    def _normalize_artifacts(raw: Any) -> list[dict]:
+    def _normalize_artifact_item(item: Any) -> dict | None:
+        if isinstance(item, str):
+            path = item.strip()
+            return {"type": "file", "path": path} if path else None
+        if not isinstance(item, dict):
+            return None
+
+        artifact = dict(item)
+        path = (
+            artifact.get("path")
+            or artifact.get("file_path")
+            or artifact.get("filepath")
+            or artifact.get("local_path")
+        )
+        if path and not artifact.get("path"):
+            artifact["path"] = path
+
+        if not artifact.get("type") and artifact.get("path"):
+            artifact["type"] = "file"
+        if not artifact.get("name"):
+            name = artifact.get("filename") or artifact.get("file_name")
+            if name:
+                artifact["name"] = name
+
+        return artifact
+
+    @classmethod
+    def _normalize_artifacts(cls, raw: Any) -> list[dict]:
         """Normalize ``artifacts`` param: handle str (JSON), list of dicts, etc.
 
         Some LLM models pass artifacts as a JSON string instead of a list.
@@ -83,9 +133,13 @@ class IMChannelHandler:
                 try:
                     parsed = json.loads(raw)
                     if isinstance(parsed, list):
-                        return [item for item in parsed if isinstance(item, dict)]
+                        return [
+                            item
+                            for item in (cls._normalize_artifact_item(item) for item in parsed)
+                            if item is not None
+                        ]
                     if isinstance(parsed, dict):
-                        return [parsed]
+                        return cls._normalize_artifacts(parsed)
                 except (json.JSONDecodeError, TypeError):
                     pass
             logger.warning(
@@ -94,10 +148,47 @@ class IMChannelHandler:
             )
             return []
         if isinstance(raw, list):
-            return [item for item in raw if isinstance(item, dict)]
+            return [
+                item
+                for item in (cls._normalize_artifact_item(item) for item in raw)
+                if item is not None
+            ]
         if isinstance(raw, dict):
-            return [raw]
+            nested = raw.get("artifacts") or raw.get("recipients") or raw.get("files")
+            nested = nested or raw.get("file_attachments") or raw.get("attachments")
+            if nested is not None:
+                return cls._normalize_artifacts(nested)
+            item = cls._normalize_artifact_item(raw)
+            return [item] if item is not None else []
         return []
+
+    @classmethod
+    def _normalize_delivery_params(cls, params: dict[str, Any]) -> dict[str, Any]:
+        """Convert legacy delivery shapes into the single ``artifacts`` manifest."""
+        normalized = dict(params or {})
+        raw = None
+        raw_key = ""
+        for key in ("artifacts", "recipients", "files", "file_attachments", "attachments"):
+            value = normalized.get(key)
+            if value not in (None, "", []):
+                raw = value
+                raw_key = key
+                break
+
+        artifacts = cls._normalize_artifacts(raw)
+        normalized["artifacts"] = artifacts
+
+        if raw_key == "recipients" and not normalized.get("target_channel"):
+            channels = {
+                str(item.get("channel") or "").strip()
+                for item in artifacts
+                if isinstance(item, dict)
+            }
+            channels -= {"", "default", "current", "desktop"}
+            if len(channels) == 1:
+                normalized["target_channel"] = next(iter(channels))
+
+        return normalized
 
     async def handle(self, tool_name: str, params: dict[str, Any]) -> str:
         """处理工具调用"""
@@ -105,6 +196,7 @@ class IMChannelHandler:
 
         # deliver_artifacts 支持跨通道发送（target_channel 参数）
         if tool_name == "deliver_artifacts":
+            params = self._normalize_delivery_params(params)
             target_channel = (params.get("target_channel") or "").strip()
             if target_channel:
                 prefer_chat_type = (params.get("prefer_chat_type") or "private").strip()
@@ -545,17 +637,18 @@ class IMChannelHandler:
                 }
             )
 
-        return json.dumps(
-            {
-                "ok": all(r.get("status") == "delivered" for r in receipts),
-                "channel": "desktop",
-                "receipts": receipts,
-                "hint": "Desktop mode: files are served via /api/files/ endpoint. "
-                "Frontend should display images inline using the file_url.",
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        ok = all(r.get("status") == "delivered" for r in receipts) if receipts else False
+        payload = {
+            "ok": ok,
+            "channel": "desktop",
+            "receipts": receipts,
+            "hint": "Desktop mode: files are served via /api/files/ endpoint. "
+            "Frontend should display images inline using the file_url.",
+        }
+        if not receipts:
+            payload["error"] = "missing_artifacts"
+            payload["error_code"] = "missing_artifacts"
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     async def _deliver_artifacts(self, params: dict) -> str:
         """

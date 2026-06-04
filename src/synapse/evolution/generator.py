@@ -223,7 +223,7 @@ if __name__ == "__main__":
 
 只返回名称，不要解释。"""
 
-        response = await self.brain.think(prompt, usage_scene="generate_name")
+        response = await self.brain.think(prompt)
         return response.content.strip()
 
     async def _generate_i18n(self, skill_dir: Path, name: str, description: str) -> None:
@@ -251,7 +251,7 @@ if __name__ == "__main__":
 
 只返回 Markdown 内容，不要包含 frontmatter。"""
 
-        response = await self.brain.think(prompt, usage_scene="generate_skill_md")
+        response = await self.brain.think(prompt)
         body_content = response.content.strip()
 
         # 组装完整的 SKILL.md
@@ -332,7 +332,7 @@ if __name__ == "__main__":
 
 请生成完整的代码。只输出代码，不要解释。'''
 
-        response = await self.brain.think(prompt, usage_scene="generate_script")
+        response = await self.brain.think(prompt)
 
         # 提取代码
         code = response.content
@@ -390,7 +390,7 @@ if __name__ == "__main__":
 
 只输出修复后的完整代码，不要解释。"""
 
-        response = await self.brain.think(prompt, usage_scene="fix_script")
+        response = await self.brain.think(prompt)
 
         fixed_code = response.content
         if "```python" in fixed_code:
@@ -443,7 +443,7 @@ if __name__ == "__main__":
 
 请输出改进后的完整代码，不要解释。"""
 
-        response = await self.brain.think(prompt, usage_scene="improve")
+        response = await self.brain.think(prompt)
 
         improved_code = response.content
         if "```python" in improved_code:

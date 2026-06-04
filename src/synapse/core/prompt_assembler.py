@@ -53,7 +53,7 @@ class PromptAssembler:
         Args:
             task_description: 任务描述（用于记忆检索）
             session_type: 会话类型 "cli" 或 "im"
-            agent_voice: 当前 Agent 显示名（用于 SOUL 占位符替换）
+            agent_voice: 当前 Agent 的显示名（用于 SOUL.md 占位符替换）
 
         Returns:
             完整的系统提示词
@@ -78,6 +78,11 @@ class PromptAssembler:
         user_input_tokens: int = 0,
         prompt_profile: "Any | None" = None,
         prompt_tier: "Any | None" = None,
+        prompt_mode: "Any | None" = None,
+        memory_scope: "Any | None" = None,
+        catalog_scope: list[str] | None = None,
+        include_project_guidelines: bool | None = None,
+        intent_tool_hints: list[str] | None = None,
         agent_voice: str = "",
     ) -> str:
         """
@@ -133,6 +138,11 @@ class PromptAssembler:
             context_window=context_window,
             prompt_profile=prompt_profile,
             prompt_tier=prompt_tier,
+            prompt_mode=prompt_mode,
+            memory_scope=memory_scope,
+            catalog_scope=catalog_scope,
+            include_project_guidelines=include_project_guidelines,
+            intent_tool_hints=intent_tool_hints,
             agent_voice=agent_voice,
         )
 

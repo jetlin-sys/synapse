@@ -109,6 +109,11 @@ class ValidationContext:
     delivery_receipts: list[dict] = field(default_factory=list)
     tool_results: list[dict] = field(default_factory=list)
     conversation_id: str = ""
+    # --- 组织视角字段（默认值确保向后兼容；非组织 agent 永远是 0/False） ---
+    # 当前激活 chain 子树下已 ACCEPTED 的子任务数（严格信号）
+    accepted_child_count: int = 0
+    # 该节点 mailbox 最近 60s 内是否收到过 deliverable_accepted 类事件（弱信号兜底）
+    has_recent_accepted_signal: bool = False
 
 
 class PlanValidator(BaseValidator):
@@ -181,6 +186,8 @@ class PlanValidator(BaseValidator):
 class ArtifactValidator(BaseValidator):
     """交付物完整性验证"""
 
+    _SUCCESS_STATUSES = {"delivered", "skipped", "relayed"}
+
     @property
     def name(self) -> str:
         return "ArtifactValidator"
@@ -193,8 +200,14 @@ class ArtifactValidator(BaseValidator):
                 reason="No deliver_artifacts call",
             )
 
-        delivered = [r for r in context.delivery_receipts if r.get("status") == "delivered"]
-        failed = [r for r in context.delivery_receipts if r.get("status") == "failed"]
+        delivered = [
+            r for r in context.delivery_receipts if r.get("status") in self._SUCCESS_STATUSES
+        ]
+        failed = [
+            r
+            for r in context.delivery_receipts
+            if r.get("status") not in self._SUCCESS_STATUSES
+        ]
 
         if failed:
             return ValidatorOutput(
@@ -213,7 +226,7 @@ class ArtifactValidator(BaseValidator):
         return ValidatorOutput(
             name=self.name,
             result=ValidationResult.FAIL,
-            reason="deliver_artifacts called but no delivery receipts",
+            reason="deliver_artifacts called but no successful delivery receipts",
         )
 
 
@@ -295,12 +308,14 @@ class FileValidator(BaseValidator):
 
     从 tool_results 文本中提取路径，校验文件在磁盘上的实际状态：
     - write_file / edit_file: 文件应存在且大小 > 0
+    - move_file: 源路径应已不存在，目标路径应存在
     - delete_file: 文件应已不存在
     """
 
     _WRITE_PATH_RE = re.compile(
         r"文件已[写编][入辑][:：]\s*(.+?)(?:\s+\(\d+\s*bytes\)|（|$)", re.MULTILINE
     )
+    _MOVE_PATH_RE = re.compile(r"(?:文件|目录)已移动[:：]\s*(.+?)\s*->\s*(.+?)\s*$", re.MULTILINE)
     _DELETE_PATH_RE = re.compile(r"(?:文件|目录)已删除[:：]\s*(.+?)\s*$", re.MULTILINE)
 
     @property
@@ -308,7 +323,7 @@ class FileValidator(BaseValidator):
         return "FileValidator"
 
     def validate(self, context: ValidationContext) -> ValidatorOutput:
-        file_tools = {"write_file", "edit_file", "delete_file"}
+        file_tools = {"write_file", "edit_file", "move_file", "delete_file"}
         if not (file_tools & set(context.executed_tools)):
             return ValidatorOutput(
                 name=self.name,
@@ -339,6 +354,21 @@ class FileValidator(BaseValidator):
                         issues.append(f"write/edit 目标为空文件: {fpath}")
                 except OSError as e:
                     issues.append(f"无法检查 {fpath}: {e}")
+                continue
+
+            # move: 源应消失，目标应存在
+            m = self._MOVE_PATH_RE.search(content)
+            if m:
+                src = m.group(1).strip()
+                dst = m.group(2).strip()
+                checked += 1
+                try:
+                    if Path(src).exists():
+                        issues.append(f"move 源路径仍存在: {src}")
+                    if not Path(dst).exists():
+                        issues.append(f"move 目标不存在: {dst}")
+                except OSError as e:
+                    issues.append(f"无法检查 move 结果: {e}")
                 continue
 
             # delete: 文件应已不存在
@@ -374,6 +404,56 @@ class FileValidator(BaseValidator):
         )
 
 
+class OrgDelegationValidator(BaseValidator):
+    """组织协作者交付完成度验证。
+
+    协调者节点（如 Editor-in-Chief / PlanningEditor）完成的方式是「下属
+    交付物均已验收」，本身并不会调用 ``deliver_artifacts``。这种场景下
+    原有 ArtifactValidator 不适用，verify 容易把汇总文本误判为
+    ``verify_incomplete``。本 validator 在以下两种信号成立时回 ``PASS``：
+
+    1) 严格信号：``accepted_child_count >= 1`` —— 当前激活 chain 子树下
+       至少有 1 个子任务已 ACCEPTED（来自 ProjectStore）。
+    2) 弱信号兜底：``has_recent_accepted_signal=True`` —— 该节点 mailbox
+       最近 60s 内有 ``deliverable_accepted`` 类事件（runtime 层面）。
+
+    非组织 agent 默认两个字段都是 0/False，validator 永远 SKIP，
+    与原有 verify 流程行为一致。
+    """
+
+    @property
+    def name(self) -> str:
+        return "OrgDelegationValidator"
+
+    def validate(self, context: ValidationContext) -> ValidatorOutput:
+        accepted = int(getattr(context, "accepted_child_count", 0) or 0)
+        recent = bool(getattr(context, "has_recent_accepted_signal", False))
+
+        if accepted >= 1:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.PASS,
+                reason=(
+                    f"{accepted} downstream task(s) already ACCEPTED in current chain — "
+                    "treating coordinator response as completed"
+                ),
+            )
+        if recent:
+            return ValidatorOutput(
+                name=self.name,
+                result=ValidationResult.PASS,
+                reason=(
+                    "recent deliverable_accepted signal in node mailbox — "
+                    "treating coordinator response as completed (weak signal)"
+                ),
+            )
+        return ValidatorOutput(
+            name=self.name,
+            result=ValidationResult.SKIP,
+            reason="no accepted child task / no recent deliverable_accepted signal",
+        )
+
+
 # ==================== 验证器注册表 ====================
 
 _DEFAULT_VALIDATORS: list[BaseValidator] = [
@@ -382,6 +462,7 @@ _DEFAULT_VALIDATORS: list[BaseValidator] = [
     ToolSuccessValidator(),
     FileValidator(),
     CompletePlanValidator(),
+    OrgDelegationValidator(),
 ]
 
 
@@ -444,3 +525,4 @@ class ValidatorRegistry:
 def create_default_registry() -> ValidatorRegistry:
     """创建默认验证器注册表"""
     return ValidatorRegistry()
+

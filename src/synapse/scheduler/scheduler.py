@@ -12,11 +12,27 @@ import contextlib
 import json
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from ..utils.atomic_io import safe_json_write, safe_write
+from ._naming import quarantine_invalid_task_name, validate_task_name
+from .locks import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    ExecLock,
+    OrphanLock,
+    acquire_exec_lock,
+    default_lock_dir,
+    heartbeat_exec_lock,
+    release_exec_lock,
+    reset_current_scheduled_task_id,
+    scan_orphaned_locks,
+    set_current_scheduled_task_id,
+    unlink_orphan,
+)
 from .task import ScheduledTask, TaskDurability, TaskExecution, TaskStatus, TriggerType
 from .triggers import Trigger
 
@@ -57,6 +73,12 @@ class TaskScheduler:
         self.storage_path = Path(storage_path) if storage_path else Path("data/scheduler")
         self.storage_path.mkdir(parents=True, exist_ok=True)
 
+        # C17 Phase A.1：scheduler 单任务执行锁目录。``locks.acquire_exec_lock``
+        # 写入 ``exec_<task_id>.json``；startup rescan 用 ``scan_orphaned_locks``
+        # 清理崩溃残留。
+        self.lock_dir = default_lock_dir(self.storage_path)
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+
         self.executor = executor
         self.timezone = timezone
         self.max_concurrent = max_concurrent
@@ -95,15 +117,31 @@ class TaskScheduler:
         self._load_executions()
 
     async def start(self) -> None:
-        """启动调度器"""
+        """启动调度器（幂等：重复 start 立即返回，避免新建第二条 _scheduler_loop 与 _semaphore）。
+
+        C17 Phase A.3: startup rescan 必须先于 ``_scheduler_loop`` 启动：
+
+        1. 扫描 ``data/scheduler/locks/`` 里所有 stale exec lock，删文件 +
+           对应 task 强制 reset 回 SCHEDULED。
+        2. 用 ``_reconcile_awaiting_approval()`` 把 ``awaiting_approval``
+           的 task 与 ``pending_approvals.json`` 对账：pending 缺失 / 过期
+           → 标 fail；存活 → 保留。
+        3. 已有的 ``missed_tasks`` 处理保留（但加 stagger / cap，借鉴
+           openclaw ``planStartupCatchup``）。
+        """
+        if self._running:
+            logger.debug("TaskScheduler.start() called while already running — no-op")
+            return
+
         self._running = True
         self._semaphore = asyncio.Semaphore(self.max_concurrent)
 
         self._trim_executions_file()
 
-        # 更新任务的下一次运行时间
-        # 注意：只有 next_run 为空或已严重过期的任务才重新计算
-        # 避免程序重启导致任务立即执行
+        # ── C17 Phase A.3: rescan + reconcile，必须先于 scheduler_loop ──
+        orphans = self._rescan_orphaned_runs()
+        self._reconcile_awaiting_approval()
+
         now = datetime.now()
         missed_tasks: list[ScheduledTask] = []
 
@@ -116,12 +154,23 @@ class TaskScheduler:
                         missed_tasks.append(task)
                         self._recalculate_missed_run(task, now)
 
+            # C17 Phase A.3：startup catch-up stagger + cap，避免重启后
+            # 同一秒触发 N 个任务给 LLM 发雷群。借鉴 openclaw
+            # ``planStartupCatchup``：超过 MAX_MISSED_PER_RESTART 的任务
+            # 推迟到分散的将来时间点。
+            self._stagger_missed_tasks(missed_tasks, now)
+
             self._save_tasks()
 
         # 启动调度循环
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
-        logger.info(f"TaskScheduler started with {len(self._tasks)} tasks")
+        logger.info(
+            "TaskScheduler started with %d tasks (orphan_locks=%d, missed=%d)",
+            len(self._tasks),
+            len(orphans),
+            len(missed_tasks),
+        )
 
         # 异步通知 missed 任务
         if missed_tasks and self.on_missed_tasks_summary:
@@ -133,6 +182,209 @@ class TaskScheduler:
             await self.on_missed_tasks_summary(missed)
         except Exception as e:
             logger.debug(f"on_missed_tasks_summary callback error: {e}")
+
+    # ---- C17 Phase A.3: startup rescan + reconcile -----------------------
+
+    # missed 任务恢复时一次性可以"立刻就触发"的上限；超过部分按
+    # STAGGER_INTERVAL_S 推迟到将来不同时刻。借鉴 openclaw
+    # ``planStartupCatchup`` 防雷群策略。
+    MAX_MISSED_PER_RESTART: int = 10
+    STAGGER_INTERVAL_S: int = 30
+
+    def _rescan_orphaned_runs(self) -> list[OrphanLock]:
+        """C17 Phase A.3：清理上次进程崩溃留下的执行锁。
+
+        - 用 :func:`scan_orphaned_locks` 找出 stale lock 文件。
+        - 对应 task 若仍处于 ``RUNNING``，``force_reset_to_scheduled`` 回到
+          可调度状态（保留 audit trail）。
+        - 把 audit 记录追加到 ``data/scheduler/recovery.jsonl``（plain JSONL，
+          C17 文档明确：恢复审计与策略 hash 链是两套系统，不交叉）。
+        """
+        orphans = scan_orphaned_locks(self.lock_dir)
+        if not orphans:
+            return []
+
+        recovery_log = self.storage_path / "recovery.jsonl"
+        try:
+            recovery_log.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+        for orphan in orphans:
+            task = self._tasks.get(orphan.task_id)
+            reset_reason = f"startup_rescan:{orphan.reason}"
+            if task is not None and task.status == TaskStatus.RUNNING:
+                try:
+                    task.force_reset_to_scheduled(reason=reset_reason)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[scheduler] reset(%s) on orphan lock failed: %s",
+                        orphan.task_id,
+                        exc,
+                    )
+
+            try:
+                unlink_orphan(orphan)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[scheduler] unlink_orphan(%s) failed (will retry next start): %s",
+                    orphan.task_id,
+                    exc,
+                )
+
+            try:
+                with open(recovery_log, "a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(
+                            {
+                                "ts": datetime.now().isoformat(),
+                                "kind": "orphan_lock",
+                                "task_id": orphan.task_id,
+                                "reason": orphan.reason,
+                                "pid": orphan.pid,
+                                "hostname": orphan.hostname,
+                                "acquired_at": orphan.acquired_at,
+                                "heartbeat_at": orphan.heartbeat_at,
+                                "lease_until": orphan.lease_until,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            except OSError as exc:
+                logger.debug("[scheduler] recovery log append failed: %s", exc)
+
+            logger.warning(
+                "[scheduler] recovered orphan lock task=%s reason=%s pid=%s",
+                orphan.task_id,
+                orphan.reason,
+                orphan.pid,
+            )
+        return orphans
+
+    def _reconcile_awaiting_approval(self) -> None:
+        """C17 Phase A.3：对账 ``awaiting_approval`` task 与 pending_approvals.json。
+
+        - 仍有未过期 ``PendingApproval`` → 保留 awaiting 状态。
+        - 找不到 / 已过期 → 标 fail，写 recovery 审计，让 task 不再永远卡住。
+
+        ``PendingApprovalsStore`` 是独立模块；这里 lazy import 避免循环。
+        """
+        awaiting_ids = [
+            tid for tid, t in self._tasks.items()
+            if t.status == TaskStatus.AWAITING_APPROVAL
+        ]
+        if not awaiting_ids:
+            return
+
+        try:
+            from ..core.pending_approvals import get_pending_approvals_store
+            store = get_pending_approvals_store()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[scheduler] reconcile_awaiting_approval skipped: "
+                "PendingApprovalsStore unavailable (%s); leaving tasks as-is",
+                exc,
+            )
+            return
+
+        recovery_log = self.storage_path / "recovery.jsonl"
+        now = datetime.now()
+        for tid in awaiting_ids:
+            task = self._tasks.get(tid)
+            if task is None:
+                continue
+            entries: list[Any] = []
+            try:
+                entries = [
+                    e for e in store.list_pending() if getattr(e, "task_id", None) == tid
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[scheduler] reconcile: list_pending(%s) failed: %s",
+                    tid,
+                    exc,
+                )
+            keep = False
+            for e in entries:
+                expires_at = getattr(e, "expires_at", None)
+                if not expires_at:
+                    keep = True
+                    break
+                try:
+                    if isinstance(expires_at, (int, float)) and expires_at > time.time():
+                        keep = True
+                        break
+                    if isinstance(expires_at, str):
+                        if datetime.fromisoformat(expires_at) > now:
+                            keep = True
+                            break
+                except Exception:
+                    continue
+            if keep:
+                continue
+
+            reason = (
+                "approval_orphaned" if not entries else "approval_expired"
+            )
+            try:
+                # mark_failed expects status==RUNNING; force-transition first
+                # so we don't tear up the state machine on the corrupted row.
+                task.status = TaskStatus.RUNNING
+                task.mark_failed(error=reason)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[scheduler] reconcile: failed to fail-out task %s: %s",
+                    tid,
+                    exc,
+                )
+            try:
+                with open(recovery_log, "a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(
+                            {
+                                "ts": now.isoformat(),
+                                "kind": "awaiting_reconcile",
+                                "task_id": tid,
+                                "reason": reason,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            except OSError as exc:
+                logger.debug("[scheduler] recovery log append failed: %s", exc)
+
+            logger.warning(
+                "[scheduler] reconciled awaiting_approval task %s → failed (reason=%s)",
+                tid,
+                reason,
+            )
+
+    def _stagger_missed_tasks(
+        self, missed_tasks: list[ScheduledTask], now: datetime
+    ) -> None:
+        """Spread missed tasks beyond MAX_MISSED_PER_RESTART out in time.
+
+        借鉴 openclaw ``planStartupCatchup``：第 N (N >= MAX) 个 missed 任务
+        的 ``next_run`` 推到 now + (N - MAX + 1) * STAGGER_INTERVAL_S，
+        避免重启瞬间把队列里所有 missed 都立刻拉起。
+        """
+        if len(missed_tasks) <= self.MAX_MISSED_PER_RESTART:
+            return
+        for idx, task in enumerate(missed_tasks[self.MAX_MISSED_PER_RESTART :], start=1):
+            try:
+                task.next_run = now + timedelta(seconds=idx * self.STAGGER_INTERVAL_S)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[scheduler] stagger(%s) failed: %s", task.id, exc
+                )
+        logger.info(
+            "[scheduler] staggered %d missed tasks (cap=%d, interval=%ds)",
+            len(missed_tasks) - self.MAX_MISSED_PER_RESTART,
+            self.MAX_MISSED_PER_RESTART,
+            self.STAGGER_INTERVAL_S,
+        )
 
     async def stop(self, graceful_timeout: float = 30.0) -> None:
         """停止调度器，优雅等待运行中的任务完成"""
@@ -196,8 +448,14 @@ class TaskScheduler:
             任务 ID
 
         Raises:
-            ValueError: 任务 ID 重复或达到上限
+            ValueError: 任务 ID 重复、达到上限或 name 不合规
         """
+        # Fix-15：内核侧统一校验 name —— 防 MCP/programmatic/系统种子任务绕开
+        # API 层的 _validate_task_name 把路径穿越/控制字符塞进 storage。
+        ok, reason = validate_task_name(task.name)
+        if not ok:
+            raise ValueError(f"Invalid task name: {reason}")
+
         async with self._lock:
             if task.id in self._tasks:
                 raise ValueError(f"Task with id {task.id!r} already exists")
@@ -345,9 +603,26 @@ class TaskScheduler:
         async with self._lock:
             self._save_tasks()
 
-    async def trigger_now(self, task_id: str) -> TaskExecution | None:
+    async def trigger_now(
+        self,
+        task_id: str,
+        *,
+        execution: TaskExecution | None = None,
+        _skip_running_check: bool = False,
+    ) -> TaskExecution | None:
         """
         立即触发任务（走 semaphore 并发控制，检查任务状态）
+
+        Args:
+            task_id: 目标任务 id
+            execution: 可选，调用方预先分配的 TaskExecution；
+                用于 trigger_in_background 场景下让 API 返回的 execution_id
+                与实际落库的 execution 对齐。若为 None 则由 _execute_task 自行创建。
+            _skip_running_check: 内部参数。当调用方已经同步把 task_id 放入
+                ``_running_tasks`` 做排他占位（trigger_in_background 的用法），
+                置为 True 以跳过重复的 "already running" 护栏——否则此处会把
+                调用方自己提前放入的标记当作"另一个正在执行的副本"直接返回
+                None，导致任务永远不被执行。
 
         Returns:
             执行记录, 或 None（任务不存在/不可用/已在运行）
@@ -360,19 +635,75 @@ class TaskScheduler:
             logger.warning(f"trigger_now: task {task_id} is disabled, skipping")
             return None
 
-        if task_id in self._running_tasks:
-            logger.warning(f"trigger_now: task {task_id} is already running, skipping")
-            return None
+        if not _skip_running_check:
+            if task_id in self._running_tasks:
+                logger.warning(f"trigger_now: task {task_id} is already running, skipping")
+                return None
+            self._running_tasks.add(task_id)
 
-        self._running_tasks.add(task_id)
         try:
             if self._semaphore:
                 async with self._semaphore:
-                    return await self._execute_task(task)
+                    return await self._execute_task(task, execution=execution)
             else:
-                return await self._execute_task(task)
+                return await self._execute_task(task, execution=execution)
         finally:
+            # discard 幂等：无论是 trigger_now 自己 add 的还是 trigger_in_background
+            # 预先 add 的，执行完后都释放占位，允许后续再次触发。
             self._running_tasks.discard(task_id)
+
+    def trigger_in_background(self, task_id: str) -> str | None:
+        """
+        在后台触发任务（不等待执行完成），用于 API 路由避免请求超时。
+
+        立即返回真实 execution_id（或 None 表示任务不存在 / 已在运行 / 已禁用）；
+        实际执行通过 asyncio.create_task 异步进行。预创建的 TaskExecution 会随后被
+        _execute_task 使用并最终落到 executions 存储中，因此调用方可用返回的 id
+        查询真实结果。
+
+        Returns:
+            真实的 execution_id（形如 "exec_<12hex>"）或 None
+        """
+        task = self._tasks.get(task_id)
+        if not task:
+            return None
+        if not task.enabled:
+            logger.warning(f"trigger_in_background: task {task_id} is disabled, skipping")
+            return None
+        if task_id in self._running_tasks:
+            logger.warning(
+                f"trigger_in_background: task {task_id} is already running, skipping"
+            )
+            return None
+
+        # 同步占位 _running_tasks，避免快速连按在 create_task 调度到之前
+        # 两次 trigger_in_background 都通过 running 检查导致重复触发。
+        # 由于 trigger_now 开头也有 "already running" 护栏，这里必须把
+        # _skip_running_check=True 透传下去，否则 _runner 里的 trigger_now
+        # 会把我们刚放进去的占位当作"另一个副本"直接返回 None，任务永远不跑。
+        self._running_tasks.add(task_id)
+
+        # 预创建 TaskExecution，让返回值与最终落库的记录共享同一个 id。
+        execution = TaskExecution.create(task.id)
+        execution_id = execution.id
+
+        async def _runner() -> None:
+            try:
+                await self.trigger_now(
+                    task_id,
+                    execution=execution,
+                    _skip_running_check=True,
+                )
+            except Exception as e:
+                logger.error(f"trigger_in_background runner error for {task_id}: {e}")
+            finally:
+                # trigger_now 正常路径已 discard；这里兜底处理 trigger_now
+                # 因 task 消失 / 被禁用等在进入 try/finally 之前 return 的情况，
+                # 保证我们提前 add 的占位最终一定被释放。
+                self._running_tasks.discard(task_id)
+
+        asyncio.create_task(_runner())
+        return execution_id
 
     # ==================== 调度循环 ====================
 
@@ -423,12 +754,133 @@ class TaskScheduler:
         finally:
             self._running_tasks.discard(task.id)
 
-    async def _execute_task(self, task: ScheduledTask) -> TaskExecution:
-        """执行任务"""
-        execution = TaskExecution.create(task.id)
+    async def _execute_task(
+        self,
+        task: ScheduledTask,
+        *,
+        execution: TaskExecution | None = None,
+    ) -> TaskExecution:
+        """执行任务
+
+        Args:
+            task: 要执行的任务
+            execution: 可选，外部预创建的 TaskExecution（trigger_in_background 用以
+                让 API 返回的 execution_id 与最终持久化的记录对齐）。
+                若为 None 则创建一个新的 TaskExecution。
+
+        C17 Phase A.2 关键时序：
+
+        1. ``mark_running`` 后立刻 ``_save_tasks`` —— SIGKILL 在
+           mark_running 和 persist 之间会让 tasks.json 看不到 running
+           状态，启动 rescan 也救不回来。
+        2. 对周期任务（cron/interval）**先**调 ``_update_next_run``
+           推进 next_run，借鉴 hermes-agent 的 ``advance_next_run``
+           前置 —— 即使本次执行崩溃，下一次 next_run 也不会因为还卡
+           在过去而被立刻重抓（at-most-once-per-window）。
+        3. 拿 :func:`scheduler.locks.acquire_exec_lock` 写 exec lock 文件 +
+           PID + lease。同进程已经 ``_running_tasks`` 占位，跨进程的
+           另一实例会在此被挡住。
+        4. 启动 heartbeat ``asyncio.Task``，每
+           ``HEARTBEAT_INTERVAL_SECONDS`` 刷新 lock 文件 ``heartbeat_at``。
+        5. 通过 :func:`scheduler.locks.set_current_scheduled_task_id`
+           把 task_id 推到 ``ContextVar`` —— Phase A.4 让
+           ``tool_executor._defer_unattended_confirm`` 拿到正确的
+           ``pending_approval.task_id``，不再都是 ``None``。
+        """
+        if execution is None:
+            execution = TaskExecution.create(task.id)
 
         logger.info(f"Executing task: {task.id} ({task.name})")
         task.mark_running()
+
+        # C17 Phase A.2 §1：mark_running 后立刻 persist。避免 SIGKILL
+        # 在状态机变更与持久化之间留下 silent gap。
+        async with self._lock:
+            self._save_tasks()
+
+        # C17 Phase A.2 §2：周期任务先把 next_run 推进到下一窗口，
+        # at-most-once-per-window 语义。一次性任务跳过（mark_completed
+        # 会处理一次性任务的终态）。
+        if task.trigger_type in (TriggerType.CRON, TriggerType.INTERVAL):
+            try:
+                self._update_next_run(task)
+                async with self._lock:
+                    self._save_tasks()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[scheduler] advance_next_run(%s) failed before exec: %s",
+                    task.id,
+                    exc,
+                )
+
+        # C17 Phase A.2 §3：cross-process exec lock。
+        expected_runtime = task.metadata.get("timeout_seconds") if isinstance(task.metadata, dict) else None
+        if not isinstance(expected_runtime, (int, float)) or expected_runtime <= 0:
+            expected_runtime = 300
+        exec_lock: ExecLock | None = acquire_exec_lock(
+            task.id,
+            lock_dir=self.lock_dir,
+            expected_runtime_s=expected_runtime,
+            execution_id=execution.id,
+        )
+        if exec_lock is None:
+            logger.warning(
+                "[scheduler] %s: another process holds the exec lease; skip this run",
+                task.id,
+            )
+            # Roll back the RUNNING transition so the next tick can retry
+            # cleanly (force_reset is the audited reset path).
+            try:
+                task.force_reset_to_scheduled(reason="exec_lock_busy")
+                async with self._lock:
+                    self._save_tasks()
+            except Exception:
+                pass
+            execution.finish(False, error="exec_lock_busy")
+            async with self._lock:
+                self._executions.append(execution)
+                self._append_execution(execution)
+            return execution
+
+        # C17 Phase A.2 §4：heartbeat task。
+        hb_stop = asyncio.Event()
+
+        async def _heartbeat_loop() -> None:
+            interval = HEARTBEAT_INTERVAL_SECONDS
+            try:
+                while not hb_stop.is_set():
+                    try:
+                        await asyncio.wait_for(hb_stop.wait(), timeout=interval)
+                    except TimeoutError:
+                        pass
+                    if hb_stop.is_set():
+                        return
+                    still_ours = await asyncio.to_thread(
+                        heartbeat_exec_lock,
+                        exec_lock,
+                        expected_runtime,
+                    )
+                    if not still_ours:
+                        logger.warning(
+                            "[scheduler] %s exec lock taken over by another "
+                            "process mid-run; stopping heartbeat",
+                            task.id,
+                        )
+                        return
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[scheduler] heartbeat loop(%s) raised %s",
+                    task.id,
+                    exc,
+                )
+
+        hb_task = asyncio.create_task(_heartbeat_loop(), name=f"sched-hb-{task.id}")
+
+        # C17 Phase A.4：把 task_id 推到 ContextVar，供
+        # tool_executor._defer_unattended_confirm 在没有 state.task_id 时回退。
+        ctx_token = set_current_scheduled_task_id(task.id)
 
         if self._plugin_hooks:
             try:
@@ -446,11 +898,55 @@ class TaskScheduler:
             else:
                 execution.finish(True, result="No executor configured")
 
+            # C12 §14.5: a `[awaiting_approval] pending_id=…` marker from the
+            # executor signals the task hit a PendingApproval and is paused —
+            # NOT a normal failure. Move task to AWAITING_APPROVAL and skip
+            # the failure-counter / auto-disable / advance_next_run flow.
+            # When owner resolves to "allow", a separate API call (resume_pending)
+            # transitions back to SCHEDULED and re-runs the task with a 30s
+            # ReplayAuthorization injected (see C12-R3-5).
+            _err_or_res = (
+                execution.error if execution.status != "success" else (execution.result or "")
+            )
+            _is_deferred = isinstance(_err_or_res, str) and _err_or_res.startswith(
+                "[awaiting_approval]"
+            )
+
             if execution.status == "success":
+                # Fix: 使用"实际预定时间"而非 datetime.now() 作为基准。
+                # 由于调度循环的 advance_seconds=20 让任务比预定时间提前 ~20s 触发，
+                # 任务在「真正预定时刻」之前完成时，若直接用 now 调
+                # trigger.get_next_run_time(now)，CronTrigger 内部会
+                # `start = now + 1 分钟 → replace(s/ms=0)`，对于 cron `0 9 * * *`
+                # 这种整点表达式，得到的"下一次"仍然落在今天 09:00 这个槽位，
+                # 于是 _scheduler_loop 下一轮立刻再触发 → 同一任务连跑两次。
+                # 把基线推到 `now + advance_seconds + 5s` 之外，可保证 cron 必须
+                # 跳到下一个真正的匹配槽位。等价于失败/取消路径用的 _advance_next_run。
                 trigger = self._triggers.get(task.id)
-                next_run = trigger.get_next_run_time(datetime.now()) if trigger else None
+                if trigger:
+                    min_next = datetime.now() + timedelta(seconds=self.advance_seconds + 5)
+                    next_run = trigger.get_next_run_time(min_next)
+                else:
+                    next_run = None
                 task.mark_completed(next_run)
+                # 成功跑完一次后，重置 metadata 里历史累计的 missed_count，
+                # 否则前端会一直显示 "missed=27/29/36" 这种早期版本遗留的体感数字，
+                # 让用户误以为系统在不停漏跑。保留 missed_count_cleared_at 时间戳，
+                # 便于排查历史 missed 行为。
+                if isinstance(task.metadata, dict) and task.metadata.get("missed_count"):
+                    task.metadata["missed_count"] = 0
+                    task.metadata["missed_count_cleared_at"] = datetime.now().isoformat()
                 logger.info(f"Task {task.id} completed successfully")
+            elif _is_deferred:
+                # C12 §14.5: pause the task; do not increment fail_count,
+                # do not advance next_run. ``mark_awaiting_approval`` keeps
+                # the state machine honest (with logging if transition illegal).
+                task.mark_awaiting_approval(marker=_err_or_res)
+                logger.info(
+                    "Task %s paused awaiting owner approval: %s",
+                    task.id,
+                    _err_or_res,
+                )
             else:
                 self._handle_task_failure(task, execution.error or "Unknown error")
 
@@ -466,6 +962,25 @@ class TaskScheduler:
             task.mark_failed(error_msg)
             self._advance_next_run(task)
             logger.error(f"Task {task.id} failed: {error_msg}", exc_info=True)
+
+        finally:
+            # C17 Phase A.2 §4：heartbeat task + exec lock 兜底清理。
+            # 即便上面任一分支抛了未捕获异常，也要保证 lock 文件被删除、
+            # ContextVar 被复位，否则下次进程启动会把这次留下的 lock
+            # 当 orphan 走 rescan，task 状态徒增噪音。
+            hb_stop.set()
+            hb_task.cancel()
+            try:
+                await hb_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            try:
+                release_exec_lock(exec_lock)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[scheduler] release_exec_lock(%s) raised %s", task.id, exc
+                )
+            reset_current_scheduled_task_id(ctx_token)
 
         async with self._lock:
             self._executions.append(execution)
@@ -537,7 +1052,23 @@ class TaskScheduler:
         # 对于间隔任务和 cron 任务，记录 missed 并推进到下一次
         task.metadata["last_missed_at"] = missed_at.isoformat() if missed_at else now.isoformat()
         missed_count = task.metadata.get("missed_count", 0)
-        task.metadata["missed_count"] = missed_count + 1
+        new_missed_count = missed_count + 1
+
+        # Fix-7：missed_count 上限保护（默认 100）。无限累积只会让 UI
+        # SchedulerView 出现"missed=27"这种"不健康"的数字，但实际上调度器
+        # 已经按 trigger.get_next_run_time(now) 跳过历史，再多统计也无意义。
+        # 超过上限时强制清零并写一条审计字段，避免历史包袱误导用户。
+        _MISSED_COUNT_HARD_CAP = 100
+        if new_missed_count >= _MISSED_COUNT_HARD_CAP:
+            task.metadata["missed_count_reset_at"] = now.isoformat()
+            task.metadata["missed_count_last_overflow"] = new_missed_count
+            new_missed_count = 0
+            logger.warning(
+                f"Task {task.id} missed_count reached cap "
+                f"({_MISSED_COUNT_HARD_CAP}); resetting to 0 and stamping "
+                f"metadata.missed_count_last_overflow"
+            )
+        task.metadata["missed_count"] = new_missed_count
 
         next_run = trigger.get_next_run_time(now)
 
@@ -548,7 +1079,7 @@ class TaskScheduler:
         task.next_run = next_run
         logger.info(
             f"Recalculated next_run for task {task.id}: {next_run} "
-            f"(missed at {missed_at}, total missed: {missed_count + 1})"
+            f"(missed at {missed_at}, total missed: {new_missed_count})"
         )
 
     # ==================== 持久化 ====================
@@ -601,16 +1132,26 @@ class TaskScheduler:
                 return
 
             skipped_session = 0
+            quarantined_names: list[tuple[str, str]] = []
             for item in data:
                 try:
                     if not isinstance(item, dict):
                         logger.warning(f"Skipping non-dict task entry: {type(item).__name__}")
                         continue
                     task = ScheduledTask.from_dict(item)
-                    # T1: SESSION tasks should not survive restart
                     if task.durability == TaskDurability.SESSION:
                         skipped_session += 1
                         continue
+
+                    # Fix-15：历史 task 可能在 storage 里残留路径穿越/控制字符
+                    # 形态的 name —— 启动时一次性 quarantine 重命名，
+                    # 既保留审计痕迹（可在 UI 看到 `__quarantine__/` 前缀），
+                    # 又把这些非法字符隔离出后续日志/文件命名链路。
+                    new_name = quarantine_invalid_task_name(task.name)
+                    if new_name is not None:
+                        quarantined_names.append((task.name, new_name))
+                        task.name = new_name
+
                     self._tasks[task.id] = task
 
                     trigger = Trigger.from_config(task.trigger_type.value, task.trigger_config)
@@ -621,6 +1162,16 @@ class TaskScheduler:
                     logger.warning(f"Failed to load task {task_id}: {e}")
             if skipped_session:
                 logger.info(f"Skipped {skipped_session} SESSION-durability task(s) on load")
+
+            if quarantined_names:
+                for orig, new in quarantined_names:
+                    logger.warning(
+                        "[Scheduler] Quarantined invalid task name on load: %r → %r",
+                        orig,
+                        new,
+                    )
+                with contextlib.suppress(Exception):
+                    self._save_tasks()
 
             logger.info(f"Loaded {len(self._tasks)} tasks from storage")
 

@@ -28,6 +28,13 @@ class RelationalMemoryStore:
         self._conn = conn
         self._ensure_tables()
 
+    @staticmethod
+    def _active_node_where(alias: str = "") -> tuple[str, list[str]]:
+        prefix = f"{alias}." if alias else ""
+        return f"({prefix}valid_until IS NULL OR {prefix}valid_until >= ?)", [
+            datetime.now().isoformat()
+        ]
+
     # ------------------------------------------------------------------
     # Schema
     # ------------------------------------------------------------------
@@ -97,6 +104,11 @@ class RelationalMemoryStore:
             c.execute("ALTER TABLE mdrm_nodes ADD COLUMN agent_id TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        for col, default in [("user_id", "'default'"), ("workspace_id", "'default'")]:
+            try:
+                c.execute(f"ALTER TABLE mdrm_nodes ADD COLUMN {col} TEXT DEFAULT {default}")
+            except sqlite3.OperationalError:
+                pass
 
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_mdrm_nodes_time ON mdrm_nodes(occurred_at)",
@@ -104,6 +116,7 @@ class RelationalMemoryStore:
             "CREATE INDEX IF NOT EXISTS idx_mdrm_nodes_project ON mdrm_nodes(project)",
             "CREATE INDEX IF NOT EXISTS idx_mdrm_nodes_session ON mdrm_nodes(session_id)",
             "CREATE INDEX IF NOT EXISTS idx_mdrm_nodes_agent ON mdrm_nodes(agent_id)",
+            "CREATE INDEX IF NOT EXISTS idx_mdrm_nodes_owner ON mdrm_nodes(workspace_id, user_id)",
             "CREATE INDEX IF NOT EXISTS idx_mdrm_edges_source ON mdrm_edges(source_id)",
             "CREATE INDEX IF NOT EXISTS idx_mdrm_edges_target ON mdrm_edges(target_id)",
             "CREATE INDEX IF NOT EXISTS idx_mdrm_edges_dim ON mdrm_edges(dimension)",
@@ -289,8 +302,8 @@ class RelationalMemoryStore:
                (id, content, node_type, occurred_at, valid_from, valid_until,
                 entities, action_verb, action_category, session_id, project, goal,
                 importance, confidence, access_count, embedding, created_at, updated_at,
-                agent_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                agent_id, user_id, workspace_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 node.id,
                 node.content,
@@ -311,6 +324,8 @@ class RelationalMemoryStore:
                 node.created_at.isoformat() if node.created_at else now,
                 now,
                 node.agent_id,
+                node.user_id,
+                node.workspace_id,
             ),
         )
 
@@ -344,8 +359,8 @@ class RelationalMemoryStore:
                    (id, content, node_type, occurred_at, valid_from, valid_until,
                     entities, action_verb, action_category, session_id, project, goal,
                     importance, confidence, access_count, embedding, created_at, updated_at,
-                    agent_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    agent_id, user_id, workspace_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     node.id,
                     node.content,
@@ -366,6 +381,8 @@ class RelationalMemoryStore:
                     node.created_at.isoformat() if node.created_at else now,
                     now,
                     node.agent_id,
+                    node.user_id,
+                    node.workspace_id,
                 ),
             )
             self._conn.execute("DELETE FROM mdrm_entity_index WHERE node_id = ?", (node.id,))
@@ -498,9 +515,10 @@ class RelationalMemoryStore:
             if not ranked_ids:
                 return self.search_like(query, limit)
             placeholders = ",".join("?" for _ in ranked_ids)
+            active_where, active_params = self._active_node_where()
             cur2 = self._conn.execute(
-                f"SELECT * FROM mdrm_nodes WHERE id IN ({placeholders})",
-                ranked_ids,
+                f"SELECT * FROM mdrm_nodes WHERE id IN ({placeholders}) AND {active_where}",
+                ranked_ids + active_params,
             )
             desc = cur2.description
             nodes_by_id: dict[str, MemoryNode] = {}
@@ -516,12 +534,16 @@ class RelationalMemoryStore:
             return []
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
+        active_where, active_params = self._active_node_where()
         cur = self._conn.execute(
             """SELECT * FROM mdrm_nodes
-               WHERE content LIKE ? ESCAPE '\\' OR action_verb LIKE ? ESCAPE '\\'
-               OR project LIKE ? ESCAPE '\\'
+               WHERE (content LIKE ? ESCAPE '\\' OR action_verb LIKE ? ESCAPE '\\'
+               OR project LIKE ? ESCAPE '\\')
+               AND """
+            + active_where
+            + """
                ORDER BY importance DESC LIMIT ?""",
-            (pattern, pattern, pattern, limit),
+            (pattern, pattern, pattern, *active_params, limit),
         )
         return [self._row_to_node(cur.description, r) for r in cur.fetchall()]
 
@@ -534,29 +556,52 @@ class RelationalMemoryStore:
         row = cur.fetchone()
         canonical = row[0] if row else name_lower
 
+        active_where, active_params = self._active_node_where("n")
         cur = self._conn.execute(
             """SELECT n.* FROM mdrm_nodes n
                JOIN mdrm_entity_index ei ON n.id = ei.node_id
-               WHERE ei.entity_name = ?
+               WHERE ei.entity_name = ? AND """
+            + active_where
+            + """
                ORDER BY n.importance DESC LIMIT ?""",
-            (canonical, limit),
+            (canonical, *active_params, limit),
         )
         return [self._row_to_node(cur.description, r) for r in cur.fetchall()]
 
     def search_by_time_range(
         self, start: datetime, end: datetime, limit: int = 50
     ) -> list[MemoryNode]:
+        active_where, active_params = self._active_node_where()
         cur = self._conn.execute(
             """SELECT * FROM mdrm_nodes
-               WHERE occurred_at >= ? AND occurred_at <= ?
+               WHERE occurred_at >= ? AND occurred_at <= ? AND """
+            + active_where
+            + """
                ORDER BY occurred_at DESC LIMIT ?""",
-            (start.isoformat(), end.isoformat(), limit),
+            (start.isoformat(), end.isoformat(), *active_params, limit),
         )
         return [self._row_to_node(cur.description, r) for r in cur.fetchall()]
 
-    def get_all_nodes(self, limit: int = 2000) -> list[MemoryNode]:
+    def get_all_nodes(
+        self,
+        limit: int = 2000,
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> list[MemoryNode]:
+        active_where, active_params = self._active_node_where()
+        conditions = [active_where]
+        params: list[object] = [*active_params]
+        if user_id is not None:
+            conditions.append("COALESCE(user_id, 'default') = ?")
+            params.append(user_id)
+        if workspace_id is not None:
+            conditions.append("COALESCE(workspace_id, 'default') = ?")
+            params.append(workspace_id)
+        where = " AND ".join(conditions)
         cur = self._conn.execute(
-            "SELECT * FROM mdrm_nodes ORDER BY importance DESC LIMIT ?", (limit,)
+            f"SELECT * FROM mdrm_nodes WHERE {where} ORDER BY importance DESC LIMIT ?",
+            (*params, limit),
         )
         return [self._row_to_node(cur.description, r) for r in cur.fetchall()]
 
@@ -738,6 +783,8 @@ class RelationalMemoryStore:
             created_at=_parse_dt(d.get("created_at")),
             updated_at=_parse_dt(d.get("updated_at")),
             agent_id=d.get("agent_id", ""),
+            user_id=d.get("user_id", "default") or "default",
+            workspace_id=d.get("workspace_id", "default") or "default",
         )
 
     def _row_to_edge(self, description: Any, row: tuple) -> MemoryEdge:

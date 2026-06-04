@@ -12,15 +12,26 @@
 - manage_skill_enabled: 启用/禁用技能
 - execute_skill: 在隔离上下文中执行技能 (F10)
 - uninstall_skill: 卸载外部技能 (F14)
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
+import asyncio
 import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...core.policy_v2 import ApprovalClass
 from ...core.tool_executor import MAX_TOOL_RESULT_CHARS, OVERFLOW_MARKER, save_overflow
-from ...skills.events import notify_skills_changed
+from ...skills.catalog import SKILL_INSTRUCTION_ADVISORY
+from ...skills.events import SkillEvent
 from ...skills.exposure import build_skill_exposure
 
 if TYPE_CHECKING:
@@ -49,6 +60,20 @@ class SkillsHandler:
         "execute_skill",
         "uninstall_skill",
     ]
+
+    # C7 explicit ApprovalClass — skills installation modifies skills/ dir
+    TOOL_CLASSES = {
+        "list_skills": ApprovalClass.READONLY_GLOBAL,
+        "get_skill_info": ApprovalClass.READONLY_GLOBAL,
+        "run_skill_script": ApprovalClass.EXEC_CAPABLE,
+        "get_skill_reference": ApprovalClass.READONLY_GLOBAL,
+        "install_skill": ApprovalClass.CONTROL_PLANE,
+        "load_skill": ApprovalClass.CONTROL_PLANE,
+        "reload_skill": ApprovalClass.CONTROL_PLANE,
+        "manage_skill_enabled": ApprovalClass.CONTROL_PLANE,
+        "execute_skill": ApprovalClass.EXEC_CAPABLE,
+        "uninstall_skill": ApprovalClass.DESTRUCTIVE,
+    }
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
@@ -87,6 +112,8 @@ class SkillsHandler:
 
     def _list_skills(self, params: dict) -> str:
         """列出所有技能，区分启用/禁用/可发现状态"""
+        verbose = bool(params.get("verbose", False))
+        include_paths = bool(params.get("include_paths", False))
         all_skills = self.agent.skill_registry.list_all(include_disabled=True)
         if not all_skills:
             return (
@@ -110,39 +137,57 @@ class SkillsHandler:
             f"({enabled_total} 预加载, "
             f"{len(discoverable_external)} 可发现, "
             f"{len(disabled_external)} 禁用):\n\n"
+            "默认返回紧凑目录，避免把所有技能说明塞进对话上下文。"
+            "需要完整描述时再次调用 `list_skills({\"verbose\": true})`；"
+            "需要准确路径时优先用 `get_skill_info(skill_name)`，或显式传 `include_paths: true`。\n\n"
         )
+
+        def display_name(skill) -> str:
+            zh_name = skill.name_i18n.get("zh", "")
+            return f"{skill.name} ({zh_name})" if zh_name else skill.name
+
+        def short_desc(skill, limit: int = 80) -> str:
+            desc = (getattr(skill, "description", "") or "").split("\n")[0].strip()
+            when = (getattr(skill, "when_to_use", "") or "").strip()
+            text = when or desc
+            if len(text) > limit:
+                return text[:limit].rstrip() + "..."
+            return text
+
+        def exposure_suffix(skill, *, system: bool = False) -> str:
+            exposed = build_skill_exposure(skill)
+            parts = [f"source={exposed.origin_label}"]
+            if system and exposed.tool_name:
+                parts.append(f"tool={exposed.tool_name}")
+            if system and exposed.handler:
+                parts.append(f"handler={exposed.handler}")
+            if include_paths and exposed.skill_dir:
+                parts.append(f"path={exposed.skill_dir}")
+            return ", ".join(parts)
 
         if system_skills:
             output += f"**系统技能 ({len(system_skills)})** [全部启用]:\n"
             for skill in system_skills:
-                exposed = build_skill_exposure(skill)
                 auto = "自动" if not skill.disable_model_invocation else "手动"
-                zh_name = skill.name_i18n.get("zh", "")
-                name_part = f"{skill.name} ({zh_name})" if zh_name else skill.name
-                output += f"- {name_part} [{auto}] - {skill.description}\n"
-                output += (
-                    f"  source={exposed.origin_label}"
-                    + (f", tool={exposed.tool_name}" if exposed.tool_name else "")
-                    + (f", handler={exposed.handler}" if exposed.handler else "")
-                    + (f", path={exposed.skill_dir}" if exposed.skill_dir else "")
-                    + "\n"
-                )
+                output += f"- {display_name(skill)} [{auto}]"
+                if verbose:
+                    output += f" - {skill.description}"
+                else:
+                    hint = short_desc(skill)
+                    if hint:
+                        output += f" - {hint}"
+                output += f"\n  {exposure_suffix(skill, system=True)}\n"
             output += "\n"
 
         if enabled_external:
             output += f"**已启用外部技能 ({len(enabled_external)})**:\n"
             for skill in enabled_external:
-                exposed = build_skill_exposure(skill)
                 auto = "自动" if not skill.disable_model_invocation else "手动"
-                zh_name = skill.name_i18n.get("zh", "")
-                name_part = f"{skill.name} ({zh_name})" if zh_name else skill.name
-                output += f"- {name_part} [{auto}]\n"
-                output += f"  {skill.description}\n"
-                output += (
-                    f"  source={exposed.origin_label}"
-                    + (f", path={exposed.skill_dir}" if exposed.skill_dir else "")
-                    + "\n\n"
-                )
+                output += f"- {display_name(skill)} [{auto}]"
+                hint = skill.description if verbose else short_desc(skill)
+                if hint:
+                    output += f" - {hint}"
+                output += f"\n  {exposure_suffix(skill)}\n\n"
 
         if discoverable_external:
             output += (
@@ -150,32 +195,22 @@ class SkillsHandler:
                 "[未预加载 — 使用 get_skill_info(skill_name) 加载指令后即可使用]:\n"
             )
             for skill in discoverable_external:
-                exposed = build_skill_exposure(skill)
-                zh_name = skill.name_i18n.get("zh", "")
-                name_part = f"{skill.name} ({zh_name})" if zh_name else skill.name
-                output += f"- {name_part} [可发现]\n"
-                output += f"  {skill.description}\n"
-                output += (
-                    f"  source={exposed.origin_label}"
-                    + (f", path={exposed.skill_dir}" if exposed.skill_dir else "")
-                    + "\n\n"
-                )
+                output += f"- {display_name(skill)} [可发现]"
+                hint = skill.description if verbose else short_desc(skill)
+                if hint:
+                    output += f" - {hint}"
+                output += f"\n  {exposure_suffix(skill)}\n\n"
 
         if disabled_external:
             output += (
                 f"**已禁用外部技能 ({len(disabled_external)})** [需在技能面板启用后才可使用]:\n"
             )
             for skill in disabled_external:
-                exposed = build_skill_exposure(skill)
-                zh_name = skill.name_i18n.get("zh", "")
-                name_part = f"{skill.name} ({zh_name})" if zh_name else skill.name
-                output += f"- {name_part} [已禁用]\n"
-                output += f"  {skill.description}\n"
-                output += (
-                    f"  source={exposed.origin_label}"
-                    + (f", path={exposed.skill_dir}" if exposed.skill_dir else "")
-                    + "\n\n"
-                )
+                output += f"- {display_name(skill)} [已禁用]"
+                hint = skill.description if verbose else short_desc(skill)
+                if hint:
+                    output += f" - {hint}"
+                output += f"\n  {exposure_suffix(skill)}\n\n"
 
         return self._truncate_skill_content("list_skills", output)
 
@@ -274,9 +309,9 @@ class SkillsHandler:
         # F7: inject allowed_tools into policy engine
         if skill.allowed_tools:
             try:
-                from synapse.core.policy import get_policy_engine
+                from synapse.core.policy_v2 import get_skill_allowlist_manager
 
-                get_policy_engine().add_skill_allowlist(skill.skill_id, skill.allowed_tools)
+                get_skill_allowlist_manager().add(skill.skill_id, skill.allowed_tools)
             except Exception as e:
                 logger.warning("Failed to inject skill allowlist for %s: %s", skill.skill_id, e)
 
@@ -314,10 +349,17 @@ class SkillsHandler:
             output += f"**处理器**: {skill.handler}\n"
         else:
             output += "**类型**: 外部技能\n"
+            output += f"**使用原则**: {SKILL_INSTRUCTION_ADVISORY}\n"
         if exposed.instruction_only:
             output += "**脚本**: instruction-only (no executable scripts)\n"
         else:
             output += f"**可执行脚本**: {', '.join(exposed.scripts)}\n"
+            if exposed.skill_dir:
+                output += f"**脚本默认工作目录**: {exposed.skill_dir}\n"
+                output += (
+                    "**脚本导入规则**: Python 脚本执行时会把技能目录加入 PYTHONPATH；"
+                    "入口脚本依赖的模块应放在该技能目录内，不要依赖工作区根目录的游离 .py 文件。\n"
+                )
         if exposed.references:
             output += f"**参考文档**: {', '.join(exposed.references)}\n"
         output += (
@@ -328,6 +370,11 @@ class SkillsHandler:
             output += f"**许可证**: {skill.license}\n"
         if skill.compatibility:
             output += f"**兼容性**: {skill.compatibility}\n"
+        if getattr(skill, "python_env", "") or getattr(skill, "python_dependencies", None):
+            output += f"**Python 环境**: {getattr(skill, 'python_env', '') or 'agent'}\n"
+            deps = list(getattr(skill, "python_dependencies", []) or [])
+            if deps:
+                output += f"**Python 依赖**: {', '.join(deps)}\n"
         if skill.model:
             output += f"**推荐模型**: {skill.model}\n"
         if skill.execution_context and skill.execution_context != "inline":
@@ -341,6 +388,9 @@ class SkillsHandler:
             if args_block:
                 output += f"\n{args_block}\n"
 
+        from ...utils.context_scan import scan_context_content
+
+        body, threats = scan_context_content(body, source=f"skill:{skill_name}")
         output += "\n---\n\n"
         output += body
 
@@ -381,9 +431,70 @@ class SkillsHandler:
             if not allowed:
                 return f"❌ 工作目录被拒绝: {cwd_raw}\ncwd 只能位于项目工作区或技能目录内。"
 
+        skill_entry = self.agent.skill_registry.get(skill_name)
+        python_executable: str | None = None
+        script_env: dict[str, str] | None = None
+        env_scope = "legacy"
+        deps_hash = ""
+        try:
+            import time
+
+            deps = list(getattr(skill_entry, "python_dependencies", []) or []) if skill_entry else []
+            py_env = (getattr(skill_entry, "python_env", "") or "").strip().lower() if skill_entry else ""
+            spec = None
+            if skill_entry and (deps or py_env == "skill"):
+                from ...runtime_manager import (
+                    apply_execution_environment,
+                    build_user_subprocess_environment,
+                    ensure_execution_env,
+                    resolve_skill_env,
+                )
+
+                spec = ensure_execution_env(resolve_skill_env(skill_entry.skill_id, deps=deps))
+                env_scope = "skill"
+                deps_hash = spec.deps_hash
+                python_executable = str(spec.python_path)
+                script_env = apply_execution_environment(build_user_subprocess_environment(), spec)
+            elif getattr(self.agent, "_execution_env_spec", None) is not None:
+                from ...runtime_manager import (
+                    apply_execution_environment,
+                    build_user_subprocess_environment,
+                    ensure_execution_env,
+                )
+
+                spec = ensure_execution_env(self.agent._execution_env_spec)
+                env_scope = "agent"
+                deps_hash = spec.deps_hash
+                python_executable = str(spec.python_path)
+                script_env = apply_execution_environment(build_user_subprocess_environment(), spec)
+        except Exception as exc:
+            return f"❌ 技能 Python 环境准备失败:\n{exc}"
+
+        started_at = time.monotonic()
         success, output = self.agent.skill_loader.run_script(
-            skill_name, script_name, args, cwd=resolved_cwd
+            skill_name,
+            script_name,
+            args,
+            cwd=resolved_cwd,
+            python_executable=python_executable,
+            env=script_env,
         )
+
+        try:
+            from ...experience import get_tool_experience_tracker
+
+            get_tool_experience_tracker().record(
+                tool_name="run_skill_script",
+                agent_profile_id=getattr(self.agent, "_agent_profile_id", "default"),
+                skill_name=skill_entry.skill_id if skill_entry else skill_name,
+                env_scope=env_scope,
+                deps_hash=deps_hash,
+                success=success,
+                duration_ms=(time.monotonic() - started_at) * 1000,
+                output=output,
+            )
+        except Exception:
+            pass
 
         if success:
             return f"✅ 脚本执行成功:\n{output}"
@@ -402,6 +513,16 @@ class SkillsHandler:
                 return (
                     f"❌ 脚本执行失败:\n{output}\n\n"
                     f"**建议**: Use one of the available scripts listed above."
+                )
+            elif "modulenotfounderror" in output_lower or "no module named" in output_lower:
+                module_hint = self._diagnose_missing_skill_module(skill_entry, output)
+                return (
+                    f"❌ 脚本执行失败:\n{output}\n\n"
+                    f"**建议**: 这是 Python 模块导入失败。"
+                    f"{module_hint}"
+                    f"可复用工具的入口脚本和被导入模块必须放在同一个技能目录内，"
+                    f"例如 `skills/{skill_name}/scripts/main.py` 导入 "
+                    f"`skills/{skill_name}/news_searcher.py`。"
                 )
             elif "not found" in output_lower or "未找到" in output_lower:
                 return (
@@ -430,6 +551,44 @@ class SkillsHandler:
                     f"**建议**: 请检查脚本参数是否正确，或使用 `get_skill_info` 查看技能使用说明"
                 )
 
+    @staticmethod
+    def _diagnose_missing_skill_module(skill_entry: Any, output: str) -> str:
+        """Return a targeted hint when a skill script imports a module outside its skill dir."""
+        match = re.search(r"No module named ['\"]([^'\"]+)['\"]", output)
+        if not match:
+            return ""
+        module_name = match.group(1).split(".")[0]
+        candidate_name = f"{module_name}.py"
+
+        try:
+            from synapse.config import settings
+
+            project_root = Path(settings.project_root)
+        except Exception:
+            project_root = Path.cwd()
+
+        root_candidate = project_root / candidate_name
+        if not root_candidate.exists():
+            return ""
+
+        skill_dir = None
+        try:
+            skill_dir = Path(skill_entry.skill_dir) if skill_entry else None
+        except Exception:
+            skill_dir = None
+
+        if skill_dir:
+            return (
+                f"检测到 `{candidate_name}` 位于工作区根目录 `{project_root}`，"
+                f"但当前脚本从技能目录 `{skill_dir}` 执行，无法稳定导入它。"
+                f"请把该模块移动到 `{skill_dir / candidate_name}`，"
+                f"或把入口脚本改为导入技能目录内的模块。"
+            )
+        return (
+            f"检测到 `{candidate_name}` 位于工作区根目录 `{project_root}`，"
+            "请把它移动到当前技能目录内。"
+        )
+
     def _get_skill_reference(self, params: dict) -> str:
         """获取技能参考文档"""
         skill_name = params["skill_name"]
@@ -451,7 +610,7 @@ class SkillsHandler:
         extra_files = params.get("extra_files", [])
 
         result = await self.agent.skill_manager.install_skill(source, name, subdir, extra_files)
-        notify_skills_changed("install")
+        self.agent.propagate_skill_change(SkillEvent.INSTALL)
         return result
 
     def _load_skill(self, params: dict) -> str:
@@ -480,17 +639,39 @@ class SkillsHandler:
             return f"⚠️ 技能 '{skill_name}' 已存在。如需更新，请使用 reload_skill"
 
         try:
-            # 加载技能
-            loaded = self.agent.skill_loader.load_skill(skill_dir)
+            loaded = self.agent.skill_loader.load_skill(skill_dir, force=True)
 
             if loaded:
-                # 刷新技能目录缓存 + handler 映射
-                self.agent._skill_catalog_text = self.agent.skill_catalog.generate_catalog()
-                self.agent._update_skill_tools()
-                self.agent.notify_pools_skills_changed()
-                notify_skills_changed("load")
-
+                # 所有刷新（catalog / tool 映射 / activation / pool / system prompt / event）
+                # 都在 propagate_skill_change 里完成，工具处理器层不要再手工调用任何子步骤。
+                self.agent.propagate_skill_change(SkillEvent.LOAD, rescan=False)
                 logger.info(f"Skill loaded: {skill_name}")
+
+                # 触发后台自动翻译（不阻塞返回）。安装路径已经做过同样处理，
+                # _load_skill 是另一条入口（用户用工具加载本地新建技能），
+                # 这里补齐让 i18n.yaml 写入一致。
+                try:
+                    brain = getattr(self.agent, "brain", None)
+                    if brain is not None:
+                        from synapse.skills.i18n import auto_translate_skill
+
+                        meta = loaded.metadata
+                        kw = list(getattr(meta, "keywords", []) or [])
+                        coro = auto_translate_skill(
+                            skill_dir=skill_dir,
+                            name=meta.name,
+                            description=meta.description or "",
+                            brain=brain,
+                            when_to_use=getattr(meta, "when_to_use", "") or "",
+                            keywords=kw,
+                            argument_hint=getattr(meta, "argument_hint", "") or "",
+                        )
+                        try:
+                            asyncio.get_running_loop().create_task(coro)
+                        except RuntimeError:
+                            coro.close()
+                except Exception as te:  # pragma: no cover - 仅日志
+                    logger.debug(f"auto_translate_skill scheduling skipped: {te}")
 
                 return f"""✅ 技能加载成功！
 
@@ -517,16 +698,11 @@ class SkillsHandler:
             return f"❌ 技能 '{skill_name}' 未加载。如需加载新技能，请使用 load_skill"
 
         try:
-            # 重新加载
             reloaded = self.agent.skill_loader.reload_skill(skill_name)
 
             if reloaded:
-                # 刷新技能目录缓存 + handler 映射
-                self.agent._skill_catalog_text = self.agent.skill_catalog.generate_catalog()
-                self.agent._update_skill_tools()
-                self.agent.notify_pools_skills_changed()
-                notify_skills_changed("reload")
-
+                # loader.reload_skill 已经重新注册单个 skill，rescan=False 避免二次全量扫描。
+                self.agent.propagate_skill_change(SkillEvent.RELOAD, rescan=False)
                 logger.info(f"Skill reloaded: {skill_name}")
 
                 return f"""✅ 技能重新加载成功！
@@ -545,7 +721,7 @@ class SkillsHandler:
 
     def _manage_skill_enabled(self, params: dict) -> str:
         """批量启用/禁用外部技能"""
-        import json
+        from synapse.skills.allowlist_io import overwrite_allowlist, read_allowlist
 
         changes: list[dict] = params.get("changes", [])
         reason: str = params.get("reason", "")
@@ -553,36 +729,16 @@ class SkillsHandler:
         if not changes:
             return "❌ 未指定要变更的技能"
 
-        from synapse.utils.whaleclouddevtool import (
-            WHALECLOUD_BASE_SCRIPTS_SKILL_ID,
-            is_whalecloud_base_scripts_skill_id,
-        )
+        _, existing_allowlist = read_allowlist()
 
-        try:
-            from synapse.config import settings
-
-            cfg_path = settings.project_root / "data" / "skills.json"
-        except Exception:
-            cfg_path = Path.cwd() / "data" / "skills.json"
-
-        # 读取现有 allowlist
-        existing_allowlist: set[str] | None = None
-        try:
-            if cfg_path.exists():
-                raw = cfg_path.read_text(encoding="utf-8")
-                cfg = json.loads(raw) if raw.strip() else {}
-                al = cfg.get("external_allowlist", None)
-                if isinstance(al, list):
-                    existing_allowlist = {str(x).strip() for x in al if str(x).strip()}
-        except Exception:
-            pass
-
-        # 如果没有 allowlist 文件，初始化为当前所有外部技能的 skill_id
+        # 若文件尚不存在：用当前所有已启用外部技能作为初始集合
         if existing_allowlist is None:
             all_skills = self.agent.skill_registry.list_all()
             existing_allowlist = {s.skill_id for s in all_skills if not s.system}
+        else:
+            existing_allowlist = set(existing_allowlist)
 
-        # 收集所有已知外部技能 skill_id（包括被 prune 的）
+        # 收集所有已知外部技能 skill_id（包括被 prune 掉、仅在 loader 缓存里的）
         all_external_ids = set(existing_allowlist)
         loader = getattr(self.agent, "skill_loader", None)
         if loader:
@@ -592,6 +748,7 @@ class SkillsHandler:
 
         applied: list[str] = []
         skipped: list[str] = []
+        any_disabled = False
 
         for change in changes:
             name = change.get("skill_name", "").strip()
@@ -599,16 +756,12 @@ class SkillsHandler:
             if not name:
                 continue
 
-            # Resolve to skill_id (accept both skill_id and display name)
+            # 支持 skill_id 或显示名
             skill = self.agent.skill_registry.get(name)
             sid = skill.skill_id if skill else name
 
             if skill and skill.system:
                 skipped.append(f"{sid}（系统技能，不可禁用）")
-                continue
-
-            if not enabled and is_whalecloud_base_scripts_skill_id(sid):
-                skipped.append(f"{sid}（研发工具必选依赖，不可禁用）")
                 continue
 
             if sid not in all_external_ids:
@@ -619,6 +772,7 @@ class SkillsHandler:
                 existing_allowlist.add(sid)
             else:
                 existing_allowlist.discard(sid)
+                any_disabled = True
             applied.append(f"{sid} → {'启用' if enabled else '禁用'}")
 
         if not applied:
@@ -627,44 +781,22 @@ class SkillsHandler:
                 msg += f"\n跳过: {', '.join(skipped)}"
             return msg
 
-        existing_allowlist.add(WHALECLOUD_BASE_SCRIPTS_SKILL_ID)
-
-        # 写入 data/skills.json
-        content = {
-            "version": 1,
-            "external_allowlist": sorted(existing_allowlist),
-            "updated_at": __import__("datetime").datetime.now().isoformat(),
-        }
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(
-            json.dumps(content, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-        # 热重载
+        # 原子写入 data/skills.json（唯一写入点：allowlist_io.overwrite_allowlist）
         try:
-            from synapse.skills.preset_utils import collect_preset_referenced_skills
-
-            effective = (
-                loader.compute_effective_allowlist(existing_allowlist)
-                if loader
-                else existing_allowlist
-            )
-            agent_skills = collect_preset_referenced_skills()
-            if loader:
-                loader.prune_external_by_allowlist(effective, agent_referenced_skills=agent_skills)
-            catalog = getattr(self.agent, "skill_catalog", None)
-            if catalog:
-                catalog.invalidate_cache()
-                self.agent._skill_catalog_text = catalog.generate_catalog()
-            self.agent._update_skill_tools()
-            self.agent.notify_pools_skills_changed()
+            overwrite_allowlist(existing_allowlist)
         except Exception as e:
-            logger.warning(f"Post-manage reload failed: {e}")
+            logger.error("Failed to persist skills allowlist: %s", e)
+            return f"❌ 写入 data/skills.json 失败: {e}"
 
-        notify_skills_changed("enable")
+        # 统一刷新入口：rescan=False，仅重跑 allowlist→catalog→pool 链
+        action = SkillEvent.DISABLE if any_disabled else SkillEvent.ENABLE
+        self.agent.propagate_skill_change(action, rescan=False)
 
-        output = f"✅ 技能状态已更新（{len(applied)} 项变更）\n\n"
+        output = (
+            f"✅ 外部技能启用列表已更新（{len(applied)} 项变更）\n\n"
+            "说明: 本操作只修改 `data/skills.json` 的 `external_allowlist`，"
+            "不修改安全策略白名单或 IM 白名单。\n\n"
+        )
         if reason:
             output += f"**原因**: {reason}\n\n"
         output += "**变更详情**:\n"
@@ -708,9 +840,9 @@ class SkillsHandler:
         # F7: inject temporary tool allowlist
         if skill.allowed_tools:
             try:
-                from synapse.core.policy import get_policy_engine
+                from synapse.core.policy_v2 import get_skill_allowlist_manager
 
-                get_policy_engine().add_skill_allowlist(skill.skill_id, skill.allowed_tools)
+                get_skill_allowlist_manager().add(skill.skill_id, skill.allowed_tools)
             except Exception as e:
                 logger.warning(
                     "Failed to inject allowlist for fork skill %s: %s", skill.skill_id, e
@@ -775,7 +907,6 @@ class SkillsHandler:
                 conversation_id=fork_conv_id,
                 is_sub_agent=True,
                 endpoint_override=endpoint_override,
-                usage_scene=f"execute_skill_{skill.skill_id}",
             )
         except Exception as e:
             logger.error("Fork execution of skill '%s' failed: %s", skill_name, e, exc_info=True)
@@ -797,9 +928,9 @@ class SkillsHandler:
         """Clean up temporary tool allowlist injected for fork execution."""
         if skill.allowed_tools:
             try:
-                from synapse.core.policy import get_policy_engine
+                from synapse.core.policy_v2 import get_skill_allowlist_manager
 
-                get_policy_engine().remove_skill_allowlist(skill.skill_id)
+                get_skill_allowlist_manager().remove(skill.skill_id)
             except Exception:
                 pass
 
@@ -860,23 +991,29 @@ class SkillsHandler:
         if self.agent.skill_registry.get(skill_id):
             self.agent.skill_registry.unregister(skill_id)
 
-        # Refresh catalog and tools
-        self.agent.skill_catalog.invalidate_cache()
-        self.agent._update_skill_tools()
-        notify_skills_changed("uninstall")
+        # 从 external_allowlist 中移除（若存在）；失败不影响卸载主流程。
+        try:
+            from synapse.skills.allowlist_io import remove_skill_ids
 
-        # Clean up activation manager
+            remove_skill_ids({skill_id})
+        except Exception as e:
+            logger.warning("Failed to update allowlist after uninstall of %s: %s", skill_id, e)
+
+        # Clean up activation manager（必须在 propagate 之前，因为 propagate 会重建激活表）
         activation = getattr(self.agent, "_skill_activation", None)
         if activation:
             activation.unregister(skill_id)
 
         # Clean up policy allowlists
         try:
-            from synapse.core.policy import get_policy_engine
+            from synapse.core.policy_v2 import get_skill_allowlist_manager
 
-            get_policy_engine().remove_skill_allowlist(skill_id)
+            get_skill_allowlist_manager().remove(skill_id)
         except Exception:
             pass
+
+        # 统一刷新入口（catalog / tools / pool / event）
+        self.agent.propagate_skill_change(SkillEvent.UNINSTALL, rescan=False)
 
         return f"✅ 技能 '{display_name}' 已卸载。\n\n已删除目录及所有文件，并从系统中注销。"
 

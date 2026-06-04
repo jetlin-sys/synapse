@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections import ChainMap
+from collections.abc import Callable, Coroutine
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .compat import PLUGIN_UI_API_VERSION
 from .manifest import (
     BASIC_PERMISSIONS,
     PluginManifest,
@@ -80,13 +84,23 @@ class PluginAPI:
         self._manifest = manifest
         self._granted_permissions = set(granted_permissions)
         self._data_dir = data_dir
-        self._host = dict(host_refs or {})
+        # ChainMap：先查 ``_host_overrides``（per-plugin 包装层，如 scoped
+        # skill_loader），再查共享的 host_refs。这样：
+        # 1) 宿主在 plugin 加载之后才把 ``gateway`` / ``brain`` 等 wire 进来，
+        #    已存在的 PluginAPI 实例也能立即看到（live-binding）；
+        # 2) 我们对 skill_loader 的 capability-scoped 包装仍然是 plugin 私有，
+        #    不会回写污染 host_refs；
+        # 3) ``self._host.get(key)`` 这类调用点不需要任何改动。
+        self._host_overrides: dict[str, Any] = {}
+        self._host_refs_shared: dict[str, Any] = host_refs if host_refs is not None else {}
+        self._host: ChainMap[str, Any] = ChainMap(self._host_overrides, self._host_refs_shared)
         self._hook_registry = hook_registry
 
         # Wrap skill_loader with capability-scoped proxy
-        if "skill_loader" in self._host and self._host["skill_loader"] is not None:
-            self._host["skill_loader"] = _ScopedSkillLoader(
-                self._host["skill_loader"],
+        skill_loader_ref = self._host_refs_shared.get("skill_loader")
+        if skill_loader_ref is not None:
+            self._host_overrides["skill_loader"] = _ScopedSkillLoader(
+                skill_loader_ref,
                 plugin_id=plugin_id,
             )
         self._registered_tools: list[str] = []
@@ -95,6 +109,8 @@ class PluginAPI:
         self._registered_llm_slugs: list[str] = []
         self._registered_search_backends: list[str] = []
         self._pending_permissions: set[str] = set()
+        # Background tasks scheduled via spawn_task — cancelled on unload.
+        self._spawned_tasks: set[asyncio.Task[Any]] = set()
 
         self._logger = logging.getLogger(f"synapse.plugin.{plugin_id}")
         if self._logger.level == logging.NOTSET:
@@ -142,6 +158,20 @@ class PluginAPI:
             self._pending_permissions.add(required)
         return False
 
+    def has_permission(self, name: str) -> bool:
+        """Public, side-effect-free check for whether a permission is granted.
+
+        Use this in plugin code paths that want to *gracefully degrade* and
+        produce a domain-specific error message (e.g. "AI optimize disabled
+        because brain.access not granted"), instead of relying on
+        ``get_brain()`` returning ``None`` — which conflates "permission
+        missing" with "host has no brain".
+
+        Unlike ``_check_permission`` this never logs and never marks the
+        permission as pending; it's purely a read.
+        """
+        return name in BASIC_PERMISSIONS or name in self._granted_permissions
+
     # --- Logging (basic, always available) ---
 
     def log(self, msg: str, level: str = "info") -> None:
@@ -162,26 +192,25 @@ class PluginAPI:
 
     def _read_config_file(self) -> dict:
         """Read config.json without permission check (internal use)."""
-        import json
+        from synapse.utils.atomic_io import read_json_safe
 
         config_path = self._data_dir / "config.json"
-        if not config_path.exists():
-            return {}
         try:
-            return json.loads(config_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            data = read_json_safe(config_path)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
             self.log(f"Corrupt config.json, returning empty config: {e}", "warning")
             return {}
 
     def set_config(self, updates: dict) -> None:
         if not self._check_permission("config.write"):
             return
-        import json
+        from synapse.utils.atomic_io import safe_json_write
 
         config = self._read_config_file()
         config.update(updates)
         config_path = self._data_dir / "config.json"
-        config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+        safe_json_write(config_path, config)
 
     def get_data_dir(self) -> Path | None:
         if not self._check_permission("data.own"):
@@ -250,7 +279,35 @@ class PluginAPI:
 
     # --- Hook registration ---
 
-    def register_hook(self, hook_name: str, callback: Callable) -> None:
+    def register_hook(
+        self,
+        hook_name: str,
+        callback: Callable,
+        *,
+        match: Callable[..., bool] | None = None,
+    ) -> None:
+        """Register a lifecycle hook callback.
+
+        Args:
+            hook_name: One of the 15 supported hook names. Permission tier is
+                inferred from the name (basic/message/retrieve, otherwise
+                requires ``hooks.all``).
+            callback: Sync or async ``f(**kwargs) -> Any``. Each hook event
+                passes specific kwargs documented in the plugin guide.
+            match: Optional predicate ``f(**kwargs) -> bool``. When provided,
+                the dispatcher invokes the predicate first and skips the
+                callback when it returns False. Predicates are evaluated
+                cheaply (no timeout, no thread off-load); raising counts as
+                no-match and is recorded as a low-weight error.
+
+        Example::
+
+            api.register_hook(
+                "on_message_received",
+                self._on_msg,
+                match=lambda **kw: kw.get("channel") == "wecom",
+            )
+        """
         if not callable(callback):
             self.log(f"register_hook: callback is not callable: {callback!r}", "error")
             return
@@ -261,6 +318,10 @@ class PluginAPI:
             "on_message_sending",
             "on_session_start",
             "on_session_end",
+            "before_agent_run",
+            "after_agent_run",
+            "before_agent_start",
+            "agent_end",
         }
         retrieve_hooks = {
             "on_retrieve",
@@ -287,16 +348,132 @@ class PluginAPI:
             self.log("No hook_registry available", "warning")
             return
 
-        self._hook_registry.register(hook_name, callback, plugin_id=self._plugin_id)
+        if match is not None and not callable(match):
+            self.log(
+                f"register_hook: match is not callable, ignoring: {match!r}",
+                "warning",
+            )
+            match = None
+
+        self._hook_registry.register(
+            hook_name, callback, plugin_id=self._plugin_id, match=match
+        )
         timeout = self._manifest.hook_timeout
         self._hook_registry.set_timeout(hook_name, self._plugin_id, timeout)
         self._registered_hooks.append(hook_name)
+
+    # --- Asset Bus (advanced) ---
+
+    async def publish_asset(
+        self,
+        *,
+        asset_kind: str,
+        source_path: str | None = None,
+        preview_url: str | None = None,
+        duration_sec: float | None = None,
+        metadata: dict | None = None,
+        shared_with: list[str] | None = None,
+        ttl_seconds: int | None = None,
+    ) -> str | None:
+        """Publish an asset to the host-level Asset Bus for cross-plugin handoff.
+
+        Requires permission ``assets.publish``. Returns the new ``asset_id``
+        on success or ``None`` if the permission is missing or the bus is
+        not available. Consumers can fetch with :meth:`consume_asset`.
+
+        ``shared_with`` is a list of plugin IDs allowed to read this asset;
+        use ``["*"]`` for "any plugin with assets.consume".
+
+        See ``docs/asset-bus.md`` for the full ACL contract and the
+        important note that ``source_path`` is NOT validated by the bus —
+        consumers must validate paths before opening them.
+        """
+        if not self._check_permission("assets.publish"):
+            return None
+        bus = self._host.get("asset_bus")
+        if bus is None:
+            self.log("asset_bus host_ref missing, publish_asset is a no-op", "warning")
+            return None
+        try:
+            return await bus.publish(
+                plugin_id=self._plugin_id,
+                asset_kind=asset_kind,
+                source_path=source_path,
+                preview_url=preview_url,
+                duration_sec=duration_sec,
+                metadata=metadata,
+                shared_with=shared_with,
+                ttl_seconds=ttl_seconds,
+            )
+        except Exception as e:
+            self.log_error(f"publish_asset failed: {e}", e)
+            return None
+
+    async def consume_asset(self, asset_id: str) -> dict | None:
+        """Fetch an asset by id, gated by ``assets.consume`` and the bus ACL.
+
+        Returns the asset row (as a dict) when the calling plugin is the
+        owner, is listed in ``shared_with``, or the asset is shared with
+        ``"*"``. Returns ``None`` for missing AND for forbidden assets so
+        that consumers cannot enumerate assets they cannot read.
+        """
+        if not self._check_permission("assets.consume"):
+            return None
+        bus = self._host.get("asset_bus")
+        if bus is None:
+            self.log("asset_bus host_ref missing, consume_asset is a no-op", "warning")
+            return None
+        try:
+            return await bus.get(asset_id, requester_plugin_id=self._plugin_id)
+        except Exception as e:
+            self.log_error(f"consume_asset failed: {e}", e)
+            return None
+
+    async def list_my_assets(self) -> list[dict]:
+        """Return the assets owned by this plugin (newest first).
+
+        Requires ``assets.publish`` (the same gate as creating them); not
+        ``assets.consume``, because owners always see their own rows
+        regardless of consumer permission.
+        """
+        if not self._check_permission("assets.publish"):
+            return []
+        bus = self._host.get("asset_bus")
+        if bus is None:
+            return []
+        try:
+            return await bus.list_owned(self._plugin_id)
+        except Exception as e:
+            self.log_error(f"list_my_assets failed: {e}", e)
+            return []
+
+    async def delete_my_asset(self, asset_id: str) -> bool:
+        """Delete an asset only when the calling plugin is its owner.
+
+        Returns True iff a row was actually removed. Returns False on
+        permission denial, missing bus, or non-owner attempts.
+        """
+        if not self._check_permission("assets.publish"):
+            return False
+        bus = self._host.get("asset_bus")
+        if bus is None:
+            return False
+        try:
+            return await bus.delete_owned(asset_id, self._plugin_id)
+        except Exception as e:
+            self.log_error(f"delete_my_asset failed: {e}", e)
+            return False
 
     # --- API routes (advanced) ---
 
     def register_api_routes(self, router) -> None:
         if not self._check_permission("routes.register"):
             return
+        # ``_admin/*`` is a reserved namespace owned by the host's plugin
+        # management API (see ``src/synapse/api/routes/plugins.py``). Drop
+        # any plugin route that would shadow / collide with it before mounting,
+        # and warn loudly so the developer knows to rename.
+        self._strip_reserved_admin_routes(router)
         api_server = self._host.get("api_app")
         if api_server is not None:
             try:
@@ -310,6 +487,36 @@ class PluginAPI:
         pending = self._host.setdefault("_pending_plugin_routers", [])
         pending.append((self._plugin_id, router))
         self.log(f"API app not yet available, routes queued for /api/plugins/{self._plugin_id}")
+
+    def _strip_reserved_admin_routes(self, router) -> None:
+        """Remove any plugin route under the reserved ``_admin/*`` prefix.
+
+        Plugins must NOT register routes under ``_admin/`` because the host
+        already exposes its plugin-management API there
+        (``/api/plugins/{plugin_id}/_admin/...``). Allowing both would
+        re-introduce the FastAPI route-shadowing bug that caused plugin
+        ``GET /tasks`` endpoints to be silently masked by the host's
+        ``GET /{plugin_id}/_admin/spawned-tasks`` (formerly ``/tasks``).
+        """
+        routes = getattr(router, "routes", None)
+        if not routes:
+            return
+        kept = []
+        dropped: list[str] = []
+        for route in routes:
+            path = getattr(route, "path", "") or ""
+            normalized = path if path.startswith("/") else "/" + path
+            if normalized == "/_admin" or normalized.startswith("/_admin/"):
+                dropped.append(path)
+                continue
+            kept.append(route)
+        if dropped:
+            router.routes = kept
+            self.log(
+                "Refused to register reserved-namespace routes "
+                f"(prefix /_admin is owned by the host): {dropped}",
+                "warning",
+            )
 
     # --- Channel registration (advanced) ---
 
@@ -477,6 +684,177 @@ class PluginAPI:
         except RuntimeError:
             self.log("No event loop for send_message", "warning")
 
+    async def send_message_async(self, channel: str, chat_id: str, text: str) -> str:
+        if not self._check_permission("channel.send"):
+            raise PluginPermissionError(
+                f"Plugin '{self._plugin_id}' requires permission 'channel.send'"
+            )
+        gateway = self._host.get("gateway")
+        if gateway is None:
+            raise RuntimeError("No gateway available for send_message")
+        adapter = gateway.get_adapter(channel)
+        if adapter is None:
+            raise RuntimeError(f"No adapter found for channel '{channel}'")
+        return await adapter.send_text(chat_id, text)
+
+    def send_file(
+        self,
+        channel: str,
+        chat_id: str,
+        file_path: str | Path,
+        caption: str | None = None,
+    ) -> bool:
+        if not self._check_permission("channel.send"):
+            return False
+        gateway = self._host.get("gateway")
+        if gateway is None:
+            self.log("No gateway available for send_file", "warning")
+            return False
+        adapter = gateway.get_adapter(channel)
+        if adapter is None:
+            self.log(f"No adapter found for channel '{channel}'", "warning")
+            return False
+        if hasattr(adapter, "has_capability") and not adapter.has_capability("send_file"):
+            self.log(f"Adapter '{channel}' does not support send_file", "warning")
+            return False
+        import asyncio
+
+        path = str(file_path)
+
+        async def _safe_send() -> None:
+            try:
+                await adapter.send_file(chat_id, path, caption)
+            except Exception as e:
+                self.log(f"send_file failed: {e}", "error")
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_safe_send())
+            return True
+        except RuntimeError:
+            self.log("No event loop for send_file", "warning")
+            return False
+
+    async def send_file_async(
+        self,
+        channel: str,
+        chat_id: str,
+        file_path: str | Path,
+        caption: str | None = None,
+    ) -> str:
+        if not self._check_permission("channel.send"):
+            raise PluginPermissionError(
+                f"Plugin '{self._plugin_id}' requires permission 'channel.send'"
+            )
+        gateway = self._host.get("gateway")
+        if gateway is None:
+            raise RuntimeError("No gateway available for send_file")
+        adapter = gateway.get_adapter(channel)
+        if adapter is None:
+            raise RuntimeError(f"No adapter found for channel '{channel}'")
+        if hasattr(adapter, "has_capability") and not adapter.has_capability("send_file"):
+            raise RuntimeError(f"Adapter '{channel}' does not support send_file")
+        return await adapter.send_file(chat_id, str(file_path), caption)
+
+    # --- File serving utilities (Plugin 2.0) ---
+
+    def create_file_response(
+        self,
+        source: str | Path,
+        *,
+        filename: str | None = None,
+        media_type: str = "application/octet-stream",
+        as_download: bool = False,
+    ):
+        """Create a FastAPI response for serving a file, handling encoding correctly.
+
+        Works with both local file paths and remote URLs. Automatically handles:
+        - Content-Disposition with RFC 5987 encoding for non-ASCII filenames
+        - Local file serving via FileResponse
+        - Remote URL streaming via StreamingResponse
+
+        Args:
+            source: Local file path (str/Path) or remote URL (http/https).
+            filename: Download filename. If None, derived from source.
+            media_type: MIME type. Default: application/octet-stream.
+            as_download: If True, adds Content-Disposition: attachment header.
+
+        Returns:
+            A FileResponse or StreamingResponse ready to return from a route.
+        """
+        from urllib.parse import quote
+
+        from fastapi.responses import FileResponse, StreamingResponse
+
+        headers: dict[str, str] = {}
+        source_str = str(source)
+
+        if as_download:
+            raw_name = filename or Path(source_str).name or "download"
+            ascii_safe = raw_name.encode("ascii", "replace").decode("ascii")
+            headers["Content-Disposition"] = (
+                f'attachment; filename="{ascii_safe}"; '
+                f"filename*=UTF-8''{quote(raw_name)}"
+            )
+
+        if source_str.startswith("http://") or source_str.startswith("https://"):
+            import httpx
+
+            async def _stream():
+                async with (
+                    httpx.AsyncClient(timeout=120.0) as client,
+                    client.stream("GET", source_str) as resp,
+                ):
+                    async for chunk in resp.aiter_bytes(8192):
+                        yield chunk
+
+            return StreamingResponse(_stream(), media_type=media_type, headers=headers)
+
+        local_path = Path(source_str)
+        if not local_path.is_file():
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="File not found")
+
+        return FileResponse(str(local_path), media_type=media_type, headers=headers)
+
+    # --- UI event methods (Plugin 2.0) ---
+
+    @property
+    def ui_api_version(self) -> str:
+        """Current host UI API version (safe to read even from 1.0 plugins)."""
+        return PLUGIN_UI_API_VERSION
+
+    def register_ui_event_handler(
+        self, event_type: str, handler: Callable, **kwargs: Any,
+    ) -> None:
+        """Register a handler for bridge events sent from the plugin UI."""
+        handlers: dict = self._host.get("_ui_event_handlers", {})
+        handlers.setdefault(self._plugin_id, {})[event_type] = handler
+        # 写到共享的 host_refs（而不是 ChainMap 第一层 plugin-private overrides），
+        # 这样不同 plugin 注册的 UI handler 可以汇总到一个 dict 里。
+        self._host_refs_shared["_ui_event_handlers"] = handlers
+        self.log(f"Registered UI event handler for '{event_type}'")
+
+    def broadcast_ui_event(self, event_type: str, data: dict, **kwargs: Any) -> None:
+        """Push an event to the plugin UI via the WebSocket bridge."""
+        import asyncio
+
+        event_name = f"plugin:{self._plugin_id}:{event_type}"
+
+        async def _push() -> None:
+            try:
+                from ..api.routes.websocket import broadcast_event
+
+                await broadcast_event(event_name, data)
+            except Exception as e:
+                self.log(f"broadcast_ui_event failed: {e}", "warning")
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_push())
+        except RuntimeError:
+            self.log("No event loop for broadcast_ui_event", "warning")
+
     # --- Cleanup ---
 
     def _cleanup(self) -> None:
@@ -500,6 +878,11 @@ class PluginAPI:
                 self._logger.removeHandler(h)
         except Exception:
             pass
+
+        try:
+            self._cleanup_routes()
+        except Exception as e:
+            logger.debug("Plugin '%s' route cleanup error: %s", self._plugin_id, e)
 
         try:
             self._cleanup_tools()
@@ -556,6 +939,26 @@ class PluginAPI:
         except Exception:
             pass
 
+    def _cleanup_routes(self) -> None:
+        """Remove API routes registered by this plugin from the FastAPI app."""
+        api_server = self._host.get("api_app")
+        if api_server is None:
+            return
+        prefix = f"/api/plugins/{self._plugin_id}"
+        original_routes = api_server.routes[:]
+        removed = 0
+        for route in original_routes:
+            route_path = getattr(route, "path", "")
+            route_prefix = getattr(route, "prefix", "")
+            if route_path.startswith(prefix) or route_prefix.startswith(prefix):
+                try:
+                    api_server.routes.remove(route)
+                    removed += 1
+                except ValueError:
+                    pass
+        if removed:
+            self.log(f"Removed {removed} API routes under {prefix}")
+
     def _cleanup_tools(self) -> None:
         """Remove plugin-registered tools from all host registries."""
         if not self._registered_tools:
@@ -608,30 +1011,142 @@ class PluginAPI:
         self._registered_channels.clear()
 
     def _cleanup_mcp(self) -> None:
-        """Disconnect and remove MCP server registered by this plugin."""
+        """Synchronous fallback: just remove the server entry without disconnecting.
+
+        The async variant ``_aclose_mcp`` performs a graceful disconnect.
+        This sync method is kept so the legacy ``_cleanup()`` path
+        (used in error/teardown branches that don't have an event loop) still
+        de-registers the server entry, even if the actual subprocess can't be
+        torn down cleanly here.
+        """
         mcp_client = self._host.get("mcp_client")
         if mcp_client is None:
             return
         server_name = self._plugin_id
         if not hasattr(mcp_client, "get_server") or mcp_client.get_server(server_name) is None:
             return
-        import asyncio
-
-        async def _do_cleanup():
-            try:
-                if hasattr(mcp_client, "disconnect"):
-                    await mcp_client.disconnect(server_name)
-            except Exception:
-                pass
-            if hasattr(mcp_client, "remove_server"):
-                mcp_client.remove_server(server_name)
-
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(_do_cleanup())
         except RuntimeError:
-            if hasattr(mcp_client, "remove_server"):
+            loop = None
+        if loop is not None:
+            # Best-effort schedule; aclose() should be preferred for awaited cleanup.
+            loop.create_task(self._aclose_mcp())
+            return
+        if hasattr(mcp_client, "remove_server"):
+            try:
                 mcp_client.remove_server(server_name)
+            except Exception:
+                pass
+
+    async def _aclose_mcp(self) -> None:
+        """Awaitable MCP cleanup: disconnect subprocess, then drop server entry."""
+        mcp_client = self._host.get("mcp_client")
+        if mcp_client is None:
+            return
+        server_name = self._plugin_id
+        if not hasattr(mcp_client, "get_server") or mcp_client.get_server(server_name) is None:
+            return
+        try:
+            if hasattr(mcp_client, "disconnect"):
+                await mcp_client.disconnect(server_name)
+        except Exception as e:
+            logger.debug("Plugin '%s' MCP disconnect error: %s", self._plugin_id, e)
+        if hasattr(mcp_client, "remove_server"):
+            try:
+                mcp_client.remove_server(server_name)
+            except Exception:
+                pass
+
+    # --- Background task tracking ---
+
+    def spawn_task(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[Any]:
+        """Schedule a background task tied to this plugin's lifecycle.
+
+        Tasks registered via this helper are cancelled (and awaited) when the
+        plugin is unloaded, preventing leaked workers that keep file handles
+        and network connections alive.
+
+        Plugins **must** use this instead of raw ``asyncio.create_task`` for
+        any long-running background work (poll loops, schedulers, etc.).
+        """
+        if not inspect.iscoroutine(coro):
+            raise TypeError(
+                f"spawn_task expects a coroutine, got {type(coro).__name__}"
+            )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Plugin '{self._plugin_id}': spawn_task requires a running event loop"
+            ) from e
+        task_name = name or f"plugin:{self._plugin_id}:bg"
+        task = loop.create_task(coro, name=task_name)
+        self._spawned_tasks.add(task)
+        task.add_done_callback(self._spawned_tasks.discard)
+        return task
+
+    async def _cancel_spawned_tasks(self, *, timeout: float = 5.0) -> None:
+        """Cancel all background tasks registered via ``spawn_task``."""
+        if not self._spawned_tasks:
+            return
+        pending = [t for t in list(self._spawned_tasks) if not t.done()]
+        for t in pending:
+            t.cancel()
+        if not pending:
+            return
+        try:
+            await asyncio.wait(pending, timeout=timeout)
+        except Exception as e:
+            logger.debug(
+                "Plugin '%s' background task cancel error: %s", self._plugin_id, e
+            )
+
+    def list_spawned_tasks(self) -> list[dict[str, Any]]:
+        """Diagnostics helper: snapshot of background tasks for this plugin."""
+        out: list[dict[str, Any]] = []
+        for t in list(self._spawned_tasks):
+            coro = t.get_coro()
+            coro_name = (
+                getattr(coro, "__qualname__", None)
+                or getattr(coro, "__name__", "")
+                or repr(coro)
+            )
+            out.append(
+                {
+                    "name": t.get_name(),
+                    "done": t.done(),
+                    "cancelled": t.cancelled(),
+                    "coro": str(coro_name)[:200],
+                }
+            )
+        return out
+
+    async def aclose(self) -> None:
+        """Awaitable, ordered teardown — preferred entry point for unload.
+
+        Steps:
+          1. Cancel & await background tasks scheduled via ``spawn_task``.
+          2. Gracefully disconnect MCP subprocess (if any).
+          3. Run the synchronous ``_cleanup`` for routes/tools/hooks/channels.
+        """
+        try:
+            await self._cancel_spawned_tasks()
+        except Exception as e:
+            logger.debug("Plugin '%s' task cancel error: %s", self._plugin_id, e)
+        try:
+            await self._aclose_mcp()
+        except Exception as e:
+            logger.debug("Plugin '%s' mcp aclose error: %s", self._plugin_id, e)
+        try:
+            self._cleanup()
+        except Exception as e:
+            logger.debug("Plugin '%s' sync cleanup error: %s", self._plugin_id, e)
 
     def __getattr__(self, name: str) -> Any:
         logger.warning(
@@ -686,11 +1201,19 @@ class PluginBase(ABC):
 
     Subclass this and implement ``on_load``.
     Optionally override ``on_unload`` for cleanup.
+
+    ``on_unload`` may be either a synchronous method or an ``async def``
+    coroutine — the framework awaits it on the main event loop so plugins can
+    cleanly close database connections, HTTP clients, etc.
     """
 
     @abstractmethod
     def on_load(self, api: PluginAPI) -> None:
         """Called when the plugin is loaded. Register capabilities here."""
 
-    def on_unload(self) -> None:  # noqa: B027
-        """Called when the plugin is being unloaded. Clean up resources."""
+    def on_unload(self) -> Any:  # noqa: B027
+        """Called when the plugin is being unloaded. Clean up resources.
+
+        May return ``None`` (sync cleanup) or an awaitable / coroutine
+        (``async def on_unload``) — the framework will detect and await it.
+        """

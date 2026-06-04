@@ -55,9 +55,7 @@ class OrgIdentity:
                 level = 1
         else:
             level = 0
-            if node.agent_profile_id:
-                role = self._get_profile_prompt(node.agent_profile_id) or ""
-            if not role and node.custom_prompt:
+            if node.custom_prompt:
                 role = node.custom_prompt
             if not role:
                 role = self._auto_generate_role(node)
@@ -72,6 +70,7 @@ class OrgIdentity:
         pending_messages: str = "",
         policy_index: str = "",
         project_tasks_summary: str = "",
+        root_intent: str = "",
     ) -> str:
         """Build the full organization context prompt for a node agent.
 
@@ -101,11 +100,30 @@ class OrgIdentity:
 
         parts: list[str] = []
 
+        # BUG-3：用户当前指令贴在最前（最高可见性），让所有子节点都能看到
+        # 用户原话的范围/字数/格式约束，避免上级转述时漂移。
+        # 仅当 root_intent 非空且当前命令仍在进行时由调用方传入。
+        if root_intent:
+            _intent_brief = root_intent.strip()
+            if len(_intent_brief) > 400:
+                _intent_brief = _intent_brief[:400] + "..."
+            parts.append(
+                "## 用户当前指令（最高优先级，禁止超出）\n"
+                f"\"{_intent_brief}\"\n"
+                "下达任何子任务、写任何代码、产出任何交付物之前，"
+                "先检查你的输出严格在该指令的范围、字数、格式约束之内。"
+                "若与上级转述冲突，以上述用户原话为准。"
+            )
+
         # Compact identity declaration (replaces full SOUL.md + AGENT.md)
         parts.append(
             f"# Synapse 组织 Agent\n\n"
-            f"你是「{org.name}」中的 **{node.role_title}**。"
+            f"你是「{org.name}」中的 **{node.role_title}**（你的节点 id：`{node.id}`）。"
             f"你是 AI Agent，由 Synapse 驱动。\n\n"
+            f"**关键：凡是需要指定目标节点的工具参数（`to_node` / `node_id` / `target_node_id`），"
+            f"必须填写下方组织结构里那个反引号包住的精确节点 id（例如 `{node.id}`），"
+            f"不要写角色名、不要写自己的 id；不确定时先用 `org_get_org_chart` 或 "
+            f"`org_find_colleague` 查询。**\n\n"
             f"## 核心原则\n"
             f"- 诚实：不编造信息，不确定时明确说明\n"
             f"- 安全：不执行可能造成伤害的操作\n"
@@ -155,6 +173,12 @@ class OrgIdentity:
         # Relationships with enhanced delegation guidance
         rel_parts = []
         persona = org.user_persona
+        # Always surface the caller's own identity first so the LLM can never
+        # delegate/send to itself by mistake — pairs with the strict
+        # resolve_reference guard in OrgToolHandler._resolve_node_refs.
+        rel_parts.append(
+            f"- 你自己：**{node.role_title}** (id: `{node.id}`) ← 不要把消息或任务发给这个 id"
+        )
         if parent:
             rel_parts.append(f"- 直属上级：**{parent.role_title}** (id: `{parent.id}`)")
         elif persona and persona.label:
@@ -217,6 +241,21 @@ class OrgIdentity:
                 "3. 重要成果同时写入 org_write_blackboard 供团队查阅\n"
                 "4. **不要**使用 org_submit_deliverable，你没有上级节点可提交\n\n"
                 "验收下属交付物时，用 org_accept_deliverable（通过）或 org_reject_deliverable（打回）。\n\n"
+                "⚠️ 派工后的汇报时机（非常重要）：\n"
+                "- 使用 org_delegate_task 把任务委派给下属后，**不要**立刻给指挥者发"
+                "「已委派」「进行中」之类的中间态回复，也不要立刻结束本轮对话\n"
+                "- 必须等所有相关下级通过 org_submit_deliverable 完成提交，并由你"
+                "org_accept_deliverable 验收通过后，再用**一次**综合回复向指挥者给出最终结论\n"
+                "- 验收期间若需查看进度，用 org_list_delegated_tasks / org_get_task_progress，"
+                "不要给指挥者发中间态汇报\n"
+                "- 指挥者看到的「完成」消息应当包含完整结论，而不是"
+                "「已把任务分配给 XXX，等待中」这种过程性回复\n\n"
+                "⚠️ 最终汇总字数与节奏约束（P1-7）：\n"
+                "- 一句话问答（如「请用一句话告诉我...」），汇总只给一句话，最多 80 字\n"
+                "- 普通任务汇总控制在 200 字内，每位下属一行 1-2 句要点 + 关键文件/链接\n"
+                "- 复杂方案/选型类汇总不超过 500 字，必须分段并标小标题\n"
+                "- 严禁逐字复述下级 deliverable 全文；引用下属成果用「<节点>: <一句话要点>」格式\n"
+                "- 等待下级期间用 org_wait_for_deliverable 阻塞等待，不要紧密轮询 org_list_delegated_tasks\n\n"
                 "⚠️ 严格约束：\n"
                 "- 只执行指挥者明确下达的指令，不要自行扩展工作范围\n"
                 "- 指令完成后停止，不要主动发起新的项目或任务\n"
@@ -231,13 +270,26 @@ class OrgIdentity:
                 "4. 被打回时根据反馈修改后重新提交\n"
                 "5. 验收通过后任务完结\n\n"
                 "缺少工具时，用 org_request_tools 向上级申请。\n\n"
-                "⚠️ 工作范围约束：\n"
-                "- 只完成上级分配给你的任务，不要自行发起新的项目或扩展工作范围\n"
+                "⚠️ **工作范围硬约束（优先级高于效率意识）**：\n"
+                "- **严格对齐用户原始指令**：若文档顶部出现「用户当前指令」段落，"
+                "你的产出必须严格在该指令的范围、字数、格式之内；"
+                "上级转述与原始指令冲突时，**以用户原话为准**\n"
+                "- **宁可少做，不可超出**：用户要 50 字纲要就只写 50 字纲要，"
+                "不要顺手补全代码、不要扩展未要求的细节、不要追加交付物\n"
+                "- 只完成上级明确分配的任务，不要自行发起新项目或扩展工作范围\n"
                 "- 任务完成并被验收后停止，等待上级下达新指令\n"
-                "- 如果认为有后续工作需要做，在交付物中建议即可，由上级决定是否执行"
+                "- 如果认为有后续工作需要做，在交付物中**建议**即可，由上级决定是否执行\n"
+                "- 上面的「AI 效率意识」鼓励你快速行动，但不等于鼓励你越过用户的边界做额外工作"
             )
 
         has_external = bool(node.external_tools)
+        # E0-4: 节点级"基础文件工具"开关。即便没有勾选 external_tools，只要
+        # enable_file_tools=True（默认），节点也会被注入安全的 write_file /
+        # read_file / edit_file / list_directory；此时 prompt 必须告诉 LLM 这些
+        # 工具是可用的，并指导它在交付物是文档/代码时主动落盘 + 走
+        # org_submit_deliverable(file_attachments=[...])，否则会出现"工具明明
+        # 在但提示词说不可用"的自相矛盾。
+        has_basic_file_tools = getattr(node, "enable_file_tools", True)
         if has_external:
             from .tool_categories import TOOL_CATEGORIES, expand_tool_categories
             ext_names = expand_tool_categories(node.external_tools)
@@ -251,6 +303,22 @@ class OrgIdentity:
                 "- 外部工具得到的重要结果，用 org_write_blackboard 写入黑板共享给同事\n"
                 "- 优先通过直接连线关系沟通（上下级、协作伙伴）\n"
                 "- 非必要不跨级沟通\n"
+                "- 回复要简洁，1-3 句话概括行动和结果即可\n\n"
+                + delivery_flow
+            )
+        elif has_basic_file_tools:
+            parts.append(
+                "## 组织工具与行为约束\n"
+                "你拥有 org_* 组织协作工具，以及一组基础文件工具（write_file / "
+                "read_file / edit_file / list_directory），用于把文档/代码/方案"
+                "等结构化交付物落盘到组织 workspace。注意：run_shell、网络爬取、"
+                "MCP 等高级工具未授权给你，需要时通过 org_request_tools 申请。\n"
+                "协作规则：\n"
+                "- 与同事沟通、委派、汇报用 org_* 工具\n"
+                "- 当你的交付物是文档/代码/HTML 等结构化内容时，**先用 write_file "
+                "把文件落盘**，再用 org_submit_deliverable(file_attachments=[…]) "
+                "把附件交给委派人，不要只把全文塞进 deliverable 字段\n"
+                "- 重要决策和方案写入 org_write_blackboard，写之前先 org_read_blackboard 检查避免重复\n"
                 "- 回复要简洁，1-3 句话概括行动和结果即可\n\n"
                 + delivery_flow
             )
@@ -404,3 +472,4 @@ class OrgIdentity:
             except Exception:
                 return None
         return None
+

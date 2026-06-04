@@ -6,6 +6,14 @@ PowerShell 工具处理器
 - 版本感知的语法指导注入
 - EncodedCommand 沙箱执行
 - 只读 cmdlet 识别
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import asyncio
@@ -15,6 +23,9 @@ import os
 import shutil
 import subprocess
 from typing import TYPE_CHECKING, Any
+
+from ...config import settings
+from ...core.policy_v2 import ApprovalClass
 
 if TYPE_CHECKING:
     from ...core.agent import Agent
@@ -181,6 +192,7 @@ class PowerShellHandler:
     """PowerShell 工具处理器"""
 
     TOOLS = ["run_powershell"]
+    TOOL_CLASSES = {"run_powershell": ApprovalClass.EXEC_CAPABLE}
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
@@ -204,9 +216,13 @@ class PowerShellHandler:
 
         working_dir = params.get("working_directory")
         try:
-            timeout = max(10, min(int(params.get("timeout", 120)), 600))
+            timeout = int(params.get("timeout", settings.powershell_default_timeout_seconds))
         except (TypeError, ValueError):
-            timeout = 120
+            timeout = int(settings.powershell_default_timeout_seconds)
+        timeout = max(0, timeout)
+        max_timeout = int(getattr(settings, "powershell_max_timeout_seconds", 1800) or 0)
+        if max_timeout > 0 and timeout > 0:
+            timeout = min(timeout, max_timeout)
 
         exe = ps_info["executable"]
 
@@ -227,19 +243,30 @@ class PowerShellHandler:
 
         cwd = working_dir or getattr(self.agent, "default_cwd", None) or os.getcwd()
 
-        env = os.environ.copy()
-        try:
-            from ...runtime_env import IS_FROZEN, get_python_executable
+        from ...runtime_manager import build_user_subprocess_environment
 
-            if IS_FROZEN:
-                _ext_py = get_python_executable()
-                if _ext_py:
-                    from pathlib import Path
+        env = build_user_subprocess_environment()
+        spec = getattr(self.agent, "_execution_env_spec", None)
+        if spec is not None:
+            try:
+                from ...runtime_manager import apply_execution_environment, ensure_execution_env
 
-                    _py_dir = str(Path(_ext_py).parent)
-                    env["PATH"] = _py_dir + os.pathsep + env.get("PATH", "")
-        except Exception:
-            pass
+                env = apply_execution_environment(env, ensure_execution_env(spec))
+            except Exception as exc:
+                logger.warning("[PowerShell] Falling back to shared agent Python env: %s", exc)
+                try:
+                    from ...runtime_manager import apply_agent_python_environment
+
+                    env = apply_agent_python_environment(env)
+                except Exception:
+                    pass
+        else:
+            try:
+                from ...runtime_manager import apply_agent_python_environment
+
+                env = apply_agent_python_environment(env)
+            except Exception:
+                pass
 
         logger.info(f"[PowerShell] Executing: {command[:300]}")
 
@@ -254,13 +281,17 @@ class PowerShellHandler:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
 
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=timeout,
-            )
+            communicate = process.communicate()
+            if timeout > 0:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    communicate,
+                    timeout=timeout,
+                )
+            else:
+                stdout_bytes, stderr_bytes = await communicate
 
-            stdout = self._decode(stdout_bytes)
-            stderr = self._decode(stderr_bytes)
+            stdout = self._strip_clixml_noise(self._decode(stdout_bytes))
+            stderr = self._strip_clixml_noise(self._decode(stderr_bytes))
             rc = process.returncode or 0
 
             logger.info(f"[PowerShell] Exit code: {rc}")
@@ -278,7 +309,7 @@ class PowerShellHandler:
                     parts.append(f"[stderr]:\n{stderr}")
                 return "\n".join(parts)
 
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             logger.error(f"[PowerShell] Command timed out after {timeout}s")
             if process and process.returncode is None:
                 try:
@@ -306,6 +337,21 @@ class PowerShellHandler:
                 return data.decode(f"cp{oem_cp}", errors="replace")
             except Exception:
                 return data.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _strip_clixml_noise(text: str) -> str:
+        """Remove PowerShell progress CLIXML fragments from captured streams."""
+        if not text or "#< CLIXML" not in text:
+            return text
+        import re
+
+        cleaned = re.sub(r"#< CLIXML\s*<Objs[\s\S]*?</Objs>", "", text)
+        cleaned = re.sub(r"#< CLIXML[\s\S]*?(?=\r?\n(?!<)|$)", "", cleaned)
+        cleaned = re.sub(r"<Obj[^>]*>\s*<TN[^>]*>[\s\S]*?</Obj>", "", cleaned)
+        return "\n".join(
+            line for line in cleaned.splitlines()
+            if line.strip() and not line.lstrip().startswith(("#< CLIXML", "<Objs", "</Objs>"))
+        ).strip()
 
 
 def create_handler(agent: "Agent"):

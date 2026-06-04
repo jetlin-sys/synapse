@@ -5,6 +5,7 @@ File 工具 - 文件操作
 import logging
 import re
 import shutil
+from fnmatch import fnmatch
 from pathlib import Path
 
 import aiofiles
@@ -33,12 +34,50 @@ DEFAULT_IGNORE_DIRS = {
     "egg-info",
 }
 
+# Extra prune list applied only to grep (heavier/longer than glob/list).
+# Treats the Synapse data plane and any vendored Python install as no-go
+# zones — the LLM should never need to recursively scan these. Previously a
+# misrouted grep on `~/.synapse` could lock up the worker for minutes
+# (see incident 2026-05-09 P0-1).
+GREP_EXTRA_BLOCKED_DIR_NAMES = {
+    "site-packages",
+    "Lib",  # Windows venv layout: <venv>/Lib/site-packages
+    "lib",  # Unix venv layout
+    "Scripts",
+    "bin",
+    "include",
+    "Include",
+    "share",
+    "runtime",
+    "workspaces",
+    "dist-web",
+    "logs",
+    "llm_debug",
+    "react_traces",
+    "delegation_logs",
+    "failure_analysis",
+    "diagnostics",
+    "memory_db",
+    "vector_store",
+}
+
+GREP_HARD_FORBIDDEN_PATH_FRAGMENTS = (
+    "/.synapse/runtime",
+    "/.synapse/workspaces",
+    "\\.synapse\\runtime",
+    "\\.synapse\\workspaces",
+)
+
+GREP_DEFAULT_MAX_FILES = 5000
+GREP_DEFAULT_MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MiB
+
 
 class FileTool:
     """文件操作工具"""
 
     def __init__(self, base_path: str | None = None):
         self.base_path = Path(base_path) if base_path else Path.cwd()
+        self.last_traversal_skipped = 0
 
     def _resolve_path(self, path: str) -> Path:
         """解析路径（支持相对路径和绝对路径）"""
@@ -102,6 +141,12 @@ class FileTool:
         """
         file_path = self._resolve_path(path)
         logger.debug(f"Reading file: {file_path}")
+
+        # Windows 下用 open() 打开目录会抛 PermissionError [WinError 5]，导致
+        # 错误分类为 PERMISSION 触发反复重试。提前显式检测目录并抛 IsADirectoryError，
+        # 让 classify_error 能正确建议 LLM 改用 list_directory。
+        if file_path.is_dir():
+            raise IsADirectoryError(f"路径是目录而非文件，无法读取文件内容: {file_path}")
 
         # 检查是否为二进制文件
         suffix = file_path.suffix.lower()
@@ -259,11 +304,20 @@ class FileTool:
         context_lines: int = 0,
         max_results: int = 50,
         case_insensitive: bool = False,
+        max_files: int | None = None,
+        max_total_bytes: int | None = None,
     ) -> list[dict]:
         """纯 Python 内容搜索（跨平台，无需外部工具）。
 
+        Safety guards (PR-A1, see incident 2026-05-09 P0-1):
+        - Hard-rejects scanning the Synapse runtime/workspaces directory or
+          drive roots / user home.
+        - Caps file count and bytes scanned to avoid worker lock-up when the
+          LLM aims grep at a multi-GB tree.
+
         Returns:
-            list of dicts: {file, line, text, context_before, context_after}
+            list of dicts: {file, line, text, context_before, context_after,
+                            _scan_summary?}
         """
         flags = re.IGNORECASE if case_insensitive else 0
         try:
@@ -279,34 +333,71 @@ class FileTool:
         if not dir_path.is_dir():
             raise FileNotFoundError(f"Directory not found: {dir_path}")
 
+        # Path safety (feature-flagged so ops can roll back).
+        try:
+            from ..core.feature_flags import is_enabled as _ff_enabled
+        except Exception:
+            def _ff_enabled(_name: str) -> bool:
+                return True
+        if _ff_enabled("grep_safety_v1"):
+            forbidden_reason = self._grep_path_forbidden(dir_path)
+            if forbidden_reason:
+                raise ValueError(f"grep refused: {forbidden_reason}")
+            file_cap = (
+                max_files
+                if isinstance(max_files, int) and max_files > 0
+                else GREP_DEFAULT_MAX_FILES
+            )
+            byte_cap = (
+                max_total_bytes
+                if isinstance(max_total_bytes, int) and max_total_bytes > 0
+                else GREP_DEFAULT_MAX_TOTAL_BYTES
+            )
+        else:
+            file_cap = max_files if isinstance(max_files, int) and max_files > 0 else 10**9
+            byte_cap = (
+                max_total_bytes
+                if isinstance(max_total_bytes, int) and max_total_bytes > 0
+                else 10**12
+            )
+
         file_glob = include or "*"
         results: list[dict] = []
+        files_scanned = 0
+        bytes_scanned = 0
+        capped_reason: str | None = None
 
-        for file_path in dir_path.rglob(file_glob):
+        iterator = (
+            self._iter_grep_paths(dir_path, file_glob)
+            if _ff_enabled("grep_safety_v1")
+            else self._iter_matching_paths(dir_path, file_glob, recursive=True)
+        )
+        for file_path in iterator:
             if len(results) >= max_results:
                 break
+            if files_scanned >= file_cap:
+                capped_reason = f"reached file cap ({file_cap})"
+                break
+            if bytes_scanned >= byte_cap:
+                capped_reason = f"reached byte cap ({byte_cap // (1024 * 1024)} MiB)"
+                break
 
-            if not file_path.is_file():
-                continue
-
-            # 跳过忽略目录
-            parts = file_path.relative_to(dir_path).parts
-            if any(p in DEFAULT_IGNORE_DIRS for p in parts):
-                continue
-            # 跳过 .xxx 隐藏目录（除 .github 等常用目录）
-            if any(
-                p.startswith(".") and p not in (".github", ".vscode", ".cursor") for p in parts[:-1]
-            ):
-                continue
-
-            # 跳过二进制文件
             if file_path.suffix.lower() in self.BINARY_EXTENSIONS:
+                continue
+
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            if stat.st_size > 5 * 1024 * 1024:
                 continue
 
             try:
                 text = file_path.read_text(encoding="utf-8", errors="replace")
             except (OSError, PermissionError):
                 continue
+            files_scanned += 1
+            bytes_scanned += stat.st_size
 
             lines = text.splitlines()
             rel = str(file_path.relative_to(dir_path))
@@ -327,7 +418,98 @@ class FileTool:
                         entry["context_after"] = lines[i + 1 : end]
                     results.append(entry)
 
+        if capped_reason and not results:
+            results.append(
+                {
+                    "_scan_summary": (
+                        f"grep stopped early: {capped_reason} after {files_scanned} files"
+                        f" / {bytes_scanned // 1024} KiB scanned. Narrow path/include."
+                    ),
+                }
+            )
+        elif capped_reason:
+            results.append(
+                {
+                    "_scan_summary": (
+                        f"grep partial: {capped_reason}. Scanned {files_scanned} files /"
+                        f" {bytes_scanned // 1024} KiB before stopping."
+                    ),
+                }
+            )
+
         return results
+
+    @staticmethod
+    def _grep_path_forbidden(dir_path: Path) -> str | None:
+        """Return a human-readable rejection reason or ``None`` if path is safe."""
+        try:
+            resolved = dir_path.resolve()
+        except OSError:
+            resolved = dir_path
+        path_str = str(resolved)
+        path_norm = path_str.replace("\\", "/").lower()
+
+        for fragment in GREP_HARD_FORBIDDEN_PATH_FRAGMENTS:
+            if fragment.replace("\\", "/").lower() in path_norm:
+                return (
+                    f"path '{path_str}' is under a protected runtime/workspaces "
+                    f"directory; refuse to scan recursively. Use a project-local "
+                    f"path or read specific files instead."
+                )
+
+        if resolved.parent == resolved:
+            return f"path '{path_str}' is a filesystem root; too broad for grep."
+        try:
+            home = Path.home().resolve()
+        except OSError:
+            home = None
+        if home is not None and resolved == home:
+            return f"path '{path_str}' is the user home directory; too broad for grep."
+
+        return None
+
+    def _iter_grep_paths(self, dir_path: Path, pattern: str):
+        """Like ``_iter_matching_paths`` but with the grep-only prune list."""
+        self.last_traversal_skipped = 0
+        forbidden_norm = tuple(
+            f.replace("\\", "/").lower() for f in GREP_HARD_FORBIDDEN_PATH_FRAGMENTS
+        )
+
+        def walk(root: Path):
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                self.last_traversal_skipped += 1
+                return
+
+            for child in children:
+                if self._should_skip_relative_path(child, dir_path):
+                    continue
+                if child.name in GREP_EXTRA_BLOCKED_DIR_NAMES:
+                    self.last_traversal_skipped += 1
+                    continue
+                try:
+                    child_resolved = str(child.resolve()).replace("\\", "/").lower()
+                except OSError:
+                    child_resolved = str(child).replace("\\", "/").lower()
+                if any(frag in child_resolved for frag in forbidden_norm):
+                    self.last_traversal_skipped += 1
+                    continue
+
+                try:
+                    is_dir = child.is_dir()
+                    is_file = child.is_file()
+                except OSError:
+                    self.last_traversal_skipped += 1
+                    continue
+
+                if is_file and self._matches_pattern(child, dir_path, pattern):
+                    yield child
+
+                if is_dir:
+                    yield from walk(child)
+
+        yield from walk(dir_path)
 
     async def delete(self, path: str) -> bool:
         """删除单个文件或空目录。非空目录一律拒绝。"""
@@ -383,9 +565,17 @@ class FileTool:
         dir_path = self._resolve_path(path)
 
         if recursive:
-            return [str(p.relative_to(dir_path)) for p in dir_path.rglob(pattern)]
-        else:
+            return [
+                str(p.relative_to(dir_path))
+                for p in self._iter_matching_paths(dir_path, pattern, recursive=True, files_only=False)
+            ]
+
+        self.last_traversal_skipped = 0
+        try:
             return [str(p.relative_to(dir_path)) for p in dir_path.glob(pattern)]
+        except OSError:
+            self.last_traversal_skipped = 1
+            return []
 
     async def search(
         self,
@@ -422,6 +612,84 @@ class FileTool:
                     matches.append(str(file_path.relative_to(dir_path)))
 
         return matches
+
+    def _iter_matching_paths(
+        self,
+        dir_path: Path,
+        pattern: str,
+        *,
+        recursive: bool,
+        files_only: bool = True,
+    ):
+        """Yield paths while pruning ignored and unstable directories.
+
+        Cloud desktops and package managers can mutate deep dependency trees while
+        we scan them. Treat those races like unreadable folders: skip and keep
+        returning useful results instead of failing the whole tool call.
+        """
+        self.last_traversal_skipped = 0
+
+        if not recursive:
+            try:
+                candidates = dir_path.glob(pattern)
+                for path in candidates:
+                    if self._should_skip_relative_path(path, dir_path):
+                        continue
+                    if files_only and not path.is_file():
+                        continue
+                    yield path
+            except OSError:
+                self.last_traversal_skipped += 1
+            return
+
+        def walk(root: Path):
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                self.last_traversal_skipped += 1
+                return
+
+            for child in children:
+                if self._should_skip_relative_path(child, dir_path):
+                    continue
+
+                try:
+                    is_dir = child.is_dir()
+                    is_file = child.is_file()
+                except OSError:
+                    self.last_traversal_skipped += 1
+                    continue
+
+                if self._matches_pattern(child, dir_path, pattern) and (not files_only or is_file):
+                    yield child
+
+                if is_dir:
+                    yield from walk(child)
+
+        yield from walk(dir_path)
+
+    @staticmethod
+    def _matches_pattern(path: Path, root: Path, pattern: str) -> bool:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return False
+        rel_posix = rel.as_posix()
+        pattern_posix = pattern.replace("\\", "/")
+        return rel.match(pattern) or fnmatch(rel_posix, pattern_posix) or fnmatch(path.name, pattern)
+
+    @staticmethod
+    def _should_skip_relative_path(path: Path, root: Path) -> bool:
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:
+            return True
+        if any(part in DEFAULT_IGNORE_DIRS for part in parts):
+            return True
+        return any(
+            part.startswith(".") and part not in (".github", ".vscode", ".cursor")
+            for part in parts[:-1]
+        )
 
     async def copy(self, src: str, dst: str) -> bool:
         """

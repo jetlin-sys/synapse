@@ -9,6 +9,7 @@ Session 代表一个独立的对话上下文，包含:
 """
 
 import logging
+import re
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -36,7 +37,7 @@ class SessionConfig:
     可覆盖全局配置，实现会话级别的定制
     """
 
-    max_history: int = 100  # 最大历史消息数
+    max_history: int = 2000  # 硬安全上限（日常由 _trim_old_metadata 控制体积，此值仅为极端兜底）
     timeout_minutes: int = 30  # 超时时间（分钟）
     language: str = "zh"  # 语言
     model: str | None = None  # 覆盖默认模型
@@ -58,6 +59,70 @@ class SessionConfig:
 
 
 @dataclass
+class TaskCheckpoint:
+    """任务检查点 — 借鉴 claude-code 的"任务连续性"思路。
+
+    每条代表推理流式循环里的一次节点状态，用于：
+    1) 前端"任务时间线"展示（已完成什么、下一步打算）；
+    2) 流式中断 / 预算暂停后从特定 messages_offset 续跑。
+
+    实际持久化形式为 dict（嵌入 SessionContext.task_checkpoints），
+    本 dataclass 只是构造与字段校验的帮手，与 handoff_events 等同风格。
+    """
+
+    checkpoint_id: str
+    task_id: str
+    conversation_id: str
+    iteration: int
+    created_at: float
+    summary: str = ""
+    next_step_hint: str = ""
+    exit_reason: str = "running"
+    artifacts: list[str] = field(default_factory=list)
+    messages_offset: int = 0
+
+    # 合法 exit_reason 取值（仅供调用方对照，未做严格枚举校验以保持向前兼容）
+    EXIT_REASONS = (
+        "running",
+        "iteration_complete",
+        "budget_paused",
+        "user_cancelled",
+        "network_error",
+        "completed",
+        "failed",
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "checkpoint_id": self.checkpoint_id,
+            "task_id": self.task_id,
+            "conversation_id": self.conversation_id,
+            "iteration": self.iteration,
+            "created_at": self.created_at,
+            "summary": self.summary,
+            "next_step_hint": self.next_step_hint,
+            "exit_reason": self.exit_reason,
+            "artifacts": list(self.artifacts),
+            "messages_offset": self.messages_offset,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TaskCheckpoint":
+        return cls(
+            checkpoint_id=str(data.get("checkpoint_id", "")),
+            task_id=str(data.get("task_id", "")),
+            conversation_id=str(data.get("conversation_id", "")),
+            iteration=int(data.get("iteration", 0) or 0),
+            created_at=float(data.get("created_at", 0.0) or 0.0),
+            summary=str(data.get("summary", "")),
+            next_step_hint=str(data.get("next_step_hint", "")),
+            exit_reason=str(data.get("exit_reason", "running")),
+            artifacts=list(data.get("artifacts") or []),
+            messages_offset=int(data.get("messages_offset", 0) or 0),
+        )
+
+
+@dataclass
 class SessionContext:
     """
     会话上下文
@@ -74,6 +139,7 @@ class SessionContext:
     current_topic_start: int = 0  # 当前话题起始消息索引
     agent_profile_id: str = "default"
     agent_switch_history: list[dict] = field(default_factory=list)
+    working_facts: dict[str, Any] = field(default_factory=dict)
     handoff_events: list[dict] = field(default_factory=list)  # agent_handoff events for SSE
     # Active agents in this session (multi-agent collaboration)
     active_agents: list[str] = field(default_factory=list)
@@ -81,6 +147,12 @@ class SessionContext:
     delegation_chain: list[dict] = field(default_factory=list)
     # Sub-agent work records — persisted traces of delegated tasks
     sub_agent_records: list[dict] = field(default_factory=list)
+    # Task checkpoints — emitted by reasoning_engine.reason_stream for resume / timeline
+    # 上限由 append_task_checkpoint 控制，避免长会话无限增长。
+    task_checkpoints: list[dict] = field(default_factory=list)
+    focus_terms: list[str] = field(default_factory=list)
+    focus_updated_at: str | None = None
+    precompact_snapshot: dict[str, Any] = field(default_factory=dict)
     _msg_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     _DEDUP_TIME_WINDOW_SECONDS = 30
@@ -121,7 +193,95 @@ class SessionContext:
                     **metadata,
                 }
             )
+            if role == "user" and content:
+                self.update_focus_terms(content)
             return True
+
+    def append_marker(self, role: str, content: str, **metadata) -> None:
+        """直接追加一条消息，**绕过** :meth:`add_message` 的去重逻辑。
+
+        v1.27.14 (plan: conversation concurrency v1.28, S1.8):
+        ``_preempt_or_queue_prev_task`` 抢占 / abandon 老 task 时，需要在
+        会话历史里留一条 ``"[上一条任务被中断]"`` 标记，让前端时间线和
+        后续 LLM 上下文知道这里"老回答没说完"。这种 marker 几秒内连发可能
+        相同（连续被多次抢占），dedup 会把后几条丢掉——但 dedup 丢掉
+        marker 会让会话历史**变得不诚实**（前端"以为"老回答完整结束）。
+
+        本方法保证：每次调用都真的 append 一条，不做任何去重检查。
+
+        Args:
+            role: 通常是 ``"assistant"`` 或 ``"system"``；当作普通消息渲染。
+            content: marker 文本。
+            **metadata: 额外字段（``marker_type``、``preempted_task_id``、
+                ``policy`` 等）一并存入这条消息记录，便于前端按 marker_type
+                决定渲染样式。
+        """
+        with self._msg_lock:
+            self.messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "timestamp": datetime.now().isoformat(),
+                    **metadata,
+                }
+            )
+
+    _FOCUS_FILE_RE = re.compile(
+        r"(?:[A-Za-z]:[\\/][^\s\"'<>|]+|[\w./\\-]+\.(?:py|ts|tsx|js|jsx|md|json|yaml|yml|toml|rs|go))"
+    )
+    _FOCUS_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,12}")
+    _FOCUS_STOP_WORDS = {
+        "帮我",
+        "这个",
+        "那个",
+        "一下",
+        "继续",
+        "看看",
+        "请问",
+        "如何",
+        "怎么",
+        "需要",
+        "实现",
+        "修改",
+        "the",
+        "and",
+        "for",
+        "with",
+    }
+
+    def update_focus_terms(self, content: str, *, max_terms: int = 12) -> None:
+        """Update lightweight session focus terms; never writes long-term memory."""
+        text = content.strip()
+        if not text:
+            return
+        if len(self.messages) - self.current_topic_start <= 1:
+            self.focus_terms = []
+
+        candidates: list[str] = []
+        candidates.extend(m.group(0).strip(".,，。;；") for m in self._FOCUS_FILE_RE.finditer(text))
+        for match in self._FOCUS_WORD_RE.finditer(text):
+            term = match.group(0).strip()
+            if len(term) < 2 or term.lower() in self._FOCUS_STOP_WORDS:
+                continue
+            if (
+                any(ch.isupper() for ch in term)
+                or "_" in term
+                or "-" in term
+                or "/" in term
+                or any(
+                    keyword in term
+                    for keyword in ("任务", "记忆", "权限", "审计", "会话", "路径", "压缩", "队列")
+                )
+            ):
+                candidates.append(term)
+
+        merged: list[str] = []
+        for term in [*candidates, *self.focus_terms]:
+            if term and term not in merged:
+                merged.append(term)
+        self.focus_terms = merged[:max_terms]
+        if candidates:
+            self.focus_updated_at = datetime.now().isoformat()
 
     def mark_topic_boundary(self) -> None:
         """在当前消息位置标记话题边界。
@@ -131,6 +291,8 @@ class SessionContext:
         boundary_idx = len(self.messages)
         self.topic_boundaries.append(boundary_idx)
         self.current_topic_start = boundary_idx
+        self.focus_terms = []
+        self.focus_updated_at = datetime.now().isoformat()
 
     def get_current_topic_messages(self) -> list[dict]:
         """获取当前话题的消息（从最后一个边界开始）。"""
@@ -167,6 +329,44 @@ class SessionContext:
             self.current_topic_start = 0
             self.variables["_context_reset_at"] = datetime.now().isoformat()
 
+    def append_task_checkpoint(
+        self,
+        checkpoint: "TaskCheckpoint | dict",
+        *,
+        max_keep: int = 50,
+    ) -> dict:
+        """追加任务检查点，超出 max_keep 时仅保留最近若干条。
+
+        Args:
+            checkpoint: TaskCheckpoint 实例或等价 dict。
+            max_keep: 单会话内保留的检查点上限，默认 50。
+
+        Returns:
+            落到 task_checkpoints 中的 dict（也用于 SSE emit）。
+        """
+        if isinstance(checkpoint, TaskCheckpoint):
+            data = checkpoint.to_dict()
+        elif isinstance(checkpoint, dict):
+            data = TaskCheckpoint.from_dict(checkpoint).to_dict()
+        else:
+            raise TypeError(
+                f"checkpoint must be TaskCheckpoint or dict, got {type(checkpoint).__name__}"
+            )
+
+        with self._msg_lock:
+            self.task_checkpoints.append(data)
+            if len(self.task_checkpoints) > max_keep:
+                self.task_checkpoints = self.task_checkpoints[-max_keep:]
+        return data
+
+    def latest_task_checkpoint(self, task_id: str | None = None) -> dict | None:
+        """返回最近一条检查点；若给出 task_id，则限定该任务。"""
+        with self._msg_lock:
+            for ckpt in reversed(self.task_checkpoints):
+                if task_id is None or ckpt.get("task_id") == task_id:
+                    return ckpt
+        return None
+
     def to_dict(self) -> dict:
         """序列化"""
         return {
@@ -179,10 +379,15 @@ class SessionContext:
             "current_topic_start": self.current_topic_start,
             "agent_profile_id": self.agent_profile_id,
             "agent_switch_history": self.agent_switch_history,
+            "working_facts": self.working_facts,
             "handoff_events": self.handoff_events,
             "active_agents": self.active_agents,
             "delegation_chain": self.delegation_chain,
             "sub_agent_records": self.sub_agent_records,
+            "task_checkpoints": self.task_checkpoints,
+            "focus_terms": self.focus_terms,
+            "focus_updated_at": self.focus_updated_at,
+            "precompact_snapshot": self.precompact_snapshot,
         }
 
     @classmethod
@@ -198,10 +403,15 @@ class SessionContext:
             current_topic_start=data.get("current_topic_start", 0),
             agent_profile_id=data.get("agent_profile_id", "default"),
             agent_switch_history=data.get("agent_switch_history", []),
+            working_facts=data.get("working_facts", {}),
             handoff_events=data.get("handoff_events", []),
             active_agents=data.get("active_agents", []),
             delegation_chain=data.get("delegation_chain", []),
             sub_agent_records=data.get("sub_agent_records", []),
+            task_checkpoints=data.get("task_checkpoints", []),
+            focus_terms=data.get("focus_terms", []),
+            focus_updated_at=data.get("focus_updated_at"),
+            precompact_snapshot=data.get("precompact_snapshot", {}),
         )
 
 
@@ -220,6 +430,7 @@ class Session:
     channel: str  # 来源通道
     chat_id: str  # 聊天 ID（群/私聊）
     user_id: str  # 用户 ID
+    bot_instance_id: str = ""  # 机器人实例 ID（为空时兼容旧数据，回退 channel）
     thread_id: str | None = None  # 话题/线程 ID（飞书话题等）
     chat_type: str = "private"  # "group" | "private"
     display_name: str = ""  # 用户昵称（用于 UI 展示）
@@ -239,12 +450,41 @@ class Session:
     # 元数据
     metadata: dict = field(default_factory=dict)
 
+    # PolicyV2 正交两层 mode（C8 §2.2 新增）
+    # ``session_role``: SessionRole 枚举字符串 ("agent" / "plan" / "ask" / "coordinator")
+    # ``confirmation_mode_override``: 若非 None，覆盖全局 ConfirmationMode（"default"
+    # / "trust" / "strict" / "accept_edits" / "dont_ask"）。switch_mode 工具写入
+    # ``session_role``；UI/handler 后续可对个别 session 单独覆盖 confirmation_mode。
+    # 用 ``str`` 而非 ``Enum`` 是为了让旧 sessions.json（无字段）反序列化时可
+    # ``getattr(session, "session_role", "agent")`` 兼容；adapter.build_policy_context
+    # 把字符串 coerce 回 SessionRole 枚举。
+    session_role: str = "agent"
+    confirmation_mode_override: str | None = None
+
+    # C12 §14.2: PolicyV2 unattended fields. Promoted from `metadata` to
+    # first-class fields so scheduler / spawn_agent / webhook callers can set
+    # them at session creation without metadata fishing. PolicyContext.from_session
+    # reads first-class fields when present (with metadata fallback for
+    # back-compat with sessions persisted before C12).
+    #
+    # ``is_unattended``: True for sessions where no human is interactively
+    # responding (cron task / webhook / autonomous spawn). PolicyEngineV2
+    # step 11 routes through ``_handle_unattended`` only when this is True.
+    #
+    # ``unattended_strategy``: empty → engine uses
+    # ``config.unattended.default_strategy`` ("ask_owner" by default).
+    # Explicit values: "deny" / "auto_approve" / "defer_to_owner" /
+    # "defer_to_inbox" / "ask_owner".  Per-session override of config default.
+    is_unattended: bool = False
+    unattended_strategy: str = ""
+
     @classmethod
     def create(
         cls,
         channel: str,
         chat_id: str,
         user_id: str,
+        bot_instance_id: str = "",
         thread_id: str | None = None,
         config: SessionConfig | None = None,
         chat_type: str = "private",
@@ -260,6 +500,7 @@ class Session:
             channel=channel,
             chat_id=chat_id,
             user_id=user_id,
+            bot_instance_id=bot_instance_id or channel,
             thread_id=thread_id,
             chat_type=chat_type,
             display_name=display_name,
@@ -361,18 +602,111 @@ class Session:
     @property
     def session_key(self) -> str:
         """会话唯一标识"""
-        key = f"{self.channel}:{self.chat_id}:{self.user_id}"
+        namespace = self.bot_instance_id or self.channel
+        key = f"{namespace}:{self.chat_id}:{self.user_id}"
         if self.thread_id:
             key += f":{self.thread_id}"
         return key
+
+    # 重型元数据键（思考链、工具摘要、代码产物），对旧消息裁剪以控制体积
+    _HEAVY_METADATA_KEYS = ("chain_summary", "tool_summary", "artifacts")
+    # 保留最近 N 条消息的完整元数据（前端展示思考链等），更早的仅保留 base content
+    _METADATA_PRESERVE_WINDOW = 50
+
+    def append_marker(self, role: str, content: str, **metadata) -> None:
+        """直接追加一条消息（绕过去重）；用于 cancel/preempt marker。
+
+        v1.27.14 (plan v1.28, S1.8). 详见 :meth:`SessionContext.append_marker`.
+
+        FIX 5 (vs v1.27.14 first cut): also persist to SqliteTurnStore so
+        markers survive a process restart.  Without persistence, after a
+        backend restart the frontend timeline silently looks "as if the
+        previous answer finished normally" — defeating the whole point
+        of writing the marker.  We mirror ``Session.add_message``'s
+        best-effort persistence path (history_db_merge_v1 feature-gated,
+        skip on transient_for_llm, swallow exceptions to never block
+        the chat loop).
+        """
+        self.context.append_marker(role, content, **metadata)
+        self.touch()
+
+        # Best-effort SQLite persistence, identical guards to ``add_message``.
+        try:
+            if role in ("user", "assistant", "tool") and not metadata.get(
+                "transient_for_llm"
+            ):
+                self._write_turn_to_store(role, content, metadata)
+        except Exception as exc:
+            logger.debug(f"[Session] append_marker write_turn_to_store skipped: {exc}")
 
     def add_message(self, role: str, content: str, **metadata) -> bool:
         """添加消息并更新活跃时间。返回 True 表示消息被添加，False 表示被去重跳过。"""
         added = self.context.add_message(role, content, **metadata)
         self.touch()
-        if added and len(self.context.messages) > self.config.max_history:
-            self._truncate_history()
+
+        if added:
+            self._trim_old_metadata()
+            if len(self.context.messages) > self.config.max_history:
+                self._truncate_history()
+            # PR-D3: best-effort 同步写 SqliteTurnStore，避免崩溃丢历史。
+            # 仅持久化主对话角色（user/assistant），且 transient_for_llm 的
+            # 临时消息（如 RiskGate 确认应答）不写盘。
+            try:
+                if (
+                    role in ("user", "assistant", "tool")
+                    and not metadata.get("transient_for_llm")
+                ):
+                    self._write_turn_to_store(role, content, metadata)
+            except Exception as exc:
+                logger.debug(f"[Session] write_turn_to_store skipped: {exc}")
         return added
+
+    def _write_turn_to_store(self, role: str, content: str, metadata: dict) -> None:
+        """Persist a single turn to SQLite via session_manager._turn_writer."""
+        try:
+            from ..core.feature_flags import is_enabled as _ff_enabled
+
+            if not _ff_enabled("history_db_merge_v1"):
+                return
+        except Exception:
+            return
+
+        manager = getattr(self, "_manager", None)
+        writer = getattr(manager, "_turn_writer", None) if manager else None
+        if writer is None:
+            return
+
+        try:
+            import re as _re
+
+            safe_id = (self.session_key or "").replace(":", "__")
+            safe_id = _re.sub(r'[/\\+=%?*<>|"\x00-\x1f]', "_", safe_id)
+            turn_index = max(0, len(self.context.messages) - 1)
+            writer(
+                safe_id,
+                turn_index,
+                role,
+                content,
+                metadata,
+            )
+        except Exception as exc:
+            logger.debug(f"[Session] turn writer failed: {exc}")
+
+    def _trim_old_metadata(self) -> None:
+        """裁剪旧消息的重型元数据以控制内存与序列化体积。
+
+        保留所有消息的 base content（role, content, timestamp），仅移除
+        chain_summary / tool_summary / artifacts 等重型字段。
+        这是日常的体积控制机制，不会删除任何消息——用户永远不会丢失聊天记录。
+        """
+        with self.context._msg_lock:
+            messages = self.context.messages
+            trim_end = len(messages) - self._METADATA_PRESERVE_WINDOW
+            if trim_end <= 0:
+                return
+            for msg in messages[:trim_end]:
+                for key in self._HEAVY_METADATA_KEYS:
+                    msg.pop(key, None)
 
     _RULE_SIGNAL_WORDS = (
         "不要",
@@ -390,15 +724,22 @@ class Session:
     )
 
     def _truncate_history(self) -> None:
-        """截断历史消息，保留 75%，对丢弃部分生成简要摘要插入头部。
+        """硬安全网：仅当消息数超过 max_history（默认 2000）时触发。
 
-        优先保留用户设定的行为规则类消息。
+        日常体积控制由 _trim_old_metadata 负责（不删消息），本方法仅在极端情况
+        下删除最老 5% 的消息。正常使用几乎不会触发。
         """
         with self.context._msg_lock:
-            keep_count = int(self.config.max_history * 3 / 4)
+            keep_count = int(self.config.max_history * 95 / 100)
             messages = self.context.messages
             dropped = messages[:-keep_count]
             kept = messages[-keep_count:]
+
+            logger.warning(
+                f"Session {self.id}: HARD CAP truncation — "
+                f"total {len(messages)}, dropping {len(dropped)}, "
+                f"keeping {len(kept)} (max_history={self.config.max_history})"
+            )
 
             self._mark_dropped_for_extraction(dropped)
 
@@ -454,8 +795,8 @@ class Session:
                 kept.insert(0, {"role": "system", "content": "\n\n".join(header_parts)})
 
             self.context.messages = kept
-            logger.debug(
-                f"Session {self.id}: truncated history — "
+            logger.info(
+                f"Session {self.id}: truncated — "
                 f"dropped {len(dropped)}, kept {len(kept)} messages, "
                 f"preserved {len(rule_snippets)} rule snippets"
             )
@@ -499,6 +840,7 @@ class Session:
         return {
             "id": self.id,
             "channel": self.channel,
+            "bot_instance_id": self.bot_instance_id or self.channel,
             "chat_id": self.chat_id,
             "user_id": self.user_id,
             "thread_id": self.thread_id,
@@ -518,6 +860,10 @@ class Session:
                 "auto_summarize": self.config.auto_summarize,
             },
             "metadata": serializable_metadata,
+            "session_role": self.session_role,
+            "confirmation_mode_override": self.confirmation_mode_override,
+            "is_unattended": self.is_unattended,
+            "unattended_strategy": self.unattended_strategy,
         }
 
     def _is_json_serializable(self, value: Any) -> bool:
@@ -534,9 +880,22 @@ class Session:
     def from_dict(cls, data: dict) -> "Session":
         """反序列化"""
         config_data = data.get("config", {})
+        # C8: session_role / confirmation_mode_override 旧 sessions.json 没有，
+        # 走默认 "agent" / None。读取时容错任意非法值（None/类型错） → 默认。
+        sr_raw = data.get("session_role", "agent")
+        session_role = sr_raw if isinstance(sr_raw, str) and sr_raw else "agent"
+        cm_raw = data.get("confirmation_mode_override")
+        confirmation_mode_override = cm_raw if isinstance(cm_raw, str) and cm_raw else None
+        # C12 §14.2: is_unattended / unattended_strategy. 旧 sessions.json 没有
+        # → 默认 False / "" (= use config.unattended.default_strategy)
+        is_unattended_raw = data.get("is_unattended", False)
+        is_unattended = bool(is_unattended_raw) if is_unattended_raw is not None else False
+        us_raw = data.get("unattended_strategy", "")
+        unattended_strategy = us_raw if isinstance(us_raw, str) else ""
         return cls(
             id=data["id"],
             channel=data["channel"],
+            bot_instance_id=data.get("bot_instance_id") or data.get("channel", ""),
             chat_id=data["chat_id"],
             user_id=data["user_id"],
             thread_id=data.get("thread_id"),
@@ -548,7 +907,7 @@ class Session:
             last_active=datetime.fromisoformat(data["last_active"]),
             context=SessionContext.from_dict(data.get("context") or {}),
             config=SessionConfig(
-                max_history=config_data.get("max_history", 100),
+                max_history=max(config_data.get("max_history", 2000), 500),
                 timeout_minutes=config_data.get("timeout_minutes", 30),
                 language=config_data.get("language", "zh"),
                 model=config_data.get("model"),
@@ -556,4 +915,8 @@ class Session:
                 auto_summarize=config_data.get("auto_summarize", True),
             ),
             metadata=data.get("metadata", {}),
+            session_role=session_role,
+            confirmation_mode_override=confirmation_mode_override,
+            is_unattended=is_unattended,
+            unattended_strategy=unattended_strategy,
         )

@@ -102,6 +102,8 @@ class MemoryNode:
     project: str = ""
     goal: str = ""
     agent_id: str = ""
+    user_id: str = "default"
+    workspace_id: str = "default"
 
     importance: float = 0.5
     confidence: float = 0.5
@@ -152,3 +154,4 @@ class RetrievalResult:
     score: float = 0.0
     path: list[str] = field(default_factory=list)
     dimensions_matched: list[Dimension] = field(default_factory=list)
+

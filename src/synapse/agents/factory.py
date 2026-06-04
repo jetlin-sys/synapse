@@ -88,6 +88,11 @@ class _GlobalStoreSource:
     Used by isolated-memory agents with memory_inherit_global=True to also
     retrieve from the shared global memory during search.
 
+    Phase 2b.1 安全洞修复：必须按当前 (user_id, workspace_id) 透传过滤，
+    否则 isolated agent 在 "继承全局" 模式下会拉到别的用户的记忆。
+    检索仅返回 ``scope="user"`` 范围、且 `user_id/workspace_id` 与
+    isolated MemoryManager 当前租户匹配的记忆，禁止跨用户、跨工作区。
+
     RetrievalEngine._call_external_sources_sync expects:
       - ``source.source_name: str``
       - ``async source.retrieve(query, limit) -> list[dict]``
@@ -96,11 +101,45 @@ class _GlobalStoreSource:
 
     source_name = "global_memory"
 
-    def __init__(self, global_store):
+    def __init__(self, global_store, owner_provider):
+        """
+        Args:
+            global_store: 共享的全局 UnifiedStore
+            owner_provider: 无参可调用对象，返回当前 (user_id, workspace_id) 元组。
+                通常绑定到 isolated MemoryManager._current_owner，以便每次
+                检索时拿到该 Agent 当前会话的真实租户身份。
+        """
         self._store = global_store
+        self._owner_provider = owner_provider
 
     async def retrieve(self, query: str, limit: int = 8) -> list[dict]:
-        memories = self._store.search_semantic(query, limit=limit)
+        try:
+            user_id, workspace_id = self._owner_provider()
+        except Exception as e:
+            logger.warning(
+                "[_GlobalStoreSource] owner_provider failed (%s); refusing cross-user fallback",
+                e,
+            )
+            return []
+        if not user_id or user_id in {"default", "anonymous", "legacy", "system", ""}:
+            logger.debug(
+                "[_GlobalStoreSource] user_id=%r is non-personal; "
+                "skipping global memory inheritance to avoid leaking shared bucket.",
+                user_id,
+            )
+            return []
+        try:
+            memories = self._store.search_semantic(
+                query,
+                limit=limit,
+                scope="user",
+                scope_owner="",
+                user_id=user_id,
+                workspace_id=workspace_id or "default",
+            )
+        except Exception as e:
+            logger.warning("[_GlobalStoreSource] tenant-scoped search failed: %s", e)
+            return []
         results = []
         for mem in memories:
             results.append(
@@ -127,14 +166,39 @@ class AgentFactory:
         profile: AgentProfile,
         *,
         parent_brain: Any = None,
+        share_from: Any = None,
         **kwargs: Any,
     ) -> Agent:
-        from synapse.core.agent import Agent
+        from synapse.core.agent import Agent, get_primary_agent
 
         agent = Agent(name=profile.get_display_name(), brain=parent_brain, **kwargs)
-        agent._agent_profile = profile
 
-        await agent.initialize(start_scheduler=False, lightweight=True)
+        # ── share_from 选取策略（P0-A 性能修复）──
+        # 默认尝试复用进程主 Agent 的注册表 —— sub-agent 不再各自加载一次
+        # 124 个工具/22 个插件/30 个 handler，把节点切换延迟从 30~80s 降到 <1s。
+        # 但只有"完全共享"配置才能安全 share_from（plugin/identity/memory 任何
+        # 一个隔离都会破坏共享语义，必须走传统的 lightweight full-init）。
+        # 注意：``plugins_mode == "all"`` 且没显式列 plugins 视作"全部继承"。
+        share_target = share_from if share_from is not None else get_primary_agent()
+        can_share = (
+            share_target is not None
+            and share_target is not agent
+            and getattr(share_target, "_initialized", False)
+            and getattr(profile, "identity_mode", "shared") == "shared"
+            and getattr(profile, "memory_mode", "shared") == "shared"
+            and (
+                getattr(profile, "plugins_mode", "all") == "all"
+                or not getattr(profile, "plugins", None)
+            )
+        )
+
+        if can_share:
+            await agent.initialize(
+                start_scheduler=False, lightweight=True, share_from=share_target
+            )
+        else:
+            await agent.initialize(start_scheduler=False, lightweight=True)
+        agent.configure_runtime_environment(profile)
 
         self._apply_skill_filter(agent, profile)
         self._apply_tool_filter(agent, profile)
@@ -193,6 +257,7 @@ class AgentFactory:
 
         if profile.preferred_endpoint:
             agent._preferred_endpoint = profile.preferred_endpoint
+            agent._endpoint_policy = profile.endpoint_policy or "prefer"
 
         logger.info(
             f"AgentFactory created: {profile.id} "
@@ -203,7 +268,8 @@ class AgentFactory:
             f"plugins_mode={profile.plugins_mode}, "
             f"identity_mode={profile.identity_mode}, "
             f"memory_mode={profile.memory_mode}, "
-            f"preferred_endpoint={profile.preferred_endpoint or 'auto'})"
+            f"preferred_endpoint={profile.preferred_endpoint or 'auto'}, "
+            f"endpoint_policy={profile.endpoint_policy or 'prefer'})"
         )
         return agent
 
@@ -370,13 +436,29 @@ class AgentFactory:
         agent.identity = identity
 
         if hasattr(agent, "_context"):
-            base_prompt = identity.get_system_prompt()
-            agent._context.system = agent._build_system_prompt(
-                base_prompt,
-                use_compiled=True,
-            )
+            agent._context.system = agent._build_system_prompt()
 
         logger.info(f"Identity override applied: profile={profile.id}, dir={profile_identity_dir}")
+
+    @staticmethod
+    def _isolated_memory_md_seed(profile: AgentProfile) -> str:
+        """Phase 2b.3：生成 isolated agent 的 MEMORY.md 初始内容。
+
+        刻意不引用全局记忆，让 daily_consolidator 在该 Agent 运行一段时间后
+        用它**自己**的对话和经验填充。
+        """
+        from datetime import datetime
+
+        name = (profile.name or profile.id).strip()
+        return (
+            f"# {name} — 独立记忆\n\n"
+            f"<!-- Phase 2b.3 seeded {datetime.now().isoformat(timespec='seconds')} -->\n\n"
+            f"_这是 Agent `{profile.id}` 的独立记忆文件。_\n\n"
+            f"这个 Agent 配置了 `memory_isolation=isolated`，所以它有自己的偏好、"
+            f"经验和事实记忆，不会和其它 Agent / 全局记忆混在一起。\n\n"
+            f"当 Agent 在对话里习得新的偏好、规则或事实，后台 lifecycle 任务会"
+            f"把它们写到这里。_无需手动编辑。_\n"
+        )
 
     @staticmethod
     def _apply_memory_isolation(agent: Agent, profile: AgentProfile) -> None:
@@ -390,9 +472,34 @@ class AgentFactory:
         memory_dir = profile_dir / "memory"
         memory_dir.mkdir(parents=True, exist_ok=True)
 
+        # Phase 2b.3：isolated agent 首次启动 seed 一份属于自己的 MEMORY.md。
+        #
+        # 旧实现（v4 之前）：找不到 profile 自己的 MEMORY.md 时回退到全局
+        # ``settings.memory_path``。这有两个问题：
+        # 1) 启动时读到的是**别人**（全局）的偏好和经验，破坏 isolated 语义；
+        # 2) daily_consolidator.refresh_memory_md() 会用 isolated MemoryManager
+        #    的数据**覆写**全局 MEMORY.md —— 这是真正的数据污染 bug。
+        #
+        # 新实现：永远使用 profile 私有的路径；不存在就写入一份带注释头的
+        # 空模板，让用户知道这是该 Agent 的独立记忆区域。
         memory_md_path = profile_dir / "identity" / "MEMORY.md"
         if not memory_md_path.exists():
-            memory_md_path = settings.memory_path
+            try:
+                memory_md_path.parent.mkdir(parents=True, exist_ok=True)
+                seed = AgentFactory._isolated_memory_md_seed(profile)
+                memory_md_path.write_text(seed, encoding="utf-8")
+                logger.info(
+                    "[Memory] Seeded isolated MEMORY.md for %s at %s",
+                    profile.id, memory_md_path,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Memory] Failed to seed MEMORY.md for %s (%s); falling "
+                    "back to global path. This may temporarily cross-pollinate "
+                    "global memory.",
+                    profile.id, e,
+                )
+                memory_md_path = settings.memory_path
 
         isolated_mm = MemoryManager(
             data_dir=memory_dir,
@@ -411,7 +518,12 @@ class AgentFactory:
         if profile.memory_inherit_global:
             global_store = agent.memory_manager.store
             isolated_mm._global_store_ref = global_store
-            isolated_mm.retrieval_engine._external_sources.append(_GlobalStoreSource(global_store))
+            # P2b.1：把 owner_provider 绑定到 isolated_mm 的 _current_owner，
+            # 让全局检索严格按当前 (user_id, workspace_id) 过滤，
+            # 防止 isolated agent 从全局拉到别的用户/工作区的记忆。
+            isolated_mm.retrieval_engine._external_sources.append(
+                _GlobalStoreSource(global_store, isolated_mm._current_owner)
+            )
 
         agent.memory_manager = isolated_mm
 
@@ -449,15 +561,28 @@ class AgentFactory:
 
 
 class _PoolEntry:
-    __slots__ = ("agent", "profile_id", "session_id", "created_at", "last_used", "skills_version")
+    __slots__ = (
+        "agent",
+        "profile_id",
+        "session_id",
+        "created_at",
+        "last_used",
+        "runtime_config_version",
+    )
 
-    def __init__(self, agent: Agent, profile_id: str, session_id: str, skills_version: int = 0):
+    def __init__(
+        self,
+        agent: Agent,
+        profile_id: str,
+        session_id: str,
+        runtime_config_version: int = 0,
+    ):
         self.agent = agent
         self.profile_id = profile_id
         self.session_id = session_id
         self.created_at = time.monotonic()
         self.last_used = time.monotonic()
-        self.skills_version = skills_version
+        self.runtime_config_version = runtime_config_version
 
     def touch(self) -> None:
         self.last_used = time.monotonic()
@@ -495,7 +620,7 @@ class AgentInstancePool:
         # Per-composite-key locks for concurrent creation
         self._create_locks: dict[str, asyncio.Lock] = {}
         self._reaper_task: asyncio.Task | None = None
-        self._skills_version: int = 0
+        self._runtime_config_version: int = 0
 
     @staticmethod
     def _make_key(session_id: str, profile_id: str) -> str:
@@ -529,9 +654,23 @@ class AgentInstancePool:
         logger.info("AgentInstancePool stopped")
 
     def notify_skills_changed(self) -> None:
-        """全局技能变更通知 — 递增版本号使池中已有 Agent 在下次使用时重建。"""
-        self._skills_version += 1
-        logger.info(f"Pool skills version bumped to {self._skills_version}")
+        """全局技能变更通知 — 使池中已有 Agent 在下次使用时重建。"""
+        self.notify_runtime_config_changed("skills")
+
+    def notify_runtime_config_changed(self, reason: str = "runtime_config") -> None:
+        """Mark pooled Agent instances stale after runtime-affecting config changes.
+
+        Agent instances own Brain/LLMClient/tool catalogs.  Reusing an old
+        instance after changing skills or LLM endpoints keeps stale runtime
+        state alive until process restart, so the pool tracks a single runtime
+        version and recreates entries lazily on the next request.
+        """
+        self._runtime_config_version += 1
+        logger.info(
+            "Pool runtime config version bumped to %s (reason=%s)",
+            self._runtime_config_version,
+            reason,
+        )
 
     def invalidate_profile(self, profile_id: str) -> int:
         """Drop all pooled Agent instances bound to *profile_id*."""
@@ -565,33 +704,24 @@ class AgentInstancePool:
         All dict operations are safe under asyncio's single-threaded event loop;
         only the async create_lock is needed to serialize factory.create() calls.
 
-        当全局技能版本变更时，旧的 Agent 会被丢弃并重建，
-        确保技能安装/卸载/启禁用等操作能同步到所有池 Agent。
+        当全局运行时配置版本变更时，旧的 Agent 会被丢弃并重建，
+        确保技能、LLM 端点等会影响 Agent/Brain 构造的配置同步到所有池 Agent。
         """
         key = self._make_key(session_id, profile.id)
-        current_version = self._skills_version
+        current_version = self._runtime_config_version
 
         entry = self._pool.get(key)
         if entry:
-            if entry.skills_version >= current_version:
+            if entry.runtime_config_version >= current_version:
                 entry.touch()
                 return entry.agent
-            # 研发会议室白名单：notify_skills_changed 不强制让正在使用的会议室 Agent 重建，
-            # 否则会议节点跑到一半技能变更（install/load/reload/enable）就会丢上下文。
-            # 仅在 Agent 完全空闲（无活跃任务）时才允许升级；否则推迟到下次显式 idle reap。
-            if session_id.startswith("rd_meeting:"):
-                astate = getattr(entry.agent, "agent_state", None)
-                has_active = getattr(astate, "has_active_task", False) if astate is not None else False
-                if has_active:
-                    logger.debug(
-                        f"Pool meeting agent has active task, skip skills_version upgrade: "
-                        f"session={session_id}, profile={profile.id}"
-                    )
-                    entry.touch()
-                    return entry.agent
             logger.info(
-                f"Pool agent stale (skills_version {entry.skills_version} < {current_version}), "
-                f"recreating: session={session_id}, profile={profile.id}"
+                "Pool agent stale (runtime_config_version %s < %s), recreating: "
+                "session=%s, profile=%s",
+                entry.runtime_config_version,
+                current_version,
+                session_id,
+                profile.id,
             )
             self._pool.pop(key, None)
             self._schedule_shutdown(entry.agent)
@@ -602,7 +732,7 @@ class AgentInstancePool:
 
         async with create_lock:
             entry = self._pool.get(key)
-            if entry and entry.skills_version >= current_version:
+            if entry and entry.runtime_config_version >= current_version:
                 entry.touch()
                 return entry.agent
 
@@ -611,6 +741,7 @@ class AgentInstancePool:
                 e
                 for e in self._pool.values()
                 if e.session_id == session_id and hasattr(e.agent, "brain")
+                and e.runtime_config_version >= current_version
             ]
             if session_entries:
                 # Prefer default/system profiles, then earliest created

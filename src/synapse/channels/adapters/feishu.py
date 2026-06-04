@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,33 @@ def _drain_loop_tasks(loop: asyncio.AbstractEventLoop, timeout: float = 3.0) -> 
         pass
 
 
+def _feishu_ws_loop_exception_handler(
+    loop: asyncio.AbstractEventLoop, context: dict
+) -> None:
+    """飞书 WS 线程 loop 的异常处理器。
+
+    Windows ProactorEventLoop 在 WebSocket 远端先关闭连接时，
+    ``_ProactorBasePipeTransport._call_connection_lost`` 会因为 ``shutdown(SHUT_RDWR)``
+    遭到 ``ConnectionResetError(WinError 10054)`` 而抛错。这些异常对业务无影响
+    （连接本就要关），但会被 ``loop.default_exception_handler`` 当成未处理异常
+    每隔几秒刷一次错误日志。
+
+    本 handler 只吞掉这一类无害噪声，其他异常仍走默认 handler 供观察。
+    """
+    exc = context.get("exception")
+    # Windows: WinError 10054；POSIX: ECONNRESET。两种都属于"对端先关"情形。
+    # lark-oapi WS transport 关闭路径上没有需要业务介入的 ConnectionReset，
+    # 全部静默掉，避免重连时刷一屏堆栈。
+    if isinstance(exc, ConnectionResetError):
+        logger.debug(
+            "Feishu WS loop swallowed ConnectionResetError: %s",
+            context.get("message", ""),
+        )
+        return
+    # 其余异常按默认行为处理
+    loop.default_exception_handler(context)
+
+
 # 延迟导入
 lark_oapi = None
 
@@ -85,10 +113,18 @@ def _import_lark():
             lark_oapi = lark
         except ImportError as exc:
             logger.error("lark_oapi import failed: %s", exc, exc_info=True)
-            if "JSONDecodeError" in str(exc) and "simplejson" in str(exc):
+            exc_str = str(exc)
+            if "JSONDecodeError" in exc_str and "simplejson" in exc_str:
                 raise ImportError(
                     "飞书 SDK 依赖冲突：simplejson 缺少 JSONDecodeError。"
                     "请前往「设置中心 → Python 环境」执行一键修复后重启。"
+                ) from exc
+            if "Crypto" in exc_str or "AES" in exc_str:
+                from synapse.tools._import_helper import import_or_hint
+
+                raise ImportError(
+                    import_or_hint("Crypto")
+                    or "缺少依赖: pip install pycryptodome"
                 ) from exc
             from synapse.tools._import_helper import import_or_hint
 
@@ -249,6 +285,9 @@ class FeishuAdapter(ChannelAdapter):
         # 若存在则使用 CardKit API 更新卡片（无编辑次数限制）
         self._cardkit_cards: dict[str, tuple[str, str]] = {}
         self._cardkit_available: bool | None = None  # None=未探测
+        # 每个 card_id 的 PUT/PATCH 严格递增 sequence（飞书 CardKit 流式更新必填字段）
+        # 所有对同一 card_id 的写操作必须在 sequence 上单调递增，否则飞书拒绝
+        self._cardkit_sequence: dict[str, int] = {}
         self._tenant_token: str | None = None
         self._tenant_token_expires: float = 0
         self._tenant_token_lock: asyncio.Lock = asyncio.Lock()
@@ -281,6 +320,9 @@ class FeishuAdapter(ChannelAdapter):
         self._streaming_last_patch: dict[str, float] = {}
         # session_key → 是否已 finalize
         self._streaming_finalized: set[str] = set()
+        # session_key → 后台卡片刷新任务。中间刷新不能阻塞 token 消费，
+        # 否则飞书 CardKit/PatchMessage API 变慢时会造成流式输出卡顿。
+        self._streaming_patch_tasks: dict[str, asyncio.Task] = {}
         # session_key → 思考内容（流式期间暂存，finalize 后清理）
         self._streaming_thinking: dict[str, str] = {}
         # session_key → 思考耗时(ms)
@@ -618,16 +660,24 @@ class FeishuAdapter(ChannelAdapter):
             pass
 
         # 探测 CardKit 流式卡片权限 (cardkit:card:write)
+        # 探测使用与正式路径完全一致的请求体格式，确保探测通过的能力在生产可用
         try:
+            probe_card_json = self._build_streaming_card_json("probe", "probe_content")
             result = await self._cardkit_api(
                 "POST",
                 "/open-apis/cardkit/v1/cards",
-                body={"type": "card_json", "data": "{}", "settings": {}},
+                body={"type": "card_json", "data": probe_card_json},
+                validate=False,
             )
             code = result.get("code", -1)
-            if code == 0 or "card_id" in result.get("data", {}):
+            probe_card_id = (result.get("data") or {}).get("card_id", "")
+            if code == 0 and probe_card_id:
                 self._cardkit_available = True
                 self._capabilities.append("CardKit 流式卡片")
+                # 立即关闭探测卡片的流式态，避免占用 10 分钟自动关闭窗口
+                with contextlib.suppress(Exception):
+                    self._cardkit_sequence[probe_card_id] = 0
+                    await self._finish_cardkit_card(probe_card_id, summary_text="probe")
             elif self._is_permission_error(result.get("msg", "")):
                 self._cardkit_available = False
                 logger.info(
@@ -635,12 +685,26 @@ class FeishuAdapter(ChannelAdapter):
                     "建议在飞书开放平台开通 cardkit:card:write 权限。"
                 )
             else:
-                self._cardkit_available = True
-                self._capabilities.append("CardKit 流式卡片")
-        except Exception:
+                self._cardkit_available = False
+                logger.info(f"Feishu: CardKit 探测失败，回退 PatchMessage: {result}")
+        except Exception as e:
             self._cardkit_available = False
+            logger.info(f"Feishu: CardKit 探测异常，回退 PatchMessage: {e}")
 
         logger.info(f"Feishu capabilities: {self._capabilities}")
+        _stream_detail = (
+            f"streaming={self._streaming_enabled}"
+            f", group_streaming={self._group_streaming}"
+            f", cardkit={self._cardkit_available}"
+            f", throttle={self._streaming_throttle_ms}ms"
+        )
+        if self._streaming_enabled:
+            logger.info(f"Feishu: 流式输出已启用 ({_stream_detail})")
+        else:
+            logger.info(
+                f"Feishu: 流式输出未启用 ({_stream_detail})。"
+                "如需启用，请在 bot 配置中添加 streaming_enabled=true 或设置环境变量 FEISHU_STREAMING_ENABLED=true"
+            )
 
     def start_websocket(self, blocking: bool = True) -> None:
         """
@@ -674,6 +738,12 @@ class FeishuAdapter(ChannelAdapter):
             new_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(new_loop)
             self._ws_loop = new_loop
+
+            # 抑制 Windows ProactorEventLoop 在 WebSocket 关闭/重连时
+            # 反复打印的 ConnectionResetError(WinError 10054) 噪声。
+            # 这些是 lark-oapi SDK 内部 transport 在远端先关连接时的正常清理路径，
+            # 没有任何用户可操作信号。其他异常仍走默认 handler。
+            new_loop.set_exception_handler(_feishu_ws_loop_exception_handler)
 
             try:
                 spec = importlib.util.find_spec("lark_oapi.ws.client")
@@ -1013,7 +1083,20 @@ class FeishuAdapter(ChannelAdapter):
         return {}
 
     def _handle_security_decision(self, value: dict) -> dict:
-        """Handle security confirmation card button clicks."""
+        """Handle security confirmation card button clicks.
+
+        Called from two contexts:
+        1. WS mode (_on_card_action): runs in the Feishu WS thread — a foreign
+           thread with no running asyncio loop. We MUST dispatch to the main
+           event loop via run_coroutine_threadsafe so asyncio.Event.set() in
+           UIConfirmBus.resolve() reliably wakes the reasoning_engine waiter.
+        2. Webhook mode (_handle_card_action_webhook): runs inside the main
+           event loop thread (called from a sync FastAPI handler). We call
+           apply_resolution directly — already in the correct thread.
+
+        Detecting which case we're in: asyncio.get_running_loop() succeeds
+        when called from the event loop thread, raises RuntimeError otherwise.
+        """
         action = value.get("action", "")
         confirm_id = value.get("confirm_id", "")
         decision_map = {
@@ -1024,21 +1107,51 @@ class FeishuAdapter(ChannelAdapter):
             "security_allow_always": "allow_always",
         }
         decision = decision_map.get(action, "deny")
+        labels = {
+            "allow_once": "✅ 已允许",
+            "deny": "❌ 已拒绝",
+            "sandbox": "🔒 沙箱执行",
+            "allow_session": "✅ 会话允许",
+            "allow_always": "✅ 始终允许",
+        }
         try:
-            from synapse.core.policy import get_policy_engine
+            from synapse.core.policy_v2 import apply_resolution
 
-            get_policy_engine().resolve_ui_confirm(confirm_id, decision)
-            labels = {
-                "allow_once": "✅ 已允许",
-                "deny": "❌ 已拒绝",
-                "sandbox": "🔒 沙箱执行",
-                "allow_session": "✅ 会话允许",
-                "allow_always": "✅ 始终允许",
-            }
+            try:
+                asyncio.get_running_loop()
+                in_event_loop = True
+            except RuntimeError:
+                in_event_loop = False
+
+            if in_event_loop:
+                apply_resolution(confirm_id, decision)
+            elif self._main_loop is not None and self._main_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._apply_resolution_async(confirm_id, decision),
+                    self._main_loop,
+                )
+                future.result(timeout=2.5)
+            else:
+                apply_resolution(confirm_id, decision)
             return {"toast": {"type": "success", "content": labels.get(decision, decision)}}
+        except TimeoutError:
+            logger.warning(
+                "Feishu: security decision dispatch timed out "
+                "(confirm_id=%s, decision=%s)",
+                confirm_id,
+                decision,
+            )
+            return {"toast": {"type": "warning", "content": labels.get(decision, decision)}}
         except Exception as e:
             logger.warning(f"Feishu: security decision failed: {e}")
             return {"toast": {"type": "error", "content": "处理失败"}}
+
+    @staticmethod
+    async def _apply_resolution_async(confirm_id: str, decision: str) -> bool:
+        """Thin async wrapper so apply_resolution runs inside the event loop."""
+        from synapse.core.policy_v2 import apply_resolution
+
+        return apply_resolution(confirm_id, decision)
 
     def _handle_expand_folder(self, path: str) -> dict:
         """读取目录内容并返回包含文件树和展开按钮的更新卡片。"""
@@ -1266,12 +1379,28 @@ class FeishuAdapter(ChannelAdapter):
             self._tenant_token_expires = time.time() + data.get("expire", 7200) - 300
             return self._tenant_token
 
-    async def _cardkit_api(self, method: str, path: str, body: dict | None = None) -> dict:
-        """调用飞书 CardKit REST API。"""
+    async def _cardkit_api(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        validate: bool = True,
+    ) -> dict:
+        """调用飞书 CardKit REST API。
+
+        - 透传响应中的 ``code/msg/log_id``，便于在 400/403 等异常情况下精准定位是
+          权限、参数还是 sequence 越界问题。
+        - 任何 HTTP 非 2xx 都会读取响应体后再抛出，避免只看到 ``raise_for_status``
+          的"Bad Request"无线索。
+        """
         token = await self._get_tenant_access_token()
         import httpx
 
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
         url = f"{self.config.api_domain}{path}"
         async with httpx.AsyncClient(timeout=15.0) as client:
             if method.upper() == "POST":
@@ -1282,56 +1411,158 @@ class FeishuAdapter(ChannelAdapter):
                 resp = await client.patch(url, json=body, headers=headers)
             else:
                 resp = await client.get(url, headers=headers)
-        return resp.json()
+        if resp.status_code >= 400:
+            # 飞书在 4xx 时仍然会在 body 里返回 code/msg，先打印再抛出
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = {"raw": resp.text[:500]}
+            raise RuntimeError(
+                f"CardKit API HTTP {resp.status_code} on {method} {path}: {detail}"
+            )
+        result = resp.json()
+        if validate and result.get("code", 0) != 0:
+            raise RuntimeError(
+                f"CardKit API failed ({method} {path}): "
+                f"code={result.get('code')} msg={result.get('msg')!r} "
+                f"log_id={(result.get('data') or {}).get('log_id') or result.get('log_id')}"
+            )
+        return result
+
+    def _next_cardkit_seq(self, card_id: str) -> int:
+        """返回 *card_id* 下一个严格递增的 sequence。
+
+        飞书 CardKit 流式更新接口（PUT element content / PATCH card settings）
+        必填 ``sequence``，且对同一 card 必须严格递增。否则飞书返回参数校验错误。
+        """
+        seq = self._cardkit_sequence.get(card_id, 0) + 1
+        self._cardkit_sequence[card_id] = seq
+        return seq
+
+    @staticmethod
+    def _build_streaming_card_json(content: str, element_id: str) -> str:
+        """构造启用流式更新的 schema 2.0 卡片 JSON 字符串。
+
+        关键点（参照 https://open.feishu.cn/document/cardkit-v1）：
+        - ``streaming_mode`` 与 ``streaming_config`` 必须放在 ``config`` 里，
+          顶层 settings 不再承载流式开关。
+        - ``summary.content`` 留空可避免飞书侧客户端聊天预览长期停留在「[生成中...]」。
+        """
+        card = {
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": ""},
+                "streaming_config": {
+                    "print_frequency_ms": {"default": 70},
+                    "print_step": {"default": 2},
+                    "print_strategy": "fast",
+                },
+            },
+            "body": {
+                "direction": "vertical",
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": content,
+                        "text_size": "normal",
+                        "element_id": element_id,
+                    }
+                ],
+            },
+        }
+        return json.dumps(card, ensure_ascii=False)
 
     async def _create_cardkit_card(self, content: str) -> tuple[str, str]:
-        """创建 CardKit 流式卡片，返回 (card_id, element_id)。"""
+        """创建 CardKit 流式卡片，返回 ``(card_id, element_id)``。"""
         element_id = "streaming_content"
-        card_json = json.dumps(
-            {
-                "schema": "2.0",
-                "body": {
-                    "direction": "vertical",
-                    "elements": [
-                        {
-                            "tag": "markdown",
-                            "content": content,
-                            "text_size": "normal",
-                            "element_id": element_id,
-                        }
-                    ],
-                },
-            }
-        )
+        card_json = self._build_streaming_card_json(content, element_id)
         result = await self._cardkit_api(
             "POST",
             "/open-apis/cardkit/v1/cards",
             body={
                 "type": "card_json",
                 "data": card_json,
-                "settings": {"config": {"streaming_mode": True}},
             },
         )
         data = result.get("data", {})
         card_id = data.get("card_id", "")
         if not card_id:
             raise RuntimeError(f"CardKit create failed: {result}")
+        # 重置该卡片的 sequence 计数器（新卡片从 1 开始）
+        self._cardkit_sequence[card_id] = 0
         return card_id, element_id
 
     async def _update_cardkit_element(self, card_id: str, element_id: str, content: str) -> None:
-        """更新 CardKit 卡片元素内容（无编辑次数限制）。"""
+        """流式更新 CardKit 卡片中的 markdown 元素内容（全量文本，平台计算增量）。
+
+        正确请求体（参照官方文档 *流式更新文本*）：
+        - ``content``: 必填，纯字符串（markdown / 纯文本），1~100000 字符。
+        - ``sequence``: 必填，严格递增整数。
+        - ``uuid``: 可选，幂等键，避免重试时重复消费。
+        """
+        body = {
+            "content": content,
+            "sequence": self._next_cardkit_seq(card_id),
+            "uuid": uuid.uuid4().hex,
+        }
         await self._cardkit_api(
             "PUT",
             f"/open-apis/cardkit/v1/cards/{card_id}/elements/{element_id}/content",
-            body={"content": json.dumps({"tag": "markdown", "content": content})},
+            body=body,
         )
 
-    async def _finish_cardkit_card(self, card_id: str) -> None:
-        """结束 CardKit 卡片流式状态。"""
+    async def _overwrite_cardkit_card(
+        self, card_id: str, content: str, *, element_id: str = "streaming_content"
+    ) -> None:
+        """全量覆盖 CardKit 卡片（schema 2.0）作为 finalize 的二级 fallback。
+
+        当 element 流式 PUT 失败时，可用此接口直接重建卡片的 body。比删卡片再
+        发文本消息体验好得多——用户看到的是占位卡片就地变成最终回复，没有
+        撤回闪烁。
+        """
+        card_data = self._build_streaming_card_json(content, element_id)
+        body = {
+            "card": {
+                "type": "card_json",
+                "data": card_data,
+            },
+            "sequence": self._next_cardkit_seq(card_id),
+            "uuid": uuid.uuid4().hex,
+        }
+        await self._cardkit_api(
+            "PUT",
+            f"/open-apis/cardkit/v1/cards/{card_id}",
+            body=body,
+        )
+
+    async def _finish_cardkit_card(
+        self, card_id: str, *, summary_text: str | None = None
+    ) -> None:
+        """关闭 CardKit 流式态，并写入正确摘要（避免聊天预览停留在「[生成中...]」）。
+
+        ``settings`` 字段必须是 JSON **字符串**，sequence 严格递增。
+        """
+        # 摘要长度受飞书限制，截断到 60 字（聊天列表已显示不下更多）
+        if summary_text:
+            summary = summary_text.strip().replace("\n", " ")[:60]
+        else:
+            summary = ""
+        settings_obj = {
+            "config": {
+                "streaming_mode": False,
+                "summary": {"content": summary},
+            }
+        }
+        body = {
+            "settings": json.dumps(settings_obj, ensure_ascii=False),
+            "sequence": self._next_cardkit_seq(card_id),
+            "uuid": uuid.uuid4().hex,
+        }
         await self._cardkit_api(
             "PATCH",
-            f"/open-apis/cardkit/v1/cards/{card_id}",
-            body={"settings": {"config": {"streaming_mode": False}}},
+            f"/open-apis/cardkit/v1/cards/{card_id}/settings",
+            body=body,
         )
 
     def _invalidate_token_cache(self) -> None:
@@ -1385,20 +1616,22 @@ class FeishuAdapter(ChannelAdapter):
         """发送"思考中..."占位卡片（首次调用时发送，后续调用跳过）。
 
         Gateway 的 _keep_typing 每 4 秒调用一次，仅第一次生成卡片。
+        卡片已存在时直接返回，不清空流式状态（与 dingtalk 等适配器一致）。
         """
         sk = self._make_session_key(chat_id, thread_id)
-        self._streaming_finalized.discard(sk)
-        self._streaming_thinking.pop(sk, None)
-        self._streaming_thinking_ms.pop(sk, None)
-        self._streaming_chain.pop(sk, None)
         if sk in self._typing_suppressed:
             return
         if sk in self._thinking_cards:
             return
         if not self._client:
             return
+        # 仅在真正创建新卡片时初始化流式状态
+        self._streaming_finalized.discard(sk)
+        self._streaming_thinking.pop(sk, None)
+        self._streaming_thinking_ms.pop(sk, None)
+        self._streaming_chain.pop(sk, None)
         self._typing_start_time[sk] = time.time()
-        self._typing_status[sk] = "思考中"
+        self._typing_status[sk] = "处理中"
         reply_to = self._last_user_msg.pop(sk, None) or thread_id
         card_msg_id = await self._send_thinking_card(chat_id, reply_to=reply_to, sk=sk)
         if card_msg_id:
@@ -1581,20 +1814,31 @@ class FeishuAdapter(ChannelAdapter):
         final: bool = False,
     ) -> bool:
         """更新占位卡片内容。优先 CardKit element update（无次数限制），
-        回退至 im.v1.message.patch（有 20-30 次限制）。"""
+        回退至 im.v1.message.patch（有 20-30 次限制）。
+
+        注意：CardKit（schemaV2）创建的卡片不能用 PatchMessage（schemaV1）更新，
+        因此 CardKit 卡片失败时不走 PatchMessage 回退。
+        """
         # --- CardKit 路径 ---
         ck = self._cardkit_cards.get(sk) if sk else None
         if ck:
             card_id, element_id = ck
             try:
                 await self._update_cardkit_element(card_id, element_id, new_content)
-                if final:
-                    await self._finish_cardkit_card(card_id)
-                return True
             except Exception as e:
-                logger.debug(f"Feishu: CardKit element update failed, falling back: {e}")
+                logger.warning(f"Feishu: CardKit element update failed: {e}")
+                return False
+            if final:
+                try:
+                    # 用最终内容前 60 字作为聊天预览摘要，避免停留在「[生成中...]」
+                    await self._finish_cardkit_card(card_id, summary_text=new_content)
+                except Exception as e:
+                    logger.info(
+                        f"Feishu: CardKit finish failed (content already updated): {e}"
+                    )
+            return True
 
-        # --- PatchMessage 回退 ---
+        # --- PatchMessage 回退（仅用于非 CardKit 创建的 schemaV1 卡片） ---
         card = self._build_card_json(new_content, sk, final=final)
         request = (
             lark_oapi.api.im.v1.PatchMessageRequest.builder()
@@ -1637,6 +1881,42 @@ class FeishuAdapter(ChannelAdapter):
             return False
         return True
 
+    def _schedule_stream_patch(self, sk: str, card_id: str, *, final: bool = False) -> None:
+        """调度一次后台卡片刷新，使用当前最新缓冲区内容。"""
+        existing = self._streaming_patch_tasks.get(sk)
+        if existing and not existing.done():
+            return
+        try:
+            self._streaming_patch_tasks[sk] = asyncio.create_task(
+                self._run_stream_patch(sk, card_id, final=final)
+            )
+        except RuntimeError:
+            logger.debug("Feishu: no running loop to schedule stream patch")
+
+    async def _run_stream_patch(self, sk: str, card_id: str, *, final: bool = False) -> None:
+        display = self._compose_thinking_display(sk)
+        try:
+            await self._patch_card_content(card_id, display, sk, final=final)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.info(f"Feishu: background streaming patch failed (non-fatal): {e}")
+        finally:
+            if self._streaming_patch_tasks.get(sk) is asyncio.current_task():
+                self._streaming_patch_tasks.pop(sk, None)
+
+    async def _cancel_stream_patch(self, sk: str, *, grace_seconds: float = 0.0) -> None:
+        task = self._streaming_patch_tasks.pop(sk, None)
+        if not task or task.done():
+            return
+        if grace_seconds > 0:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=grace_seconds)
+                return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
     async def stream_thinking(
         self,
         chat_id: str,
@@ -1646,7 +1926,10 @@ class FeishuAdapter(ChannelAdapter):
         is_group: bool = False,
         duration_ms: int = 0,
     ) -> None:
-        """接收思考内容，PATCH 到卡片显示思考过程。"""
+        """接收思考内容，节流后 PATCH 到卡片显示思考过程。
+
+        当 duration_ms > 0 时表示思考阶段结束，强制刷新不受节流限制。
+        """
         if not self.is_streaming_enabled(is_group):
             return
 
@@ -1660,12 +1943,16 @@ class FeishuAdapter(ChannelAdapter):
         if not card_id:
             return
 
-        display = self._compose_thinking_display(sk)
-        try:
-            await self._patch_card_content(card_id, display, sk)
-            self._streaming_last_patch[sk] = time.time()
-        except Exception as e:
-            logger.debug(f"Feishu: stream_thinking patch failed (non-fatal): {e}")
+        now = time.time()
+        is_final = duration_ms > 0
+        if not is_final:
+            last_t = self._streaming_last_patch.get(sk, 0.0)
+            throttle_s = self._streaming_throttle_ms / 1000.0
+            if now - last_t < throttle_s:
+                return
+
+        self._streaming_last_patch[sk] = now
+        self._schedule_stream_patch(sk, card_id)
 
     async def stream_chain_text(
         self,
@@ -1691,12 +1978,10 @@ class FeishuAdapter(ChannelAdapter):
         last_t = self._streaming_last_patch.get(sk, 0.0)
         throttle_s = self._streaming_throttle_ms / 1000.0
         if now - last_t >= throttle_s:
-            display = self._compose_thinking_display(sk)
-            try:
-                await self._patch_card_content(card_id, display, sk)
-                self._streaming_last_patch[sk] = now
-            except Exception as e:
-                logger.debug(f"Feishu: stream_chain_text patch failed (non-fatal): {e}")
+            self._streaming_last_patch[sk] = now
+            self._schedule_stream_patch(sk, card_id)
+
+    _THINKING_DISPLAY_MAX = 800
 
     def _compose_thinking_display(self, sk: str) -> str:
         """根据当前 thinking + chain + reply buffer 构建卡片显示内容"""
@@ -1709,8 +1994,9 @@ class FeishuAdapter(ChannelAdapter):
         if thinking:
             dur_str = f" ({dur_ms / 1000:.1f}s)" if dur_ms else ""
             preview = thinking.strip()
-            if len(preview) > 600:
-                preview = preview[:600] + "..."
+            limit = self._THINKING_DISPLAY_MAX
+            if len(preview) > limit:
+                preview = "..." + preview[-limit:]
             parts.append(f"💭 **思考过程**{dur_str}\n> {preview.replace(chr(10), chr(10) + '> ')}")
 
         if chain_lines:
@@ -1758,12 +2044,12 @@ class FeishuAdapter(ChannelAdapter):
 
         if now - last_t >= throttle_s:
             has_thinking = sk in self._streaming_thinking
-            display_text = self._compose_thinking_display(sk) if has_thinking else (buf + " ▍")
-            try:
-                await self._patch_card_content(card_id, display_text, sk)
-                self._streaming_last_patch[sk] = now
-            except Exception as e:
-                logger.debug(f"Feishu: streaming patch failed (non-fatal): {e}")
+            if not has_thinking:
+                # _compose_thinking_display normally handles this too, but keeping
+                # the branch makes the plain reply path explicit.
+                self._streaming_buffers[sk] = buf
+            self._streaming_last_patch[sk] = now
+            self._schedule_stream_patch(sk, card_id)
 
     async def finalize_stream(
         self,
@@ -1772,14 +2058,23 @@ class FeishuAdapter(ChannelAdapter):
         *,
         thread_id: str | None = None,
     ) -> bool:
-        """流式结束：用完整文本做最终 PATCH
+        """流式结束：把占位卡片就地变成最终回复。
+
+        逐级 fallback，目的是**尽量不让用户看到「卡片被撤回 + 重新发文本」的闪烁**：
+
+        1. 优先 ``_patch_card_content``：CardKit 元素 PUT / PatchMessage（命中常规路径）。
+        2. 若失败且当前是 CardKit 卡片，再尝试 ``_overwrite_cardkit_card``：用全量
+           schema 2.0 卡片 PUT 覆盖 body，仍属同一张卡片，无撤回闪烁。
+        3. 仍失败才退到旧逻辑：删除占位卡片 + 让 ``send_message`` 走文本路径。
 
         Returns:
-            True 表示 PATCH 成功（send_message 应跳过重复发送），
-            False 表示失败（send_message 走正常发送路径）。
+            True 表示卡片已被就地更新成功（``send_message`` 应跳过重复发送），
+            False 表示需要走 ``send_message`` 正常路径。
         """
         sk = self._make_session_key(chat_id, thread_id)
         card_id = self._thinking_cards.get(sk)
+
+        await self._cancel_stream_patch(sk, grace_seconds=0.8)
 
         self._streaming_buffers.pop(sk, None)
         self._streaming_last_patch.pop(sk, None)
@@ -1791,9 +2086,38 @@ class FeishuAdapter(ChannelAdapter):
             self._cardkit_cards.pop(sk, None)
             return False
 
+        ck = self._cardkit_cards.get(sk)
+
+        # —— 第一级：常规 PATCH/PUT element ——
+        patch_ok = False
         try:
-            success = await self._patch_card_content(card_id, final_text, sk, final=True)
-            if success:
+            patch_ok = await self._patch_card_content(card_id, final_text, sk, final=True)
+        except Exception as e:
+            logger.warning(f"Feishu: finalize_stream patch failed: {e}")
+
+        if patch_ok:
+            self._streaming_finalized.add(sk)
+            self._thinking_cards.pop(sk, None)
+            self._cardkit_cards.pop(sk, None)
+            self._typing_suppressed.add(sk)
+            self._typing_start_time.pop(sk, None)
+            self._typing_status.pop(sk, None)
+            return True
+
+        # —— 第二级：CardKit 全量覆盖（同一张卡片就地变身为最终回复）——
+        if ck:
+            ck_card_id, ck_element_id = ck
+            try:
+                await self._overwrite_cardkit_card(
+                    ck_card_id, final_text, element_id=ck_element_id
+                )
+                # 覆盖成功后关闭流式态、写入摘要
+                with contextlib.suppress(Exception):
+                    await self._finish_cardkit_card(ck_card_id, summary_text=final_text)
+                logger.info(
+                    "Feishu: finalize_stream recovered via _overwrite_cardkit_card "
+                    f"(card={ck_card_id})"
+                )
                 self._streaming_finalized.add(sk)
                 self._thinking_cards.pop(sk, None)
                 self._cardkit_cards.pop(sk, None)
@@ -1801,10 +2125,15 @@ class FeishuAdapter(ChannelAdapter):
                 self._typing_start_time.pop(sk, None)
                 self._typing_status.pop(sk, None)
                 return True
-        except Exception as e:
-            logger.warning(f"Feishu: finalize_stream patch failed: {e}")
+            except Exception as e:
+                logger.warning(
+                    f"Feishu: _overwrite_cardkit_card fallback also failed: {e}"
+                )
+            # 覆盖失败前主动关闭流式态，避免飞书侧卡片留在「[生成中...]」预览
+            with contextlib.suppress(Exception):
+                await self._finish_cardkit_card(ck_card_id, summary_text=final_text)
 
-        # PATCH 失败回退：删除占位卡片，让 send_message 走正常路径
+        # —— 第三级：旧的兜底逻辑，删除占位卡片走文本回复 ——
         with contextlib.suppress(Exception):
             await self._delete_feishu_message(card_id)
         self._thinking_cards.pop(sk, None)
@@ -2380,6 +2709,7 @@ class FeishuAdapter(ChannelAdapter):
 
         # ---- 思考卡片处理：尝试 PATCH 占位卡片为最终回复 ----
         sk = self._make_session_key(message.chat_id, message.thread_id)
+        await self._cancel_stream_patch(sk)
 
         # 中间消息（ask_user 问题、提醒、反馈等）不参与卡片状态管理，
         # 保留思考卡片给最终回复使用
@@ -2820,19 +3150,16 @@ class FeishuAdapter(ChannelAdapter):
     async def upload_media(self, path: Path, mime_type: str) -> MediaFile:
         """上传媒体文件"""
         if mime_type.startswith("image/"):
-            image_key = await self._upload_image(str(path))
-            media = MediaFile.create(
-                filename=path.name,
-                mime_type=mime_type,
-                file_id=image_key,
-            )
-            media.status = MediaStatus.READY
-            return media
-
-        return MediaFile.create(
+            file_key = await self._upload_image(str(path))
+        else:
+            file_key = await self._upload_file(str(path))
+        media = MediaFile.create(
             filename=path.name,
             mime_type=mime_type,
+            file_id=file_key,
         )
+        media.status = MediaStatus.READY
+        return media
 
     async def send_card(
         self,

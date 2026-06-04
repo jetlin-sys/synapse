@@ -20,7 +20,7 @@ from rich.table import Table
 
 console = Console()
 
-_TOTAL_STEPS = 11
+_TOTAL_STEPS = 10
 
 
 def _ask_secret(prompt_text: str, *, allow_empty: bool = False) -> str:
@@ -57,6 +57,17 @@ def _load_providers() -> list[dict]:
     return json.loads(providers_path.read_text(encoding="utf-8"))
 
 
+def _resolve_identity_template(rel_name: str) -> Path | None:
+    """Locate a packaged identity template (e.g. ``SOUL.md.example``).
+
+    Thin wrapper over ``core.identity._resolve_bundled_identity_template`` so
+    wizard-time and runtime template lookup share a single source of truth.
+    """
+    from synapse.core.identity import _resolve_bundled_identity_template
+
+    return _resolve_bundled_identity_template(rel_name)
+
+
 class SetupWizard:
     """交互式安装向导"""
 
@@ -68,8 +79,8 @@ class SetupWizard:
         self._defaults: dict = {
             "MODEL_DOWNLOAD_SOURCE": "hf-mirror",
             "EMBEDDING_MODEL": "shibing624/text2vec-base-chinese",
-            "WHISPER_LANGUAGE": "zh",
             "SCHEDULER_TIMEZONE": "Asia/Shanghai",
+            "WHISPER_LANGUAGE": "zh",
         }
         self._llm_endpoints: list[dict] = []
         self._providers: list[dict] = _load_providers()
@@ -107,7 +118,6 @@ class SetupWizard:
             self._configure_compiler()
             self._configure_im_channels()
             self._configure_memory()
-            self._configure_voice()
             self._configure_advanced()
             self._write_env_file()
             self._check_channel_deps()
@@ -344,24 +354,20 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
             self._defaults = {
                 "MODEL_DOWNLOAD_SOURCE": "hf-mirror",
                 "EMBEDDING_MODEL": "shibing624/text2vec-base-chinese",
-                "WHISPER_LANGUAGE": "zh",
                 "SCHEDULER_TIMEZONE": "Asia/Shanghai",
             }
             console.print("\n[green]已选择：中文 / 中国大陆[/green]")
-            console.print("[dim]模型将默认从国内镜像下载，语音识别默认中文[/dim]\n")
+            console.print("[dim]模型将默认从国内镜像下载[/dim]\n")
         else:
             self._locale = "en"
             # 国际默认值
             self._defaults = {
                 "MODEL_DOWNLOAD_SOURCE": "huggingface",
                 "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
-                "WHISPER_LANGUAGE": "en",
                 "SCHEDULER_TIMEZONE": "UTC",
             }
             console.print("\n[green]Selected: English / International[/green]")
-            console.print(
-                "[dim]Models will download from HuggingFace, voice recognition defaults to English[/dim]\n"
-            )
+            console.print("[dim]Models will download from HuggingFace[/dim]\n")
 
     def _create_directories(self):
         """创建必要的目录结构"""
@@ -756,23 +762,20 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
 
     def _write_llm_endpoints(self):
         """将 LLM 端点和 Compiler 端点写入 data/llm_endpoints.json"""
-        endpoints_path = self.project_dir / "data" / "llm_endpoints.json"
+        from synapse.llm.endpoint_manager import EndpointManager
 
-        existing_data: dict = {}
-        if endpoints_path.exists():
-            try:
-                existing_data = json.loads(endpoints_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
+        mgr = EndpointManager(self.project_dir)
+        mgr._json_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Use wizard-collected endpoints if available; otherwise fall back to legacy config
+        # Build the list of main endpoints
+        endpoints_to_save: list[dict] = []
         if self._llm_endpoints:
             max_tokens = int(self.config.get("MAX_TOKENS", "0"))
             for ep in self._llm_endpoints:
                 if ep.get("max_tokens", 0) == 0:
                     ep["max_tokens"] = max_tokens
-            existing_data["endpoints"] = self._llm_endpoints
-        elif not existing_data.get("endpoints"):
+            endpoints_to_save = self._llm_endpoints
+        elif not mgr.list_endpoints("endpoints"):
             api_key_env = "ANTHROPIC_API_KEY"
             base_url = self.config.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
             model = self.config.get("DEFAULT_MODEL", "claude-sonnet-4-20250514")
@@ -790,7 +793,7 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
             if not capabilities:
                 capabilities = ["text", "tools"]
 
-            existing_data["endpoints"] = [
+            endpoints_to_save = [
                 {
                     "name": "primary",
                     "provider": provider,
@@ -802,12 +805,27 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
                     "max_tokens": int(self.config.get("MAX_TOKENS", "0")),
                     "timeout": 180,
                     "capabilities": capabilities,
-                }
+                },
+                {
+                    "name": "backup",
+                    "provider": provider,
+                    "api_type": api_type,
+                    "base_url": base_url,
+                    "api_key_env": api_key_env,
+                    "model": model,
+                    "priority": 2,
+                    "max_tokens": int(self.config.get("MAX_TOKENS", "0")),
+                    "timeout": 180,
+                    "capabilities": capabilities,
+                    "note": "向导预置的第二聊天端点（可与 primary 共用同一密钥，便于故障切换占位）",
+                },
             ]
+
+        for ep in endpoints_to_save:
+            mgr.save_endpoint(endpoint=ep, endpoint_type="endpoints")
 
         # Compiler endpoints
         compiler_endpoints = []
-
         primary_cfg = self.config.get("_compiler_primary")
         if primary_cfg:
             compiler_endpoints.append(
@@ -844,23 +862,19 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
                 }
             )
 
-        if compiler_endpoints:
-            existing_data["compiler_endpoints"] = compiler_endpoints
+        for ep in compiler_endpoints:
+            mgr.save_endpoint(endpoint=ep, endpoint_type="compiler_endpoints")
 
-        if not existing_data.get("settings"):
-            existing_data["settings"] = {
+        # Default settings
+        existing_settings = mgr.get_all_config().get("settings", {})
+        if not existing_settings:
+            mgr.update_settings({
                 "retry_count": 2,
                 "retry_delay_seconds": 2,
                 "health_check_interval": 60,
                 "fallback_on_error": True,
-            }
+            })
 
-        from synapse.llm.endpoint_manager import EndpointManager
-
-        mgr = EndpointManager(self.project_dir)
-        # Use EndpointManager's atomic write for safety
-        mgr._json_path.parent.mkdir(parents=True, exist_ok=True)
-        mgr._write_json(existing_data)
         console.print(f"  [green]✓[/green] LLM endpoints saved to {mgr.json_path}")
 
     def _configure_im_channels(self):
@@ -1217,73 +1231,9 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
 
         console.print("\n[green]Memory configuration complete![/green]\n")
 
-    def _configure_voice(self):
-        """配置语音识别 (Whisper)"""
-        self._step_screen(8, "Voice Recognition (Optional)")
-
-        use_voice = Confirm.ask("Enable local voice recognition (Whisper)?", default=True)
-        if not use_voice:
-            self.config.setdefault("WHISPER_MODEL", "base")
-            self.config.setdefault(
-                "WHISPER_LANGUAGE", getattr(self, "_defaults", {}).get("WHISPER_LANGUAGE", "zh")
-            )
-            console.print(
-                "[dim]Voice will be configured with defaults, model downloads on first use.[/dim]\n"
-            )
-            return
-
-        defaults = getattr(self, "_defaults", {})
-        default_lang = defaults.get("WHISPER_LANGUAGE", "zh")
-
-        # 语言选择
-        console.print("Voice recognition language:\n")
-        lang_options = [
-            ("1", "zh", "中文 (Chinese)"),
-            ("2", "en", "English (uses smaller, faster .en model)"),
-            ("3", "auto", "Auto-detect language"),
-        ]
-        default_lang_choice = {"zh": "1", "en": "2", "auto": "3"}.get(default_lang, "1")
-
-        for num, _, desc in lang_options:
-            marker = " ← recommended" if num == default_lang_choice else ""
-            console.print(f"  [{num}] {desc}{marker}")
-        console.print()
-
-        lang_choice = Prompt.ask(
-            "Select voice language",
-            choices=["1", "2", "3"],
-            default=default_lang_choice,
-        )
-        whisper_lang = {n: code for n, code, _ in lang_options}[lang_choice]
-        self.config["WHISPER_LANGUAGE"] = whisper_lang
-
-        # 模型大小选择
-        console.print("\nWhisper model size:\n")
-        model_options = [
-            ("1", "tiny", "Tiny (~39MB)  - fastest, lower accuracy"),
-            ("2", "base", "Base (~74MB)  - recommended, balanced"),
-            ("3", "small", "Small (~244MB) - good accuracy"),
-            ("4", "medium", "Medium (~769MB) - high accuracy"),
-            ("5", "large", "Large (~1.5GB) - highest accuracy, resource-heavy"),
-        ]
-        # 英语时 .en 模型更小，提示用户
-        if whisper_lang == "en":
-            console.print(
-                "[dim]  Note: English .en models are auto-selected and are more efficient[/dim]\n"
-            )
-
-        model_choice = Prompt.ask(
-            "Select model size",
-            choices=["1", "2", "3", "4", "5"],
-            default="2",
-        )
-        self.config["WHISPER_MODEL"] = {n: m for n, m, _ in model_options}[model_choice]
-
-        console.print("\n[green]Voice configuration complete![/green]\n")
-
     def _configure_advanced(self):
         """高级配置"""
-        self._step_screen(9, "Advanced Configuration (Optional)")
+        self._step_screen(8, "Advanced Configuration (Optional)")
 
         configure_advanced = Confirm.ask("Configure advanced options?", default=False)
 
@@ -1383,7 +1333,7 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
 
     def _write_env_file(self):
         """写入 .env 文件"""
-        self._step_screen(10, "Saving Configuration")
+        self._step_screen(9, "Saving Configuration")
 
         # 检查是否已存在
         if self.env_path.exists():
@@ -1455,7 +1405,7 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
             [
                 "",
                 "# ========== Agent Configuration ==========",
-                "AGENT_NAME=Synapse",
+                "# Agent 的显示名称由桌面端 Agents 菜单的 Agent Profile 管理，无需在 .env 配置。",
                 f"MAX_ITERATIONS={self.config.get('MAX_ITERATIONS', '300')}  # ReAct 循环最大迭代次数",
                 "AUTO_CONFIRM=false  # 工具调用是否自动确认（无需人工审批）",
                 "SELFCHECK_AUTOFIX=true  # Agent 自检发现问题后是否自动修复",
@@ -1527,17 +1477,6 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
                     "",
                 ]
             )
-
-        # Whisper
-        whisper_lang = self.config.get("WHISPER_LANGUAGE", "zh")
-        lines.extend(
-            [
-                "# ========== Voice (optional) ==========",
-                f"WHISPER_MODEL={self.config.get('WHISPER_MODEL', 'base')}",
-                f"WHISPER_LANGUAGE={whisper_lang}",
-                "",
-            ]
-        )
 
         # IM 通道配置
         lines.append("# ========== IM Channels ==========")
@@ -1813,31 +1752,52 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
         return "\n".join(lines)
 
     def _create_identity_examples(self):
-        """创建 identity 目录下的示例文件"""
+        """Seed identity/SOUL.md by copying from the shipped SOUL.md.example.
+
+        Earlier the wizard wrote a short hardcoded stub that began with
+        ``你是 Synapse ...``. That stub bypassed the per-Agent
+        ``{{agent_name}}`` substitution introduced alongside the templated
+        ``SOUL.md.example``: once the stub existed on disk, the runtime
+        ``Identity._sync_identity_file`` saw a file present, recorded its
+        hash, and never replaced it with the templated example. Every Agent
+        profile then read back ``Synapse`` from the stub regardless of
+        what the user had named the profile in the Agents manager.
+
+        The wizard now resolves the bundled ``SOUL.md.example`` (either in
+        the repo checkout under dev install, or under the installed
+        ``synapse`` package directory for wheel installs - see the
+        ``[tool.hatch.build.targets.wheel.force-include]`` entries that
+        ship the identity templates into the wheel) and copies it
+        verbatim. If neither location is available - e.g. running from a
+        loose source tarball that is neither a dev checkout nor an
+        installed wheel - we deliberately leave ``SOUL.md`` unwritten
+        rather than seeding a hardcoded brand name. In that fallback
+        case the prompt builder reaches into
+        ``_STATIC_FALLBACKS['identity_core']`` (compiler.py), which
+        itself uses the ``{{agent_name}}`` placeholder, so chat
+        self-introduction still respects per-Agent naming even without
+        a populated ``SOUL.md``.
+        """
         identity_dir = self.project_dir / "identity"
         identity_dir.mkdir(exist_ok=True)
 
-        # SOUL.md - Agent 的核心身份
-        soul_example = identity_dir / "SOUL.md"
-        if not soul_example.exists():
-            soul_example.write_text(
-                """# Agent Soul
+        soul_target = identity_dir / "SOUL.md"
+        if soul_target.exists():
+            return
 
-你是 Synapse，一个忠诚可靠的 AI 助手。
-
-## 核心特质
-- 永不放弃，持续尝试直到成功
-- 诚实可靠，不会隐瞒问题
-- 主动学习，不断自我改进
-
-## 行为准则
-- 优先考虑用户的真实需求
-- 遇到困难时寻找替代方案
-- 保持简洁清晰的沟通方式
-""",
-                encoding="utf-8",
+        soul_template = _resolve_identity_template("SOUL.md.example")
+        if soul_template is None:
+            console.print(
+                "  [yellow]![/yellow] identity/SOUL.md.example not found; "
+                "skipping seed (runtime will create SOUL.md from the bundled "
+                "template on first agent start)"
             )
-            console.print("  [green]✓[/green] Created identity/SOUL.md")
+            return
+
+        import shutil
+
+        shutil.copy2(soul_template, soul_target)
+        console.print("  [green]✓[/green] Created identity/SOUL.md from SOUL.md.example")
 
     def _check_channel_deps(self):
         """检查并安装已选 IM 通道的可选依赖。"""
@@ -2084,7 +2044,7 @@ Synapse 按「现状」(AS IS) 提供，不附带任何形式的明示或暗示
 
     def _test_connection(self):
         """测试 API 连接"""
-        self._step_screen(11, "Testing Connection")
+        self._step_screen(10, "Testing Connection")
 
         test_api = Confirm.ask("Test API connection now?", default=True)
 

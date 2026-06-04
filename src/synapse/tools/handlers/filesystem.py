@@ -9,7 +9,16 @@
 - list_directory: 列出目录
 - grep: 内容搜索
 - glob: 文件名模式搜索
+- move_file: 移动或重命名文件/目录
 - delete_file: 删除文件
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import logging
@@ -18,6 +27,10 @@ import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...config import settings
+from ...core.policy_v2 import ApprovalClass
+from ..path_safety import resolve_within_root
+
 if TYPE_CHECKING:
     from ...core.agent import Agent
 
@@ -25,6 +38,12 @@ logger = logging.getLogger(__name__)
 
 _terminal_managers: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
 _terminal_mgr_strong_refs: dict[int, Any] = {}
+_TRUNCATED_PREVIEW_MARKERS = (
+    "[OUTPUT_TRUNCATED]",
+    "[已截断",
+    "[部分工具结果已截断",
+    "[PAGE_HAS_MORE]",
+)
 
 
 def _get_terminal_manager(agent: "Agent") -> Any:
@@ -39,9 +58,15 @@ def _get_terminal_manager(agent: "Agent") -> Any:
     agent_id = id(agent)
     mgr = _terminal_mgr_strong_refs.get(agent_id)
     if mgr is not None:
+        mgr.execution_env_spec = getattr(agent, "_execution_env_spec", None)
+        for session in getattr(mgr, "sessions", {}).values():
+            session.execution_env_spec = mgr.execution_env_spec
         return mgr
     cwd = getattr(agent, "default_cwd", None) or str(Path.cwd())
-    mgr = TerminalSessionManager(default_cwd=cwd)
+    mgr = TerminalSessionManager(
+        default_cwd=cwd,
+        execution_env_spec=getattr(agent, "_execution_env_spec", None),
+    )
     _terminal_mgr_strong_refs[agent_id] = mgr
     try:
         weakref.finalize(agent, _terminal_mgr_strong_refs.pop, agent_id, None)
@@ -66,8 +91,24 @@ class FilesystemHandler:
         "list_directory",
         "grep",
         "glob",
+        "move_file",
         "delete_file",
     ]
+
+    # C7：v2 PolicyEngine 显式分类（避免启发式回退到 UNKNOWN）。
+    # 跨盘 / 工作区外路径的升级（MUTATING_SCOPED → MUTATING_GLOBAL）由
+    # classifier._refine_with_params 处理；此处声明 base class 即可。
+    TOOL_CLASSES = {
+        "run_shell": ApprovalClass.EXEC_CAPABLE,
+        "write_file": ApprovalClass.MUTATING_SCOPED,
+        "read_file": ApprovalClass.READONLY_SCOPED,
+        "edit_file": ApprovalClass.MUTATING_SCOPED,
+        "list_directory": ApprovalClass.READONLY_GLOBAL,
+        "grep": ApprovalClass.READONLY_SEARCH,
+        "glob": ApprovalClass.READONLY_SEARCH,
+        "move_file": ApprovalClass.MUTATING_SCOPED,
+        "delete_file": ApprovalClass.DESTRUCTIVE,
+    }
 
     def __init__(self, agent: "Agent"):
         """
@@ -77,6 +118,7 @@ class FilesystemHandler:
             agent: Agent 实例，用于访问 shell_tool 和 file_tool
         """
         self.agent = agent
+        self._read_file_cache: dict[tuple[str, int, int], str] = {}
 
     def _get_fix_policy(self) -> dict | None:
         """
@@ -88,6 +130,13 @@ class FilesystemHandler:
         if isinstance(policy, dict) and policy.get("enabled"):
             return policy
         return None
+
+    @staticmethod
+    def _looks_like_truncated_tool_preview(content: str) -> bool:
+        """Detect tool preview/pagination markers that should not be written as file content."""
+        if not isinstance(content, str) or not content:
+            return False
+        return any(marker in content for marker in _TRUNCATED_PREVIEW_MARKERS)
 
     def _resolve_to_abs(self, raw: str) -> Path:
         p = Path(raw)
@@ -105,6 +154,64 @@ class FilesystemHandler:
             except Exception:
                 continue
         return False
+
+    def _allowed_roots(self) -> list[str]:
+        """工作区路径白名单。返回空列表表示"不做白名单检查"。
+
+        Profile 语义：
+
+        - ``off``:    安全策略整体关闭 → 空列表。
+        - ``trust``:  信任 AI 自主选择路径 → 空列表（与 off 在本函数行为一致，
+                      但全局其他机制 safety_immune / shell_risk / confirmation
+                      仍由 engine 各自处理，与本函数无关）。
+        - ``protect`` / ``strict`` / ``custom``: 读取 ``cfg.workspace.paths``，
+                      用户在 SecurityView 里维护的"允许访问的工作区"。
+        - 异常 fallback: agent.default_cwd → Path.cwd()（保留向后兼容）。
+
+        此外永远附加 ``settings.data_dir``（Synapse 内部数据目录，读写自身
+        sessions/audit/memory 等不应被白名单卡住）。
+        """
+        roots = []
+        try:
+            from ...core.policy_v2 import get_config_v2
+
+            cfg = get_config_v2()
+            if not cfg.enabled or cfg.profile.current in ("off", "trust"):
+                return []
+            roots.extend(str(p) for p in cfg.workspace.paths if p)
+        except Exception:
+            roots.append(getattr(self.agent, "default_cwd", None) or str(Path.cwd()))
+        try:
+            roots.append(str(settings.data_dir))
+        except Exception:
+            pass
+        return [str(r) for r in roots if r]
+
+    def _guard_path_boundary(self, raw_path: str, *, op: str) -> str | None:
+        allowed_roots = self._allowed_roots()
+        if not allowed_roots:
+            return None
+        result = resolve_within_root(raw_path, allowed_roots)
+        if result.ok:
+            return None
+        try:
+            from ...core.audit_logger import get_audit_logger
+
+            get_audit_logger().log_event(
+                "path_denial",
+                {
+                    "operation": op,
+                    "reason": result.reason,
+                    "path_ref": result.safe_ref,
+                },
+            )
+        except Exception:
+            pass
+        return (
+            f"❌ 路径名单拒绝 {op}: {result.reason} ({result.safe_ref})。"
+            "请在 安全策略 → 路径名单 → 允许访问的工作区 中添加该目录，"
+            "或将文件复制到当前工作区。"
+        )
 
     async def handle(self, tool_name: str, params: dict[str, Any]) -> str:
         """
@@ -131,6 +238,8 @@ class FilesystemHandler:
             return await self._grep(params)
         elif tool_name == "glob":
             return await self._glob(params)
+        elif tool_name == "move_file":
+            return await self._move_file(params)
         elif tool_name == "delete_file":
             return await self._delete_file(params)
         else:
@@ -204,6 +313,40 @@ class FilesystemHandler:
     }
 
     @classmethod
+    def _format_run_shell_missing_command(cls, params: dict) -> str:
+        """缺 'command' 参数时返回引导式错误，识别常见误传字段。
+
+        - 列出实际收到的键，方便 LLM 发现自己传错；
+        - 若误传 script/cmd/shell/bash/code，特别提示重命名为 'command'。
+        """
+        try:
+            keys = list(params.keys()) if isinstance(params, dict) else []
+        except Exception:
+            keys = []
+
+        wrong_alias = None
+        if isinstance(params, dict):
+            for alias in cls._RUN_SHELL_ALIAS_KEYS:
+                if alias in params and params.get(alias):
+                    wrong_alias = alias
+                    break
+
+        lines = [
+            "❌ run_shell 缺少必要参数 'command'。",
+            'Usage: run_shell(command="ls -la", working_directory=None, timeout=60)',
+            f"You passed keys: {keys}",
+        ]
+        if wrong_alias is not None:
+            lines.append(
+                f"检测到你传了 '{wrong_alias}'，请改名为 'command' 后重试，参数值原样保留即可。"
+            )
+        else:
+            lines.append(
+                "常见误传字段：script / cmd / shell / bash / code → 都应使用 'command'。"
+            )
+        return "\n".join(lines)
+
+    @classmethod
     def _interpret_exit_code(cls, command: str, exit_code: int) -> str | None:
         """Return a human-readable meaning if the exit code is a known
         non-error for the given command, or ``None`` otherwise."""
@@ -224,11 +367,14 @@ class FilesystemHandler:
         meanings = cls._EXIT_CODE_SEMANTICS.get(cmd_name, {})
         return meanings.get(exit_code)
 
+    # 常见的 LLM 误传字段名 -> 都应改写为 'command'
+    _RUN_SHELL_ALIAS_KEYS = ("script", "cmd", "shell", "bash", "code")
+
     async def _run_shell(self, params: dict) -> str:
         """Execute shell command with persistent session + background support."""
         command = params.get("command", "")
         if not command:
-            return "❌ run_shell 缺少必要参数 'command'。"
+            return self._format_run_shell_missing_command(params)
 
         policy = self._get_fix_policy()
         if policy:
@@ -254,24 +400,64 @@ class FilesystemHandler:
 
         block_timeout_ms = params.get("block_timeout_ms")
         if block_timeout_ms is None:
-            timeout_s = params.get("timeout", 60)
-            # 确保 timeout_s 是整数类型（防止外部传入字符串导致 TypeError）
+            timeout_s = params.get("timeout")
+            if timeout_s is None:
+                try:
+                    block_timeout_ms = int(settings.run_shell_default_block_timeout_ms)
+                except (TypeError, ValueError):
+                    block_timeout_ms = 30000
+            else:
+                # 兼容旧 timeout（秒）参数。显式传入时才从秒换算为阻塞等待时间。
+                try:
+                    timeout_s = max(0, int(timeout_s))
+                except (ValueError, TypeError):
+                    timeout_s = 30
+                block_timeout_ms = timeout_s * 1000
+                try:
+                    max_block_ms = int(settings.run_shell_max_block_timeout_ms)
+                except (TypeError, ValueError):
+                    max_block_ms = 1800000
+                if max_block_ms > 0:
+                    block_timeout_ms = min(block_timeout_ms, max_block_ms)
+        else:
             try:
-                timeout_s = int(timeout_s)
+                block_timeout_ms = max(0, int(block_timeout_ms))
             except (ValueError, TypeError):
-                timeout_s = 60
-            timeout_s = max(10, min(timeout_s, 600))
-            block_timeout_ms = timeout_s * 1000
+                block_timeout_ms = int(settings.run_shell_default_block_timeout_ms)
 
         session_id = params.get("session_id", 1)
 
         terminal_mgr = _get_terminal_manager(self.agent)
-        result = await terminal_mgr.execute(
-            command,
-            session_id=session_id,
-            block_timeout_ms=block_timeout_ms,
-            working_directory=working_directory,
-        )
+        previous_spec = getattr(terminal_mgr, "execution_env_spec", None)
+        requested_scope = str(params.get("env_scope") or "").strip().lower()
+        if requested_scope == "scratch":
+            try:
+                from ...runtime_envs import resolve_scratch_env
+
+                terminal_mgr.execution_env_spec = resolve_scratch_env(
+                    session_id=f"{getattr(self.agent, '_agent_profile_id', 'default')}:{session_id}"
+                )
+                for session in getattr(terminal_mgr, "sessions", {}).values():
+                    session.execution_env_spec = terminal_mgr.execution_env_spec
+            except Exception as exc:
+                logger.warning("Failed to resolve scratch env for run_shell: %s", exc)
+        elif requested_scope == "shared":
+            terminal_mgr.execution_env_spec = None
+            for session in getattr(terminal_mgr, "sessions", {}).values():
+                session.execution_env_spec = None
+
+        try:
+            result = await terminal_mgr.execute(
+                command,
+                session_id=session_id,
+                block_timeout_ms=block_timeout_ms,
+                working_directory=working_directory,
+            )
+        finally:
+            if requested_scope in {"scratch", "shared"}:
+                terminal_mgr.execution_env_spec = previous_spec
+                for session in getattr(terminal_mgr, "sessions", {}).values():
+                    session.execution_env_spec = previous_spec
 
         from ...logging import get_session_log_buffer
 
@@ -340,9 +526,9 @@ class FilesystemHandler:
                 cmd_lower = command.strip().lower()
                 if cmd_lower.startswith(("python", "python3")):
                     output_parts.append(
-                        "⚠️ Python 不在系统 PATH 中（Windows 9009 = 命令未找到）。\n"
-                        "请先安装 Python：run_shell 执行 'winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements'\n"
-                        "安装完成后系统将自动检测，无需重启。不要再重试 python/python3 命令。"
+                        "⚠️ 当前 Shell 没有找到 Python 命令（Windows 9009 = 命令未找到）。\n"
+                        "可以先尝试 `py -3 --version`，或使用已安装 Python 的完整路径。"
+                        "如果确实未安装，再通过官网、Microsoft Store 或 winget 安装。"
                     )
                 else:
                     first_word = command.strip().split()[0] if command.strip() else command
@@ -360,9 +546,8 @@ class FilesystemHandler:
 
             full_error = "\n".join(output_parts)
             truncated_result = self._truncate_shell_output(full_error)
-            truncated_result += (
-                "\n提示: 如果不确定原因，可以调用 get_session_logs 查看详细日志，或尝试其他命令。"
-            )
+            if not result.stdout and not result.stderr:
+                truncated_result += "\n提示: 该命令没有输出；可换用更具体的诊断命令确认原因。"
             return truncated_result
 
     def _truncate_shell_output(self, text: str) -> str:
@@ -398,7 +583,17 @@ class FilesystemHandler:
 
     async def _write_file(self, params: dict) -> str:
         """写入文件"""
-        path = params.get("path")
+        # 规范 path 名是 "path"；但 LLM 经常写成 filename/filepath/file_path。
+        # 这里做一次保守兜底——只当权威的 path 缺失时才回退到别名，
+        # 并且和 runtime._record_file_output 使用同一组别名，确保写盘成功后
+        # 附件登记链路也能识别到同一个文件。schema 仍只声明 "path" 为主键
+        # （见 tools/definitions/filesystem.py），tool description 会明确要求。
+        path = (
+            params.get("path")
+            or params.get("filepath")
+            or params.get("file_path")
+            or params.get("filename")
+        )
         unc_err = self._check_unc(path)
         if unc_err:
             return f"❌ {unc_err}"
@@ -411,11 +606,22 @@ class FilesystemHandler:
                     "疑似因内容过长导致 JSON 参数被截断）。\n"
                     "请缩短内容后重试：\n"
                     "1. 将大文件拆分为多次写入（每次 < 8000 字符）\n"
-                    "2. 或用 run_shell 执行 Python 脚本生成大文件"
+                    "2. 或用平台命令工具执行 Python 脚本生成大文件"
+                    "（Windows 用 run_powershell，其他环境用 run_shell）"
                 )
             return "❌ write_file 缺少必要参数 'path'。请提供文件路径和内容后重试。"
         if content is None:
             return "❌ write_file 缺少必要参数 'content'。请提供文件内容后重试。"
+        guard = self._guard_path_boundary(path, op="write")
+        if guard:
+            return guard
+        if self._looks_like_truncated_tool_preview(content):
+            return (
+                "❌ write_file 检测到内容里包含工具分页/截断预览标记，已拒绝写入，"
+                "避免把不完整的预览内容覆盖到真实文件。\n"
+                "请先用 read_file 的 offset/limit 继续读取缺失页，或使用 edit_file "
+                "只修改目标片段；确认拿到完整内容后再写入。"
+            )
         policy = self._get_fix_policy()
         if policy:
             target = self._resolve_to_abs(path)
@@ -438,17 +644,34 @@ class FilesystemHandler:
         from ...core.im_context import get_im_session
 
         if not get_im_session():
-            result += (
-                "\n\n💡 当前为 Desktop 模式，用户无法直接访问服务器文件。"
-                "请将文件的关键内容直接包含在回复中，"
-                "或调用 deliver_artifacts(artifacts=[{type: 'file', path: '"
-                + str(path)
-                + "'}]) 使文件在前端可下载。"
-            )
+            # plan / ask 模式下 deliver_artifacts 是被 mode-guard 拦截的工具，
+            # 这里再主动诱导只会让模型撞墙报"该工具在当前模式不可用"，
+            # 用户体验和审计日志都很差。改成模式自适应：仅在 agent 模式
+            # 才提示 deliver_artifacts，其它模式只引导内联展示文件内容。
+            try:
+                _exec_mode = getattr(
+                    getattr(self.agent, "tool_executor", None), "_current_mode", "agent"
+                )
+            except Exception:
+                _exec_mode = "agent"
+            if _exec_mode == "agent":
+                result += (
+                    "\n\n💡 当前为 Desktop 模式，用户无法直接访问服务器文件。"
+                    "请将文件的关键内容直接包含在回复中，"
+                    "或调用 deliver_artifacts(artifacts=[{type: 'file', path: '"
+                    + str(path)
+                    + "'}]) 使文件在前端可下载。"
+                )
+            else:
+                result += (
+                    "\n\n💡 当前为 Desktop 模式且非 agent 执行模式，"
+                    "请将文件的关键内容直接包含在回复中（如方案大纲/checklist），"
+                    "供用户审阅。本模式下不提供文件下载工具。"
+                )
         return result
 
-    # read_file 默认最大行数（参考 Claude Code 的 2000 行，我们用 300 更保守）
-    READ_FILE_DEFAULT_LIMIT = 300
+    # read_file 默认最大行数。运行时可通过 READ_FILE_DEFAULT_LIMIT 调整。
+    READ_FILE_DEFAULT_LIMIT = 2000
 
     async def _read_file(self, params: dict) -> str:
         """读取文件（支持 offset/limit 分页）"""
@@ -458,6 +681,9 @@ class FilesystemHandler:
         unc_err = self._check_unc(path)
         if unc_err:
             return f"❌ {unc_err}"
+        guard = self._guard_path_boundary(path, op="read")
+        if guard:
+            return guard
 
         policy = self._get_fix_policy()
         if policy:
@@ -471,21 +697,29 @@ class FilesystemHandler:
         content = await self.agent.file_tool.read(path)
 
         offset = params.get("offset", 1)  # 起始行号（1-based），默认第 1 行
-        limit = params.get("limit", self.READ_FILE_DEFAULT_LIMIT)
+        limit = params.get("limit", getattr(settings, "read_file_default_limit", self.READ_FILE_DEFAULT_LIMIT))
 
         # 确保 offset/limit 合法
         try:
             offset = max(1, int(offset))
             limit = max(1, int(limit))
         except (TypeError, ValueError):
-            offset, limit = 1, self.READ_FILE_DEFAULT_LIMIT
+            offset = 1
+            limit = int(getattr(settings, "read_file_default_limit", self.READ_FILE_DEFAULT_LIMIT))
+
+        cache_key = (str(self._resolve_to_abs(path)), offset, limit)
+        cached = self._read_file_cache.get(cache_key)
+        if cached is not None:
+            return "♻️ 复用本轮 read_file 缓存结果：\n" + cached
 
         lines = content.split("\n")
         total_lines = len(lines)
 
         # 如果文件在 limit 范围内且从头读取，直接返回全部
         if total_lines <= limit and offset <= 1:
-            return f"文件内容 ({total_lines} 行):\n{content}"
+            result = f"文件内容 ({total_lines} 行):\n{content}"
+            self._remember_read_file_cache(cache_key, result)
+            return result
 
         # 分页截取
         start = offset - 1  # 转为 0-based
@@ -504,13 +738,21 @@ class FilesystemHandler:
         if end < total_lines:
             remaining = total_lines - end
             result += (
-                f"\n\n[OUTPUT_TRUNCATED] 文件共 {total_lines} 行，"
-                f"当前显示第 {start + 1}-{end} 行，剩余 {remaining} 行。\n"
+                f"\n\n[PAGE_HAS_MORE] 这是分页读取结果，原文件未截断。"
+                f"文件共 {total_lines} 行，当前仅显示第 {start + 1}-{end} 行，"
+                f"剩余 {remaining} 行。\n"
                 f'使用 read_file(path="{path}", offset={end + 1}, limit={limit}) '
                 f"查看后续内容。"
             )
 
+        self._remember_read_file_cache(cache_key, result)
         return result
+
+    def _remember_read_file_cache(self, key: tuple[str, int, int], result: str) -> None:
+        self._read_file_cache[key] = result
+        if len(self._read_file_cache) > 64:
+            oldest = next(iter(self._read_file_cache))
+            self._read_file_cache.pop(oldest, None)
 
     # list_directory 默认最大条目数
     LIST_DIR_DEFAULT_MAX = 200
@@ -529,6 +771,9 @@ class FilesystemHandler:
             return "❌ edit_file 缺少必要参数 'new_string'。"
         if old_string == new_string:
             return "❌ old_string 和 new_string 相同，无需替换。"
+        guard = self._guard_path_boundary(path, op="edit")
+        if guard:
+            return guard
 
         policy = self._get_fix_policy()
         if policy:
@@ -568,6 +813,9 @@ class FilesystemHandler:
         path = params.get("path", "")
         if not path:
             return "❌ list_directory 缺少必要参数 'path'。"
+        guard = self._guard_path_boundary(path, op="list")
+        if guard:
+            return guard
 
         policy = self._get_fix_policy()
         if policy:
@@ -604,6 +852,8 @@ class FilesystemHandler:
                 f"或缩小查询范围。"
             )
 
+        result = self._append_traversal_note(result)
+
         from ...utils.subdir_context import inject_subdir_context
 
         return inject_subdir_context(result, path)
@@ -613,11 +863,16 @@ class FilesystemHandler:
 
     async def _grep(self, params: dict) -> str:
         """内容搜索"""
+        import asyncio
+
         pattern = params.get("pattern", "")
         if not pattern:
             return "❌ grep 缺少必要参数 'pattern'。"
 
         path = params.get("path", ".")
+        guard = self._guard_path_boundary(path, op="grep")
+        if guard:
+            return guard
         include = params.get("include")
         context_lines = params.get("context_lines", 0)
         max_results = params.get("max_results", 50)
@@ -633,24 +888,63 @@ class FilesystemHandler:
             max_results = 50
 
         try:
-            results = await self.agent.file_tool.grep(
-                pattern,
-                path,
-                include=include,
-                context_lines=context_lines,
-                max_results=max_results,
-                case_insensitive=case_insensitive,
+            from ...config import settings
+
+            grep_timeout = max(
+                5,
+                min(int(getattr(settings, "grep_timeout_sec", 30) or 30), 600),
+            )
+        except Exception:
+            grep_timeout = 30
+
+        try:
+            results = await asyncio.wait_for(
+                self.agent.file_tool.grep(
+                    pattern,
+                    path,
+                    include=include,
+                    context_lines=context_lines,
+                    max_results=max_results,
+                    case_insensitive=case_insensitive,
+                ),
+                timeout=grep_timeout,
             )
         except FileNotFoundError as e:
             return f"❌ {e}"
         except ValueError as e:
+            msg = str(e)
+            if msg.startswith("grep refused"):
+                return (
+                    f"❌ grep 被拒绝执行: {msg}\n"
+                    f"提示: 请缩小 path 到具体的项目子目录（如 src/、docs/），"
+                    f"避免扫描运行时数据目录或整个用户主目录。"
+                )
             return f"❌ 正则表达式错误: {e}"
+        except TimeoutError:
+            return (
+                f"❌ grep 超时（>{grep_timeout}s）。"
+                f"建议：1) 用更精确的 path 缩小范围；2) 用 include 限定文件类型"
+                f'（如 include="*.py"）；3) 用更具体的 pattern。（可配置 grep_timeout_sec）'
+            )
 
         if not results:
-            return f"未找到匹配 '{pattern}' 的内容。"
+            return self._append_traversal_note(f"未找到匹配 '{pattern}' 的内容。")
+
+        scan_summary = ""
+        match_results = []
+        for r in results:
+            if "_scan_summary" in r:
+                scan_summary = r["_scan_summary"]
+            else:
+                match_results.append(r)
+
+        if not match_results and scan_summary:
+            return self._append_traversal_note(
+                f"未找到匹配 '{pattern}' 的内容。\n[grep] {scan_summary}"
+            )
 
         lines: list[str] = []
-        for m in results:
+        for m in match_results:
             if context_lines > 0 and "context_before" in m:
                 for ctx_line in m["context_before"]:
                     lines.append(f"{m['file']}-{ctx_line}")
@@ -659,8 +953,10 @@ class FilesystemHandler:
                 for ctx_line in m["context_after"]:
                     lines.append(f"{m['file']}-{ctx_line}")
                 lines.append("")
+        if scan_summary:
+            lines.append(f"\n[grep] {scan_summary}")
 
-        total = len(results)
+        total = len(match_results)
         header = f"找到 {total} 条匹配"
         if total >= max_results:
             header += f"（已达上限 {max_results}，可能还有更多）"
@@ -680,7 +976,7 @@ class FilesystemHandler:
             )
             return truncated
 
-        return output
+        return self._append_traversal_note(output)
 
     async def _glob(self, params: dict) -> str:
         """文件名模式搜索"""
@@ -689,6 +985,9 @@ class FilesystemHandler:
             return "❌ glob 缺少必要参数 'pattern'。"
 
         path = params.get("path", ".")
+        guard = self._guard_path_boundary(path, op="glob")
+        if guard:
+            return guard
 
         # 不以 **/ 开头的 pattern 自动加 **/ 前缀，使其递归搜索
         if not pattern.startswith("**/"):
@@ -698,21 +997,13 @@ class FilesystemHandler:
         if not dir_path.is_dir():
             return f"❌ 目录不存在: {path}"
 
-        from ..file import DEFAULT_IGNORE_DIRS
-
         results: list[tuple[str, float]] = []
         glob_pattern = pattern[3:] if pattern.startswith("**/") else pattern
-        for p in dir_path.rglob(glob_pattern):
-            if not p.is_file():
-                continue
-            parts = p.relative_to(dir_path).parts
-            if any(part in DEFAULT_IGNORE_DIRS for part in parts):
-                continue
-            if any(
-                part.startswith(".") and part not in (".github", ".vscode", ".cursor")
-                for part in parts[:-1]
-            ):
-                continue
+        for p in self.agent.file_tool._iter_matching_paths(
+            dir_path,
+            glob_pattern,
+            recursive=True,
+        ):
             try:
                 mtime = p.stat().st_mtime
             except OSError:
@@ -723,7 +1014,7 @@ class FilesystemHandler:
         results.sort(key=lambda x: x[1], reverse=True)
 
         if not results:
-            return f"未找到匹配 '{pattern}' 的文件。"
+            return self._append_traversal_note(f"未找到匹配 '{pattern}' 的文件。")
 
         total = len(results)
         max_show = self.LIST_DIR_DEFAULT_MAX
@@ -733,13 +1024,77 @@ class FilesystemHandler:
         if total > max_show:
             output += f"\n\n[OUTPUT_TRUNCATED] 共 {total} 个文件，已显示前 {max_show} 个。"
 
-        return output
+        return self._append_traversal_note(output)
+
+    def _append_traversal_note(self, output: str) -> str:
+        skipped = getattr(self.agent.file_tool, "last_traversal_skipped", 0)
+        if not skipped:
+            return output
+        return (
+            f"{output}\n\n[提示] 已跳过 {skipped} 个不可访问或临时变化的目录，"
+            "其余结果已正常返回。"
+        )
+
+    async def _move_file(self, params: dict) -> str:
+        """移动或重命名文件/目录，并验证磁盘状态。"""
+        src = (
+            params.get("src")
+            or params.get("source")
+            or params.get("source_path")
+            or params.get("from")
+            or ""
+        )
+        dst = (
+            params.get("dst")
+            or params.get("destination")
+            or params.get("target_path")
+            or params.get("to")
+            or ""
+        )
+        if not src or not dst:
+            return "❌ move_file 缺少必要参数 'src' 和 'dst'。"
+        if "\x00" in src or "\x00" in dst:
+            return "❌ move_file 路径包含无效空字符，请去掉不可见字符后重试。"
+        for raw in (src, dst):
+            guard = self._guard_path_boundary(raw, op="move")
+            if guard:
+                return guard
+
+        policy = self._get_fix_policy()
+        if policy:
+            write_roots = policy.get("write_roots") or []
+            for raw in (src, dst):
+                target = self._resolve_to_abs(raw)
+                if not self._is_under_any_root(target, write_roots):
+                    msg = f"❌ 自检自动修复护栏：禁止移动该路径。\n目标: {target}"
+                    logger.warning(msg)
+                    return msg
+
+        src_path = self.agent.file_tool._resolve_path(src)
+        dst_path = self.agent.file_tool._resolve_path(dst)
+
+        if not src_path.exists():
+            return f"❌ 源路径不存在: {src}"
+
+        final_dst_path = dst_path / src_path.name if dst_path.exists() and dst_path.is_dir() else dst_path
+        kind = "目录" if src_path.is_dir() else "文件"
+        success = await self.agent.file_tool.move(src, dst)
+        if not success:
+            return f"❌ 移动失败: {src} -> {dst}"
+        if src_path.exists():
+            return f"⚠️ 移动操作返回成功但源路径仍存在: {src}"
+        if not final_dst_path.exists():
+            return f"⚠️ 移动操作返回成功但目标路径不存在: {final_dst_path}"
+        return f"{kind}已移动: {src} -> {final_dst_path}"
 
     async def _delete_file(self, params: dict) -> str:
         """删除文件或空目录"""
         path = params.get("path", "")
         if not path:
             return "❌ delete_file 缺少必要参数 'path'。"
+        guard = self._guard_path_boundary(path, op="delete")
+        if guard:
+            return guard
 
         policy = self._get_fix_policy()
         if policy:
@@ -788,3 +1143,4 @@ def create_handler(agent: "Agent"):
     """
     handler = FilesystemHandler(agent)
     return handler.handle
+

@@ -9,8 +9,9 @@ Prompt Compiler (v2) — LLM 辅助编译 + 缓存 + 规则降级
 5. 写入 compiled/ 目录
 
 编译目标:
-- SOUL.md -> identity.core.md + identity.longform.index.md
-- AGENT.md -> agent.behavior.md
+- SOUL.md -> soul.summary.md (<=150 tokens)
+- AGENT.md -> agent.core.md (<=300 tokens)
+- USER.md -> user.summary.md (<=120 tokens)
 - personas/user_custom.md -> persona.custom.md (<=150 tokens)
 """
 
@@ -32,19 +33,31 @@ _COMPILE_PROMPTS: dict[str, dict] = {
     "identity_core": {
         "target": "identity_core",
         "system": "你是身份文件编译器，只保留不可省略的核心身份和安全原则。",
-        "user": "将以下 SOUL.md 编译为 300-600 tokens 的核心身份摘要，保留安全、诚实、人类监督、语言/价值观边界；第一人称使用 {{agent_name}} 占位符，项目/platform 称 Synapse。\n\n原文:\n{content}",
+        "user": "将以下 SOUL.md 编译为 300-600 tokens 的核心身份摘要，保留安全、诚实、人类监督、语言/价值观边界。\n\n原文:\n{content}",
         "max_tokens": 600,
     },
     "agent_behavior": {
         "target": "agent_behavior",
         "system": "你是 Agent 行为规范编译器，只保留可执行行为规则。",
-        "user": "将以下 AGENT.md 编译为 600-1000 tokens 的行为规范，保留任务执行、验证、失败处理、用户沟通边界；自称使用 {{agent_name}} 占位符。\n\n原文:\n{content}",
+        "user": "将以下 AGENT.md 编译为 600-1000 tokens 的行为规范，保留任务执行、验证、失败处理、用户沟通边界。\n\n原文:\n{content}",
         "max_tokens": 1000,
+    },
+    "agent_tooling": {
+        "target": "agent_tooling",
+        "system": "你是工具规则编译器，只保留工具/技能/MCP 相关规则。",
+        "user": "从以下 AGENT.md 中提取工具、技能、MCP、文件/命令使用规则，输出不超过 600 tokens。\n\n原文:\n{content}",
+        "max_tokens": 600,
+    },
+    "user_profile_core": {
+        "target": "user_profile_core",
+        "system": "你是用户档案编译器，只保留长期稳定且需要每轮遵守的信息。",
+        "user": "从以下 USER.md 提取 pinned 用户偏好和稳定事实，跳过占位、过期、空内容，不超过 300 tokens。\n\n原文:\n{content}",
+        "max_tokens": 300,
     },
     "identity_longform_index": {
         "target": "identity_longform_index",
         "system": "你是长身份文档索引器。",
-        "user": "为以下身份文档生成按需加载索引，只列主题，不输出全文，不超过 200 tokens；第一人称用 {{agent_name}}，项目称 Synapse。\n\n原文:\n{content}",
+        "user": "为以下身份文档生成按需加载索引，只列主题，不输出全文，不超过 200 tokens。\n\n原文:\n{content}",
         "max_tokens": 200,
     },
     "persona_custom": {
@@ -67,6 +80,8 @@ _COMPILE_PROMPTS: dict[str, dict] = {
 _SOURCE_MAP: dict[str, str] = {
     "identity_core": "SOUL.md",
     "agent_behavior": "AGENT.md",
+    "agent_tooling": "AGENT.md",
+    "user_profile_core": "USER.md",
     "identity_longform_index": "SOUL.md",
     "persona_custom": "personas/user_custom.md",
 }
@@ -74,11 +89,13 @@ _SOURCE_MAP: dict[str, str] = {
 _OUTPUT_MAP: dict[str, str] = {
     "identity_core": "identity.core.md",
     "agent_behavior": "agent.behavior.md",
+    "agent_tooling": "agent.tooling.md",
+    "user_profile_core": "user.profile.core.md",
     "identity_longform_index": "identity.longform.index.md",
     "persona_custom": "persona.custom.md",
 }
 
-_ORPHAN_FILES = ["soul.summary.md", "agent.core.md", "user.summary.md"]
+_ORPHAN_FILES = ["soul.summary.md", "user.summary.md"]
 
 
 # =========================================================================
@@ -135,9 +152,9 @@ class PromptCompiler:
             try:
                 prompt = config["user"].format(content=content, max_tokens=config["max_tokens"])
                 if hasattr(self.brain, "think_lightweight"):
-                    response = await self.brain.think_lightweight(prompt, system=config["system"], usage_scene="compile_with_llm_lightweight")
+                    response = await self.brain.think_lightweight(prompt, system=config["system"])
                 else:
-                    response = await self.brain.think(prompt, system=config["system"], usage_scene="compile_with_llm_main")
+                    response = await self.brain.think(prompt, system=config["system"])
                 result = (getattr(response, "content", None) or str(response)).strip()
                 if result:
                     return result
@@ -311,8 +328,17 @@ def _compile_with_rules(content: str, config: dict) -> str:
     """
     target = config.get("target", "")
 
-    if target in _STATIC_FALLBACKS:
+    if target in {"agent_core"}:
         return _STATIC_FALLBACKS[target]
+
+    if target in {
+        "identity_core",
+        "agent_behavior",
+        "agent_tooling",
+        "user_profile_core",
+        "identity_longform_index",
+    }:
+        return _compile_identity_target(content, target, config.get("max_tokens", 500))
 
     # Otherwise do rule-based extraction
     content = _clean_html(content)
@@ -360,6 +386,47 @@ def _compile_with_rules(content: str, config: dict) -> str:
     return "\n".join(unique[:max_items])
 
 
+def _compile_identity_target(content: str, target: str, max_tokens: int) -> str:
+    """Deterministic fallback for identity compilation.
+
+    This keeps compiled runtime prompts compact without falling back to full
+    SOUL/AGENT/USER injection when the LLM compiler is unavailable.
+    """
+    content = _clean_html(content)
+    lines = []
+    in_code_block = False
+    for raw in content.splitlines():
+        line = raw.strip()
+        if line.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block or not line:
+            continue
+        if line.startswith("#"):
+            if target == "identity_longform_index":
+                lines.append(f"- {line.lstrip('#').strip()}")
+            continue
+        if line.startswith("|") or line.startswith("---"):
+            continue
+        if len(line) > 180:
+            line = line[:177] + "..."
+        lines.append(line if line.startswith(("-", "*")) else f"- {line}")
+
+    if not lines:
+        fallback_key = {
+            "identity_core": "identity_core",
+            "agent_behavior": "agent_behavior",
+            "agent_tooling": "agent_tooling",
+            "user_profile_core": "user_profile_core",
+            "identity_longform_index": "identity_longform_index",
+        }.get(target, "")
+        return _STATIC_FALLBACKS.get(fallback_key, "")
+
+    max_items = max(max_tokens // 18, 4)
+    unique = list(dict.fromkeys(lines))
+    return "\n".join(unique[:max_items])
+
+
 def _clean_html(content: str) -> str:
     """Remove HTML comments and artifacts."""
     content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
@@ -387,7 +454,7 @@ _STATIC_FALLBACKS: dict[str, str] = {
     "identity_core": """\
 ## 身份核心
 - 你是 {{agent_name}}，由 Synapse 项目驱动的全能自进化 AI 助手。
-- 优先保持安全、诚实、支持人类监督；遵守 workspace 与 `POLICIES.yaml` 安全区。
+- 优先保持安全、诚实、支持人类监督。
 - 真正帮助用户完成任务，但不越权、不欺骗、不操纵用户。
 - 对不确定信息保持校准，必要时说明限制。""",
     "agent_behavior": """\
@@ -396,13 +463,17 @@ _STATIC_FALLBACKS: dict[str, str] = {
 - 任务执行遵循：理解 → 检查 → 执行 → 验证 → 报告。
 - 出错时分析原因并尝试修复，不能假装成功。
 - 不超出用户请求范围，不做未经授权的破坏性操作。""",
+    "user_profile_core": "",
     "identity_longform_index": """\
 ## 身份长文索引
-- Soul Overview / 核心价值观
+- 核心价值观
 - 帮助用户
 - 诚实与校准
 - 避免伤害
 - 人类监督""",
+    # NOTE: agent_core 和 agent_tooling 的 fallback 已不再使用
+    # (v3: AGENT.md 改为 builder.py 直接注入，兜底在 builder._BUILT_IN_DEFAULTS 中)
+    # 保留此处仅为向后兼容，不会被新代码路径调用。
     "agent_core": """\
 ## 核心执行原则
 
@@ -447,7 +518,7 @@ _STATIC_FALLBACKS: dict[str, str] = {
 1. **已安装技能** — 技能可能来自内置目录、用户工作区目录或项目目录；不要猜路径，使用 `list_skills` / `get_skill_info`
 2. **MCP 服务器工具** — 通过 MCP 协议调用的外部工具
 3. **Shell 命令** — 系统命令和脚本
-4. **临时脚本** — write_file 写脚本 + run_shell 执行
+4. **临时脚本** — write_file 写脚本 + 平台命令工具执行（Windows 用 run_powershell，其他环境用 run_shell）
 5. **网络搜索 + 安装** — 搜索 GitHub 找到并安装新能力
 6. **自己编写技能** — 用 skill-creator 创建永久技能
 
@@ -527,17 +598,24 @@ def compile_soul(content: str) -> str:
 
 
 def compile_agent_core(content: str) -> str:
-    """向后兼容：历史上 agent_core 对应现在的 agent_behavior。"""
+    """向后兼容 alias。
+
+    历史上 ``agent_core`` 是 AGENT.md 的核心行为编译目标；新方案把它
+    拆成 ``agent_behavior`` + ``agent_tooling``。这里转 ``agent_behavior``
+    作为最接近原语义的目标，避免外部调用者拿到 ``KeyError``。
+    """
     return _compile_with_rules(content, _COMPILE_PROMPTS["agent_behavior"])
 
 
 def compile_agent_tooling(content: str) -> str:
-    return _compile_with_rules(content, {"target": "agent_tooling", "max_tokens": 300})
+    return _compile_with_rules(content, _COMPILE_PROMPTS["agent_tooling"])
 
 
 def compile_user(content: str) -> str:
-    return _compile_with_rules(content, _COMPILE_PROMPTS["user"])
+    """向后兼容 alias，新名字是 ``user_profile_core``。"""
+    return _compile_with_rules(content, _COMPILE_PROMPTS["user_profile_core"])
 
 
 def compile_persona(content: str) -> str:
     return _compile_with_rules(content, _COMPILE_PROMPTS["persona_custom"])
+

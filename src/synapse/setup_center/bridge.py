@@ -16,19 +16,40 @@ import synapse._ensure_utf8  # noqa: F401  # isort: skip
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import re
 import sys
+import time
 import zipfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+_MODEL_LIST_ACCEPT_ENCODING = "gzip, deflate"
+
+
+def _model_list_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Avoid zstd responses in model-list probes; some bundles ship broken zstandard."""
+    return {
+        **headers,
+        "Accept-Encoding": _MODEL_LIST_ACCEPT_ENCODING,
+    }
+
 
 def _json_print(obj: Any) -> None:
     sys.stdout.write(json.dumps(obj, ensure_ascii=False))
     sys.stdout.write("\n")
+
+
+class SkillInstallError(RuntimeError):
+    """Structured install failure for Setup Center API responses."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 def _to_dict(obj: Any) -> Any:
@@ -52,6 +73,27 @@ async def _list_models_openai(api_key: str, base_url: str, provider_slug: str | 
     import httpx
 
     from synapse.llm.capabilities import infer_capabilities
+
+    def _is_openrouter_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        return slug == "openrouter" or "openrouter.ai" in b
+
+    def _openrouter_router_models() -> list[dict]:
+        return [
+            {
+                "id": "openrouter/auto",
+                "name": "OpenRouter Auto Router",
+                "capabilities": infer_capabilities("openrouter/auto", provider_slug="openrouter")
+                | {"tools": True},
+            },
+            {
+                "id": "openrouter/free",
+                "name": "OpenRouter Free Models Router",
+                "capabilities": infer_capabilities("openrouter/free", provider_slug="openrouter")
+                | {"tools": True},
+            },
+        ]
 
     def _is_minimax_provider() -> bool:
         slug = (provider_slug or "").strip().lower()
@@ -81,9 +123,30 @@ async def _list_models_openai(api_key: str, base_url: str, provider_slug: str | 
         is_qianfan = slug == "qianfan" or "qianfan.baidubce.com" in b
         return is_qianfan and "coding" in b
 
-    def _minimax_fallback_models() -> list[dict]:
-        # MiniMax Anthropic/OpenAI 兼容文档仅列出固定模型，且未提供 /models 列表接口。
+    def _is_xfyun_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_xfyun = slug == "xfyun" or "xf-yun.com" in b
+        return is_xfyun and "maas-coding-api" in b
+
+    def _xfyun_coding_plan_fallback_models() -> list[dict]:
         ids = [
+            "astron-code-latest",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="xfyun"),
+            }
+            for mid in ids
+        ]
+
+    def _minimax_fallback_models() -> list[dict]:
+        # 内置候选：仅在上游 /v1/models 拉取失败时回退使用。
+        # 不含 M3 —— 列表里出现 M3 即说明用的是在线列表，否则是这份内置回退。
+        ids = [
+            "MiniMax-M2.7",
             "MiniMax-M2.5",
             "MiniMax-M2.5-highspeed",
             "MiniMax-M2.1",
@@ -181,12 +244,13 @@ async def _list_models_openai(api_key: str, base_url: str, provider_slug: str | 
         return _dashscope_coding_plan_fallback_models()
     if _is_qianfan_coding_plan_provider():
         return _qianfan_coding_plan_fallback_models()
+    if _is_xfyun_coding_plan_provider():
+        return _xfyun_coding_plan_fallback_models()
     if _is_longcat_provider():
         return _longcat_fallback_models()
 
-    # MiniMax 兼容接口无模型列表端点，直接返回文档内置候选，避免无效探测和误报。
-    if _is_minimax_provider():
-        return _minimax_fallback_models()
+    # MiniMax 现已提供 OpenAI 兼容的 /v1/models 端点，正常流程即可拉取。
+    # 拉取失败（旧网关无该端点 / 网络错误等）时回退到内置候选，详见下方 except。
 
     from synapse.llm.types import normalize_base_url
 
@@ -200,14 +264,16 @@ async def _list_models_openai(api_key: str, base_url: str, provider_slug: str | 
 
     from synapse.llm.providers.proxy_utils import get_httpx_client_kwargs
 
-    _is_local = any(h in base_url.lower() for h in ("localhost", "127.0.0.1", "[::1]"))
-    client_kw = get_httpx_client_kwargs(timeout=30, is_local=_is_local)
+    client_kw = get_httpx_client_kwargs(timeout=30, target_url=base_url)
     client_kw["follow_redirects"] = True
     client_kw["event_hooks"] = {"request": [_ensure_auth]}
 
     async with httpx.AsyncClient(**client_kw) as client:
         try:
-            resp = await client.get(url, headers={"Authorization": auth_header})
+            resp = await client.get(
+                url,
+                headers=_model_list_headers({"Authorization": auth_header}),
+            )
             resp.raise_for_status()
             ct = (resp.headers.get("content-type") or "").lower()
             if "json" not in ct:
@@ -218,14 +284,19 @@ async def _list_models_openai(api_key: str, base_url: str, provider_slug: str | 
                     f"\n响应预览: {preview}"
                 )
             data = resp.json()
-        except httpx.HTTPStatusError:
+        except Exception:
+            # MiniMax：在线拉取失败时回退到内置候选（列表里因此不会出现 M3）。
+            if _is_minimax_provider():
+                return _minimax_fallback_models()
             raise
 
-    out: list[dict] = []
+    out: list[dict] = _openrouter_router_models() if _is_openrouter_provider() else []
+    seen = {str(m.get("id") or "") for m in out}
     for m in data.get("data", []):
         mid = str(m.get("id", "")).strip()
-        if not mid:
+        if not mid or mid in seen:
             continue
+        seen.add(mid)
         out.append(
             {
                 "id": mid,
@@ -234,6 +305,9 @@ async def _list_models_openai(api_key: str, base_url: str, provider_slug: str | 
             }
         )
     out.sort(key=lambda x: x["id"])
+    # MiniMax：在线端点返回空列表时也回退内置候选，避免空选择框。
+    if not out and _is_minimax_provider():
+        return _minimax_fallback_models()
     return out
 
 
@@ -272,8 +346,30 @@ async def _list_models_anthropic(
         is_qianfan = slug == "qianfan" or "qianfan.baidubce.com" in b
         return is_qianfan and "coding" in b
 
-    def _minimax_fallback_models() -> list[dict]:
+    def _is_xfyun_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_xfyun = slug == "xfyun" or "xf-yun.com" in b
+        return is_xfyun and "maas-coding-api" in b
+
+    def _xfyun_coding_plan_fallback_models() -> list[dict]:
         ids = [
+            "astron-code-latest",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="xfyun"),
+            }
+            for mid in ids
+        ]
+
+    def _minimax_fallback_models() -> list[dict]:
+        # 内置候选：仅在上游 /v1/models 拉取失败时回退使用。
+        # 不含 M3 —— 列表里出现 M3 即说明用的是在线列表，否则是这份内置回退。
+        ids = [
+            "MiniMax-M2.7",
             "MiniMax-M2.5",
             "MiniMax-M2.5-highspeed",
             "MiniMax-M2.1",
@@ -365,35 +461,39 @@ async def _list_models_anthropic(
         return _dashscope_coding_plan_fallback_models()
     if _is_qianfan_coding_plan_provider():
         return _qianfan_coding_plan_fallback_models()
+    if _is_xfyun_coding_plan_provider():
+        return _xfyun_coding_plan_fallback_models()
     if _is_longcat_provider():
         return _longcat_fallback_models()
 
-    # MiniMax 兼容接口无模型列表端点，直接返回文档内置候选，避免无效探测和误报。
-    if _is_minimax_provider():
-        return _minimax_fallback_models()
+    # MiniMax 现已提供模型列表端点，正常流程即可拉取；失败时回退内置候选（见下方 except）。
 
     b = base_url.rstrip("/")
     url = b + "/models" if b.endswith("/v1") else b + "/v1/models"
 
     from synapse.llm.providers.proxy_utils import get_httpx_client_kwargs
 
-    _is_local = any(h in base_url.lower() for h in ("localhost", "127.0.0.1", "[::1]"))
-    client_kw = get_httpx_client_kwargs(timeout=30, is_local=_is_local)
+    client_kw = get_httpx_client_kwargs(timeout=30, target_url=base_url)
 
     async with httpx.AsyncClient(**client_kw) as client:
         try:
             resp = await client.get(
                 url,
-                headers={
-                    "x-api-key": api_key,
-                    # 部分 Anthropic 兼容网关仅识别 Bearer。
-                    "Authorization": f"Bearer {api_key}",
-                    "anthropic-version": "2023-06-01",
-                },
+                headers=_model_list_headers(
+                    {
+                        "x-api-key": api_key,
+                        # 部分 Anthropic 兼容网关仅识别 Bearer。
+                        "Authorization": f"Bearer {api_key}",
+                        "anthropic-version": "2023-06-01",
+                    }
+                ),
             )
             resp.raise_for_status()
             data = resp.json()
-        except httpx.HTTPStatusError:
+        except Exception:
+            # MiniMax：在线拉取失败时回退到内置候选（列表里因此不会出现 M3）。
+            if _is_minimax_provider():
+                return _minimax_fallback_models()
             raise
 
     out: list[dict] = []
@@ -408,6 +508,9 @@ async def _list_models_anthropic(
                 "capabilities": infer_capabilities(mid, provider_slug=provider_slug),
             }
         )
+    # MiniMax：在线端点返回空列表时也回退内置候选，避免空选择框。
+    if not out and _is_minimax_provider():
+        return _minimax_fallback_models()
     return out
 
 
@@ -725,71 +828,6 @@ async def health_check_im(workspace_dir: str, channel: str | None) -> None:
 
 def ensure_channel_deps(workspace_dir: str) -> None:
     """检查已启用 IM 通道的 Python 依赖，缺失的自动 pip install。"""
-    import importlib
-    import subprocess
-
-    from synapse.python_compat import patch_simplejson_jsondecodeerror
-    from synapse.runtime_env import (
-        get_channel_deps_dir,
-        get_python_executable,
-        inject_module_paths_runtime,
-    )
-
-    def _build_pip_env(py_path: Path) -> dict[str, str]:
-        e = os.environ.copy()
-        for k in (
-            "PYTHONPATH",
-            "PYTHONHOME",
-            "PYTHONSTARTUP",
-            "VIRTUAL_ENV",
-            "CONDA_PREFIX",
-            "CONDA_DEFAULT_ENV",
-            "CONDA_SHLVL",
-            "CONDA_PYTHON_EXE",
-            "PIP_INDEX_URL",
-            "PIP_TARGET",
-            "PIP_PREFIX",
-            "PIP_USER",
-            "PIP_REQUIRE_VIRTUALENV",
-        ):
-            e.pop(k, None)
-        if py_path.parent.name == "_internal":
-            parts = [str(py_path.parent)]
-            for sub in ("Lib", "DLLs"):
-                p = py_path.parent / sub
-                if p.is_dir():
-                    parts.append(str(p))
-            e["PYTHONPATH"] = os.pathsep.join(parts)
-        return e
-
-    def _probe_python(py: str, env: dict[str, str], extra: dict) -> tuple[bool, str]:
-        try:
-            p = subprocess.run(
-                [py, "-c", "import encodings, pip; print('ok')"],
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-                **extra,
-            )
-        except Exception as exc:
-            return False, f"{type(exc).__name__}: {exc}"
-        if p.returncode == 0:
-            return True, ""
-        return False, (p.stderr or p.stdout or "").strip()[-600:]
-
-    def _find_offline_wheels(py_path: Path) -> Path | None:
-        candidates = [
-            py_path.parent.parent / "modules" / "channel-deps" / "wheels",
-            py_path.parent / "modules" / "channel-deps" / "wheels",
-        ]
-        for c in candidates:
-            if c.is_dir():
-                return c
-        return None
-
     wd = Path(workspace_dir).expanduser().resolve()
 
     env: dict[str, str] = {}
@@ -803,182 +841,9 @@ def ensure_channel_deps(workspace_dir: str) -> None:
             if eq > 0:
                 env[line[:eq].strip()] = line[eq + 1 :].strip()
 
-    from synapse.channels.deps import CHANNEL_DEPS
+    from synapse.runtime_channel_deps import ensure_channel_dependencies
 
-    channel_deps = CHANNEL_DEPS
-
-    enabled_key_map = {
-        "feishu": "FEISHU_ENABLED",
-        "dingtalk": "DINGTALK_ENABLED",
-        "wework": "WEWORK_ENABLED",
-        "wework_ws": "WEWORK_WS_ENABLED",
-        "onebot": "ONEBOT_ENABLED",
-        "onebot_reverse": "ONEBOT_ENABLED",
-        "qqbot": "QQBOT_ENABLED",
-        "wechat": "WECHAT_ENABLED",
-    }
-
-    inject_module_paths_runtime()
-    patch_simplejson_jsondecodeerror()
-
-    missing: list[str] = []
-    for channel, enabled_key in enabled_key_map.items():
-        if env.get(enabled_key, "").strip().lower() not in ("true", "1", "yes"):
-            continue
-        for import_name, pip_name in channel_deps.get(channel, []):
-            try:
-                importlib.import_module(import_name)
-            except ImportError as exc:
-                if (
-                    import_name == "lark_oapi"
-                    and "JSONDecodeError" in str(exc)
-                    and "simplejson" in str(exc)
-                ):
-                    patch_simplejson_jsondecodeerror()
-                    try:
-                        importlib.import_module(import_name)
-                        continue
-                    except Exception:
-                        pass
-                if pip_name not in missing:
-                    missing.append(pip_name)
-
-    if not missing:
-        _json_print({"status": "ok", "installed": [], "message": "所有依赖已就绪"})
-        return
-
-    py = get_python_executable() or sys.executable
-    py_path = Path(py)
-    target_dir = get_channel_deps_dir()
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    extra: dict = {}
-    if sys.platform == "win32":
-        extra["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    pip_env = _build_pip_env(py_path)
-    ok, probe = _probe_python(py, pip_env, extra)
-    if not ok and py_path.parent.name == "_internal":
-        pip_env["PYTHONHOME"] = str(py_path.parent)
-        ok, probe = _probe_python(py, pip_env, extra)
-    if not ok:
-        _json_print(
-            {
-                "status": "error",
-                "installed": [],
-                "missing": missing,
-                "message": f"Python 运行时异常（无法导入 encodings/pip）: {probe}",
-            }
-        )
-        return
-
-    # 离线优先（若安装包内置了 wheels）
-    wheels_dir = _find_offline_wheels(py_path)
-    if wheels_dir is not None:
-        try:
-            offline_cmd = [
-                py,
-                "-m",
-                "pip",
-                "install",
-                "--no-index",
-                "--find-links",
-                str(wheels_dir),
-                "--target",
-                str(target_dir),
-                "--prefer-binary",
-                *missing,
-            ]
-            off = subprocess.run(
-                offline_cmd,
-                env=pip_env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=240,
-                **extra,
-            )
-            if off.returncode == 0:
-                importlib.invalidate_caches()
-                inject_module_paths_runtime()
-                _json_print(
-                    {
-                        "status": "ok",
-                        "installed": missing,
-                        "message": f"已安装(offline): {', '.join(missing)}",
-                    }
-                )
-                return
-        except Exception:
-            pass
-
-    # 在线镜像回退
-    user_index = os.environ.get("PIP_INDEX_URL", "").strip()
-    mirrors: list[tuple[str, str]] = []
-    if user_index:
-        host = user_index.split("//")[1].split("/")[0] if "//" in user_index else ""
-        mirrors.append((user_index, host))
-    mirrors.extend(
-        [
-            ("https://mirrors.aliyun.com/pypi/simple/", "mirrors.aliyun.com"),
-            ("https://pypi.tuna.tsinghua.edu.cn/simple/", "pypi.tuna.tsinghua.edu.cn"),
-            ("https://pypi.org/simple/", "pypi.org"),
-        ]
-    )
-
-    last_err = ""
-    for index_url, trusted_host in mirrors:
-        cmd = [
-            py,
-            "-m",
-            "pip",
-            "install",
-            "--target",
-            str(target_dir),
-            "-i",
-            index_url,
-            "--prefer-binary",
-            "--timeout",
-            "60",
-            *missing,
-        ]
-        if trusted_host:
-            cmd.extend(["--trusted-host", trusted_host])
-        try:
-            result = subprocess.run(
-                cmd,
-                env=pip_env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=180,
-                **extra,
-            )
-            if result.returncode == 0:
-                importlib.invalidate_caches()
-                inject_module_paths_runtime()
-                _json_print(
-                    {
-                        "status": "ok",
-                        "installed": missing,
-                        "message": f"已安装: {', '.join(missing)}",
-                    }
-                )
-                return
-            last_err = (result.stderr or result.stdout or "").strip()[-500:]
-        except Exception as e:
-            last_err = str(e)
-
-    _json_print(
-        {
-            "status": "error",
-            "installed": [],
-            "missing": missing,
-            "message": f"安装失败: {last_err}",
-        }
-    )
+    _json_print(ensure_channel_dependencies(workspace_env=env))
 
 
 async def feishu_onboard_start(domain: str) -> None:
@@ -1158,7 +1023,6 @@ def list_skills(workspace_dir: str) -> None:
             {
                 "skill_id": sid,
                 "name": s.name,
-                "label": getattr(s, "label", None),
                 "description": s.description,
                 "system": bool(getattr(s, "system", False)),
                 "enabled": bool(getattr(s, "system", False))
@@ -1336,11 +1200,47 @@ def _validate_zip_members(zf: zipfile.ZipFile) -> None:
             raise RuntimeError(f"Zip Slip detected: dangerous member '{name}'")
 
 
+_PROXY_ENV_KEYS: tuple[str, ...] = (
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+)
+
+
+def _validate_git_proxy_environment(env: dict[str, str]) -> None:
+    """Fail early when Git would inherit a malformed proxy URL."""
+    from urllib.parse import urlparse
+
+    for key in _PROXY_ENV_KEYS:
+        value = (env.get(key) or "").strip()
+        if not value:
+            continue
+        parsed = urlparse(value)
+        if "：" in value or parsed.scheme not in {"http", "https", "socks4", "socks5", "socks5h"}:
+            raise SkillInstallError(
+                "git_proxy_invalid",
+                (
+                    f"代理配置格式错误：{key}={value!r}。"
+                    "请在设置中心修正为类似 http://127.0.0.1:7890，或清空该代理配置后重试。"
+                ),
+            )
+        if not parsed.hostname:
+            raise SkillInstallError(
+                "git_proxy_invalid",
+                (f"代理配置缺少主机名：{key}={value!r}。请检查代理地址，或清空该代理配置后重试。"),
+            )
+
+
 def _git_clone(args: list[str]) -> None:
-    """执行 git clone，git 不可用时抛出友好错误。"""
+    """执行 git clone，git 不可用或代理错误时抛出友好错误。"""
     import subprocess
 
     try:
+        env = os.environ.copy()
+        _validate_git_proxy_environment(env)
         extra: dict = {}
         if sys.platform == "win32":
             extra["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -1351,12 +1251,28 @@ def _git_clone(args: list[str]) -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
             **extra,
         )
     except FileNotFoundError:
         raise FileNotFoundError(
             "未找到 git 命令。请安装 Git (https://git-scm.com) 或使用 GitHub 简写格式安装技能"
         )
+    except subprocess.CalledProcessError as e:
+        output = f"{e.stdout or ''}\n{e.stderr or ''}".strip()
+        lower = output.lower()
+        if "invalid proxy" in lower or "proxy url" in lower:
+            raise SkillInstallError(
+                "git_proxy_invalid",
+                (
+                    "Git 代理配置无效，导致无法下载技能。"
+                    f"请检查 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 配置。\n\nGit 输出：{output[-1200:]}"
+                ),
+            ) from e
+        raise SkillInstallError(
+            "git_clone_failed",
+            f"Git 下载技能失败，请检查仓库地址、网络或权限。\n\nGit 输出：{output[-1200:]}",
+        ) from e
 
 
 def _parse_github_url(url: str) -> tuple[str, str, str | None] | None:
@@ -1434,11 +1350,64 @@ def _read_skill_source(d: Path) -> str:
         return ""
 
 
-def _cleanup_broken_skill_dir(d: Path) -> None:
-    """清理残留的无效技能目录（无 SKILL.md）。清理失败则抛出异常。"""
+def _make_path_writable(path: str) -> None:
+    """Best-effort chmod used before deleting Git pack files on Windows."""
+    import os
+    import stat
+
+    with contextlib.suppress(Exception):
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+
+
+def _remove_tree(d: Path, *, retries: int = 3) -> None:
+    """Remove a directory with small Windows-friendly retries."""
     import shutil
 
-    shutil.rmtree(d)
+    def onerror(func, path, exc_info):
+        _make_path_writable(path)
+        func(path)
+
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(d, onerror=onerror)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.15 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+
+
+def _quarantine_broken_skill_dir(d: Path) -> Path:
+    """Move an undeletable partial install aside so a clean install can continue."""
+    quarantine_root = d.parent / ".synapse-broken"
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    target = quarantine_root / f"{d.name}-{int(time.time())}"
+    d.rename(target)
+    return target
+
+
+def _cleanup_broken_skill_dir(d: Path) -> None:
+    """清理残留的无效技能目录（无 SKILL.md）。清理失败则抛出异常。"""
+    try:
+        _remove_tree(d)
+    except Exception as remove_err:
+        try:
+            quarantined = _quarantine_broken_skill_dir(d)
+        except Exception as quarantine_err:
+            raise SkillInstallError(
+                "skill_residual_cleanup_failed",
+                (
+                    f"无法清理残留技能目录：{d}。"
+                    "该目录可能被 Git、杀毒软件或文件管理器占用。"
+                    "请关闭相关程序后重试，或手动删除该目录。"
+                ),
+            ) from quarantine_err
+        sys.stderr.write(
+            f"[install_skill] 残留目录无法直接删除，已隔离到 {quarantined}: {remove_err}\n"
+        )
 
 
 def _ensure_target_available(target: Path, url: str) -> None:
@@ -1452,30 +1421,161 @@ def _ensure_target_available(target: Path, url: str) -> None:
     if not target.exists():
         return
     if not _is_valid_skill_dir(target):
-        try:
-            _cleanup_broken_skill_dir(target)
-        except Exception:
-            raise ValueError(f"无法清理残留目录，请手动删除: {target}")
+        _cleanup_broken_skill_dir(target)
         return
     if _read_skill_source(target) == url:
         raise ValueError(f"该技能已安装: {target}")
     raise ValueError(f"技能目录名称冲突: {target}")
 
 
+def _copy_skill_tree(source_dir: Path, target: Path) -> None:
+    """Copy a validated skill tree to the final directory without Git metadata."""
+    import shutil
+
+    shutil.copytree(
+        str(source_dir),
+        str(target),
+        ignore=shutil.ignore_patterns(".git", ".git/*"),
+    )
+
+
+def _install_repo_tree_to_target(
+    *,
+    repo_url: str,
+    target: Path,
+    subdir: str | None = None,
+    zip_downloader: Any | None = None,
+) -> None:
+    """Clone/download a repo into temp storage, then copy only the skill tree."""
+    import shutil
+    import tempfile
+
+    tmp_parent = Path(tempfile.mkdtemp(prefix="synapse_skill_"))
+    tmp_dir = tmp_parent / "repo"
+    try:
+        if _has_git():
+            _git_clone(["git", "clone", "--depth", "1", repo_url, str(tmp_dir)])
+        elif zip_downloader is not None:
+            zip_downloader(tmp_dir)
+        else:
+            raise FileNotFoundError("未找到 git 命令。请安装 Git (https://git-scm.com) 后重试")
+
+        source_dir = tmp_dir / subdir if subdir else tmp_dir
+        if not source_dir.is_dir():
+            raise ValueError(f"仓库中未找到技能目录: {subdir}")
+        _copy_skill_tree(source_dir, target)
+    finally:
+        shutil.rmtree(str(tmp_parent), ignore_errors=True)
+
+
+# 通用 CLI 命令前缀清洗：用户经常直接复制类似
+#   "synapse install-skill owner/repo"
+#   "npx skills add owner/repo"
+#   "uv pip install owner/repo"
+#   "Run: synapse skill add owner/repo"
+# 这样的指令到对话框 / API 里。从中抽出真正的 URL/owner/repo 信号，
+# 避免 install_skill 因为前面的命令串而拒绝。
+_CMD_VERB = r"(?:add|install|i|get|use|run)"
+_CMD_TOOL = (
+    r"(?:synapse(?:\s+(?:skills?|install[- ]skill))?"
+    r"|npx\s+skills?"
+    r"|skills?"
+    r"|pnpm\s+(?:add|install)"
+    r"|npm\s+(?:i|install|add)"
+    r"|yarn\s+add"
+    r"|uv(?:\s+pip)?"
+    r"|pipx?"
+    r"|cargo)"
+)
 _CMD_PREFIXES = re.compile(
-    r"^(?:npx\s+skills?\s+(?:add|install)|synapse\s+(?:install[- ]skill|skill\s+install))\s+",
+    rf"^(?:Run\s*:\s*)?(?:{_CMD_TOOL}\s+){_CMD_VERB}?\s+",
     re.IGNORECASE,
 )
 
+# 用于从混杂文本里提取首个有效 skill 信号（URL / owner/repo / 本地路径）
+_SKILL_URL_RE = re.compile(
+    r"(github:[A-Za-z0-9_./-]+"
+    r"|https?://\S+"
+    r"|git@[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+\.git"
+    r"|[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)"
+)
 
-def install_skill(workspace_dir: str, url: str) -> None:
-    """安装技能（从 Git URL、GitHub 简写或本地目录）"""
-    url = _CMD_PREFIXES.sub("", url.strip()).strip()
+
+def _extract_skill_signal(raw: str) -> str:
+    """从用户输入里提取真正的 skill 安装信号。
+
+    支持三种粘贴方式：
+      1. 纯 URL / owner/repo / 本地路径（直接 strip）。
+      2. 单行 CLI：``synapse install-skill owner/repo`` —— 先用
+         ``_CMD_PREFIXES`` 剥离命令前缀；剥离后还可能留 ``--flag value``，
+         再尝试用 ``_SKILL_URL_RE`` 抽出第一个 URL/owner-repo 片段。
+      3. 多行文本：按行扫描，取第一行能命中 URL/owner-repo 的内容。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+
+    # Single line first: cheapest and most common.
+    if "\n" not in text:
+        cleaned = _CMD_PREFIXES.sub("", text).strip()
+        if not cleaned:
+            return ""
+        # If the cleaned form has flags / extra args, keep only the first URL-like token.
+        if cleaned.split() and len(cleaned.split()) > 1:
+            m = _SKILL_URL_RE.search(cleaned)
+            if m:
+                return m.group(1).strip()
+        return cleaned
+
+    # Multi-line: scan lines, pick the first that yields a URL-like token.
+    for line in text.splitlines():
+        line = line.strip().strip("`").strip()
+        if not line or line.startswith("#"):
+            continue
+        candidate = _CMD_PREFIXES.sub("", line).strip()
+        if not candidate:
+            continue
+        m = _SKILL_URL_RE.search(candidate)
+        if m:
+            return m.group(1).strip()
+        if candidate.startswith(("./", "../", "/", "~", ".\\", "..\\")) or (
+            len(candidate) >= 2 and candidate[1] == ":"
+        ):
+            return candidate
+    return ""
+
+
+def install_skill(workspace_dir: str, url: str, *, category: str | None = None) -> None:
+    """安装技能（从 Git URL、GitHub 简写或本地目录）。
+
+    Args:
+        workspace_dir: 工作区根目录
+        url: 技能来源（github:owner/repo / 完整 URL / owner/repo / 本地路径）
+        category: 可选大类。命中且通过校验时，安装到 ``skills/<category>/<skill_id>/``；
+            否则维持旧行为安装到 ``skills/<skill_id>/``（顶层平铺）。
+    """
+    url = _extract_skill_signal(url)
     if not url:
         raise ValueError("请输入有效的技能地址，如 owner/repo 或 Git URL")
 
-    skills_dir = _resolve_skills_dir(workspace_dir)
-    skills_dir.mkdir(parents=True, exist_ok=True)
+    root_skills_dir = _resolve_skills_dir(workspace_dir)
+    root_skills_dir.mkdir(parents=True, exist_ok=True)
+
+    # 校验 category 并解析最终落盘根。校验失败时退化为顶层安装并向 stderr
+    # 写一行提示，**不污染 stdout 的 JSON 协议**（CLI 与 API 都按行解析 stdout）。
+    skills_dir = root_skills_dir
+    if category:
+        try:
+            from synapse.skills.categories import is_valid_category_name
+
+            if is_valid_category_name(category):
+                skills_dir = root_skills_dir / category
+                skills_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                sys.stderr.write(f"[install_skill] 分类名 {category!r} 非法，已忽略并安装到顶层\n")
+        except Exception as ce:
+            sys.stderr.write(f"[install_skill] 分类校验异常 {category!r}: {ce}，已安装到顶层\n")
+            skills_dir = root_skills_dir
 
     if url.startswith("github:"):
         # github:user/repo/path -> clone from GitHub
@@ -1484,15 +1584,18 @@ def install_skill(workspace_dir: str, url: str) -> None:
             raise ValueError(f"无效的 GitHub URL: {url}")
         owner, repo = parts[0], parts[1]
         skill_name = parts[-1] if len(parts) > 2 else repo
+        gh_subdir = "/".join(parts[2:]) if len(parts) > 2 else None
         target = skills_dir / skill_name
 
         _ensure_target_available(target, url)
 
-        if _has_git():
-            git_url = f"https://github.com/{owner}/{repo}.git"
-            _git_clone(["git", "clone", "--depth", "1", git_url, str(target)])
-        else:
-            _download_github_zip(owner, repo, target)
+        git_url = f"https://github.com/{owner}/{repo}.git"
+        _install_repo_tree_to_target(
+            repo_url=git_url,
+            target=target,
+            subdir=gh_subdir,
+            zip_downloader=lambda dest: _download_github_zip(owner, repo, dest),
+        )
 
     elif url.startswith("http://") or url.startswith("https://"):
         gh = _parse_github_url(url)
@@ -1506,44 +1609,27 @@ def install_skill(workspace_dir: str, url: str) -> None:
             target = skills_dir / skill_name
             _ensure_target_available(target, url)
 
-            if gh_subdir:
-                # 有子路径：克隆到临时目录，再提取子目录
-                import shutil
-                import tempfile
-
-                tmp_parent = Path(tempfile.mkdtemp(prefix="synapse_gh_"))
-                tmp_dir = tmp_parent / "repo"
-                try:
-                    repo_url = f"https://github.com/{owner}/{repo}.git"
-                    if _has_git():
-                        _git_clone(["git", "clone", "--depth", "1", repo_url, str(tmp_dir)])
-                    else:
-                        _download_github_zip(owner, repo, tmp_dir)
-                    source_dir = tmp_dir / gh_subdir
-                    if not source_dir.is_dir():
-                        raise ValueError(f"仓库 {owner}/{repo} 中未找到子目录: {gh_subdir}")
-                    shutil.copytree(str(source_dir), str(target))
-                finally:
-                    shutil.rmtree(str(tmp_parent), ignore_errors=True)
-            else:
-                if _has_git():
-                    repo_url = f"https://github.com/{owner}/{repo}.git"
-                    _git_clone(["git", "clone", "--depth", "1", repo_url, str(target)])
-                else:
-                    _download_github_zip(owner, repo, target)
+            repo_url = f"https://github.com/{owner}/{repo}.git"
+            _install_repo_tree_to_target(
+                repo_url=repo_url,
+                target=target,
+                subdir=gh_subdir,
+                zip_downloader=lambda dest: _download_github_zip(owner, repo, dest),
+            )
         elif ge:
             skill_name = url.rstrip("/").split("/")[-1].replace(".git", "")
             target = skills_dir / skill_name
             _ensure_target_available(target, url)
-            if _has_git():
-                _git_clone(["git", "clone", "--depth", "1", url, str(target)])
-            else:
-                _download_gitee_zip(ge[0], ge[1], target)
+            _install_repo_tree_to_target(
+                repo_url=url,
+                target=target,
+                zip_downloader=lambda dest: _download_gitee_zip(ge[0], ge[1], dest),
+            )
         else:
             skill_name = url.rstrip("/").split("/")[-1].replace(".git", "")
             target = skills_dir / skill_name
             _ensure_target_available(target, url)
-            _git_clone(["git", "clone", "--depth", "1", url, str(target)])
+            _install_repo_tree_to_target(repo_url=url, target=target)
 
     elif _looks_like_github_shorthand(url):
         # GitHub 简写格式: "owner/repo@skill-name" 或 "owner/repo"
@@ -1581,6 +1667,8 @@ def install_skill(workspace_dir: str, url: str) -> None:
                 pass
             _json_print({"status": "ok", "skill_dir": str(target), "source": "platform-cache"})
             return
+        # Cache downloads may leave a partial directory if interrupted or locked.
+        _ensure_target_available(target, url)
 
         # Strategy 2: git clone / ZIP download
         tmp_parent = Path(tempfile.mkdtemp(prefix="synapse_skill_"))
@@ -1619,12 +1707,7 @@ def install_skill(workspace_dir: str, url: str) -> None:
 
             # 若未命中子目录，则按“整个仓库就是一个技能”处理
             source_dir = source_dir or tmp_dir
-            shutil.copytree(str(source_dir), str(target))
-            if source_dir == tmp_dir:
-                # 清理克隆产生的 .git 目录
-                git_dir = target / ".git"
-                if git_dir.exists():
-                    shutil.rmtree(str(git_dir), ignore_errors=True)
+            _copy_skill_tree(source_dir, target)
         finally:
             shutil.rmtree(str(tmp_parent), ignore_errors=True)
     else:
@@ -1634,11 +1717,10 @@ def install_skill(workspace_dir: str, url: str) -> None:
             raise ValueError(f"源路径不存在: {url}")
         if not src.is_dir():
             raise ValueError(f"源路径不是目录: {url}")
-        import shutil
 
         target = skills_dir / src.name
         _ensure_target_available(target, url)
-        shutil.copytree(str(src), str(target))
+        _copy_skill_tree(src, target)
 
     # Record install origin for marketplace matching (Issue #15)
     try:
@@ -1673,11 +1755,6 @@ def uninstall_skill(workspace_dir: str, skill_name: str) -> None:
         content = skill_md.read_bytes().decode("utf-8", errors="replace")
         if "system: true" in content.lower()[:500]:
             raise ValueError(f"不允许删除系统技能: {skill_name}")
-
-    from synapse.utils.whaleclouddevtool import is_whalecloud_base_scripts_skill_id
-
-    if is_whalecloud_base_scripts_skill_id(skill_name):
-        raise ValueError(f"不允许删除研发工具必选依赖技能: {skill_name}")
 
     shutil.rmtree(str(target))
     _json_print({"status": "ok", "removed": skill_name})

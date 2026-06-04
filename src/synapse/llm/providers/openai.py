@@ -18,12 +18,21 @@ from json import JSONDecodeError
 
 import httpx
 
+from ..cache import build_cached_system_blocks
 from ..converters.messages import convert_messages_to_openai
 from ..converters.tools import (
     convert_tool_calls_from_openai,
     convert_tools_to_openai,
     has_text_tool_calls,
     parse_text_tool_calls,
+)
+from ..model_registry import get_model_capabilities, resolve_output_token_budget
+from ..thinking import (
+    is_minimax_endpoint,
+    minimax_thinking_depth,
+    normalize_thinking_depth,
+    reasoning_effort_for_depth,
+    thinking_budget_for_depth,
 )
 from ..types import (
     AuthenticationError,
@@ -39,9 +48,49 @@ from ..types import (
     normalize_base_url,
 )
 from .base import LLMProvider
-from .proxy_utils import build_httpx_timeout, get_httpx_transport, get_proxy_config
+from .proxy_utils import (
+    build_httpx_timeout,
+    get_httpx_transport,
+    get_proxy_config,
+    should_bypass_proxy,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_dig(data: object, *keys: str) -> object:
+    """Walk nested dicts safely; returns ``None`` if any key is missing."""
+    cur = data
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+        if cur is None:
+            return None
+    return cur
+
+
+def _extract_reasoning_delta(value: object) -> str:
+    """Best-effort extraction for reasoning deltas from OpenAI-compatible gateways."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_extract_reasoning_delta(item) for item in value)
+    if isinstance(value, dict):
+        for key in (
+            "text",
+            "delta",
+            "content",
+            "reasoning",
+            "reasoning_content",
+            "thinking",
+            "summary_text",
+        ):
+            if key in value:
+                extracted = _extract_reasoning_delta(value.get(key))
+                if extracted:
+                    return extracted
+    return ""
 
 
 def _is_stream_only_error(error: str) -> bool:
@@ -52,6 +101,84 @@ def _is_stream_only_error(error: str) -> bool:
         or "stream is required" in err_lower
         or ("text/event-stream" in err_lower and "invalid json" in err_lower)
     )
+
+
+def _is_empty_response_error(error: str) -> bool:
+    """检测错误是否为非流式空响应（可能流式模式能正常返回内容）。
+
+    仅匹配 _chat_non_stream 产生的 "choices/output 为空" 错误，
+    不匹配流式路径的空响应错误。
+    """
+    err_lower = error.lower()
+    if "stream" in err_lower:
+        return False
+    return (
+        "empty response" in err_lower
+        or "no choices" in err_lower
+        or "no output" in err_lower
+    )
+
+
+def _humanize_upstream_error(status: int, body: str) -> str:
+    """把云端 LLM 的英文错误转成对小白用户更友好的中文摘要。
+
+    原始 body 仍会通过 logger.error 留档以便排查；这里只控制传播给用户那条
+    LLMError 的 message。完全找不到匹配时回退到一个通用 HTTP 提示。
+
+    例外：如果是 stream-only relay（"stream must be set to true" 等），
+    必须保留原文，以便 chat() 的 except 分支识别后自动切到流式重试。
+    """
+    if _is_stream_only_error(body or ""):
+        return body or f"API error ({status})"
+    body_l = (body or "").lower()
+
+    # 内容安全审核（DashScope DataInspectionFailed / OpenAI moderation /
+    # 国内云模型绿网拦截等）。返回字符串中必须保留 data_inspection_failed
+    # 关键字，下游 errors.classify_error / reasoning_engine 方案 D /
+    # 前端 chatHelpers.classifyError 共同依赖此关键字判定 content_filter。
+    if (
+        "data_inspection" in body_l
+        or "datainspectionfailed" in body_l
+        or "inappropriate content" in body_l
+        or "content_filter" in body_l
+    ):
+        return (
+            f"云端模型的内容安全审核未通过 (HTTP {status}, data_inspection_failed)。"
+            "请尝试换一种表述、清空对话上下文，或切换到对内容审核更宽松的模型端点。"
+        )
+
+    if (
+        "invalidparameter" in body_l
+        and (
+            "url" in body_l
+            or "image" in body_l
+            or "vision" in body_l
+        )
+    ):
+        return "云端模型未能访问到您发送的图片（图片需可公网访问或采用内嵌方式），请稍后重试或更换更小的图片"
+    if "appidnoautherror" in body_l or "code\":11200" in body_l or "code\":\"11200" in body_l:
+        return (
+            "讯飞模型授权或额度异常 (xfyun_auth_or_quota, AppIdNoAuthError/code 11200)。"
+            "请检查 Coding Plan 订阅、模型权限和当日用量。"
+        )
+    if status == 401 or "authenticationerror" in body_l or "invalid api key" in body_l:
+        return "API Key 无效或已过期，请到设置中心检查模型端点凭据"
+    if status == 429 or "rate limit" in body_l:
+        return "调用频率已超过上游限制，请稍后再试"
+    if (
+        status == 402
+        or "insufficientquota" in body_l
+        or "insufficient_quota" in body_l
+        or "balance" in body_l
+    ):
+        return "云端账户余额不足或额度已用尽 (quota_exhausted)，请充值后再继续使用"
+    if status == 408 or "timeout" in body_l:
+        return "云端响应超时，请稍后重试或换个模型"
+    if status == 404 or "modelnotfound" in body_l or "model not found" in body_l:
+        return "目标模型不存在或当前账号无权限调用该模型"
+    if status >= 500:
+        return f"云端服务暂时不可用 (HTTP {status})，请稍后重试"
+    return f"云端模型调用失败 (HTTP {status})"
 
 
 class _BearerAuth(httpx.Auth):
@@ -79,6 +206,7 @@ class OpenAIProvider(LLMProvider):
         self._client: httpx.AsyncClient | None = None
         self._client_loop_id: int | None = None  # 记录创建客户端时的事件循环 ID
         self._stream_only: bool = config.stream_only
+        self._last_raw_diagnostic: dict | None = None
 
     @property
     def api_key(self) -> str:
@@ -167,7 +295,7 @@ class OpenAIProvider(LLMProvider):
                 "event_hooks": {"request": [_ensure_auth_on_redirect]},
             }
 
-            if proxy and not is_local:
+            if proxy and not should_bypass_proxy(self.base_url):
                 client_kwargs["proxy"] = proxy
                 logger.debug(f"[OpenAI] Using proxy: {proxy}")
 
@@ -219,17 +347,27 @@ class OpenAIProvider(LLMProvider):
         )
 
     async def chat(self, request: LLMRequest) -> LLMResponse:
-        """发送聊天请求（支持 stream-only 端点自动检测）"""
+        """发送聊天请求（统一的非流式 → 流式自动回退）
+
+        回退策略（按优先级）：
+        1. 配置 stream_only → 直接走流式
+        2. 代理明确要求 stream → 永久切换流式
+        3. 非流式空响应异常 / 非流式成功但内容空+token>0 → 尝试流式，成功则记忆
+        """
         await self.acquire_rate_limit()
 
         if self._stream_only:
             return await self._chat_via_stream(request)
 
+        response: LLMResponse | None = None
+        non_stream_error: LLMError | None = None
+
         try:
-            return await self._chat_non_stream(request)
+            response = await self._chat_non_stream(request)
         except (AuthenticationError, RateLimitError):
             raise
         except LLMError as e:
+            non_stream_error = e
             if _is_stream_only_error(str(e)):
                 logger.info(
                     f"[OpenAI] '{self.name}': detected stream-only endpoint, "
@@ -237,7 +375,44 @@ class OpenAIProvider(LLMProvider):
                 )
                 self._stream_only = True
                 return await self._chat_via_stream(request)
-            raise
+
+        # 统一判断：非流式未能产出内容 → 尝试流式回退
+        _should_fallback = (
+            (non_stream_error is not None and _is_empty_response_error(str(non_stream_error)))
+            or (response is not None and not response.content
+                and response.usage.output_tokens > 0)
+        )
+
+        if _should_fallback:
+            _reason = (
+                f"non-stream error: {non_stream_error}"
+                if non_stream_error
+                else f"empty content with {response.usage.output_tokens} output tokens"  # type: ignore[union-attr]
+            )
+            logger.warning(
+                f"[OpenAI] '{self.name}': {_reason}, attempting stream fallback"
+            )
+            try:
+                stream_response = await self._chat_via_stream(request)
+                if stream_response.content:
+                    logger.info(
+                        f"[OpenAI] '{self.name}': stream fallback recovered content "
+                        f"({len(stream_response.content)} blocks), "
+                        f"switching to stream-only for this endpoint"
+                    )
+                    self._stream_only = True
+                    return stream_response
+                logger.warning(
+                    f"[OpenAI] '{self.name}': stream fallback also returned empty content"
+                )
+            except Exception as stream_err:
+                logger.warning(
+                    f"[OpenAI] '{self.name}': stream fallback failed: {stream_err}"
+                )
+
+        if non_stream_error is not None:
+            raise non_stream_error
+        return response  # type: ignore[return-value]
 
     async def _chat_non_stream(self, request: LLMRequest) -> LLMResponse:
         """非流式请求实现（原始路径，逻辑完全不变）。调用方须已获取 rate limit。"""
@@ -259,12 +434,28 @@ class OpenAIProvider(LLMProvider):
 
             if response.status_code >= 400:
                 body = (response.text or "")[:500]
+                logger.error(
+                    "[OpenAIProvider] upstream non-stream error status=%s body=%s",
+                    response.status_code, body[:1000],
+                )
                 if response.status_code == 401:
-                    raise AuthenticationError(f"Authentication failed: {body}", status_code=401)
+                    raise AuthenticationError(
+                        _humanize_upstream_error(401, body),
+                        status_code=401,
+                        raw_body=body,
+                    )
                 if response.status_code == 429:
-                    raise RateLimitError(f"Rate limit exceeded: {body}", status_code=429)
+                    retry_after = response.headers.get("retry-after")
+                    raw_body = f"{body}\nretry-after: {retry_after}" if retry_after else body
+                    raise RateLimitError(
+                        _humanize_upstream_error(429, body),
+                        status_code=429,
+                        raw_body=raw_body,
+                    )
                 raise LLMError(
-                    f"API error ({response.status_code}): {body}", status_code=response.status_code
+                    _humanize_upstream_error(response.status_code, body),
+                    status_code=response.status_code,
+                    raw_body=body,
                 )
 
             try:
@@ -293,9 +484,13 @@ class OpenAIProvider(LLMProvider):
                 )
                 raise LLMError(f"API error in response body: {err_msg}")
 
-            # HTTP 200 但 choices 为空 —— 某些中转/兼容 API 的异常行为
+            # HTTP 200 但 choices 为空 —— 尝试 Responses API 解析
             choices = data.get("choices")
             if not choices:
+                _output = data.get("output")
+                if isinstance(_output, list) and _output:
+                    self.mark_healthy()
+                    return self._parse_responses_api(data, _output)
                 body_preview = json.dumps(data, ensure_ascii=False)[:500]
                 logger.warning(
                     f"[OpenAI] '{self.name}': API returned 200 but choices is empty. "
@@ -312,7 +507,13 @@ class OpenAIProvider(LLMProvider):
                 )
 
             self.mark_healthy()
-            return self._parse_response(data)
+            self._last_raw_diagnostic = None
+            result = self._parse_response(data)
+            # 附加原始响应诊断（content lost 时由 _parse_response 设置）
+            _diag = self._last_raw_diagnostic
+            if _diag and not result.content:
+                result._raw_diagnostic = _diag  # type: ignore[attr-defined]
+            return result
 
         except httpx.TimeoutException as e:
             detail = f"{type(e).__name__}: {e}"
@@ -343,19 +544,32 @@ class OpenAIProvider(LLMProvider):
                 if response.status_code >= 400:
                     error_body = await response.aread()
                     error_text = error_body.decode(errors="replace")[:500]
+                    logger.error(
+                        "[OpenAIProvider] upstream stream error status=%s body=%s",
+                        response.status_code, error_text,
+                    )
                     if response.status_code == 401:
                         raise AuthenticationError(
-                            f"Authentication failed: {error_text}",
+                            _humanize_upstream_error(401, error_text),
                             status_code=401,
+                            raw_body=error_text,
                         )
                     if response.status_code == 429:
+                        retry_after = response.headers.get("retry-after")
+                        raw_body = (
+                            f"{error_text}\nretry-after: {retry_after}"
+                            if retry_after
+                            else error_text
+                        )
                         raise RateLimitError(
-                            f"Rate limit exceeded: {error_text}",
+                            _humanize_upstream_error(429, error_text),
                             status_code=429,
+                            raw_body=raw_body,
                         )
                     raise LLMError(
-                        f"API error ({response.status_code}): {error_text}",
+                        _humanize_upstream_error(response.status_code, error_text),
                         status_code=response.status_code,
+                        raw_body=error_text,
                     )
 
                 has_content = False
@@ -432,20 +646,28 @@ class OpenAIProvider(LLMProvider):
         body["stream"] = True
 
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: dict[str, dict] = {}
         current_tool_id: str | None = None
         stop_reason = StopReason.END_TURN
         response_model = self.config.model
+        stream_usage: dict | None = None
 
         async for event in self._iter_sse_events(body):
             event_type = event.get("type")
+
+            if event_type == "usage":
+                stream_usage = event.get("usage")
+                continue
 
             if event_type == "content_block_delta":
                 delta = event.get("delta", {})
                 delta_type = delta.get("type")
 
                 if delta_type == "text":
-                    text_parts.append(delta.get("text", ""))
+                    text_parts.append(delta.get("text") or "")
+                elif delta_type == "reasoning":
+                    reasoning_parts.append(delta.get("text") or "")
                 elif delta_type == "tool_use":
                     call_id = delta.get("id")
                     if call_id:
@@ -457,6 +679,9 @@ class OpenAIProvider(LLMProvider):
                         elif delta.get("name") and not tool_calls[call_id]["name"]:
                             tool_calls[call_id]["name"] = delta["name"]
                         current_tool_id = call_id
+                        extra = delta.get("extra_content")
+                        if extra and "extra_content" not in tool_calls[call_id]:
+                            tool_calls[call_id]["extra_content"] = extra
                     target_id = call_id or current_tool_id
                     if target_id and target_id in tool_calls:
                         tool_calls[target_id]["arguments"] += delta.get("arguments") or ""
@@ -489,18 +714,46 @@ class OpenAIProvider(LLMProvider):
                     id=call_id,
                     name=tc["name"],
                     input=args,
+                    provider_extra=tc.get("extra_content"),
                 )
             )
 
         if tool_calls and stop_reason != StopReason.MAX_TOKENS:
             stop_reason = StopReason.TOOL_USE
 
+        _reasoning_text = "".join(reasoning_parts)
+        has_any_tool_calls = bool(tool_calls)
+
+        # 防御层：与 _parse_response 对齐 — reasoning 作为可见文本 fallback
+        if not content_blocks and not has_any_tool_calls and _reasoning_text:
+            logger.warning(
+                f"[STREAM] content empty but reasoning has {len(_reasoning_text)} chars "
+                f"from {self.name} — using reasoning as visible text fallback"
+            )
+            content_blocks.append(TextBlock(text=_reasoning_text))
+            _reasoning_text = ""
+
+        # 从流尾部 usage chunk 获取 token 统计（不再始终为零）
+        _usage = Usage()
+        if stream_usage:
+            _usage = Usage(
+                input_tokens=stream_usage.get("prompt_tokens", 0),
+                output_tokens=stream_usage.get("completion_tokens", 0),
+            )
+
+        if not content_blocks and _usage.output_tokens > 0:
+            logger.error(
+                f"[STREAM] ⚠️ CONTENT LOST: {_usage.output_tokens} output tokens "
+                f"but content is empty from {self.name} (stream_only adapter)"
+            )
+
         return LLMResponse(
             id="",
             content=content_blocks,
             stop_reason=stop_reason,
-            usage=Usage(),
+            usage=_usage,
             model=response_model,
+            reasoning_content=_reasoning_text or None,
         )
 
     async def chat_stream(self, request: LLMRequest) -> AsyncIterator[dict]:
@@ -513,17 +766,16 @@ class OpenAIProvider(LLMProvider):
             yield event
 
     def _is_local_endpoint(self) -> bool:
-        """检查是否为本地端点（Ollama/LM Studio 等）"""
+        """检查是否为本地/局域网端点（Ollama/LM Studio/vLLM 等）
+
+        覆盖 loopback + RFC 1918 私有地址 + link-local，与 proxy_utils._is_private_host 对齐。
+        """
+        from .proxy_utils import should_bypass_proxy
+
         url = self.base_url.lower()
-        return any(
-            host in url
-            for host in (
-                "localhost",
-                "127.0.0.1",
-                "0.0.0.0",
-                "[::1]",
-            )
-        )
+        if any(host in url for host in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")):
+            return True
+        return should_bypass_proxy(self.base_url)
 
     def _get_auth(self) -> _BearerAuth:
         """获取认证信息（通过 httpx Auth 机制，确保重定向时不丢失凭据）"""
@@ -559,6 +811,8 @@ class OpenAIProvider(LLMProvider):
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            # 避免部分打包环境缺少可用 zstd 解码器时，httpx 在业务错误分类前失败。
+            "Accept-Encoding": "gzip, deflate",
         }
 
         if "openrouter" in self.base_url.lower():
@@ -586,11 +840,18 @@ class OpenAIProvider(LLMProvider):
             if is_always_thinking:
                 thinking_enabled = True
 
+        _vision_available = self.config.has_capability("vision") and not getattr(
+            self,
+            "_vision_payload_unsupported",
+            False,
+        )
         messages = convert_messages_to_openai(
             request.messages,
             request.system,
             provider=self.config.provider,
             enable_thinking=thinking_enabled,
+            model=self.config.model,
+            vision_available=_vision_available,
         )
 
         body = {
@@ -599,10 +860,9 @@ class OpenAIProvider(LLMProvider):
         }
 
         # max_tokens 处理策略：
-        # 理想情况下不传 max_tokens 可让 API 使用模型默认上限，但实际上部分 OpenAI 兼容
-        # API（如 NVIDIA NIM）默认 max_tokens 极低（~200），开启 thinking 后所有输出预算
-        # 被思考内容耗尽，导致无可见文本返回。
-        # 因此：调用方传了 max_tokens > 0 时直接使用，否则用端点配置值或兜底 16384。
+        # - 调用方/端点显式给值时尽量尊重，但已知模型不能超过其真实输出上限；
+        # - 未显式给值时用模型默认输出预算；
+        # - 未知模型保留历史 16k 兜底，避免对中转/自定义模型过度限制。
         #
         # 特殊情况 — OpenAI o1/o3/o4 推理模型：
         # 这些模型拒绝 max_tokens 参数，要求使用 max_completion_tokens。
@@ -613,12 +873,11 @@ class OpenAIProvider(LLMProvider):
         )
         _token_key = "max_completion_tokens" if _is_openai_reasoning else "max_tokens"
 
-        _max_tokens = request.max_tokens
-        if _max_tokens and _max_tokens > 0:
-            body[_token_key] = _max_tokens
-        else:
-            _fallback = self.config.max_tokens or 16384
-            body[_token_key] = _fallback
+        body[_token_key] = resolve_output_token_budget(
+            self.config.model,
+            request_max_tokens=request.max_tokens,
+            endpoint_max_tokens=self.config.max_tokens,
+        )
 
         # 工具
         if request.tools:
@@ -639,6 +898,12 @@ class OpenAIProvider(LLMProvider):
         if request.extra_params:
             body.update(request.extra_params)
 
+        is_minimax = is_minimax_endpoint(
+            self.config.provider,
+            self.base_url,
+            self.config.model,
+        )
+
         # ── 本地端点检测 ──
         # Ollama / LM Studio 等本地推理引擎不支持 OpenAI 风格的
         # thinking: {"type": "enabled"} 嵌套参数，但 Ollama 0.9+ 支持
@@ -652,8 +917,7 @@ class OpenAIProvider(LLMProvider):
                 ds_thinking = True
             body["enable_thinking"] = ds_thinking
             if ds_thinking and request.thinking_depth:
-                budget_map = {"low": 1024, "medium": 4096, "high": 16384}
-                budget = budget_map.get(request.thinking_depth)
+                budget = thinking_budget_for_depth(request.thinking_depth)
                 if budget:
                     body["thinking_budget"] = budget
             elif not ds_thinking:
@@ -689,8 +953,7 @@ class OpenAIProvider(LLMProvider):
                 # 必须清理 extra_params 可能泄漏的 enable_thinking
                 body.pop("enable_thinking", None)
                 if request.thinking_depth:
-                    budget_map = {"low": 1024, "medium": 4096, "high": 16384}
-                    budget = budget_map.get(request.thinking_depth)
+                    budget = thinking_budget_for_depth(request.thinking_depth)
                     if budget:
                         body["thinking_budget"] = budget
             else:
@@ -698,8 +961,7 @@ class OpenAIProvider(LLMProvider):
                 body["enable_thinking"] = bool(request.enable_thinking)
                 if request.enable_thinking:
                     if request.thinking_depth:
-                        budget_map = {"low": 1024, "medium": 4096, "high": 16384}
-                        budget = budget_map.get(request.thinking_depth)
+                        budget = thinking_budget_for_depth(request.thinking_depth)
                         if budget:
                             body["thinking_budget"] = budget
                 else:
@@ -731,8 +993,9 @@ class OpenAIProvider(LLMProvider):
             body.pop("reasoning_effort", None)
 
             if request.enable_thinking or is_always_thinking:
-                depth_map = {"low": "low", "medium": "medium", "high": "high"}
-                effort = depth_map.get(request.thinking_depth or "medium", "medium")
+                depth_map = {"low": "low", "medium": "medium", "high": "high", "max": "high"}
+                depth = normalize_thinking_depth(request.thinking_depth or "medium")
+                effort = depth_map.get(depth or "medium", "medium")
                 body["reasoning"] = {"effort": effort}
             else:
                 body.pop("reasoning", None)
@@ -752,16 +1015,30 @@ class OpenAIProvider(LLMProvider):
 
             if request.enable_thinking or is_always_thinking:
                 if "thinking" not in body:
-                    body["thinking"] = {"type": "enabled"}
+                    thinking_type = "adaptive" if is_minimax else "enabled"
+                    body["thinking"] = {"type": thinking_type}
                 if request.thinking_depth:
-                    depth_map = {"low": "low", "medium": "medium", "high": "high"}
-                    effort = depth_map.get(request.thinking_depth)
+                    effort = reasoning_effort_for_depth(
+                        provider=self.config.provider,
+                        base_url=self.base_url,
+                        model=self.config.model,
+                        depth=request.thinking_depth,
+                    )
                     if effort:
                         body["reasoning_effort"] = effort
             else:
                 body.pop("reasoning_effort", None)
                 if "thinking" in body:
                     body["thinking"] = {"type": "disabled"}
+
+        # MiniMax accepts only low/medium/high for the top-level thinking_depth
+        # field. Synapse's UI exposes "max"; clamp it at the provider boundary.
+        if is_minimax:
+            depth = minimax_thinking_depth(request.thinking_depth or body.get("thinking_depth"))
+            if depth:
+                body["thinking_depth"] = depth
+            else:
+                body.pop("thinking_depth", None)
 
         # ── 本地端点清理 ──
         # 移除可能通过 extra_params 泄漏的、本地引擎不支持的思考参数。
@@ -794,12 +1071,186 @@ class OpenAIProvider(LLMProvider):
             if _tv is not None and (not isinstance(_tv, int) or _tv <= 0):
                 body.pop(_tk, None)
 
+        # ── DashScope Explicit Prompt Cache ──
+        # DashScope OpenAI 兼容模式支持 Anthropic 风格的 cache_control 字段，
+        # 命中后输入 token 按 20% 计费、TTFT 显著降低。激活条件：
+        #   1) provider == "dashscope"
+        #   2) 模型在 model_registry 中标记 supports_cache=True
+        #   3) system prompt 含 SYSTEM_PROMPT_DYNAMIC_BOUNDARY 切割标记
+        # 仅切割 system 一处即可（DashScope cache 走 message content blocks，
+        # tools 数组层面不接受 cache_control）。命中情况通过 _parse_response /
+        # 流式 chunk_usage 中的 prompt_tokens_details.cached_tokens 统计。
+        if self.config.provider == "dashscope":
+            try:
+                _caps = get_model_capabilities(self.config.model)
+                if _caps.supports_cache and body.get("messages"):
+                    _msgs = body["messages"]
+                    if _msgs and _msgs[0].get("role") == "system":
+                        _sys_content = _msgs[0].get("content")
+                        if isinstance(_sys_content, str) and _sys_content:
+                            _blocks = build_cached_system_blocks(_sys_content)
+                            if _blocks:
+                                _msgs[0] = {"role": "system", "content": _blocks}
+            except Exception as _cache_err:
+                logger.debug(
+                    f"[CACHE] DashScope cache_control injection skipped: {_cache_err}"
+                )
+
         return body
+
+    @staticmethod
+    def _extract_from_responses_output(output: list) -> str:
+        """从 OpenAI Responses API 的 output 数组中提取文本内容。"""
+        texts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type", "")
+            if itype == "message":
+                for part in item.get("content", []):
+                    if isinstance(part, dict):
+                        ptype = part.get("type", "")
+                        if ptype in ("output_text", "text"):
+                            texts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        texts.append(part)
+            elif itype in ("text", "output_text"):
+                texts.append(item.get("text", ""))
+        return "".join(texts)
+
+    @staticmethod
+    def _extract_text_value(value: object) -> str:
+        """Best-effort text extraction from non-standard OpenAI-compatible fields."""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return "".join(
+                OpenAIProvider._extract_text_value(item) for item in value
+            ).strip()
+        if isinstance(value, dict):
+            for key in (
+                "text",
+                "output_text",
+                "content",
+                "value",
+                "message",
+                "response",
+                "refusal",
+                "thinking",
+            ):
+                if key in value:
+                    recovered = OpenAIProvider._extract_text_value(value.get(key))
+                    if recovered:
+                        return recovered
+        return ""
+
+    def _recover_empty_content_text(self, message: dict, choice: dict, data: dict) -> tuple[str, str]:
+        """Recover visible text from compatibility gateways with empty message.content.
+
+        PR-C1: extended to cover the dashscope OpenAI-compat gateway, which
+        sometimes returns the actual text in non-standard locations
+        (``message.reasoning_content`` for thinking models, ``data.output.text``
+        / ``data.output.choices[0].message.content`` for native dashscope
+        passthroughs, or ``choice.delta.content`` for accidentally streamed
+        chunks).
+        """
+        # 1) reasoning_content / message-level fallbacks
+        for source, value in (
+            ("message.reasoning_content", message.get("reasoning_content")),
+            ("message.output", message.get("output")),
+            ("message.text", message.get("text")),
+            ("message.thinking", message.get("thinking")),
+            ("message.refusal", message.get("refusal")),
+            ("choice.text", choice.get("text")),
+        ):
+            recovered = self._extract_text_value(value)
+            if recovered:
+                return source, recovered
+
+        # 2) choice.delta.content — when an OpenAI-compat proxy accidentally
+        #    sends a stream-style payload through the non-stream endpoint.
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        if isinstance(delta, dict):
+            recovered = self._extract_text_value(delta.get("content"))
+            if recovered:
+                return "choice.delta.content", recovered
+
+        # 3) Responses API style array
+        output = data.get("output")
+        if isinstance(output, list) and output:
+            recovered = self._extract_from_responses_output(output)
+            if recovered:
+                return "data.output", recovered.strip()
+
+        # 4) Native dashscope passthrough: data.output.{text,choices,...}
+        if isinstance(output, dict):
+            recovered = self._extract_text_value(output.get("text"))
+            if recovered:
+                return "data.output.text", recovered
+            choices_in_output = output.get("choices")
+            if isinstance(choices_in_output, list):
+                for inner in choices_in_output:
+                    if not isinstance(inner, dict):
+                        continue
+                    inner_msg = inner.get("message") or {}
+                    recovered = self._extract_text_value(inner_msg.get("content"))
+                    if recovered:
+                        return "data.output.choices.message.content", recovered
+                    recovered = self._extract_text_value(inner.get("text"))
+                    if recovered:
+                        return "data.output.choices.text", recovered
+
+        for source, value in (
+            ("data.text", data.get("text")),
+            ("data.output_text", data.get("output_text")),
+            ("data.response", data.get("response")),
+            ("data.result.output_text", _safe_dig(data, "result", "output_text")),
+            ("data.result.text", _safe_dig(data, "result", "text")),
+        ):
+            recovered = self._extract_text_value(value)
+            if recovered:
+                return source, recovered
+
+        return "", ""
+
+    def _parse_responses_api(self, data: dict, output: list) -> LLMResponse:
+        """解析 OpenAI Responses API 格式的响应。"""
+        text = self._extract_from_responses_output(output)
+        content_blocks = [TextBlock(text=text)] if text else []
+
+        usage_data = data.get("usage", {})
+        usage = Usage(
+            input_tokens=usage_data.get("input_tokens") or usage_data.get("prompt_tokens", 0),
+            output_tokens=usage_data.get("output_tokens") or usage_data.get("completion_tokens", 0),
+        )
+
+        if content_blocks:
+            logger.info(
+                f"[PARSE] Parsed Responses API format: {len(text)} chars from {self.name}"
+            )
+        else:
+            logger.warning(
+                f"[PARSE] Responses API format detected but no text extracted from {self.name}, "
+                f"output_items={len(output)}"
+            )
+
+        return LLMResponse(
+            id=data.get("id", ""),
+            content=content_blocks,
+            stop_reason=StopReason.END_TURN,
+            usage=usage,
+            model=data.get("model", self.config.model),
+        )
 
     def _parse_response(self, data: dict) -> LLMResponse:
         """解析响应"""
+        self._last_raw_diagnostic = None
         choices = data.get("choices", [])
         if not choices:
+            # Responses API 兼容：部分中转代理使用 output 字段返回内容
+            _output = data.get("output")
+            if isinstance(_output, list) and _output:
+                return self._parse_responses_api(data, _output)
             return LLMResponse(
                 id=data.get("id", ""),
                 content=[],
@@ -817,14 +1268,23 @@ class OpenAIProvider(LLMProvider):
         # 部分 OpenAI 兼容 API (如 Google Gemini OpenAI-compat) 返回 content 为数组:
         #   [{"type": "text", "text": "..."}, ...]
         raw_content = message.get("content")
+        _thinking_from_content: list[str] = []
         if isinstance(raw_content, list):
             text_content = ""
             for part in raw_content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text_content += part.get("text", "")
+                if isinstance(part, dict):
+                    ptype = part.get("type", "")
+                    if ptype == "text" or ptype == "output_text":
+                        text_content += part.get("text", "")
+                    elif ptype == "thinking":
+                        _tval = part.get("thinking", "") or part.get("text", "")
+                        if _tval:
+                            _thinking_from_content.append(_tval)
+                    elif "text" in part and ptype not in ("tool_use", "image"):
+                        text_content += part.get("text", "")
                 elif isinstance(part, str):
                     text_content += part
-            if not text_content and raw_content:
+            if not text_content and raw_content and not _thinking_from_content:
                 logger.warning(
                     f"[PARSE] content is list but no text parts extracted: "
                     f"types={[p.get('type') if isinstance(p, dict) else type(p).__name__ for p in raw_content[:3]]}"
@@ -870,6 +1330,14 @@ class OpenAIProvider(LLMProvider):
                 reasoning_content = _or_reasoning
             elif isinstance(_or_reasoning, dict):
                 reasoning_content = _or_reasoning.get("content", "") or ""
+        # 收集 content 数组中的 thinking 块到 reasoning_content (#415)
+        if _thinking_from_content:
+            _joined = "\n".join(_thinking_from_content)
+            reasoning_content = reasoning_content + "\n" + _joined if reasoning_content else _joined
+            logger.info(
+                f"[PARSE] Extracted {len(_thinking_from_content)} thinking block(s) "
+                f"({len(_joined)} chars) from content array into reasoning_content"
+            )
         if not has_tool_calls and not text_content and reasoning_content:
             if has_text_tool_calls(reasoning_content):
                 combined_for_check = reasoning_content
@@ -899,6 +1367,14 @@ class OpenAIProvider(LLMProvider):
                     f"from {'reasoning_content' if _tool_calls_from_reasoning else 'text'}"
                 )
 
+        # ── pull usage early so empty-content fallbacks below can reference token counts ──
+        usage_data = data.get("usage", {})
+        _out_tokens = int(
+            usage_data.get("output_tokens")
+            or usage_data.get("completion_tokens")
+            or 0
+        )
+
         # Reasoning 模型容错：content 为空但 reasoning 有内容
         # 当 reasoning 模型被 max_tokens 截断时，所有输出可能都在 reasoning 字段，
         # content 为空。此时尝试从 reasoning 中提取结构化内容作为兜底。
@@ -917,15 +1393,101 @@ class OpenAIProvider(LLMProvider):
                     f"({len(text_content)} chars extracted from {len(reasoning_content)} chars reasoning)"
                 )
             else:
+                # 1. 把 reasoning 全文作为 visible text fallback (优于直接放弃)
+                text_content = reasoning_content
+                reasoning_content = ""
+                content_blocks.insert(0, TextBlock(text=text_content))
                 logger.warning(
-                    f"[PARSE] content is empty, reasoning has {len(reasoning_content)} chars "
-                    f"but no extractable structured content. Response may be truncated "
-                    f"(model exhausted max_tokens on reasoning before producing content)."
+                    f"[PARSE] content is empty; using reasoning_content "
+                    f"({len(text_content)} chars) as visible text fallback from {self.name}"
                 )
 
-        # 添加文本内容
-        if text_content:
+        # 非标准 OpenAI-compatible 代理容错：有 token 但 message.content 为空时，
+        # 不要求一定存在 reasoning_content，尽量从其他常见字段恢复可见文本。
+        recovered_from: str = ""
+        if not text_content and not has_tool_calls and not content_blocks and _out_tokens > 0:
+            recovered_source, recovered_text = self._recover_empty_content_text(
+                message, choice, data
+            )
+            if recovered_text:
+                text_content = recovered_text
+                content_blocks.insert(0, TextBlock(text=text_content))
+                recovered_from = recovered_source
+                # PR-C2: 已经成功恢复，不要打 ERROR；INFO 级足够运维观察
+                logger.info(
+                    f"[PARSE] auto-recovered {len(recovered_text)} chars from {recovered_source} "
+                    f"(content empty, {_out_tokens} output tokens, endpoint={self.name})"
+                )
+
+        # Add recovered/plain text before diagnosing content loss.  The previous
+        # order logged false CONTENT LOST errors whenever message.content was a
+        # plain string that had not yet been converted into a TextBlock.
+        if text_content and not any(
+            isinstance(b, TextBlock) and b.text == text_content for b in content_blocks
+        ):
             content_blocks.insert(0, TextBlock(text=text_content))
+
+        # 仍然为空 → 记录详细诊断信息（帮助定位代理格式变化）
+        if not content_blocks and _out_tokens > 0:
+            msg_keys = sorted(k for k in message if k != "role")
+            msg_preview = {
+                k: (
+                    str(v)[:200]
+                    if isinstance(v, str)
+                    else f"[{type(v).__name__}, len={len(v)}]"
+                    if isinstance(v, (list, dict))
+                    else str(v)[:100]
+                )
+                for k, v in message.items()
+                if k != "role"
+            }
+            _extra_keys = sorted(
+                k
+                for k in data
+                if k
+                not in (
+                    "id",
+                    "object",
+                    "created",
+                    "model",
+                    "choices",
+                    "usage",
+                    "system_fingerprint",
+                )
+            )
+            _choice_keys = sorted(
+                k for k in choice if k not in ("message", "index", "finish_reason", "logprobs")
+            )
+            _token_details = usage_data.get("completion_tokens_details")
+            # PR-C2: 降级为 WARN（不再误触发 endpoint cooldown）
+            logger.warning(
+                f"[PARSE] CONTENT LOST: {_out_tokens} output tokens but content_blocks "
+                f"is empty from {self.name}. message keys={msg_keys}, "
+                f"preview={msg_preview}, "
+                f"extra_data_keys={_extra_keys}, extra_choice_keys={_choice_keys}, "
+                f"token_details={_token_details}"
+            )
+            # 附加原始响应摘要供 llm_debug 保存
+            self._last_raw_diagnostic = {
+                "endpoint": self.name,
+                "data_keys": sorted(data.keys()),
+                "choice_keys": sorted(choice.keys()),
+                "message_keys": msg_keys,
+                "message_preview": msg_preview,
+                "extra_data_keys": _extra_keys,
+                "extra_choice_keys": _choice_keys,
+                "token_details": _token_details,
+                "usage": usage_data,
+            }
+            # PR-C3: 把完整原始响应 dump 到 data/llm_debug/empty_response_*.json
+            # 供后续根因分析或向 dashscope 提工单。受 feature flag 控制。
+            try:
+                from ...core.feature_flags import is_enabled as _ff_enabled
+
+                if _ff_enabled("openai_empty_response_dump_v1"):
+                    self._dump_empty_response(data)
+            except Exception:
+                pass
 
         # 解析停止原因
         finish_reason = choice.get("finish_reason", "stop")
@@ -943,11 +1505,24 @@ class OpenAIProvider(LLMProvider):
             }
             stop_reason = stop_reason_map.get(finish_reason, StopReason.END_TURN)
 
-        # 解析使用统计
-        usage_data = data.get("usage", {})
+        # 解析使用统计（usage_data 已在前面 empty-content fallback 链中提取）
+        # OpenAI 兼容协议（DashScope/OpenAI/部分 OpenAI 兼容网关）通过
+        # prompt_tokens_details.cached_tokens 暴露 prompt cache 命中数。
+        # 部分模型（如 DashScope 新加坡区 / qwen3-vl-*）直接放在 usage.cached_tokens。
+        _details = usage_data.get("prompt_tokens_details") or {}
+        _cached = 0
+        if isinstance(_details, dict):
+            _cached = int(_details.get("cached_tokens") or 0)
+        if not _cached:
+            _cached = int(usage_data.get("cached_tokens") or 0)
+        _cache_creation = 0
+        if isinstance(_details, dict):
+            _cache_creation = int(_details.get("cache_creation_input_tokens") or 0)
         usage = Usage(
             input_tokens=usage_data.get("prompt_tokens", 0),
             output_tokens=usage_data.get("completion_tokens", 0),
+            cache_read_input_tokens=_cached,
+            cache_creation_input_tokens=_cache_creation,
         )
 
         return LLMResponse(
@@ -957,7 +1532,32 @@ class OpenAIProvider(LLMProvider):
             usage=usage,
             model=data.get("model", self.config.model),
             reasoning_content=reasoning_content,
+            recovered_from=recovered_from,
         )
+
+    def _dump_empty_response(self, data: dict) -> None:
+        """PR-C3: 把无可恢复内容的 raw response 写到 llm_debug 便于排查。"""
+        try:
+            from datetime import datetime
+
+            from ...config import settings as _settings
+
+            debug_dir = _settings.project_root / "data" / "llm_debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = debug_dir / f"empty_response_{self.name}_{ts}.json"
+            payload = {
+                "endpoint": self.name,
+                "model": self.config.model,
+                "raw_response": data,
+            }
+            filename.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info(f"[PARSE] Empty response dumped to {filename}")
+        except Exception as exc:
+            logger.debug(f"[PARSE] dump empty_response failed: {exc}")
 
     def _convert_stream_event(self, event: dict) -> dict | list[dict]:
         """转换流式事件为统一格式。
@@ -969,12 +1569,23 @@ class OpenAIProvider(LLMProvider):
         if not choices:
             usage = event.get("usage")
             if usage:
+                _det = usage.get("prompt_tokens_details") or {}
+                _cached = 0
+                if isinstance(_det, dict):
+                    _cached = int(_det.get("cached_tokens") or 0)
+                if not _cached:
+                    _cached = int(usage.get("cached_tokens") or 0)
+                _create = 0
+                if isinstance(_det, dict):
+                    _create = int(_det.get("cache_creation_input_tokens") or 0)
                 return {
                     "type": "message_delta",
                     "delta": {},
                     "usage": {
                         "input_tokens": usage.get("prompt_tokens", 0),
                         "output_tokens": usage.get("completion_tokens", 0),
+                        "cache_read_input_tokens": _cached,
+                        "cache_creation_input_tokens": _create,
                     },
                 }
             return {"type": "ping"}
@@ -983,14 +1594,16 @@ class OpenAIProvider(LLMProvider):
         delta = choice.get("delta", {})
         events: list[dict] = []
 
-        # 1) Thinking: reasoning_content (DeepSeek R1, Qwen3) / reasoning (OpenRouter)
-        reasoning = delta.get("reasoning_content") or ""
-        if not reasoning:
-            r = delta.get("reasoning")
-            if isinstance(r, str) and r:
-                reasoning = r
-            elif isinstance(r, dict):
-                reasoning = r.get("content", "") or ""
+        # 1) Thinking: reasoning_content (DeepSeek R1, Qwen3) / reasoning
+        # (OpenRouter) plus common proxy variants.
+        reasoning = (
+            _extract_reasoning_delta(delta.get("reasoning_content"))
+            or _extract_reasoning_delta(delta.get("reasoning"))
+            or _extract_reasoning_delta(delta.get("reasoning_delta"))
+            or _extract_reasoning_delta(delta.get("reasoning_details"))
+            or _extract_reasoning_delta(event.get("reasoning_content"))
+            or _extract_reasoning_delta(event.get("reasoning"))
+        )
         if reasoning:
             events.append(
                 {
@@ -1013,15 +1626,19 @@ class OpenAIProvider(LLMProvider):
             tool_calls = delta["tool_calls"]
             if tool_calls:
                 tc = tool_calls[0]
+                d = {
+                    "type": "tool_use",
+                    "id": tc.get("id"),
+                    "name": tc.get("function", {}).get("name"),
+                    "arguments": tc.get("function", {}).get("arguments"),
+                }
+                extra = tc.get("extra_content")
+                if extra:
+                    d["extra_content"] = extra
                 events.append(
                     {
                         "type": "content_block_delta",
-                        "delta": {
-                            "type": "tool_use",
-                            "id": tc.get("id"),
-                            "name": tc.get("function", {}).get("name"),
-                            "arguments": tc.get("function", {}).get("arguments"),
-                        },
+                        "delta": d,
                     }
                 )
 
@@ -1033,9 +1650,20 @@ class OpenAIProvider(LLMProvider):
             }
             chunk_usage = event.get("usage")
             if chunk_usage:
+                _det2 = chunk_usage.get("prompt_tokens_details") or {}
+                _cached2 = 0
+                if isinstance(_det2, dict):
+                    _cached2 = int(_det2.get("cached_tokens") or 0)
+                if not _cached2:
+                    _cached2 = int(chunk_usage.get("cached_tokens") or 0)
+                _create2 = 0
+                if isinstance(_det2, dict):
+                    _create2 = int(_det2.get("cache_creation_input_tokens") or 0)
                 stop_evt["usage"] = {
                     "input_tokens": chunk_usage.get("prompt_tokens", 0),
                     "output_tokens": chunk_usage.get("completion_tokens", 0),
+                    "cache_read_input_tokens": _cached2,
+                    "cache_creation_input_tokens": _create2,
                 }
             events.append(stop_evt)
 
@@ -1048,3 +1676,4 @@ class OpenAIProvider(LLMProvider):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+

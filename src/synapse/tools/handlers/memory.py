@@ -8,13 +8,26 @@
 - list_recent_tasks: 列出最近任务
 - search_conversation_traces: 搜索完整对话历史
 - trace_memory: 跨层导航（记忆↔情节↔对话）
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import json
 import logging
+import math
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from ...core.policy_v2 import ApprovalClass
+from ...memory.json_utils import coerce_text, coerce_tool_names
 
 if TYPE_CHECKING:
     from ...core.agent import Agent
@@ -39,7 +52,22 @@ class MemoryHandler:
         "trace_memory",
         "search_relational_memory",
         "get_session_context",
+        "memory_delete_by_query",
     ]
+
+    # C7 explicit ApprovalClass
+    TOOL_CLASSES = {
+        "consolidate_memories": ApprovalClass.EXEC_LOW_RISK,
+        "add_memory": ApprovalClass.EXEC_LOW_RISK,
+        "search_memory": ApprovalClass.READONLY_SEARCH,
+        "get_memory_stats": ApprovalClass.READONLY_GLOBAL,
+        "list_recent_tasks": ApprovalClass.READONLY_GLOBAL,
+        "search_conversation_traces": ApprovalClass.READONLY_SEARCH,
+        "trace_memory": ApprovalClass.READONLY_GLOBAL,
+        "search_relational_memory": ApprovalClass.READONLY_SEARCH,
+        "get_session_context": ApprovalClass.READONLY_GLOBAL,
+        "memory_delete_by_query": ApprovalClass.DESTRUCTIVE,
+    }
 
     _SEARCH_TOOLS = frozenset(
         {
@@ -79,15 +107,291 @@ class MemoryHandler:
         "---\n\n"
     )
 
+    @staticmethod
+    def _context_text(value: Any, limit: int | None = None) -> str:
+        """Format persisted session values safely for human-readable output."""
+        if value is None:
+            text = ""
+        elif isinstance(value, str):
+            text = value
+        elif isinstance(value, (dict, list, tuple)):
+            try:
+                text = json.dumps(value, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                text = str(value)
+        else:
+            text = str(value)
+
+        if limit is not None:
+            return text[:limit]
+        return text
+
+    @staticmethod
+    def _importance_value(value: Any, default: float = 0.5) -> float:
+        """Coerce model-provided importance into the supported 0.0-1.0 range."""
+        if isinstance(value, bool):
+            return default
+        try:
+            importance = float(value)
+        except (TypeError, ValueError):
+            importance = default
+        if not math.isfinite(importance):
+            importance = default
+        return max(0.0, min(1.0, importance))
+
+    _ONE_OFF_TASK_RE = re.compile(
+        r"用户(?:当前|这次|希望|想要|需要|要求|让我|要).{0,24}"
+        r"(?:下载|搜索|查找|查询|整理|生成|制作|安装|启动|创建|发送|打开|访问|截图|导出|上传|配置)"
+    )
+    _TASK_REPORT_RE = re.compile(
+        r"(?:任务执行|执行摘要|已交付文件|文件已生成|成功完成|搞定|完成项|工具调用)"
+    )
+    # 稳定事实 / 用户档案级信息：放宽匹配，覆盖 LLM 常见的改写句式。
+    # 关键修复：原正则要求 `用户` 后紧跟动词，导致 "用户陈彦廷居住在重庆…"
+    # 这种 LLM 把人名插入主语位的写法完全漏判，被错误降级为 session。
+    _STABLE_FACT_RE = re.compile(
+        r"(?:"
+        # 1) 用户 + 任意 0-12 字 + 稳定属性动词 / 居住状态
+        r"用户.{0,12}(?:是|为|叫|称呼|使用|偏好|喜欢|习惯|从事|负责|"
+        r"居住|位于|来自|住在|在.{0,4}(?:工作|生活|居住|定居))"
+        # 2) 用户 + 时间副词 + 任意行为（"用户每月可投入..."）
+        r"|用户.{0,8}(?:每月|每周|每天|每年|每次|每隔|常常|经常|总是|始终|长期|平时)"
+        # 3) 项目 / 代号 / 产品 这种命名实体出现 → 倾向于是项目档案
+        r"|(?:项目代号|产品代号|代号为|代号叫|项目名|产品名|项目叫)"
+        # 4) 经典身份/地理/工具关键词
+        r"|职业|公司|行业|时区|操作系统|常用工具|首选|默认使用"
+        # 5) 时间副词独立出现
+        r"|长期|以后|每次|总是|始终|永久"
+        r")"
+    )
+    # 用户消息里出现这些关键词 → 明确希望跨会话长期保存。
+    # 由 _detect_user_persistence_intent 检索 session 上下文使用。
+    _USER_PERSIST_INTENT_RE = re.compile(
+        r"(?:永久(?:保存|记住|记下)|长期(?:记住|保存|留着)|"
+        r"跨会话|新(?:窗口|会话|对话).{0,6}(?:也能|可以|还能).{0,6}(?:查|看|找|记)|"
+        r"下次.{0,6}(?:也能|还能|可以).{0,6}(?:查|看|找|记|用)|"
+        r"一直记(?:住|着)|别忘了|不要忘|永远(?:记|不要忘))"
+    )
+    _SUPERSEDE_RE = re.compile(r"(?:取消|不要了|不再|改用|改成|替代|更新为|撤销)")
+
+    @staticmethod
+    def _current_scope(memory_manager: Any) -> tuple[str, str]:
+        """Return the active write scope if the manager exposes one."""
+        scope_getter = getattr(memory_manager, "_current_write_scope", None)
+        if callable(scope_getter):
+            try:
+                value = scope_getter()
+                if (
+                    isinstance(value, tuple)
+                    and len(value) == 2
+                    and isinstance(value[0], str)
+                    and isinstance(value[1], str)
+                ):
+                    return value
+            except Exception:
+                pass
+        return "user", ""
+
+    @classmethod
+    def _memory_scope_for_manual_add(
+        cls,
+        content: str,
+        mem_type_str: str,
+        memory_manager: Any,
+        explicit_scope: str | None = None,
+        user_intent_hint: str | None = None,
+    ) -> tuple[str, str, list[str], str | None]:
+        """Choose where a manual memory should live without blocking useful learning.
+
+        Decision priority (high → low):
+        1. ``explicit_scope`` — model passed scope= argument (global/session)
+        2. ``user_intent_hint`` — recent user message contains explicit cross-
+           session keywords ("永久保存"/"下次新会话也能查到"/...)
+        3. Stable preferences/rules/skills/experiences → global by default
+        4. ``_STABLE_FACT_RE`` heuristic on memory content → global
+        5. One-off task or report → session (or short-term global fallback)
+        6. Default → session when an active session exists
+        """
+        current_scope, current_owner = cls._current_scope(memory_manager)
+        tags: list[str] = ["manual"]
+        content = content.strip()
+        mem_type = (mem_type_str or "fact").lower()
+        normalized_scope = (explicit_scope or "auto").strip().lower()
+
+        # 1) explicit scope wins — model knows best when user is explicit
+        if normalized_scope == "global":
+            tags.append("explicit-global")
+            return "user", "", tags, "已按当前用户范围保存为跨会话长期记忆。"
+        if normalized_scope == "session":
+            tags.append("explicit-session")
+            if current_scope == "session" and current_owner:
+                return current_scope, current_owner, tags, None
+            # No active session — fall back to global short-term
+            return "user", "", tags, None
+
+        # 2) user explicitly asked for cross-session persistence in their msg
+        if user_intent_hint and cls._USER_PERSIST_INTENT_RE.search(user_intent_hint):
+            tags.append("user-requested-global")
+            return "user", "", tags, "已按当前用户范围保存为跨会话长期记忆。"
+
+        # 3) durable types default to global unless caller is in a tight session
+        if mem_type in {"preference", "rule", "skill", "error", "experience"}:
+            if cls._SUPERSEDE_RE.search(content):
+                tags.append("supersedes-prior-memory")
+            return "user", "", tags, None
+
+        # 4) regex on content body
+        if cls._STABLE_FACT_RE.search(content):
+            return "user", "", tags, None
+
+        # 5) one-off / task report → session-scoped
+        if cls._ONE_OFF_TASK_RE.search(content) or cls._TASK_REPORT_RE.search(content):
+            tags.append("session-only")
+            if current_scope == "session" and current_owner:
+                return (
+                    current_scope,
+                    current_owner,
+                    tags,
+                    "这更像当前任务上下文，已仅保存在本会话，避免污染长期记忆。",
+                )
+            return (
+                "user",
+                "",
+                tags,
+                "这更像一次性任务记录，已按低优先级短期记忆保存。",
+            )
+
+        # 6) default — keep within session, but make the downgrade message
+        # actionable so model knows how to escalate next time.
+        if current_scope == "session" and current_owner:
+            tags.append("session-only")
+            return (
+                current_scope,
+                current_owner,
+                tags,
+                "未识别为长期偏好，已先保存在当前会话。"
+                "如需跨会话持久化，请改传 scope=\"global\" 重试。",
+            )
+
+        return "user", "", tags, None
+
+    def _supersede_related_memories(
+        self,
+        new_memory_id: str,
+        content: str,
+        mem_type_str: str,
+        scope: str,
+        scope_owner: str,
+    ) -> int:
+        """Mark older, related active rules/preferences as superseded by the new memory."""
+        if not new_memory_id or not self._SUPERSEDE_RE.search(content):
+            return 0
+        if (mem_type_str or "").lower() not in {"rule", "preference", "fact"}:
+            return 0
+
+        store = getattr(getattr(self.agent, "memory_manager", None), "store", None)
+        if store is None:
+            return 0
+
+        try:
+            owner_getter = getattr(getattr(self.agent, "memory_manager", None), "_current_owner", None)
+            user_id, workspace_id = owner_getter() if callable(owner_getter) else ("default", "default")
+            hits = store.search_semantic(
+                content,
+                limit=10,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+        except Exception:
+            return 0
+
+        updated = 0
+        for hit in hits:
+            if not hit.id or hit.id == new_memory_id or hit.superseded_by:
+                continue
+            if hit.type.value not in {"rule", "preference", "fact"}:
+                continue
+            if not self._has_meaningful_overlap(content, hit.content):
+                continue
+            if store.update_semantic(hit.id, {"superseded_by": new_memory_id}):
+                updated += 1
+        return updated
+
+    @staticmethod
+    def _has_meaningful_overlap(left: str, right: str) -> bool:
+        terms_left = {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_\-\u4e00-\u9fff]{2,}", left or "")
+            if t not in {"取消", "不要", "不再", "改用", "改成", "规则", "偏好"}
+        }
+        terms_right = {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_\-\u4e00-\u9fff]{2,}", right or "")
+        }
+        if terms_left and terms_left.intersection(terms_right):
+            return True
+
+        def cjk_bigrams(text: str) -> set[str]:
+            chars = "".join(re.findall(r"[\u4e00-\u9fff]", text or ""))
+            return {chars[i : i + 2] for i in range(max(0, len(chars) - 1))}
+
+        left_bigrams = cjk_bigrams(left)
+        right_bigrams = cjk_bigrams(right)
+        if not left_bigrams or not right_bigrams:
+            return False
+        overlap = len(left_bigrams & right_bigrams) / len(left_bigrams | right_bigrams)
+        return overlap >= 0.12
+
+    # Persistent marker file path: once created, the navigation guide will
+    # never be shown again — for any session, any agent re-creation, any
+    # process restart. Delete this file to re-enable the guide.
+    _GUIDE_MARKER_FILENAME = "memory_navigation_guide_shown.flag"
+
     def __init__(self, agent: "Agent"):
         self.agent = agent
         self._guide_injected: bool = False
         self._recent_add_contents: list[str] = []
+        self._search_cache: dict[tuple[str, str, str], str] = {}
+        # Hydrate _guide_injected from the persistent marker so AgentPool
+        # eviction / process restart don't reinject the guide.
+        self._guide_marker_path = self._compute_guide_marker_path()
+        if self._guide_marker_path is not None and self._guide_marker_path.exists():
+            self._guide_injected = True
+
+    def _compute_guide_marker_path(self) -> Path | None:
+        try:
+            from ...config import settings
+
+            base = settings.data_dir / "state"
+            base.mkdir(parents=True, exist_ok=True)
+            return base / self._GUIDE_MARKER_FILENAME
+        except Exception:
+            return None
+
+    def _persist_guide_marker(self) -> None:
+        if self._guide_marker_path is None:
+            return
+        try:
+            self._guide_marker_path.write_text("1", encoding="utf-8")
+        except Exception:
+            pass
 
     def reset_guide(self) -> None:
-        """Reset the one-shot guide flag (call on new session start)."""
-        self._guide_injected = False
+        """Reset the per-session add-dedup cache.
+
+        Note: ``_guide_injected`` is intentionally **not** reset here anymore.
+        The navigation guide is meant as a one-shot onboarding artifact —
+        re-emitting it on every new session burns ~800 tokens of context for
+        no value, and was responsible for P1-6's "guide spam across turns".
+        Once the persistent marker exists the guide stays suppressed forever;
+        operators can re-enable it by deleting ``data/state/<flag>``.
+        """
         self._recent_add_contents.clear()
+        self._search_cache.clear()
+        if self._guide_marker_path is not None and self._guide_marker_path.exists():
+            self._guide_injected = True
 
     async def handle(self, tool_name: str, params: dict[str, Any]) -> str:
         """处理工具调用"""
@@ -109,11 +413,14 @@ class MemoryHandler:
             result = await self._search_relational_memory(params)
         elif tool_name == "get_session_context":
             return self._get_session_context(params)
+        elif tool_name == "memory_delete_by_query":
+            return self._delete_by_query(params)
         else:
             return f"❌ Unknown memory tool: {tool_name}"
 
         if tool_name in self._SEARCH_TOOLS and not self._guide_injected:
             self._guide_injected = True
+            self._persist_guide_marker()
             return self._NAVIGATION_GUIDE + result
         return result
 
@@ -166,9 +473,39 @@ class MemoryHandler:
         """添加记忆（含内容去重保护）"""
         from ...memory.types import Memory, MemoryPriority, MemoryType
 
-        content = params["content"]
-        mem_type_str = params["type"]
-        importance = params.get("importance", 0.5)
+        content = params["content"].strip()
+        if not content:
+            return "未记录：记忆内容为空。"
+        mem_type_str = params.get("type", "fact")
+        importance = self._importance_value(params.get("importance", 0.5))
+        explicit_scope_raw = params.get("scope")
+        explicit_scope: str | None = None
+        if isinstance(explicit_scope_raw, str):
+            normalized = explicit_scope_raw.strip().lower()
+            if normalized in {"global", "session", "auto"}:
+                explicit_scope = normalized
+            elif normalized in {"permanent", "long_term", "long-term", "longterm"}:
+                explicit_scope = "global"
+            elif normalized in {"short_term", "short-term", "shortterm", "temporary"}:
+                explicit_scope = "session"
+        # 取最近一条用户消息作为意图判断依据：当用户口头说
+        # "永久保存 / 下次新会话也能查到 / 长期记住" 等，但模型仍传
+        # scope=auto 时，由 hint 兜底升级为 global，避免出现
+        # "模型说存了 / 实际只在本会话可见" 的撕裂。
+        user_intent_hint: str | None = None
+        try:
+            recent_user = getattr(self.agent, "_current_user_message", "") or ""
+            if isinstance(recent_user, str) and recent_user:
+                user_intent_hint = recent_user
+        except Exception:
+            user_intent_hint = None
+        scope, scope_owner, tags, scope_note = self._memory_scope_for_manual_add(
+            content,
+            mem_type_str,
+            self.agent.memory_manager,
+            explicit_scope=explicit_scope,
+            user_intent_hint=user_intent_hint,
+        )
 
         content_key = content.strip()[:100].lower()
         if content_key in self._recent_add_contents:
@@ -176,7 +513,16 @@ class MemoryHandler:
 
         try:
             store = self.agent.memory_manager.store
-            existing_hits = store.search_semantic(content.strip(), limit=3)
+            owner_getter = getattr(self.agent.memory_manager, "_current_owner", None)
+            user_id, workspace_id = owner_getter() if callable(owner_getter) else ("default", "default")
+            existing_hits = store.search_semantic(
+                content.strip(),
+                limit=3,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
             for hit in existing_hits:
                 if hit.content and content.strip()[:80].lower() in hit.content.lower():
                     return "✅ 记忆已存在（FTS5 预检命中），无需重复记录。请继续执行其他任务。"
@@ -184,12 +530,23 @@ class MemoryHandler:
             pass
 
         try:
-            profile = getattr(self.agent, "user_profile", None)
-            if profile:
-                profile_data = profile.to_dict() if hasattr(profile, "to_dict") else {}
-                profile_text = str(profile_data).lower()
+            # Agent 上挂的属性是 profile_manager（UserProfileManager），
+            # 不是 user_profile。旧代码 getattr(self.agent, "user_profile", None)
+            # 永远拿到 None，导致这段去重永远失效。同时支持任一字段以保持兼容。
+            profile_mgr = getattr(self.agent, "profile_manager", None) or getattr(
+                self.agent, "user_profile", None
+            )
+            if profile_mgr is not None:
+                if hasattr(profile_mgr, "state") and hasattr(
+                    profile_mgr.state, "collected_items"
+                ):
+                    profile_text = str(profile_mgr.state.collected_items).lower()
+                elif hasattr(profile_mgr, "to_dict"):
+                    profile_text = str(profile_mgr.to_dict()).lower()
+                else:
+                    profile_text = ""
                 core_fact = content.strip()[:60].lower()
-                if core_fact and core_fact in profile_text:
+                if core_fact and profile_text and core_fact in profile_text:
                     return "✅ 该信息已存在于用户画像中，无需重复添加记忆。"
         except Exception:
             pass
@@ -200,6 +557,7 @@ class MemoryHandler:
             "skill": MemoryType.SKILL,
             "error": MemoryType.ERROR,
             "rule": MemoryType.RULE,
+            "experience": MemoryType.EXPERIENCE,
         }
         mem_type = type_map.get(mem_type_str, MemoryType.FACT)
 
@@ -216,14 +574,37 @@ class MemoryHandler:
             content=content,
             source="manual",
             importance_score=importance,
+            tags=tags,
         )
 
-        memory_id = self.agent.memory_manager.add_memory(memory)
+        memory_id = self.agent.memory_manager.add_memory(
+            memory,
+            scope=scope,
+            scope_owner=scope_owner,
+        )
         if memory_id:
+            superseded = self._supersede_related_memories(
+                memory_id,
+                content,
+                mem_type_str,
+                scope,
+                scope_owner,
+            )
             if len(self._recent_add_contents) >= 50:
                 self._recent_add_contents.pop(0)
             self._recent_add_contents.append(content_key)
-            return f"✅ 已记住: [{mem_type_str}] {content}\nID: {memory_id}"
+            lines = [f"✅ 已记住: [{mem_type_str}] {content}", f"ID: {memory_id}"]
+            if scope == "user":
+                lines.append("范围: 当前用户的跨会话长期记忆 (user)")
+            elif scope == "global":
+                lines.append("范围: 跨会话长期记忆 (global)")
+            else:
+                lines.append(f"范围: 仅当前会话 (session={scope_owner})")
+            if superseded:
+                lines.append(f"已替代旧记忆: {superseded} 条")
+            if scope_note:
+                lines.append(scope_note)
+            return "\n".join(lines)
         else:
             return "记忆已存在（语义相似），无需重复记录。"
 
@@ -241,12 +622,36 @@ class MemoryHandler:
         now = datetime.now()
 
         mm = self.agent.memory_manager
+        conversation_id = (
+            getattr(self.agent, "_current_conversation_id", "")
+            or getattr(self.agent, "_current_session_id", "")
+            or ""
+        )
+        cache_key = (conversation_id, str(query).strip().lower(), str(type_filter or ""))
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            return cached + "\n\n（本轮重复查询，已复用缓存结果）"
+
+        # P1-5：在调用召回前显式打日志，记录"本次召回看的是哪个 (user, workspace) 范围"，
+        # 与 manager.start_session 的 tenant 日志配合，可在事后从日志确认是否串了别的用户记忆。
+        try:
+            _u = getattr(mm, "_current_user_id", "default")
+            _w = getattr(mm, "_current_workspace_id", "default")
+            logger.info(
+                f"[search_memory] tenant=(user={_u} workspace={_w}) "
+                f"session={conversation_id or '-'} query={str(query)[:40]!r} type={type_filter or '-'}"
+            )
+        except Exception:
+            pass
 
         # 路径 A: 无类型过滤 → RetrievalEngine 多路召回
         if not type_filter:
             retrieval_engine = getattr(mm, "retrieval_engine", None)
             if retrieval_engine:
                 try:
+                    scope_setter = getattr(mm, "_set_retrieval_scope_context", None)
+                    if scope_setter:
+                        scope_setter()
                     candidates = retrieval_engine.retrieve_candidates(
                         query=query,
                         recent_messages=getattr(mm, "_recent_messages", None),
@@ -273,6 +678,7 @@ class MemoryHandler:
                                 c.content or "", 400, save_full=False, label="mem_search"
                             )
                             output += f"- [{c.source_type}] {c_trunc}{ep_hint}\n\n"
+                        self._remember_search_result(cache_key, output)
                         return output
                 except Exception as e:
                     logger.warning(f"[search_memory] RetrievalEngine failed: {e}")
@@ -281,7 +687,11 @@ class MemoryHandler:
         store = getattr(mm, "store", None)
         if store:
             try:
-                memories = store.search_semantic(query, limit=10, filter_type=type_filter)
+                search_visible = getattr(mm, "search_visible_semantic", None)
+                if search_visible:
+                    memories = search_visible(query, limit=10, filter_type=type_filter)
+                else:
+                    memories = store.search_semantic(query, limit=10, filter_type=type_filter)
                 memories = [m for m in memories if not m.expires_at or m.expires_at >= now]
                 if memories:
                     logger.info(
@@ -296,6 +706,7 @@ class MemoryHandler:
                         )
                         output += f"- [{m.type.value}] {m.content}\n"  # Memory content 完整保留
                         output += f"  (重要性: {m.importance_score:.1f}, 引用: {m.access_count}{ep_hint})\n\n"
+                    self._remember_search_result(cache_key, output)
                     return output
             except Exception as e:
                 logger.warning(f"[search_memory] SQLite search failed: {e}")
@@ -313,11 +724,20 @@ class MemoryHandler:
             }
             mem_type = type_map.get(type_filter)
 
-        memories = mm.search_memories(query=query, memory_type=mem_type, limit=10)
+        current_scope = getattr(mm, "_current_write_scope", lambda: ("global", ""))()
+        memories = mm.search_memories(
+            query=query,
+            memory_type=mem_type,
+            limit=10,
+            scope=current_scope[0],
+            scope_owner=current_scope[1],
+        )
         memories = [m for m in memories if not m.expires_at or m.expires_at >= now]
 
         if not memories:
-            return f"未找到与 '{query}' 相关的记忆"
+            output = f"未找到与 '{query}' 相关的记忆"
+            self._remember_search_result(cache_key, output)
+            return output
 
         cited = [{"id": m.id, "content": m.content[:200]} for m in memories]
         mm.record_cited_memories(cited)
@@ -330,11 +750,24 @@ class MemoryHandler:
             output += f"- [{m.type.value}] {m.content}\n"
             output += f"  (重要性: {m.importance_score:.1f}, 引用: {m.access_count}{ep_hint})\n\n"
 
+        self._remember_search_result(cache_key, output)
         return output
+
+    def _remember_search_result(self, key: tuple[str, str, str], value: str) -> None:
+        if len(self._search_cache) >= 64:
+            oldest = next(iter(self._search_cache))
+            self._search_cache.pop(oldest, None)
+        self._search_cache[key] = value
 
     def _get_memory_stats(self, params: dict) -> str:
         """获取记忆统计"""
-        stats = self.agent.memory_manager.get_stats()
+        # 三次审计：counts 也是信息泄漏 —— alice 看到"系统总记忆 1000"会推断
+        # 出存在其它用户。把 stats 收敛到当前 owner 视角。desktop 单用户场景
+        # owner 是 default/default，行为不变。
+        owner_uid, owner_wsid = self._current_owner_pair()
+        stats = self.agent.memory_manager.get_stats(
+            user_id=owner_uid, workspace_id=owner_wsid
+        )
 
         output = f"""记忆系统统计:
 
@@ -363,7 +796,17 @@ class MemoryHandler:
         if not store:
             return "记忆系统未初始化"
 
-        episodes = store.get_recent_episodes(days=days, limit=limit)
+        # Phase 2b.5：把 episode 列表限制到当前 (user_id, workspace_id)。
+        # 多用户 IM 部署下，原实现会把别人的任务也列给当前用户的 LLM —— 隐私泄漏。
+        # mm._current_owner() 在 v4 之后由 start_session 设好；session_tenants
+        # 表里登记的 episode 才会被返回（v3 之前的孤儿数据被自然过滤）。
+        owner_user_id, owner_workspace_id = self._current_owner_pair()
+        episodes = store.get_recent_episodes(
+            days=days,
+            limit=limit,
+            user_id=owner_user_id,
+            workspace_id=owner_workspace_id,
+        )
         if not episodes:
             return f"最近 {days} 天没有已完成的任务记录。"
 
@@ -371,7 +814,8 @@ class MemoryHandler:
         for i, ep in enumerate(episodes, 1):
             goal = ep.goal or "(未记录目标)"
             outcome = ep.outcome or "completed"
-            tools = ", ".join(ep.tools_used[:5]) if ep.tools_used else "无工具调用"
+            tool_names = coerce_tool_names(ep.tools_used)
+            tools = ", ".join(tool_names[:5]) if tool_names else "无工具调用"
             sa = ep.started_at
             started = sa.strftime("%Y-%m-%d %H:%M") if hasattr(sa, "strftime") else str(sa)[:16]
             mem_count = len(ep.linked_memory_ids) if ep.linked_memory_ids else 0
@@ -404,17 +848,48 @@ class MemoryHandler:
         )
 
         results: list[dict] = []
+        keywords = self._split_trace_keywords(keyword)
+
+        # === 数据源 0: 当前活跃 session（尚未落库/索引的最新轮次） ===
+        self._search_current_session_messages(
+            keyword,
+            keywords,
+            session_id_filter,
+            max_results,
+            results,
+        )
 
         # === 数据源 1: SQLite conversation_turns（主数据源） ===
         store = getattr(self.agent.memory_manager, "store", None)
+        # Phase 2b.5：把 turn 搜索限制到当前 (user_id, workspace_id)。多用户
+        # IM 部署下，原实现会让 alice 的 search_conversation_traces 搜到 bob 的对话。
+        owner_user_id, owner_workspace_id = self._current_owner_pair()
         if store:
             try:
-                rows = store.search_turns(
-                    keyword=keyword,
-                    session_id=session_id_filter or None,
-                    days_back=days_back,
-                    limit=max_results,
-                )
+                rows = []
+                seen_row_keys: set[tuple[str, str, str]] = set()
+                for kw in keywords:
+                    for row in store.search_turns(
+                        keyword=kw,
+                        session_id=session_id_filter or None,
+                        days_back=days_back,
+                        limit=max_results,
+                        user_id=owner_user_id,
+                        workspace_id=owner_workspace_id,
+                    ):
+                        key = (
+                            str(row.get("session_id", "")),
+                            str(row.get("timestamp", "")),
+                            str(row.get("role", "")),
+                        )
+                        if key in seen_row_keys:
+                            continue
+                        seen_row_keys.add(key)
+                        rows.append(row)
+                        if len(rows) >= max_results:
+                            break
+                    if len(rows) >= max_results:
+                        break
                 for row in rows:
                     results.append(
                         {
@@ -423,13 +898,39 @@ class MemoryHandler:
                             "episode_id": row.get("episode_id", ""),
                             "timestamp": row.get("timestamp", ""),
                             "role": row.get("role", ""),
-                            "content": str(row.get("content", ""))[:500],
+                            "content": coerce_text(row.get("content"))[:500],
                             "tool_calls": row.get("tool_calls") or [],
                             "tool_results": row.get("tool_results") or [],
                         }
                     )
             except Exception as e:
                 logger.warning(f"[SearchTraces] SQLite search failed, will try JSONL: {e}")
+
+        # 二次审计：JSONL / react_traces 文件级回退路径**不走** SQL，
+        # 之前的 Phase 2b.5 没覆盖到。多用户 IM 共享目录时，alice 会从这些
+        # fallback 路径读到 bob 的对话原文。先准备一个 allow-set，列出当前
+        # owner 在 session_tenants 表里登记过的 session_id 子集，回退路径
+        # 用 allow-set 做硬过滤。
+        allowed_session_ids: set[str] | None = None
+        if owner_user_id is not None and store is not None:
+            try:
+                allowed_session_ids = self._list_owned_session_ids(
+                    store,
+                    user_id=owner_user_id,
+                    workspace_id=owner_workspace_id,
+                )
+                # session_id_filter 是 LLM 显式指定的 session：如果它也属于本 owner，
+                # 一并放进 allow-set；否则 SQL 阶段就已经返回空，不会更糟。
+                if session_id_filter:
+                    if session_id_filter in allowed_session_ids or self._session_belongs_to_owner(
+                        store, session_id_filter, owner_user_id, owner_workspace_id
+                    ):
+                        allowed_session_ids.add(session_id_filter)
+            except Exception as e:
+                logger.debug(
+                    "[SearchTraces] failed to build allowed_session_ids: %s", e
+                )
+                allowed_session_ids = None
 
         # === 数据源 2: react_traces（补充工具调用细节） ===
         if len(results) < max_results:
@@ -450,6 +951,7 @@ class MemoryHandler:
                     remaining,
                     results,
                     seen_timestamps,
+                    allowed_session_ids=allowed_session_ids,
                 )
 
         # === 数据源 3: JSONL fallback（SQLite 无结果或更早历史） ===
@@ -471,12 +973,66 @@ class MemoryHandler:
                     remaining,
                     results,
                     seen_timestamps,
+                    allowed_session_ids=allowed_session_ids,
                 )
 
         if not results:
             return f"未找到包含 '{keyword}' 的对话记录（最近 {days_back} 天）"
 
         return self._format_trace_results(results, keyword)
+
+    @staticmethod
+    def _split_trace_keywords(keyword: str) -> list[str]:
+        parts = [p for p in re.split(r"[\s,，;；|/]+", keyword.strip()) if p]
+        return list(dict.fromkeys(parts or [keyword.strip()]))
+
+    def _search_current_session_messages(
+        self,
+        keyword: str,
+        keywords: list[str],
+        session_id_filter: str,
+        limit: int,
+        results: list[dict],
+    ) -> None:
+        session = getattr(self.agent, "_current_session", None)
+        if session is None:
+            return
+        sid = str(getattr(session, "id", "") or getattr(session, "session_id", "") or "")
+        if session_id_filter and session_id_filter != sid:
+            return
+        messages = getattr(session, "messages", None) or []
+        lowered_keywords = [k.lower() for k in keywords if k]
+        for msg in reversed(list(messages)):
+            if len(results) >= limit:
+                return
+            if isinstance(msg, dict):
+                role = msg.get("role", "")
+                content = coerce_text(msg.get("content"))
+                ts = msg.get("timestamp", "")
+                tool_calls = msg.get("tool_calls") or []
+                tool_results = msg.get("tool_results") or []
+            else:
+                role = getattr(msg, "role", "")
+                content = coerce_text(getattr(msg, "content", ""))
+                ts = getattr(msg, "timestamp", "")
+                tool_calls = getattr(msg, "tool_calls", []) or []
+                tool_results = getattr(msg, "tool_results", []) or []
+            hay = " ".join([
+                content,
+                json.dumps(tool_calls, ensure_ascii=False, default=str),
+                json.dumps(tool_results, ensure_ascii=False, default=str),
+            ]).lower()
+            if keyword.lower() not in hay and not any(k in hay for k in lowered_keywords):
+                continue
+            results.append({
+                "source": "current_session",
+                "session_id": sid,
+                "timestamp": str(ts),
+                "role": str(role),
+                "content": content[:500],
+                "tool_calls": tool_calls,
+                "tool_results": tool_results,
+            })
 
     def _trace_memory(self, params: dict) -> str:
         """跨层导航：从记忆→情节→对话，或从情节→记忆+对话"""
@@ -502,6 +1058,12 @@ class MemoryHandler:
         if not mem:
             return f"未找到记忆 {memory_id}"
 
+        # Phase 2b.5 二次审计：trace_memory 是按显式 ID 直读的接口，没有 SQL
+        # JOIN 过滤兜底。如果 LLM 通过其它泄漏面拿到了别人的 memory_id，这里
+        # 必须做最后一道 owner 校验，否则就是单点穿透。
+        if not self._memory_belongs_to_current_owner(mem):
+            return f"未找到记忆 {memory_id}"
+
         lines = ["## 记忆详情\n"]
         lines.append(f"- [{mem.type.value}] {mem.content}")
         lines.append(
@@ -518,6 +1080,12 @@ class MemoryHandler:
             lines.append(f"\n关联情节 {ep_id} 已不存在。")
             return "\n".join(lines)
 
+        # 防御：source episode 必须和当前 owner 同租户。否则即便 mem 本身
+        # 通过校验，关联的 episode 可能是历史误关联（极少见但理论可能）。
+        if not self._episode_belongs_to_current_owner(store, ep):
+            lines.append(f"\n关联情节 {ep_id} 不在当前用户的可见范围内。")
+            return "\n".join(lines)
+
         lines.append("\n## 来源情节\n")
         lines.append(f"- 目标: {ep.goal or '(未记录)'}")
         lines.append(f"- 结果: {ep.outcome}")
@@ -525,15 +1093,16 @@ class MemoryHandler:
         sa = ep.started_at
         started = sa.strftime("%Y-%m-%d %H:%M") if hasattr(sa, "strftime") else str(sa)[:16]
         lines.append(f"- 时间: {started}")
-        if ep.tools_used:
-            lines.append(f"- 工具: {', '.join(ep.tools_used[:8])}")
+        tool_names = coerce_tool_names(ep.tools_used)
+        if tool_names:
+            lines.append(f"- 工具: {', '.join(tool_names[:8])}")
 
         turns = store.get_session_turns(ep.session_id)
         if turns:
             lines.append(f"\n## 相关对话（共 {len(turns)} 轮，显示前 6 轮）\n")
             for t in turns[:6]:
                 role = t.get("role", "?")
-                content = str(t.get("content", ""))[:200]
+                content = coerce_text(t.get("content"))[:200]
                 lines.append(f"[{role}] {content}")
                 if t.get("tool_calls"):
                     tc = t["tool_calls"]
@@ -551,6 +1120,10 @@ class MemoryHandler:
         if not ep:
             return f"未找到情节 {episode_id}"
 
+        # Phase 2b.5 二次审计：见 _trace_from_memory 同款理由。
+        if not self._episode_belongs_to_current_owner(store, ep):
+            return f"未找到情节 {episode_id}"
+
         lines = ["## 情节详情\n"]
         lines.append(f"- 目标: {ep.goal or '(未记录)'}")
         lines.append(f"- 结果: {ep.outcome}")
@@ -558,8 +1131,9 @@ class MemoryHandler:
         sa = ep.started_at
         started = sa.strftime("%Y-%m-%d %H:%M") if hasattr(sa, "strftime") else str(sa)[:16]
         lines.append(f"- 时间: {started}")
-        if ep.tools_used:
-            lines.append(f"- 工具: {', '.join(ep.tools_used[:8])}")
+        tool_names = coerce_tool_names(ep.tools_used)
+        if tool_names:
+            lines.append(f"- 工具: {', '.join(tool_names[:8])}")
 
         if ep.linked_memory_ids:
             lines.append(f"\n## 关联记忆（{len(ep.linked_memory_ids)} 条）\n")
@@ -580,7 +1154,7 @@ class MemoryHandler:
             lines.append(f"\n## 对话原文（共 {len(turns)} 轮，显示前 8 轮）\n")
             for t in turns[:8]:
                 role = t.get("role", "?")
-                content = str(t.get("content", ""))[:300]
+                content = coerce_text(t.get("content"))[:300]
                 lines.append(f"[{role}] {content}")
                 if t.get("tool_calls"):
                     tc = t["tool_calls"]
@@ -594,6 +1168,132 @@ class MemoryHandler:
 
         return "\n".join(lines)
 
+    def _current_owner_pair(self) -> tuple[str | None, str | None]:
+        """统一拿当前 (user_id, workspace_id)，拿不到时返回 (None, None)。"""
+        try:
+            mm = self.agent.memory_manager
+            if hasattr(mm, "_current_owner"):
+                uid, wsid = mm._current_owner()
+                return uid, wsid
+        except Exception as e:
+            logger.debug("[Tool] _current_owner fetch failed: %s", e)
+        return None, None
+
+    def _memory_belongs_to_current_owner(self, mem) -> bool:
+        """memory 的 (user_id, workspace_id) 必须严格等于当前 owner。
+
+        owner 取不到（None）时退回到"放行"（默认不破坏老桌面单用户行为）。
+        owner 是 default/default 时仍走严格比较 —— v4 之后 default 是合法身份。
+        """
+        owner_uid, owner_wsid = self._current_owner_pair()
+        if owner_uid is None and owner_wsid is None:
+            return True
+        mem_uid = getattr(mem, "user_id", "default") or "default"
+        mem_wsid = getattr(mem, "workspace_id", "default") or "default"
+        if owner_uid is not None and mem_uid != owner_uid:
+            return False
+        if owner_wsid is not None and mem_wsid != owner_wsid:
+            return False
+        return True
+
+    def _episode_belongs_to_current_owner(self, store, ep) -> bool:
+        """episode 通过 session_tenants 反查 owner 比较。
+
+        没登记过（孤儿）episode 在 owner 拿到时拒绝；owner 拿不到时放行。
+        """
+        owner_uid, owner_wsid = self._current_owner_pair()
+        if owner_uid is None and owner_wsid is None:
+            return True
+        sid = getattr(ep, "session_id", "") or ""
+        if not sid:
+            return False
+        return self._session_belongs_to_owner(store, sid, owner_uid, owner_wsid)
+
+    @staticmethod
+    def _list_owned_session_ids(
+        store,
+        *,
+        user_id: str,
+        workspace_id: str | None,
+    ) -> set[str]:
+        """从 session_tenants 取当前 owner 的所有 session_id allow-set。"""
+        owned: set[str] = set()
+        try:
+            iter_owned = getattr(store, "iter_owned_session_ids", None)
+            if iter_owned is not None:
+                owned.update(iter_owned(user_id=user_id, workspace_id=workspace_id))
+        except Exception:
+            pass
+        return owned
+
+    @staticmethod
+    def _session_belongs_to_owner(
+        store,
+        session_id: str,
+        user_id: str,
+        workspace_id: str | None,
+    ) -> bool:
+        try:
+            getter = getattr(store, "get_session_tenant", None)
+            if getter is None:
+                return False
+            tenant = getter(session_id)
+            if not tenant:
+                return False
+            uid, wsid = tenant
+            if uid != user_id:
+                return False
+            if workspace_id is not None and wsid != workspace_id:
+                return False
+            return True
+        except Exception:
+            return False
+
+    # session_id 在 stem 里出现时，前后必须是这些边界字符之一（或字符串两端）。
+    # 字母/数字/Unicode 文字都视为 token 内部字符，绝对不能让 "user_alice" 误
+    # 命中 "user_alice2"（substring 攻击面）。
+    # 注：`_` 必须算"边界"——session_id 自己会含 `_`，但 stem 把多个字段用 `_`
+    # 拼起来（如 ``trace_<sid>_<ts>``），所以紧贴 `_` 的位置是合法分隔点。
+    # 同理 `.`（扩展名分隔）和 `-`。
+    _ALLOW_SET_BOUNDARY_CHARS = frozenset("_-.")
+
+    @classmethod
+    def _stem_matches_session_allow_set(
+        cls,
+        stem: str,
+        allowed_session_ids: set[str] | None,
+    ) -> bool:
+        """文件名 stem 是否对应 allow-set 里某个 session_id —— **边界感知**匹配。
+
+        三次审计修正：纯子串匹配会被前缀 / 后缀绕过（alice 的 ``user_alice``
+        会命中 bob 的 ``user_alice2``）。这里要求 session_id 在 stem 里出现时
+        其前后字符必须是 ``_`` / ``-`` / ``.`` 中的一个（或 stem 边界）。
+
+        - allow-set 为空 / None → False（owner 已知但没 owned session，安全侧）；
+        - 任一 session_id 以边界方式出现在 stem 里 → True；
+        - 否则 → False（拒绝读取该文件，宁可错杀）。
+        """
+        if not allowed_session_ids:
+            return False
+        boundary = cls._ALLOW_SET_BOUNDARY_CHARS
+        for sid in allowed_session_ids:
+            if not sid:
+                continue
+            start = 0
+            slen = len(sid)
+            stem_len = len(stem)
+            while True:
+                pos = stem.find(sid, start)
+                if pos < 0:
+                    break
+                left_ok = pos == 0 or stem[pos - 1] in boundary
+                end = pos + slen
+                right_ok = end == stem_len or stem[end] in boundary
+                if left_ok and right_ok:
+                    return True
+                start = pos + 1
+        return False
+
     def _search_react_traces(
         self,
         traces_dir: Path,
@@ -603,8 +1303,15 @@ class MemoryHandler:
         limit: int,
         results: list[dict],
         seen_timestamps: set[str],
+        *,
+        allowed_session_ids: set[str] | None = None,
     ) -> None:
-        """搜索 react_traces/{date}/*.json"""
+        """搜索 react_traces/{date}/*.json。
+
+        Phase 2b.5 二次审计：增加 allowed_session_ids 参数 —— 多用户 IM
+        共享目录场景，回退路径必须按当前 owner 的 session allow-set 过滤，
+        否则 SQL 阶段的 tenant 收敛会被这里的全目录扫描绕过。
+        """
         count = 0
         for date_dir in sorted(traces_dir.iterdir(), reverse=True):
             if not date_dir.is_dir():
@@ -617,6 +1324,10 @@ class MemoryHandler:
                 continue
             for trace_file in sorted(date_dir.glob("*.json"), reverse=True):
                 if session_id_filter and session_id_filter not in trace_file.stem:
+                    continue
+                if allowed_session_ids is not None and not self._stem_matches_session_allow_set(
+                    trace_file.stem, allowed_session_ids
+                ):
                     continue
                 try:
                     raw = trace_file.read_text(encoding="utf-8")
@@ -657,11 +1368,21 @@ class MemoryHandler:
         limit: int,
         results: list[dict],
         seen_timestamps: set[str],
+        *,
+        allowed_session_ids: set[str] | None = None,
     ) -> None:
-        """搜索 conversation_history/*.jsonl，跳过 SQLite 已返回的条目"""
+        """搜索 conversation_history/*.jsonl，跳过 SQLite 已返回的条目。
+
+        Phase 2b.5 二次审计：增加 allowed_session_ids 参数 —— 多用户 IM
+        部署里这个目录可能存放多个 user 的 jsonl，必须按 owner 收敛。
+        """
         count = 0
         for jsonl_file in sorted(history_dir.glob("*.jsonl"), reverse=True):
             if session_id_filter and session_id_filter not in jsonl_file.stem:
+                continue
+            if allowed_session_ids is not None and not self._stem_matches_session_allow_set(
+                jsonl_file.stem, allowed_session_ids
+            ):
                 continue
             try:
                 file_mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime)
@@ -688,7 +1409,7 @@ class MemoryHandler:
                             "file": jsonl_file.name,
                             "timestamp": ts,
                             "role": turn.get("role", ""),
-                            "content": str(turn.get("content", ""))[:500],
+                            "content": coerce_text(turn.get("content"))[:500],
                             "tool_calls": turn.get("tool_calls", []),
                             "tool_results": turn.get("tool_results", []),
                         }
@@ -709,7 +1430,7 @@ class MemoryHandler:
         for i, r in enumerate(results, 1):
             source = r["source"]
             output += f"--- 记录 {i} [{source}] ---\n"
-            if source in ("sqlite_turns", "conversation_history"):
+            if source in ("current_session", "sqlite_turns", "conversation_history"):
                 if r.get("session_id"):
                     output += f"会话: {r['session_id']}\n"
                 elif r.get("file"):
@@ -732,7 +1453,7 @@ class MemoryHandler:
                 if r.get("tool_calls"):
                     for tc in r["tool_calls"]:
                         output += f"  工具: {tc.get('name', 'N/A')}\n"
-                        inp = tc.get("input", {})
+                        inp = tc.get("input", tc.get("arguments", {}))
                         if isinstance(inp, dict):
                             inp_str = json.dumps(inp, ensure_ascii=False, default=str)
                             output += f"  参数: {inp_str[:300]}\n"
@@ -801,6 +1522,15 @@ class MemoryHandler:
             parts.append(f"- 通道: {getattr(session, 'channel', 'unknown')}")
             msg_count = len(ctx.messages) if ctx and hasattr(ctx, "messages") else 0
             parts.append(f"- 消息数: {msg_count}")
+            effective_model = {}
+            try:
+                effective_model = session.get_metadata("effective_model") or {}
+            except Exception:
+                effective_model = {}
+            if isinstance(effective_model, dict) and effective_model.get("effective_model"):
+                parts.append(f"- 当前模型: {effective_model.get('effective_model')}")
+                if effective_model.get("effective_endpoint"):
+                    parts.append(f"- 当前端点: {effective_model.get('effective_endpoint')}")
             sub_records = getattr(ctx, "sub_agent_records", None) or []
             parts.append(f"- 子Agent记录: {len(sub_records)} 条")
 
@@ -808,21 +1538,22 @@ class MemoryHandler:
             sub_records = getattr(ctx, "sub_agent_records", None) or []
             if sub_records:
                 parts.append("\n## 子Agent执行记录")
-                for r in sub_records:
-                    name = r.get("agent_name", "unknown")
+                for raw_record in sub_records:
+                    r = raw_record if isinstance(raw_record, dict) else {}
+                    name = self._context_text(r.get("agent_name", "unknown")) or "unknown"
                     parts.append(f"\n### {name}")
-                    task_msg = r.get("task_message", "")
+                    task_msg = self._context_text(r.get("task_message", ""), 200)
                     if task_msg:
-                        parts.append(f"- 任务: {task_msg[:200]}")
+                        parts.append(f"- 任务: {task_msg}")
                     elapsed = r.get("elapsed_s", "")
-                    if elapsed:
-                        parts.append(f"- 耗时: {elapsed}s")
-                    tools = r.get("tools_used", [])
+                    if elapsed not in (None, ""):
+                        parts.append(f"- 耗时: {self._context_text(elapsed)}s")
+                    tools = coerce_tool_names(r.get("tools_used") or [])
                     if tools:
                         parts.append(f"- 工具: {', '.join(tools[:10])}")
-                    preview = r.get("result_preview", "")
+                    preview = self._context_text(r.get("result_preview", ""), 1000)
                     if preview:
-                        parts.append(f"- 结果预览:\n{preview[:1000]}")
+                        parts.append(f"- 结果预览:\n{preview}")
             else:
                 parts.append("\n## 子Agent执行记录\n无子Agent记录")
 
@@ -830,9 +1561,10 @@ class MemoryHandler:
             parts.append("\n## 工具使用记录")
             react_traces = getattr(ctx, "react_traces", None)
             if react_traces:
-                for i, trace in enumerate(react_traces[-20:], 1):
-                    tool = trace.get("tool_name", "")
-                    status = trace.get("status", "")
+                for i, raw_trace in enumerate(react_traces[-20:], 1):
+                    trace = raw_trace if isinstance(raw_trace, dict) else {}
+                    tool = self._context_text(trace.get("tool_name", ""))
+                    status = self._context_text(trace.get("status", ""))
                     if tool:
                         parts.append(f"{i}. {tool} ({status})")
             else:
@@ -844,15 +1576,168 @@ class MemoryHandler:
             display_msgs = msgs[-20:] if len(msgs) > 20 else msgs
             if len(msgs) > 20:
                 parts.append(f"（显示最近 20 条，共 {len(msgs)} 条）\n")
-            for msg in display_msgs:
-                role = msg.get("role", "?")
-                ts = msg.get("timestamp", "")
-                ts_display = ts[:16] if ts else ""
-                content = msg.get("content", "")
-                content = content[:500] if isinstance(content, str) else str(content)[:500]
+            for raw_msg in display_msgs:
+                msg = raw_msg if isinstance(raw_msg, dict) else {}
+                role = self._context_text(msg.get("role", "?")) or "?"
+                ts_display = self._context_text(msg.get("timestamp", ""), 16)
+                content = self._context_text(msg.get("content", ""), 500)
                 parts.append(f"[{ts_display}] {role}: {content}")
 
         return "\n".join(parts) if parts else "无可用会话信息"
+
+    def _delete_by_query(self, params: dict) -> str:
+        """受控的按查询条件批量删除记忆 (PR-A3)。
+
+        前置条件（任一）：
+        - 用户已通过 RiskGate 授权（session.metadata 含 risk_authorized_intent_active）
+        - 调用方显式 dry_run=True 仅预览
+
+        参数：
+        - query: 必填，按内容关键字过滤
+        - source: 可选，按 source 过滤（如 "profile_fallback"）
+        - memory_type: 可选，按 MemoryType 过滤
+        - dry_run: 默认 True，先返回预览再要求 dry_run=False 真删
+        - max_delete: 默认 50，硬上限 200，避免一次性误删
+        - confirm_token: dry_run=False 时必填，由前一次 dry_run 返回（防止 LLM 自我授权）
+        """
+        try:
+            from ...memory.types import MemoryType
+        except Exception as exc:
+            return f"❌ memory_delete_by_query 不可用: {exc}"
+
+        query = (params.get("query") or "").strip()
+        source = (params.get("source") or "").strip() or None
+        type_str = (params.get("memory_type") or "").strip()
+        dry_run = params.get("dry_run", True)
+        if not isinstance(dry_run, bool):
+            dry_run = str(dry_run).lower() not in ("false", "0", "no")
+        try:
+            max_delete = int(params.get("max_delete") or 50)
+        except (TypeError, ValueError):
+            max_delete = 50
+        max_delete = max(1, min(max_delete, 200))
+        confirm_token = (params.get("confirm_token") or "").strip()
+
+        # 真删前必须有 dry_run 预览返回的 token，避免 LLM 直接 dry_run=False 误删或无匹配时静默返回
+        if not dry_run and not confirm_token:
+            return (
+                "❌ 拒绝执行：`dry_run=False` 时必须提供 `confirm_token`（由上一次 "
+                "`dry_run=True` 预览末尾给出）。请先预览再确认删除。"
+            )
+
+        if not query and not source and not type_str:
+            return (
+                "❌ memory_delete_by_query 至少需要 query / source / memory_type 之一。"
+                "拒绝执行无差别删除。"
+            )
+
+        memory_type: MemoryType | None = None
+        if type_str:
+            try:
+                memory_type = MemoryType(type_str.lower())
+            except ValueError:
+                return (
+                    f"❌ memory_type 无效: {type_str}. "
+                    f"可用值: {', '.join(t.value for t in MemoryType)}"
+                )
+
+        mm = getattr(self.agent, "memory_manager", None)
+        if mm is None or not hasattr(mm, "search_memories"):
+            return "❌ memory_manager 不可用，无法删除"
+
+        try:
+            candidates = mm.search_memories(
+                query=query,
+                memory_type=memory_type,
+                limit=max_delete + 1,
+            )
+        except Exception as exc:
+            return f"❌ 搜索候选记忆失败: {exc}"
+
+        if source:
+            candidates = [
+                m for m in candidates
+                if str(getattr(m, "source", "") or "") == source
+            ]
+
+        candidates = candidates[:max_delete]
+        if not candidates:
+            return f"未找到符合条件的记忆（query={query!r}, source={source!r}）。"
+
+        preview_lines = [f"将删除 {len(candidates)} 条记忆，预览前 5 条："]
+        for mem in candidates[:5]:
+            content = (getattr(mem, "content", "") or "")[:120]
+            mem_id = str(getattr(mem, "id", ""))[:12]
+            mem_source = str(getattr(mem, "source", "") or "?")
+            preview_lines.append(
+                f"- [{mem_id}] type={getattr(mem, 'type', '?')} source={mem_source}\n"
+                f"  内容: {content}"
+            )
+
+        # 生成 token 以防 LLM 在没有 dry_run 预览的情况下直接删
+        try:
+            import hashlib
+
+            token_seed = "|".join(str(getattr(m, "id", "")) for m in candidates)
+            expected_token = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:16]
+        except Exception:
+            expected_token = ""
+
+        if dry_run:
+            preview_lines.append("")
+            preview_lines.append(
+                "（这只是预览，未执行删除。如确认无误，请用相同参数 + "
+                f"`dry_run=False` 且 `confirm_token=\"{expected_token}\"` 再调一次。）"
+            )
+            return "\n".join(preview_lines)
+
+        if expected_token and confirm_token != expected_token:
+            preview_lines.append("")
+            preview_lines.append(
+                "❌ 拒绝执行：confirm_token 不匹配。请先以 dry_run=True 预览，"
+                "拷贝返回的 confirm_token 再调用。"
+            )
+            return "\n".join(preview_lines)
+
+        # 同时检查 RiskGate 已授权，二次保险
+        try:
+            session = getattr(self.agent, "current_session", None)
+            authorized = False
+            if session is not None:
+                intent = session.get_metadata("risk_authorized_intent_active")
+                if isinstance(intent, dict) and intent.get("operation") == "memory_delete":
+                    authorized = True
+            if not authorized:
+                preview_lines.append("")
+                preview_lines.append(
+                    "❌ 拒绝执行：未检测到用户在 RiskGate 中确认的授权范围。"
+                    "请引导用户重新发起删除请求并通过弹窗确认。"
+                )
+                return "\n".join(preview_lines)
+        except Exception:
+            pass
+
+        deleted = 0
+        for mem in candidates:
+            try:
+                mem_id = str(getattr(mem, "id", ""))
+                if mem_id and mm.delete_memory(mem_id):
+                    deleted += 1
+            except Exception as exc:
+                logger.warning("[memory_delete_by_query] delete %s failed: %s", mem_id, exc)
+
+        # 消费授权
+        try:
+            session = getattr(self.agent, "current_session", None)
+            if session is not None:
+                session.set_metadata("risk_authorized_intent_active", None)
+        except Exception:
+            pass
+
+        return (
+            f"✅ 已删除 {deleted}/{len(candidates)} 条记忆。\n"
+            f"前 5 条预览见上一步 dry_run 输出。"
+        )
 
 
 def create_handler(agent: "Agent"):

@@ -14,8 +14,8 @@ import importlib
 import json
 import logging
 import os
-import subprocess
 import sys
+import time
 from pathlib import Path
 
 import typer
@@ -27,7 +27,6 @@ from rich.table import Table
 from .config import settings
 from .core.agent import Agent
 from .logging import setup_logging
-from .python_compat import patch_simplejson_jsondecodeerror
 
 # MCP stdio 子进程模式：stdout 专属 JSONRPC 协议，禁止一切控制台日志输出
 _is_mcp_subprocess = "run-mcp-module" in sys.argv
@@ -44,6 +43,41 @@ setup_logging(
     log_to_file=settings.log_to_file,
 )
 logger = logging.getLogger(__name__)
+
+
+# ── Windows asyncio Proactor 噪音抑制（logging 层兜底）──
+# Tauri/uvicorn 在 Windows 上 SSE/WebSocket 客户端断开时会触发
+# ``_ProactorBasePipeTransport._call_connection_lost`` 抛 ``ConnectionResetError
+# [WinError 10054]``。``_serve()`` 里的 ``loop.set_exception_handler`` 已经
+# 处理了同一 loop 内的 callback，但有些路径（跨 loop / 多 worker / 后置
+# install 时机错过）仍会冒到 asyncio 模块自己的 logger 里。
+# 在 logging 层加一个 filter 是最稳的兜底——只要 record 命中特征就降级，不写
+# error.log，前端 BugReport 不再被 60% 噪音占据。
+class _WindowsAsyncioPipeFilter(logging.Filter):
+    _NEEDLES = (
+        "_ProactorBasePipeTransport._call_connection_lost",
+        "ConnectionResetError",
+        "WinError 10054",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg) if record.msg else ""
+        if any(needle in msg for needle in self._NEEDLES):
+            return False
+        if record.exc_info and record.exc_info[1] is not None:
+            exc = record.exc_info[1]
+            if isinstance(exc, ConnectionResetError):
+                return False
+            if "WinError 10054" in str(exc):
+                return False
+        return True
+
+
+if sys.platform == "win32":
+    logging.getLogger("asyncio").addFilter(_WindowsAsyncioPipeFilter())
 
 
 # 初始化追踪系统
@@ -103,6 +137,7 @@ async def _init_orchestrator():
     _orchestrator = AgentOrchestrator()
     if _message_gateway:
         _orchestrator.set_gateway(_message_gateway)
+        _message_gateway.set_orchestrator(_orchestrator)
     logger.info("[MultiAgent] AgentOrchestrator initialized")
     try:
         from synapse.agents.presets import ensure_presets_on_mode_enable
@@ -112,413 +147,16 @@ async def _init_orchestrator():
         logger.warning(f"[Main] Failed to deploy presets on orchestrator init: {e}")
 
 
-# ==================== IM 通道依赖自动安装 ====================
+def _ensure_channel_deps() -> dict:
+    """检查已启用 IM 通道依赖，并安装到隔离 channel-deps 目录。
 
-from .channels.deps import CHANNEL_DEPS as _CHANNEL_DEPS
-
-
-def _patch_backports_zstd() -> None:
-    """Patch incomplete ``backports.zstd`` so that ``urllib3 >= 2.3`` can load.
-
-    Some environments (notably PyInstaller bundles) ship an older
-    ``backports-zstd`` that exposes the decompressor but is missing the
-    ``ZstdError`` exception class.  ``urllib3.response`` references this
-    attribute at *class-definition time* in ``BaseHTTPResponse``, so the
-    ``AttributeError`` is raised during ``import urllib3`` — before any
-    user code can catch it.
-
-    We add a thin stub so the import succeeds.  The stub inherits from
-    ``Exception``, which is the correct base class for ``ZstdError``.
+    返回 ``ensure_channel_dependencies`` 的结果字典，调用方可以读 ``errors``
+    字段拿到逐包 pip 错误（``{"lark-oapi": "...timeout..."}``），用于在
+    Gateway 适配器启动失败时补充更具体的提示。
     """
-    try:
-        import backports.zstd as _bzstd
-    except ImportError:
-        return
+    from synapse.runtime_channel_deps import ensure_channel_dependencies
 
-    if hasattr(_bzstd, "ZstdError"):
-        return
-
-    class _ZstdError(Exception):
-        """Stub ``ZstdError`` for backports.zstd compatibility."""
-
-    _bzstd.ZstdError = _ZstdError
-    logger.debug("Patched backports.zstd: added missing ZstdError stub")
-
-
-def _build_isolated_pip_env(py_path: Path, *, is_frozen: bool) -> dict[str, str]:
-    """Build a sanitized subprocess env for ``python -m pip`` execution."""
-    pip_env = os.environ.copy()
-    for harmful_key in (
-        "PYTHONPATH",
-        "PYTHONHOME",
-        "PYTHONSTARTUP",
-        "VIRTUAL_ENV",
-        "CONDA_PREFIX",
-        "CONDA_DEFAULT_ENV",
-        "CONDA_SHLVL",
-        "CONDA_PYTHON_EXE",
-        "PIP_INDEX_URL",
-        "PIP_TARGET",
-        "PIP_PREFIX",
-        "PIP_USER",
-        "PIP_REQUIRE_VIRTUALENV",
-    ):
-        pip_env.pop(harmful_key, None)
-
-    if is_frozen and py_path.parent.name == "_internal":
-        path_parts = [str(py_path.parent)]
-        for sub in ("Lib", "DLLs"):
-            p = py_path.parent / sub
-            if p.is_dir():
-                path_parts.append(str(p))
-        pip_env["PYTHONPATH"] = os.pathsep.join(path_parts)
-
-    return pip_env
-
-
-def _probe_python_runtime(py: str, env: dict[str, str], *, extra: dict) -> tuple[bool, str]:
-    """Probe whether a Python executable can import encodings/pip normally."""
-    try:
-        result = subprocess.run(
-            [py, "-c", "import encodings, pip; print('ok')"],
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=20,
-            **extra,
-        )
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-
-    if result.returncode == 0:
-        return True, ""
-    tail = (result.stderr or result.stdout or "").strip()
-    return False, tail[-600:]
-
-
-def _find_bundled_channel_wheels() -> Path | None:
-    """Locate bundled offline wheels for IM deps if present."""
-    exe = Path(sys.executable).resolve()
-    candidates = [
-        exe.parent.parent / "modules" / "channel-deps" / "wheels",
-        exe.parent / "modules" / "channel-deps" / "wheels",
-    ]
-    for p in candidates:
-        if p.is_dir():
-            return p
-    return None
-
-
-def _ensure_channel_deps() -> None:
-    """
-    检查已启用的 IM 通道所需依赖，缺失的自动安装到隔离目录。
-
-    安装策略：使用 ``pip install --target`` 将缺失依赖安装到
-    ``~/.synapse/modules/channel-deps/site-packages``，与外部 Python
-    环境完全隔离，避免版本冲突。该目录会被 ``inject_module_paths()``
-    自动扫描并注入 sys.path。
-
-    Telegram 为核心依赖，始终包含在安装包中，不需检查。
-    """
-    _patch_backports_zstd()
-    patch_simplejson_jsondecodeerror(logger=logger)
-    try:
-        from synapse.runtime_env import inject_module_paths_runtime
-
-        inject_module_paths_runtime()
-    except Exception:
-        pass
-
-    enabled_channels: list[str] = []
-    if settings.feishu_enabled:
-        enabled_channels.append("feishu")
-    if settings.dingtalk_enabled:
-        enabled_channels.append("dingtalk")
-    if settings.wework_enabled:
-        enabled_channels.append("wework")
-    if settings.wework_ws_enabled:
-        enabled_channels.append("wework_ws")
-    if settings.onebot_enabled:
-        enabled_channels.append("onebot")
-    if settings.qqbot_enabled:
-        enabled_channels.append("qqbot")
-    if settings.wechat_enabled:
-        enabled_channels.append("wechat")
-
-    # 补充从 im_bots 中提取已启用的通道类型，确保依赖检测覆盖 UI 创建的 Bot
-    for bot_cfg in settings.im_bots or []:
-        if bot_cfg.get("enabled", True):
-            channel_type = bot_cfg.get("type", "")
-            if channel_type and channel_type not in enabled_channels:
-                enabled_channels.append(channel_type)
-
-    if not enabled_channels:
-        return
-
-    missing: list[str] = []
-    failed_import_names: list[str] = []
-    for channel in enabled_channels:
-        for import_name, pip_name in _CHANNEL_DEPS.get(channel, []):
-            try:
-                importlib.import_module(import_name)
-            except ImportError as exc:
-                # requests 在检测到 simplejson 时会导入 JSONDecodeError。
-                # 某些旧/损坏的 simplejson 缺失该符号，导致 lark_oapi 导入失败。
-                if (
-                    import_name == "lark_oapi"
-                    and "JSONDecodeError" in str(exc)
-                    and "simplejson" in str(exc)
-                ):
-                    patch_simplejson_jsondecodeerror(logger=logger)
-                    try:
-                        importlib.import_module(import_name)
-                        logger.info(
-                            "lark_oapi import recovered after simplejson compatibility patch"
-                        )
-                        continue
-                    except Exception:
-                        pass
-                if pip_name not in missing:
-                    missing.append(pip_name)
-                failed_import_names.append(import_name)
-            except Exception as e:
-                logger.warning(
-                    f"Import check for {import_name} ({channel}) hit unexpected error: "
-                    f"{type(e).__name__}: {e} — skipping auto-install for this dep"
-                )
-
-    if not missing:
-        return
-
-    pkg_list = ", ".join(missing)
-    logger.info(f"IM 通道依赖自动安装: {pkg_list} ...")
-
-    from synapse.runtime_env import IS_FROZEN, get_channel_deps_dir, get_python_executable
-
-    py = get_python_executable()
-    if not py or (IS_FROZEN and py == sys.executable):
-        logger.warning("未找到项目自带的 Python，无法自动安装依赖")
-        console.print(
-            f"[yellow]⚠[/yellow] 未找到 Python 解释器，无法自动安装: [bold]{pkg_list}[/bold]\n"
-            f"  请前往「设置中心 → Python 环境」点击「一键修复」"
-        )
-        return
-
-    target_dir = get_channel_deps_dir()
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    # 国内镜像多源回退（与 Rust 端 pip_install 行为一致）
-    # 尊重用户已配置的 PIP_INDEX_URL 环境变量
-    _user_index = os.environ.get("PIP_INDEX_URL", "").strip()
-    _mirror_sources: list[tuple[str, str]] = []
-    if _user_index:
-        _host = _user_index.split("//")[1].split("/")[0] if "//" in _user_index else ""
-        _mirror_sources.append((_user_index, _host))
-    _mirror_sources.extend(
-        [
-            ("https://mirrors.aliyun.com/pypi/simple/", "mirrors.aliyun.com"),
-            ("https://pypi.tuna.tsinghua.edu.cn/simple/", "pypi.tuna.tsinghua.edu.cn"),
-            ("https://pypi.org/simple/", "pypi.org"),
-        ]
-    )
-
-    extra: dict = {}
-    if sys.platform == "win32":
-        extra["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    py_path = Path(py)
-    pip_env = _build_isolated_pip_env(py_path, is_frozen=IS_FROZEN)
-
-    # _internal/python.exe 在部分用户机器上会因为 PythonHome 未稳定而报
-    # "No module named encodings"。先做探测，必要时追加 PYTHONHOME 再重试。
-    runtime_ok, probe_err = _probe_python_runtime(py, pip_env, extra=extra)
-    if not runtime_ok and IS_FROZEN and py_path.parent.name == "_internal":
-        pip_env["PYTHONHOME"] = str(py_path.parent)
-        runtime_ok, probe_err = _probe_python_runtime(py, pip_env, extra=extra)
-        if runtime_ok:
-            logger.info("内置 Python 通过 PYTHONHOME 修正后可用: %s", py)
-
-    if not runtime_ok:
-        logger.error("自动安装依赖前的 Python 运行时探测失败: %s", probe_err)
-        console.print(
-            "[red]✗[/red] Python 运行环境异常，无法安装 IM 依赖。\n"
-            "  建议：前往「设置中心 → Python 环境」点击「一键修复」。"
-        )
-        return
-
-    def _on_install_success(source_label: str) -> None:
-        logger.info(f"依赖安装成功 (source={source_label}, target={target_dir}): {pkg_list}")
-        console.print(f"[green]✓[/green] 依赖安装成功: {pkg_list}")
-
-        # 清理之前失败的导入在 sys.modules 中留下的残余条目，
-        # 确保后续 import 能从新安装的路径加载完整模块。
-        stale = [
-            k
-            for k in sys.modules
-            if any(k == n or k.startswith(n + ".") for n in failed_import_names)
-        ]
-        for k in stale:
-            del sys.modules[k]
-        if stale:
-            logger.debug(f"Cleared {len(stale)} stale sys.modules entries: {stale[:10]}")
-
-        importlib.invalidate_caches()
-        target_str = str(target_dir)
-        if target_str not in sys.path:
-            sys.path.append(target_str)
-            logger.info(f"已注入通道依赖路径: {target_str}")
-        try:
-            from synapse.runtime_env import inject_module_paths_runtime
-
-            inject_module_paths_runtime()
-        except Exception:
-            pass
-
-    installed = False
-
-    # 离线优先：若安装包内带了 channel-deps wheels，先走离线安装。
-    bundled_wheels = _find_bundled_channel_wheels() if IS_FROZEN else None
-    if bundled_wheels is not None:
-        console.print(
-            f"[yellow]⏳[/yellow] 自动安装 IM 通道依赖: [bold]{pkg_list}[/bold] "
-            f"(源: offline wheels)"
-        )
-        offline_cmd = [
-            py,
-            "-m",
-            "pip",
-            "install",
-            "--no-index",
-            "--find-links",
-            str(bundled_wheels),
-            "--target",
-            str(target_dir),
-            "--prefer-binary",
-            *missing,
-        ]
-        try:
-            offline = subprocess.run(
-                offline_cmd,
-                env=pip_env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=180,
-                **extra,
-            )
-            if offline.returncode == 0:
-                _on_install_success("offline")
-                installed = True
-            else:
-                err_tail = (offline.stderr or offline.stdout or "").strip()[-400:]
-                logger.warning("离线 wheels 安装失败，回退在线镜像: %s", err_tail)
-        except Exception as e:
-            logger.warning(f"离线 wheels 安装异常，回退在线镜像: {e}")
-
-    def _pip_install_via_mirrors(
-        packages: list[str],
-        label_prefix: str = "",
-    ) -> bool:
-        """Try installing *packages* through all mirror sources. Return True on success."""
-        for idx, (index_url, trusted_host) in enumerate(_mirror_sources):
-            source_label = trusted_host or index_url
-            if idx == 0:
-                console.print(
-                    f"[yellow]⏳[/yellow] {label_prefix}自动安装 IM 通道依赖: "
-                    f"[bold]{', '.join(packages)}[/bold] (源: {source_label}) ..."
-                )
-            else:
-                console.print(f"[yellow]⏳[/yellow] 切换镜像源重试: {source_label} ...")
-
-            pip_cmd = [
-                py,
-                "-m",
-                "pip",
-                "install",
-                "--target",
-                str(target_dir),
-                "-i",
-                index_url,
-                "--prefer-binary",
-                "--timeout",
-                "60",
-                *packages,
-            ]
-            if trusted_host:
-                pip_cmd.extend(["--trusted-host", trusted_host])
-
-            try:
-                result = subprocess.run(
-                    pip_cmd,
-                    env=pip_env,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=120,
-                    **extra,
-                )
-                if result.returncode == 0:
-                    _on_install_success(source_label)
-                    return True
-                else:
-                    err_tail = (result.stderr or result.stdout or "").strip()[-300:]
-                    logger.warning(
-                        f"镜像源 {source_label} 安装失败 (exit {result.returncode}): {err_tail}"
-                    )
-            except subprocess.TimeoutExpired:
-                logger.warning(f"镜像源 {source_label} 安装超时")
-            except Exception as e:
-                logger.warning(f"镜像源 {source_label} 安装异常: {e}")
-        return False
-
-    if not installed:
-        installed = _pip_install_via_mirrors(missing)
-
-    # 批量安装失败且有多个包时，逐个重试——避免一个 C 扩展编译失败拖垮纯 Python 包
-    if not installed and len(missing) > 1:
-        logger.info("批量安装失败，尝试逐个安装 ...")
-        per_pkg_ok: list[str] = []
-        per_pkg_fail: list[str] = []
-        for pkg in missing:
-            if _pip_install_via_mirrors([pkg], label_prefix="[逐个] "):
-                per_pkg_ok.append(pkg)
-            else:
-                per_pkg_fail.append(pkg)
-        if per_pkg_ok:
-            installed = True
-            if per_pkg_fail:
-                fail_list = ", ".join(per_pkg_fail)
-                logger.warning(f"部分依赖安装失败（不影响已安装的包）: {fail_list}")
-                console.print(
-                    f"[yellow]⚠[/yellow] 部分依赖安装失败: {fail_list}\n"
-                    f"  相关功能（如语音转码）可能不可用，核心 IM 通道不受影响"
-                )
-
-    if not installed:
-        logger.error(f"所有镜像源均安装失败: {pkg_list}")
-        console.print(
-            f"[red]✗[/red] 依赖安装失败（已尝试所有镜像源）: {pkg_list}\n"
-            f"  请检查网络连接，或前往「设置中心 → Python 环境」点击「一键修复」"
-        )
-        return
-
-    # 安装后验证：确保模块真正可导入
-    still_broken: list[str] = []
-    for name in failed_import_names:
-        try:
-            importlib.import_module(name)
-        except Exception as exc:
-            logger.error(f"依赖 {name} 安装后仍无法导入: {exc}", exc_info=True)
-            still_broken.append(name)
-    if still_broken:
-        console.print(
-            f"[yellow]⚠[/yellow] 以下依赖安装成功但导入失败: {', '.join(still_broken)}\n"
-            f"  日志中有详细错误信息，请反馈给开发者"
-        )
+    return ensure_channel_dependencies(print_fn=console.print) or {}
 
 
 def _create_bot_adapter(
@@ -625,17 +263,76 @@ async def ensure_session_manager():
 
 
 def _setup_session_backfill(agent_or_master):
-    """从 SQLite 回填 session 中可能缺失的消息（崩溃恢复）。"""
+    """从 SQLite 回填 session 中可能缺失的消息（崩溃恢复）。
+
+    PR-D3：同时绑定 ``set_turn_writer``，让 ``Session.add_message`` 能在
+    用户/助手每条消息落地时同步写一份到 SQLite，进程崩溃也不丢历史。
+    """
     _actual_agent = agent_or_master
     if _actual_agent and hasattr(_actual_agent, "memory_manager"):
         _mm = _actual_agent.memory_manager
         if hasattr(_mm, "store") and _session_manager is not None:
             _session_manager.set_turn_loader(
-                lambda safe_id: _mm.store.get_recent_turns(safe_id, limit=50)
+                lambda safe_id: _mm.store.get_recent_turns(safe_id, limit=200)
             )
+
+            def _write_turn(safe_id, turn_index, role, content, metadata):
+                # v1.27.15 (P1-6): forward metadata so SqliteTurnStore.save_turn
+                # can persist ``marker_type``, ``policy``, etc. — required for
+                # the lifecycle extractor to skip ``preempted`` / ``aborted_partial``
+                # markers when building long-term memory.
+                #
+                # Filter the metadata to what's actually useful for downstream
+                # consumers: timestamp goes via its own arg; the rest is JSON.
+                try:
+                    _meta = None
+                    if isinstance(metadata, dict):
+                        _meta = {
+                            k: v
+                            for k, v in metadata.items()
+                            if k != "timestamp"
+                            and v is not None
+                            and isinstance(k, str)
+                        }
+                        if not _meta:
+                            _meta = None
+                    _mm.store.save_turn(
+                        session_id=safe_id,
+                        turn_index=turn_index,
+                        role=role,
+                        content=content if isinstance(content, str) else str(content),
+                        timestamp=(metadata or {}).get("timestamp"),
+                        metadata=_meta,
+                    )
+                except Exception as exc:
+                    logger.debug(f"[main] turn writer failed: {exc}")
+
+            try:
+                _session_manager.set_turn_writer(_write_turn)
+            except Exception as exc:
+                logger.warning(f"[main] set_turn_writer failed: {exc}")
             backfilled = _session_manager.backfill_sessions_from_store()
             if backfilled:
                 logger.info(f"Session backfill: recovered {backfilled} turns from SQLite")
+
+
+def _web_password_already_set() -> bool:
+    """PR-L1: 检查 data/web_access.json 是否已经存了哈希密码。
+
+    用于 lan_mode 开启时的安全闸：只要本机已配置过密码，就允许 0.0.0.0；
+    否则拒绝启动，避免无密码裸奔。
+    """
+    try:
+        ws = settings.user_workspace_path
+        web_access = Path(ws) / "data" / "web_access.json"
+        if not web_access.exists():
+            return False
+        import json as _json
+
+        data = _json.loads(web_access.read_text(encoding="utf-8"))
+        return bool(data.get("password_hash") or data.get("hash"))
+    except Exception:
+        return False
 
 
 async def init_core_services(agent_or_master):
@@ -688,9 +385,9 @@ async def start_im_channels(agent_or_master):
                 _session_manager._plugin_hooks = agent_or_master._plugin_manager.hook_registry
         return
 
-    # 自动安装缺失的 IM 通道依赖
+    channel_deps_result: dict = {}
     try:
-        _ensure_channel_deps()
+        channel_deps_result = _ensure_channel_deps()
     except Exception as e:
         logger.error(
             f"IM channel dependency check failed ({type(e).__name__}: {e}), "
@@ -716,13 +413,19 @@ async def start_im_channels(agent_or_master):
     _message_gateway = MessageGateway(
         session_manager=_session_manager,
         agent_handler=None,  # 稍后设置
-        whisper_model=settings.whisper_model,  # 从配置读取 Whisper 模型
-        whisper_language=settings.whisper_language,  # 语音识别语言
         stt_client=stt_client,  # 在线 STT 客户端
     )
 
+    # 把"逐包 pip 错误"快照挂到 Gateway 上：适配器启动失败时若 reason 只是
+    # "缺少依赖: pip install xxx"，Gateway 会用这个表回退查具体原因
+    # （超时 / 版本冲突 / 网络错误），让前端 IM 行 tooltip 真正可读。
+    install_errors = channel_deps_result.get("errors") if channel_deps_result else None
+    if install_errors:
+        _message_gateway.set_channel_install_errors(install_errors)
+
     if _orchestrator is not None:
         _orchestrator.set_gateway(_message_gateway)
+        _message_gateway.set_orchestrator(_orchestrator)
 
     # 注册启用的适配器
     adapters_started = []
@@ -988,7 +691,6 @@ async def start_im_channels(agent_or_master):
                 session_id=session.id,
                 session=session,
                 gateway=_message_gateway,
-                usage_scene="im_message"
             )
             return response
         except Exception as e:
@@ -1012,7 +714,6 @@ async def start_im_channels(agent_or_master):
             session_id=session.id,
             session=session,
             gateway=_message_gateway,
-            usage_scene="im_message_stream",
         ):
             yield event
 
@@ -1021,7 +722,7 @@ async def start_im_channels(agent_or_master):
 
     if hasattr(agent, "_plugin_manager") and agent._plugin_manager:
         _message_gateway._plugin_hooks = agent._plugin_manager.hook_registry
-        agent._plugin_manager._host_refs["gateway"] = _message_gateway
+        agent._plugin_manager._external_host_refs["gateway"] = _message_gateway
         if _session_manager is not None:
             _session_manager._plugin_hooks = agent._plugin_manager.hook_registry
 
@@ -1219,7 +920,31 @@ async def run_interactive():
                 channel="cli", chat_id=_cid, user_id="cli_user", create_if_missing=True
             )
             if cs:
+                # C14 re-audit (D2): mark CLI interactive sessions via the
+                # entry classifier so the architectural SoT is consistent
+                # (``run_interactive`` is already TTY-gated upstream, so
+                # classifier returns ``is_unattended=False`` — no-op behavior
+                # but eliminates the "classifier sometimes skipped" pattern).
+                try:
+                    from .core.policy_v2 import (
+                        apply_classification_to_session as _apply_cls,
+                    )
+                    from .core.policy_v2 import (
+                        classify_entry as _classify,
+                    )
+
+                    _apply_cls(cs, _classify("cli"))
+                except Exception:
+                    pass
                 agent._cli_session = cs
+                cs.context.focus_terms = list(getattr(cs.context, "focus_terms", []) or [])
+                cs.context.task_checkpoints = list(getattr(cs.context, "task_checkpoints", []) or [])
+                cs.context.delegation_chain = list(getattr(cs.context, "delegation_chain", []) or [])
+                if getattr(cs.context, "precompact_snapshot", None):
+                    try:
+                        agent.memory_manager.save_precompact_snapshot(cs.context.precompact_snapshot)
+                    except Exception:
+                        logger.debug("[CLI] precompact snapshot hydration skipped", exc_info=True)
                 mc = len(cs.context.get_messages())
                 if mc > 0 and not _cli_force_new_session:
                     console.print(f"[green]✓[/green] 已恢复上次会话 ({mc} 条消息)")
@@ -1308,7 +1033,6 @@ async def run_interactive():
             session_messages=session_messages,
             session_id=_sid,
             session=_active_session,
-            usage_scene="cli_interactive_chat",
         )
         reply_text = await render_stream(event_stream, console, agent_name=agent_name)
 
@@ -1526,6 +1250,17 @@ async def run_interactive():
                 await _init_task
         with console.status("[bold yellow]正在停止服务...", spinner="dots"):
             await stop_im_channels(graceful=True, drain_timeout=30.0)
+            if agent is not None and hasattr(agent, "shutdown"):
+                try:
+                    await asyncio.wait_for(agent.shutdown(), timeout=10.0)
+                except (TimeoutError, Exception):
+                    pass
+            try:
+                from .llm.client import get_default_client
+
+                await asyncio.wait_for(get_default_client().close(), timeout=5.0)
+            except (TimeoutError, Exception):
+                pass
         console.print("[green]✓[/green] 服务已停止")
 
 
@@ -1619,6 +1354,41 @@ def show_skills():
 
 
 _cli_force_new_session = False
+_cli_permission_mode = "default"
+
+
+def _apply_auto_confirm_flag(*, enabled: bool) -> None:
+    """C18 Phase D — translate ``--auto-confirm`` to the Phase C ENV var.
+
+    Done as a tiny helper (not inlined) so unit tests can exercise it
+    without spinning up typer. The flag intentionally feeds the same
+    ``SYNAPSE_AUTO_CONFIRM`` override registered in
+    ``core.policy_v2.env_overrides``: ENV is the single contract surface
+    every subprocess / engine reload re-reads.
+
+    Importantly, **destructive (mutating_global) tools and safety_immune
+    paths still require confirm** — that gate is in classifier, not in
+    the ConfirmationMode value. So even with ``--auto-confirm``:
+
+    - ``write_file path=/etc/...`` (safety_immune) → CONFIRM
+    - ``rm -rf /`` (destructive) → CONFIRM
+    - ``read_file`` / non-destructive ``run_shell`` → ALLOW
+
+    This is documented in ``--auto-confirm`` help text + audit row.
+    """
+    if not enabled:
+        return
+    import os as _os
+
+    _os.environ["SYNAPSE_AUTO_CONFIRM"] = "1"
+    # Loud signal so operators don't forget they enabled auto-confirm.
+    # Won't trigger AGAIN at every subsequent engine reload (the
+    # underlying ENV var being set is enough; the audit row gets
+    # written by global_engine._audit_env_overrides on first load).
+    console.print(
+        "[yellow]auto-confirm enabled — non-destructive tools will skip confirm. "
+        "destructive (mutating_global) and safety_immune paths still require confirm.[/yellow]"
+    )
 
 
 @app.callback(invoke_without_command=True)
@@ -1626,14 +1396,39 @@ def main(
     ctx: typer.Context,
     version: bool = typer.Option(False, "--version", "-v", help="显示版本信息"),
     new_session: bool = typer.Option(False, "--new", help="强制开启新 CLI 会话，不恢复上次对话"),
+    auto_confirm: bool = typer.Option(
+        False,
+        "--auto-confirm",
+        help=(
+            "Skip confirm for non-destructive tools (C18 Phase D). "
+            "Equivalent to SYNAPSE_AUTO_CONFIRM=1. Destructive "
+            "(mutating_global) and safety_immune paths still require confirm."
+        ),
+    ),
+    permission_mode: str = typer.Option(
+        "default",
+        "--permission-mode",
+        help=(
+            "权限模式兼容参数。Policy V2 以 POLICIES.yaml confirmation.mode "
+            "为准；自动化场景请优先使用 --auto-confirm。"
+        ),
+    ),
 ):
     """
     Synapse - 全能自进化AI助手
 
     直接运行进入交互模式
     """
-    global _cli_force_new_session
+    global _cli_force_new_session, _cli_permission_mode
     _cli_force_new_session = new_session
+    _cli_permission_mode = permission_mode
+
+    # C18 Phase D: translate the CLI flag into the Phase C ENV var.
+    # MUST happen before any policy_v2 import in a sub-command, hence we
+    # do it in the top-level callback (typer invokes the callback before
+    # the sub-command). The classify_entry / engine init below all
+    # re-read os.environ, so the flag propagates.
+    _apply_auto_confirm_flag(enabled=auto_confirm)
 
     if version:
         from . import __version__
@@ -1653,6 +1448,29 @@ def main(
                 "请设置 ANTHROPIC_API_KEY，或运行 'synapse init' 配置 data/llm_endpoints.json"
             )
             raise typer.Exit(1)
+
+        # C14 / R4-8: 交互模式需要 TTY 来驱动 prompt_toolkit + Rich 的
+        # security_confirm 提示。stdin 为管道时（``cat ... | synapse`` /
+        # CI 环境 / launchd plist 等），prompt_toolkit 会立刻在第一次输入
+        # 处永久挂死，且 Rich ``Prompt.ask`` 退回原始 ``input()`` 也会同样
+        # block。给一个明确指引而不是挂死。
+        from .core.policy_v2 import classify_entry
+
+        cli_class = classify_entry("cli")
+        if cli_class.is_unattended:
+            console.print("[yellow]检测到 stdin 非 TTY（管道输入或非交互环境）[/yellow]")
+            console.print(
+                "交互式 CLI 需要终端。请改用以下任一非交互入口：\n"
+                "  • [bold]synapse run \"<task>\"[/bold] - 单次任务执行（unattended）\n"
+                "  • [bold]synapse serve[/bold] - 启动 API 服务并通过 /api/chat 调用"
+            )
+            raise typer.Exit(1)
+
+        if _cli_permission_mode != "default":
+            console.print(
+                "[yellow]--permission-mode 是旧 Policy V1 兼容参数；"
+                "当前 Policy V2 请通过配置页或 POLICIES.yaml 调整 confirmation.mode。[/yellow]"
+            )
 
         # 运行交互式 CLI
         asyncio.run(run_interactive())
@@ -1694,14 +1512,43 @@ def init(
 def run(
     task: str = typer.Argument(..., help="要执行的任务"),
 ):
-    """执行单个任务"""
+    """执行单个任务（unattended：CONFIRM 类工具不会等待 TTY 响应）"""
 
     async def _run():
         agent = get_agent()
         await agent.initialize()
 
+        # C14 / R4-8: ``synapse run`` 是一次性非交互入口 — 即使 stdin
+        # 是 TTY 也不应等待 ``security_confirm`` SSE/Prompt。把
+        # PolicyContext 显式标记为 unattended，让 PolicyEngineV2 step 11
+        # 按 ``unattended_strategy`` 路由（默认 ask_owner），CONFIRM-class
+        # 工具走 PendingApproval / DeferredApprovalRequired 路径而非挂死。
+        #
+        # Re-audit (D1): classifier 是 SoT — 这里通过 ``classify_entry``
+        # 拿到完整 (is_unattended, default_strategy) 后再喂给
+        # build_policy_context，避免 strategy 经 "全局默认兜底" 路径绕行。
+        from .core.policy_v2 import (
+            build_policy_context,
+            classify_entry,
+            reset_current_context,
+            set_current_context,
+        )
+
+        _cls = classify_entry("cli", force_unattended=True)
+        cli_ctx = build_policy_context(
+            session_id=f"cli_run_{int(time.time())}",
+            channel="cli",
+            is_unattended=_cls.is_unattended,
+            unattended_strategy=_cls.default_strategy or "",
+            user_message=task,
+        )
+        ctx_token = set_current_context(cli_ctx)
+
         with console.status("[bold green]执行任务中...", spinner="dots"):
-            result = await agent.execute_task_from_message(task, usage_scene="run_task")
+            try:
+                result = await agent.execute_task_from_message(task)
+            finally:
+                reset_current_context(ctx_token)
 
         if result.success:
             console.print(
@@ -1913,6 +1760,36 @@ def _reset_globals():
     _session_manager = None
 
 
+def _install_windows_asyncio_pipe_filter() -> None:
+    """Suppress known Windows Proactor pipe-close noise without hiding real errors."""
+    if sys.platform != "win32":
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    previous_handler = loop.get_exception_handler()
+
+    def _handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        message = str(context.get("message") or "")
+        handle = repr(context.get("handle") or "")
+        if (
+            "_ProactorBasePipeTransport._call_connection_lost" in message
+            or "_ProactorBasePipeTransport._call_connection_lost" in handle
+        ):
+            exc = context.get("exception")
+            logger.debug("Ignored Windows asyncio pipe close callback noise: %r", exc)
+            return
+        if previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
+
+
 @app.command()
 def serve(
     dev: bool = typer.Option(
@@ -1933,6 +1810,37 @@ def serve(
     import time
     import warnings
     from pathlib import Path
+
+    # ── 最早期心跳：在加载 IM/Skills/Plugins/uvicorn 之前先写一次心跳 ──
+    # 让 Tauri 心跳读到 phase=starting/http_ready=false，避免 dual-venv hack
+    # 期间（cold start 90~120s）前端因为读不到任何信号而误判 backend 已死。
+    # 这一段只用 stdlib，不引入任何新依赖，保证即使后续 import 失败心跳也已落盘。
+    #
+    # 心跳路径优先用 settings.user_workspace_path（Tauri 启动时通过
+    # `--workspace <ws_dir>` 传入，或环境变量 SYNAPSE_USER_WORKSPACE）。
+    # 用 Path.cwd() 作 fallback 仅在 CLI 用户从其它目录跑 `synapse serve`
+    # 时生效；那种场景 Tauri 不读心跳，所以即使落到 cwd 也不会让前端误判。
+    try:
+        _hb_root = getattr(settings, "user_workspace_path", None) or Path.cwd()
+        _early_hb_path = Path(_hb_root) / "data" / "backend.heartbeat"
+        _early_hb_path.parent.mkdir(parents=True, exist_ok=True)
+        _early_hb_tmp = _early_hb_path.with_suffix(".heartbeat.tmp")
+        _early_hb_tmp.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "timestamp": time.time(),
+                    "phase": "starting",
+                    "http_ready": False,
+                    "im_ready": False,
+                    "ready": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _early_hb_tmp.replace(_early_hb_path)
+    except Exception:
+        pass  # 早期心跳写失败不应阻塞 serve
 
     from synapse import config as cfg
 
@@ -1957,11 +1865,18 @@ def serve(
     # ── 心跳文件机制 ──
     # 后端进程通过独立守护线程定期写入心跳文件，供 Tauri 侧判断进程真实健康状态。
     # 使用独立线程而非 asyncio task，确保即使 event loop 卡死，心跳也能持续（或停止写入
-    # 以表明进程已卡死）。心跳文件位于 {CWD}/data/backend.heartbeat。
-    _heartbeat_file = Path.cwd() / "data" / "backend.heartbeat"
+    # 以表明进程已卡死）。心跳文件位于 {user_workspace_path}/data/backend.heartbeat
+    # （与上方早期心跳路径对齐，避免 CLI 模式下 cwd 漂移导致写入与读取分裂）。
+    _heartbeat_file = (
+        Path(getattr(settings, "user_workspace_path", None) or Path.cwd())
+        / "data"
+        / "backend.heartbeat"
+    )
     _heartbeat_stop = threading.Event()
-    _heartbeat_phase = "starting"  # "starting" | "initializing" | "running" | "restarting"
+    _heartbeat_phase = "starting"  # "starting" | "initializing" | "http_ready" | "starting_im" | "running" | "restarting"
     _heartbeat_http_ready = False
+    _heartbeat_im_ready = False
+    _heartbeat_ready = False
 
     def _write_heartbeat():
         """写入一次心跳（原子写入：先写临时文件再重命名）"""
@@ -1974,6 +1889,8 @@ def serve(
                 "timestamp": time.time(),
                 "phase": _heartbeat_phase,
                 "http_ready": _heartbeat_http_ready,
+                "im_ready": _heartbeat_im_ready,
+                "ready": _heartbeat_ready,
                 "version": __version__,
                 "git_hash": __git_hash__,
             }
@@ -1992,10 +1909,12 @@ def serve(
 
     def _start_heartbeat():
         """启动心跳线程"""
-        nonlocal _heartbeat_phase, _heartbeat_http_ready
+        nonlocal _heartbeat_phase, _heartbeat_http_ready, _heartbeat_im_ready, _heartbeat_ready
         _heartbeat_stop.clear()
         _heartbeat_phase = "starting"
         _heartbeat_http_ready = False
+        _heartbeat_im_ready = False
+        _heartbeat_ready = False
         _write_heartbeat()  # 立即写一次
         t = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat")
         t.start()
@@ -2017,15 +1936,26 @@ def serve(
 
     async def _serve():
         nonlocal shutdown_event, agent_or_master, shutdown_triggered
-        nonlocal _heartbeat_phase, _heartbeat_http_ready
+        nonlocal _heartbeat_phase, _heartbeat_http_ready, _heartbeat_im_ready, _heartbeat_ready
+        _install_windows_asyncio_pipe_filter()
         shutdown_event = asyncio.Event()
         shutdown_triggered = False
         _heartbeat_phase = "initializing"
+        _heartbeat_http_ready = False
+        _heartbeat_im_ready = False
+        _heartbeat_ready = False
+        _write_heartbeat()
 
         from synapse import get_version_string
 
         _version_str = get_version_string()
         logger.info(f"Synapse {_version_str} starting...")
+        try:
+            from .runtime_env import log_runtime_environment_report
+
+            log_runtime_environment_report()
+        except Exception:
+            logger.debug("Failed to log runtime environment report", exc_info=True)
 
         console.print(
             Panel(
@@ -2051,24 +1981,41 @@ def serve(
         await init_core_services(agent_or_master)
         console.print("[green]✓[/green] 核心服务已就绪")
 
-        # 启动 IM 通道（可选）
-        console.print("[bold green]正在启动 IM 通道...[/bold green]")
-        im_channels = await start_im_channels(agent_or_master)
-
-        if im_channels:
-            console.print(f"[green]✓[/green] IM 通道已启动: {', '.join(im_channels)}")
-        else:
-            console.print("[yellow]ℹ[/yellow] 未启用 IM 通道（HTTP API 仍可使用）")
-
-        # 注入 shutdown_event 到网关（供终极重启指令使用）
-        if _message_gateway is not None:
-            _message_gateway.set_shutdown_event(shutdown_event)
-
-        # 启动 HTTP API 服务器（供 Setup Center Chat 页面使用）
+        # 先启动 HTTP API（供 Setup Center/桌面端使用）。
+        # IM 通道依赖安装可能很慢，不能阻塞 /api/health 就绪。
         api_task = None
         _api_fatal = False
         try:
-            from synapse.api.server import start_api_server
+            import sys as _sys
+
+            from synapse.api.host_resolution import resolve_api_host
+            from synapse.api.server import API_PORT, start_api_server
+
+            # v1.28: 监听地址完全由 resolve_api_host 决定。优先级链：
+            #   1) 环境变量 API_HOST 显式覆盖
+            #   2) settings.api_lan_mode=True 或 headless 检测 → 0.0.0.0
+            #   3) 否则 → 127.0.0.1
+            # 旧的"api_lan_mode=True 无密码就 raise"安全闸已删除：
+            # 同等保护改由 middleware_setup_gate 在请求层强制 setup，
+            # 这样新装的 headless Linux 用户能直接打开网页完成设置。
+            _api_host = resolve_api_host(
+                env=os.environ,
+                api_lan_mode=bool(getattr(settings, "api_lan_mode", False)),
+                platform=_sys.platform,
+            )
+            _api_port = API_PORT
+            if _api_host in ("0.0.0.0", "::"):
+                if not _web_password_already_set() and not (
+                    os.environ.get("SYNAPSE_WEB_PASSWORD") or ""
+                ).strip():
+                    console.print(
+                        "[yellow]⚠ HTTP API 将绑定到 "
+                        f"{_api_host}（外部可访问），但当前未设置访问密码。[/yellow]"
+                    )
+                    console.print(
+                        "[yellow]  首次从局域网/外网打开 Web UI 时会强制要求设置密码 "
+                        "(setup 流程)。[/yellow]"
+                    )
 
             api_task = await start_api_server(
                 agent=agent_or_master,
@@ -2077,10 +2024,21 @@ def serve(
                 gateway=_message_gateway,
                 orchestrator=_orchestrator,
                 agent_pool=_desktop_pool,
+                host=_api_host,
+                port=_api_port,
             )
-            console.print("[green]✓[/green] HTTP API 已启动: http://127.0.0.1:18900")
-            _heartbeat_phase = "running"
+            _display_host = "127.0.0.1" if _api_host in ("0.0.0.0", "::") else _api_host
+            console.print(
+                f"[green]✓[/green] HTTP API 已启动: http://{_display_host}:{_api_port}"
+                + ("  [dim](lan_mode: 0.0.0.0)[/dim]" if _api_host == "0.0.0.0" else "")
+            )
+            # HTTP API 已可访问，但 IM 通道、晚绑定 gateway、部分后台服务可能仍在启动。
+            # 不要在这里把 phase 标成 running，否则前端会把"HTTP ready"误解为
+            # "整个后端已完成启动"，这正是状态面板反复出现假运行/未知 IM 的根因。
+            _heartbeat_phase = "http_ready"
             _heartbeat_http_ready = True
+            _heartbeat_im_ready = False
+            _heartbeat_ready = False
             _write_heartbeat()  # 立即刷新心跳，标记 HTTP 就绪
         except ImportError:
             console.print("[yellow]⚠[/yellow] HTTP API 未启动（缺少 fastapi/uvicorn 依赖）")
@@ -2096,6 +2054,54 @@ def serve(
                 "[red]HTTP API 启动失败，进程即将退出。请检查端口 18900 是否被占用。[/red]"
             )
             shutdown_event.set()
+
+        if not _api_fatal:
+            # 启动 IM 通道（可选）。放在 HTTP API 之后，避免首次安装通道依赖时
+            # 桌面端长时间无法访问本地健康检查。
+            _heartbeat_phase = "starting_im"
+            _heartbeat_http_ready = True
+            _heartbeat_im_ready = False
+            _heartbeat_ready = False
+            _write_heartbeat()
+            console.print("[bold green]正在启动 IM 通道...[/bold green]")
+            im_channels = await start_im_channels(agent_or_master)
+
+            if im_channels:
+                console.print(f"[green]✓[/green] IM 通道已启动: {', '.join(im_channels)}")
+            else:
+                console.print("[yellow]ℹ[/yellow] 未启用 IM 通道（HTTP API 仍可使用）")
+
+            # 注入 shutdown_event 到网关（供终极重启指令使用），并把晚启动的网关
+            # 回填给已经运行的 FastAPI app state。
+            if _message_gateway is not None:
+                _message_gateway.set_shutdown_event(shutdown_event)
+            if api_task is not None:
+                try:
+                    from synapse.api.server import update_runtime_refs
+
+                    update_runtime_refs(
+                        api_task,
+                        gateway=_message_gateway,
+                        startup_phase="running",
+                        readiness={
+                            "phase": "running",
+                            "http_ready": True,
+                            "im_ready": True,
+                            "ready": True,
+                            "started_im_channels": im_channels,
+                            "gateway_bound": _message_gateway is not None,
+                        },
+                    )
+                except Exception:
+                    logger.debug("Failed to update API runtime readiness", exc_info=True)
+
+            # 到这里才是真正的 serve 启动完成：HTTP API 可访问，IM 启动路径也已收敛
+            # （即便没有启用 IM 或某些 adapter 失败，后台服务也已完成启动流程）。
+            _heartbeat_phase = "running"
+            _heartbeat_http_ready = True
+            _heartbeat_im_ready = True
+            _heartbeat_ready = True
+            _write_heartbeat()
 
         console.print()
         if dev:
@@ -2168,7 +2174,32 @@ def serve(
                         stop_im_channels(graceful=True, drain_timeout=30.0),
                         timeout=35.0,
                     )
-                except (asyncio.TimeoutError, TimeoutError):
+                    # Agent 异步关闭（flush memory, close event bus）
+                    # Must run BEFORE LLM client close: pending memory tasks
+                    # (episode generation) may need LLM calls.
+                    if agent_or_master is not None and hasattr(
+                        agent_or_master, "shutdown"
+                    ):
+                        try:
+                            await asyncio.wait_for(
+                                agent_or_master.shutdown(), timeout=10.0
+                            )
+                        except (TimeoutError, Exception):
+                            pass
+                    # 关闭 LLM client httpx 连接池，释放 TCP 连接。
+                    # Skip on restart: the singleton persists across iterations
+                    # and _reset_globals() does not recreate it — closing here
+                    # would leave the next iteration with a dead client.
+                    if not is_restart:
+                        try:
+                            from .llm.client import get_default_client
+
+                            await asyncio.wait_for(
+                                get_default_client().close(), timeout=5.0
+                            )
+                        except (TimeoutError, Exception):
+                            pass
+                except TimeoutError:
                     logger.warning("Shutdown timeout, forcing exit")
                 except Exception as e:
                     # 忽略停止过程中的异常（常见于 Windows asyncio）
@@ -2229,11 +2260,19 @@ def serve(
 
             # 等待端口释放（旧 uvicorn 关闭后 TCP socket 可能处于 TIME_WAIT）
             try:
-                from synapse.api.server import API_HOST, API_PORT, wait_for_port_free
+                import sys as _sys
 
+                from synapse.api.host_resolution import resolve_api_host
+                from synapse.api.server import API_PORT, wait_for_port_free
+
+                _api_host = resolve_api_host(
+                    env=os.environ,
+                    api_lan_mode=bool(getattr(settings, "api_lan_mode", False)),
+                    platform=_sys.platform,
+                )
                 _api_port = int(os.environ.get("API_PORT", API_PORT))
                 console.print(f"[dim]等待端口 {_api_port} 释放...[/dim]")
-                if not wait_for_port_free(API_HOST, _api_port, timeout=15.0):
+                if not wait_for_port_free(_api_host, _api_port, timeout=15.0):
                     console.print(f"[yellow]⚠[/yellow] 端口 {_api_port} 仍被占用，继续尝试启动...")
                 else:
                     console.print(f"[dim]端口 {_api_port} 已就绪[/dim]")
@@ -2432,6 +2471,92 @@ def plugin_validate(
         console.print("\n[bold green]✓ 校验通过，一切正常！[/bold green]")
 
 
+@app.command(name="plugin-scaffold")
+def plugin_scaffold(
+    name: str = typer.Argument(..., help="Plugin ID (e.g. my-tool)"),
+    out: str = typer.Option(".", "--out", "-o", help="Parent directory for the new plugin"),
+    ui: bool = typer.Option(False, "--ui", help="Include frontend UI scaffolding (Plugin 2.0)"),
+):
+    """Generate a new plugin project skeleton."""
+    import json as _json
+
+    plugin_dir = Path(out).resolve() / name
+    if plugin_dir.exists():
+        console.print(f"[bold red]✗[/bold red] Directory already exists: {plugin_dir}")
+        raise typer.Exit(1)
+
+    plugin_dir.mkdir(parents=True)
+
+    manifest: dict = {
+        "id": name,
+        "name": name.replace("-", " ").title(),
+        "version": "0.1.0",
+        "type": "python",
+        "entry": "plugin.py",
+        "description": f"Synapse plugin: {name}",
+        "permissions": ["tools.register", "routes.register"],
+        "provides": {"tools": []},
+    }
+
+    if ui:
+        manifest["ui"] = {
+            "entry": "ui/dist/index.html",
+            "icon": "",
+            "title": manifest["name"],
+            "sidebar_group": "apps",
+            "permissions": ["theme", "notification", "download"],
+        }
+        manifest["requires"] = {"plugin_ui_api": "~1"}
+
+    (plugin_dir / "plugin.json").write_text(
+        _json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+    plugin_py = '''"""Plugin entry point."""
+from synapse.plugins.api import PluginAPI, PluginBase
+
+
+class Plugin(PluginBase):
+    def on_load(self, api: PluginAPI) -> None:
+        api.log("Plugin loaded")
+
+    def on_unload(self) -> None:
+        pass
+'''
+    (plugin_dir / "plugin.py").write_text(plugin_py, encoding="utf-8")
+
+    if ui:
+        ui_dist = plugin_dir / "ui" / "dist"
+        ui_dist.mkdir(parents=True)
+        index_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>{manifest['name']}</title>
+  <script type="module">
+    // Replace with: import {{ PluginBridge }} from "@synapse/plugin-ui-sdk";
+    const bridge = {{ init: () => window.parent.postMessage({{ __akita_bridge: true, version: 1, type: "bridge:ready" }}, "*") }};
+    bridge.init();
+  </script>
+</head>
+<body>
+  <h1>{manifest['name']}</h1>
+  <p>Plugin UI scaffold — replace this with your frontend app.</p>
+</body>
+</html>
+"""
+        (ui_dist / "index.html").write_text(index_html, encoding="utf-8")
+
+        ui_src = plugin_dir / "ui-src"
+        ui_src.mkdir()
+        (ui_src / ".gitkeep").write_text("", encoding="utf-8")
+
+    console.print(f"[bold green]✓[/bold green] Plugin scaffolded at: {plugin_dir}")
+    if ui:
+        console.print("  Includes frontend UI template (ui/dist/index.html)")
+    console.print(f"  Next: copy to data/plugins/{name}/ and restart Synapse")
+
+
 @app.command(name="run-mcp-module", hidden=True)
 def run_mcp_module(
     module_path: str = typer.Argument(..., help="Python module path for MCP server"),
@@ -2465,5 +2590,74 @@ def run_mcp_module(
     mcp_instance.run()
 
 
+@app.command(name="reset-password")
+def reset_password(
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="跳过交互确认（脚本/CI 场景）"
+    ),
+):
+    """清除 Web 访问密码，下次访问会进入 setup 流程。
+
+    用途：用户忘记密码、密码档损坏、误操作后想重置。会清空
+    ``data/web_access.json`` 中的 password_hash / password_salt /
+    password_plain_hint，但保留 jwt_secret / data_epoch / token_version
+    避免外部工具持有的 token 立即变成"未知签名"造成的混淆。
+
+    如果检测到 backend 还在运行（基于 60 秒内的心跳），会提示用户重启
+    backend，因为 ``WebAccessConfig`` 是进程级单例，加载时间在 import
+    之后，仅文件改动不会让运行中的进程立即生效。
+    """
+    import json as _json
+    import time as _time
+
+    from synapse.api.auth import WebAccessConfig
+
+    ws = settings.user_workspace_path
+    data_dir = Path(ws) / "data"
+    web_file = data_dir / "web_access.json"
+
+    if not web_file.exists():
+        console.print("[yellow]未找到 web_access.json，无需清除。[/yellow]")
+        raise typer.Exit(0)
+
+    if not yes:
+        confirmed = typer.confirm(
+            f"将清除 {web_file} 中的密码哈希，下次访问 Web UI 需重新设置。继续？",
+            default=False,
+        )
+        if not confirmed:
+            console.print("[dim]已取消。[/dim]")
+            raise typer.Exit(0)
+
+    # 复用 WebAccessConfig.clear_password() 走原子写 + fsync 持久化路径，
+    # 避免出现"清密码时因断电留下半截 JSON 让 backend 启动崩"的尴尬。同时
+    # bump token_version 让旧 token 在 backend 重启前就失效。
+    cfg = WebAccessConfig(data_dir)
+    cfg.clear_password()
+
+    console.print(f"[green]✓[/green] 已清除密码：{web_file}")
+
+    # 心跳还活着 → backend 进程在运行，需要重启才能让 setup gate 重新感知"无密码"状态。
+    heartbeat = data_dir / "heartbeat.json"
+    backend_running = False
+    if heartbeat.exists():
+        try:
+            payload = _json.loads(heartbeat.read_text(encoding="utf-8"))
+            ts = payload.get("ts") or payload.get("timestamp")
+            if isinstance(ts, (int, float)) and _time.time() - ts < 60:
+                backend_running = True
+        except Exception:
+            backend_running = False
+
+    if backend_running:
+        console.print(
+            "[yellow]⚠ 检测到 synapse backend 仍在运行。请手动重启 backend "
+            "（关闭 Setup Center / kill 进程后重新启动），新的 setup 流程才会生效。[/yellow]"
+        )
+    else:
+        console.print("[dim]下次启动 synapse 时会进入 setup 流程。[/dim]")
+
+
 if __name__ == "__main__":
     app()
+

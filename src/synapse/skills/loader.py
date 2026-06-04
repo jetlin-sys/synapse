@@ -6,17 +6,41 @@
 """
 
 import logging
+import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
+from ..core.log_health import record_health_event
+from .categories import (
+    RESERVED_NAMESPACE_DIRS,
+    CategoryRegistry,
+)
+from .category_store import CategoryStore
 from .parser import ParsedSkill, SkillMetadata, SkillParser
 from .registry import SkillRegistry
 
 _CURRENT_PLATFORM = sys.platform  # "win32", "darwin", "linux"
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SkillLoadIssue:
+    """A non-fatal skill loading problem from the most recent scan."""
+
+    skill_id: str
+    path: str
+    error: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "skill_id": self.skill_id,
+            "path": self.path,
+            "error": self.error,
+        }
 
 
 def _resolve_user_workspace_skills() -> Path:
@@ -184,10 +208,36 @@ class SkillLoader:
         self,
         registry: SkillRegistry | None = None,
         parser: SkillParser | None = None,
+        category_registry: "CategoryRegistry | None" = None,
     ):
         self.registry = registry if registry is not None else SkillRegistry()
         self.parser = parser or SkillParser()
+        if category_registry is not None:
+            self.category_registry = category_registry
+        else:
+            _default_reg = CategoryRegistry()
+            _default_reg.set_store(CategoryStore())
+            self.category_registry = _default_reg
         self._loaded_skills: dict[str, ParsedSkill] = {}
+        self._last_load_issues: list[SkillLoadIssue] = []
+
+    @property
+    def last_load_issues(self) -> list[dict[str, str]]:
+        """Non-fatal skill load issues from the most recent full scan."""
+        return [issue.to_dict() for issue in self._last_load_issues]
+
+    def _remember_load_issue(self, skill_dir: Path, error: str) -> None:
+        """Record why a skill was skipped without failing the whole refresh."""
+        issue = SkillLoadIssue(
+            skill_id=skill_dir.name,
+            path=str(skill_dir),
+            error=error.strip()[:500],
+        )
+        for index, existing in enumerate(self._last_load_issues):
+            if existing.path == issue.path:
+                self._last_load_issues[index] = issue
+                return
+        self._last_load_issues.append(issue)
 
     def discover_skill_directories(self, base_path: Path | None = None) -> list[Path]:
         """
@@ -233,11 +283,36 @@ class SkillLoader:
         Returns:
             加载的技能数量
         """
+        self._last_load_issues = []
+        try:
+            self.category_registry.clear()
+        except Exception:
+            pass
+
+        # 从 JSON store 加载用户自定义分类定义
+        try:
+            self.category_registry.load_from_store()
+        except Exception:
+            pass
+
         directories = self.discover_skill_directories(base_path)
         loaded = 0
 
         for skill_dir in directories:
-            loaded += self.load_from_directory(skill_dir)
+            # __builtin__ / skills/system/ 等只读源以及被识别为 system 的根
+            # 视为只读分类容器；用户工作区与项目 skills/ 视为可写
+            try:
+                builtin_root = _builtin_skills_root()
+            except Exception:
+                builtin_root = None
+            is_readonly_root = (
+                builtin_root is not None
+                and skill_dir.resolve() == builtin_root.resolve()
+            )
+            loaded += self.load_from_directory(
+                skill_dir,
+                _readonly=is_readonly_root,
+            )
 
         loaded += self._load_cli_anything_skills()
 
@@ -277,7 +352,7 @@ class SkillLoader:
                         full_path = rel_path.locate()
                         if isinstance(full_path, Path) and full_path.exists():
                             skill_dir = full_path.parent
-                            skill = self.load_skill(skill_dir)
+                            skill = self.load_skill(skill_dir, force=True)
                             if skill:
                                 loaded += 1
                                 logger.info(
@@ -290,15 +365,29 @@ class SkillLoader:
             logger.info(f"Loaded {loaded} cli-anything skills from pip packages")
         return loaded
 
-    def load_from_directory(self, directory: Path) -> int:
-        """
-        从目录加载所有技能
+    def load_from_directory(
+        self,
+        directory: Path,
+        *,
+        force: bool = True,
+        _readonly: bool = False,
+    ) -> int:
+        """从目录递归加载所有技能。
 
-        每个子目录如果包含 SKILL.md 则被视为一个技能。
-        特殊处理: 'system' 子目录会被递归扫描，用于存放系统工具 skill。
+        分类不再由目录层级推断，而是通过 JSON bindings 绑定。
+        目录扫描仍递归进入所有子目录以发现 SKILL.md。
+
+        递归规则：
+        - 子目录含 SKILL.md -> 视为一个技能，调用 ``load_skill``
+        - 子目录名属于 ``RESERVED_NAMESPACE_DIRS`` -> 命名空间容器，
+          递归（system 目录标记只读）
+        - 隐藏目录 / 内部目录（.git、__pycache__）-> 跳过
+        - 其他子目录 -> 递归扫描
 
         Args:
             directory: 技能目录
+            force: 是否允许覆盖已注册的同名 skill
+            _readonly: 内部参数。当前根是否为只读
 
         Returns:
             加载的技能数量
@@ -315,15 +404,41 @@ class SkillLoader:
 
             skill_md = item / "SKILL.md"
             if skill_md.exists():
-                # 有 SKILL.md，作为技能加载
                 try:
-                    skill = self.load_skill(item)
+                    skill = self.load_skill(item, force=force)
                     if skill:
                         loaded += 1
+                        cat = skill.metadata.category
+                        if cat:
+                            try:
+                                self.category_registry.add_skill(cat, item.name)
+                            except Exception:
+                                pass
                 except Exception as e:
-                    logger.error(f"Failed to load skill from {item}: {e}")
-            elif item.name in ("system", "external", "custom", "community", "builtin"):
-                loaded += self.load_from_directory(item)
+                    self._remember_load_issue(item, str(e))
+                    if record_health_event(
+                        "skill",
+                        f"{item.name}:load",
+                        str(e),
+                        severity="error",
+                        suggestion="请检查技能目录是否包含合法 SKILL.md，以及 frontmatter/脚本路径是否正确。",
+                    ):
+                        logger.error(f"Failed to load skill from {item}: {e}")
+            elif item.name in RESERVED_NAMESPACE_DIRS:
+                child_readonly = _readonly or item.name == "system"
+                loaded += self.load_from_directory(
+                    item,
+                    force=force,
+                    _readonly=child_readonly,
+                )
+            elif item.name.startswith(".") or item.name.startswith("_"):
+                continue
+            else:
+                loaded += self.load_from_directory(
+                    item,
+                    force=force,
+                    _readonly=_readonly,
+                )
 
         logger.info(f"Loaded {loaded} skills from {directory}")
         return loaded
@@ -343,12 +458,18 @@ class SkillLoader:
         skill_dir: Path,
         *,
         plugin_source: str | None = None,
+        force: bool = False,
     ) -> ParsedSkill | None:
-        """
-        加载单个技能
+        """加载单个技能。
+
+        分类优先级：
+        1. JSON bindings（CategoryStore）中的绑定 — 最高优先
+        2. SKILL.md frontmatter 中声明的 category — 兜底
 
         Args:
             skill_dir: 技能目录
+            plugin_source: 插件来源标识
+            force: 允许覆盖已注册的同名 skill
 
         Returns:
             ParsedSkill 或 None
@@ -356,8 +477,13 @@ class SkillLoader:
         try:
             skill = self.parser.parse_directory(skill_dir)
 
-            # 加载 sidecar 翻译文件
             self._load_i18n(skill_dir, skill.metadata)
+
+            # 从 JSON bindings 查找分类（优先于 frontmatter）
+            sid = skill_dir.name
+            bound_category = self.category_registry.resolve_category(sid)
+            if bound_category:
+                skill.metadata.category = bound_category
 
             # OS compatibility check
             if not self._is_os_compatible(skill.metadata.supported_os):
@@ -373,11 +499,35 @@ class SkillLoader:
             hard_errors = [e for e in (errors or []) if e.startswith("ERROR:")]
             warnings = [e for e in (errors or []) if not e.startswith("ERROR:")]
             for w in warnings:
-                logger.warning(f"Skill validation warning: {w}")
+                if record_health_event(
+                    "skill",
+                    f"{skill_dir.name}:validation_warning",
+                    w,
+                    suggestion="技能可以继续加载，但建议修正 metadata 字段以避免运行时行为不明确。",
+                ):
+                    logger.warning(f"Skill validation warning: {w}")
             if hard_errors:
+                self._remember_load_issue(
+                    skill_dir,
+                    "; ".join(e.removeprefix("ERROR:").strip() for e in hard_errors),
+                )
                 for e in hard_errors:
-                    logger.error(f"Skill validation error: {e}")
-                logger.error(f"Skill '{skill_dir.name}' rejected due to validation errors")
+                    if record_health_event(
+                        "skill",
+                        f"{skill_dir.name}:validation_error",
+                        e,
+                        severity="error",
+                        suggestion="技能已被拒绝加载，请修正 SKILL.md 必填字段或 schema。",
+                    ):
+                        logger.error(f"Skill validation error: {e}")
+                if record_health_event(
+                    "skill",
+                    f"{skill_dir.name}:rejected",
+                    "rejected due to validation errors",
+                    severity="error",
+                    suggestion="技能已跳过加载，避免重复报错。",
+                ):
+                    logger.error(f"Skill '{skill_dir.name}' rejected due to validation errors")
                 return None
 
             sid = skill_dir.name
@@ -386,17 +536,38 @@ class SkillLoader:
                 skill,
                 skill_id=sid,
                 plugin_source=plugin_source,
+                force=force,
             )
             if not registered:
                 logger.warning(f"Skill '{sid}' registration rejected (conflict)")
                 return None
 
             self._loaded_skills[sid] = skill
+            try:
+                from .runtime_registry import mark_skill_loaded
+
+                deps = getattr(skill.metadata, "python_dependencies", []) or []
+                mark_skill_loaded(
+                    sid,
+                    source_path=str(skill_dir),
+                    enabled=True,
+                    dependencies=deps,
+                )
+            except Exception:
+                logger.debug("Failed to update skill runtime registry for %s", sid, exc_info=True)
             logger.info(f"Loaded skill: {sid} (name={skill.metadata.name})")
             return skill
 
         except Exception as e:
-            logger.error(f"Failed to load skill from {skill_dir}: {e}")
+            self._remember_load_issue(skill_dir, str(e))
+            if record_health_event(
+                "skill",
+                f"{skill_dir.name}:load",
+                str(e),
+                severity="error",
+                suggestion="请检查技能 metadata、引用文件和脚本路径；该错误已聚合限频。",
+            ):
+                logger.error(f"Failed to load skill from {skill_dir}: {e}")
             return None
 
     def _load_i18n(self, skill_dir: Path, metadata: SkillMetadata) -> None:
@@ -448,15 +619,9 @@ class SkillLoader:
 
         - skills.json 存在且有 external_allowlist -> 直接使用（用户显式选择）
         - skills.json 不存在（external_allowlist is None）-> 用全部外部技能 - DEFAULT_DISABLED_SKILLS
-
-        另：`whalecloud-dev-tool-base-scripts` 为研发工具强制依赖，使用显式 allowlist 时始终并入。
         """
-        from synapse.utils.whaleclouddevtool import WHALECLOUD_BASE_SCRIPTS_SKILL_ID
-
         if external_allowlist is not None:
-            merged = set(external_allowlist)
-            merged.add(WHALECLOUD_BASE_SCRIPTS_SKILL_ID)
-            return merged
+            return external_allowlist
 
         if not DEFAULT_DISABLED_SKILLS:
             return None
@@ -491,8 +656,6 @@ class SkillLoader:
                 self.registry.set_disabled(name, False)
             return 0
 
-        from synapse.utils.whaleclouddevtool import WHALECLOUD_BASE_SCRIPTS_SKILL_ID
-
         keep_extra = agent_referenced_skills or set()
         removed = 0
         disabled_count = 0
@@ -502,10 +665,6 @@ class SkillLoader:
                     self.registry.set_disabled(name, False)
                     continue
             except Exception:
-                continue
-
-            if name == WHALECLOUD_BASE_SCRIPTS_SKILL_ID:
-                self.registry.set_disabled(name, False)
                 continue
 
             if name in external_allowlist:
@@ -607,6 +766,8 @@ class SkillLoader:
         script_name: str,
         args: list[str] | None = None,
         cwd: Path | None = None,
+        python_executable: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> tuple[bool, str]:
         """
         运行技能脚本
@@ -647,10 +808,11 @@ class SkillLoader:
         args = args or []
 
         if script_path.suffix == ".py":
-            # PyInstaller 兼容: 使用 runtime_env 获取正确的 Python 解释器
-            from synapse.runtime_env import get_python_executable
+            # Prefer the caller-provided managed env. Fall back to the legacy
+            # packaged/source interpreter for backwards compatibility.
+            from synapse.runtime_manager import get_python_executable
 
-            py = get_python_executable()
+            py = python_executable or get_python_executable()
             if not py:
                 return False, "Python 解释器不可用，无法执行脚本"
             cmd = [py, str(script_path)] + args
@@ -682,6 +844,19 @@ class SkillLoader:
             cmd = [str(script_path)] + args
 
         try:
+            from synapse.runtime_manager import build_user_subprocess_environment
+
+            run_env = build_user_subprocess_environment(env)
+            skill_dir_str = str(skill.skill_dir.resolve())
+            existing_pythonpath = run_env.get("PYTHONPATH", "")
+            pythonpath_parts = [p for p in existing_pythonpath.split(os.pathsep) if p]
+            if skill_dir_str not in pythonpath_parts:
+                run_env["PYTHONPATH"] = (
+                    skill_dir_str
+                    if not pythonpath_parts
+                    else skill_dir_str + os.pathsep + existing_pythonpath
+                )
+
             extra: dict = {}
             if sys.platform == "win32":
                 extra["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -693,6 +868,7 @@ class SkillLoader:
                 cwd=cwd or skill.skill_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=run_env,
                 **extra,
             )
             try:
@@ -776,7 +952,7 @@ class SkillLoader:
         if entry:
             plugin_source = entry.plugin_source
         self.unload_skill(name)
-        return self.load_skill(skill_dir, plugin_source=plugin_source)
+        return self.load_skill(skill_dir, plugin_source=plugin_source, force=True)
 
     @property
     def loaded_count(self) -> int:
@@ -876,3 +1052,4 @@ class SkillLoader:
         """获取技能的处理器名称"""
         skill = self._loaded_skills.get(name)
         return skill.metadata.handler if skill else None
+

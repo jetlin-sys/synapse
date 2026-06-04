@@ -249,7 +249,7 @@ class ProjectStore:
 
     def recalc_progress(self, task_id: str) -> int | None:
         """Recalculate progress_pct from children. Returns new value or None if task not found."""
-        from openakita.orgs.models import TaskStatus
+        from synapse.orgs.models import TaskStatus
 
         self._reload_if_changed()
         task, proj = self.get_task(task_id)

@@ -19,17 +19,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import sqlite3
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .exceptions import MemoryStorageUnavailable
 from .types import normalize_tags
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 5
 
 # Process-level singleton registry: same db_path → same MemoryStorage instance
 _instance_registry: dict[str, MemoryStorage] = {}
@@ -48,8 +51,29 @@ def get_shared_storage(db_path: str | Path) -> MemoryStorage:
         return inst
 
 
+def checkpoint_and_close_all_storages(timeout_mode: bool = True) -> None:
+    """Best-effort WAL checkpoint + close for all process-level storages."""
+    with _instance_lock:
+        storages = list(_instance_registry.values())
+    for storage in storages:
+        try:
+            storage.checkpoint_and_close(truncate=timeout_mode)
+        except Exception as e:
+            logger.warning("[MemoryStorage] Checkpoint/close failed for %s: %s", storage._db_path, e)
+
+
 def _is_db_locked(e: Exception) -> bool:
     return isinstance(e, sqlite3.OperationalError) and "locked" in str(e).lower()
+
+
+def _is_corruption_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return (
+        "malformed" in msg
+        or "corrupt" in msg
+        or "not a database" in msg
+        or "database disk image is malformed" in msg
+    )
 
 
 class MemoryStorage:
@@ -81,23 +105,115 @@ class MemoryStorage:
     # ======================================================================
 
     def _init_db(self) -> None:
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
+        # `path_in_sync_folder` is a domain concern for the memory subsystem
+        # (we surface it through MemoryStorageUnavailable so memory_repair
+        # can recognise it), so we keep the pre-check here even though
+        # safe_open_sync would also catch it.
+        if self._is_sync_folder_path() and os.environ.get("SYNAPSE_ALLOW_SYNC_FOLDER_DB") != "1":
+            raise MemoryStorageUnavailable(
+                "path_in_sync_folder",
+                details=str(self._db_path),
+            )
+
+        # Delegate the actual open + PRAGMA + quick_check matrix to the
+        # shared safe_sqlite helper. This consolidates the connection-open
+        # path with token_tracking / asset_bus / feedback_store etc., so
+        # any future safety tweak (e.g. fsync, journal mode bump, retry
+        # heuristic) only has to land in one file.
+        from synapse.storage.safe_sqlite import SQLiteUnavailable, safe_open_sync
 
         try:
+            conn = safe_open_sync(
+                self._db_path,
+                want_wal=True,
+                busy_ms=self._BUSY_TIMEOUT_MS,
+                run_quick_check=True,
+                foreign_keys=True,
+                check_same_thread=False,
+            )
+        except SQLiteUnavailable as e:
+            # Map safe_sqlite reasons to the historical MemoryStorageUnavailable
+            # reason vocabulary so callers (memory_repair UI, telemetry events,
+            # tests) keep working unchanged. "corrupted" → "schema_corrupt"
+            # is the only renaming; everything else passes through.
+            mapped_reason = "schema_corrupt" if e.reason == "corrupted" else e.reason
+            raise MemoryStorageUnavailable(
+                mapped_reason,
+                details=e.details or str(e),
+                extra=dict(e.extra),
+            ) from e
+
+        self._conn = conn
+        try:
             current_version = self._get_schema_version()
+            if current_version > _SCHEMA_VERSION:
+                raise MemoryStorageUnavailable(
+                    "schema_too_new",
+                    details=f"database schema v{current_version} is newer than supported v{_SCHEMA_VERSION}",
+                    extra={"schema_version": current_version, "supported_version": _SCHEMA_VERSION},
+                )
             if current_version < _SCHEMA_VERSION:
                 self._migrate_schema(current_version)
             else:
                 self._create_tables()
+        except MemoryStorageUnavailable:
+            self._cleanup_failed_init(conn)
+            raise
+        except sqlite3.DatabaseError as e:
+            self._cleanup_failed_init(conn)
+            if _is_corruption_error(e):
+                raise MemoryStorageUnavailable("schema_corrupt", details=str(e)) from e
+            msg = str(e).lower()
+            if "disk i/o error" in msg or "disk is full" in msg:
+                raise MemoryStorageUnavailable("disk_full", details=str(e)) from e
+            raise MemoryStorageUnavailable("unknown_db_error", details=str(e)) from e
+        except OSError as e:
+            self._cleanup_failed_init(conn)
+            if getattr(e, "errno", None) == 13:
+                raise MemoryStorageUnavailable("permission_denied", details=str(e)) from e
+            if getattr(e, "errno", None) == 28:
+                raise MemoryStorageUnavailable("disk_full", details=str(e)) from e
+            raise MemoryStorageUnavailable("filesystem_error", details=str(e)) from e
         except Exception as e:
+            self._cleanup_failed_init(conn)
             logger.error(f"[MemoryStorage] Schema init failed: {e}", exc_info=True)
             raise
 
         logger.debug(f"MemoryStorage initialized: {self._db_path} (schema v{_SCHEMA_VERSION})")
+
+    def _cleanup_failed_init(self, conn: sqlite3.Connection | None) -> None:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._conn = None
+
+    def quick_check_or_raise(self) -> None:
+        """Run ``PRAGMA quick_check`` and translate failures to MemoryStorageUnavailable.
+
+        Implementation now delegates to the shared safe_sqlite helper so the
+        memory subsystem and every other SQLite caller share one
+        quick_check implementation. The thrown exception type stays
+        ``MemoryStorageUnavailable`` so existing memory_repair / telemetry
+        consumers don't need to change.
+        """
+        if self._conn is None:
+            raise MemoryStorageUnavailable("not_open", details="database connection is not open")
+        from synapse.storage.safe_sqlite import (
+            SQLiteUnavailable,
+            quick_check_or_raise_sync,
+        )
+
+        try:
+            quick_check_or_raise_sync(self._conn, path=self._db_path)
+        except SQLiteUnavailable as e:
+            mapped_reason = "schema_corrupt" if e.reason == "corrupted" else e.reason
+            raise MemoryStorageUnavailable(
+                mapped_reason,
+                details=e.details or str(e),
+                extra=dict(e.extra),
+            ) from e
 
     def _get_schema_version(self) -> int:
         try:
@@ -107,15 +223,66 @@ class MemoryStorage:
             cur = self._conn.execute("SELECT value FROM _schema_meta WHERE key = 'version'")
             row = cur.fetchone()
             return int(row[0]) if row else 0
-        except Exception:
+        except sqlite3.DatabaseError as e:
+            if _is_corruption_error(e):
+                raise MemoryStorageUnavailable("schema_corrupt", details=str(e)) from e
+            logger.warning(f"[MemoryStorage] Could not read schema version, assuming v0: {e}")
+            return 0
+        except Exception as e:
+            logger.warning(f"[MemoryStorage] Could not read schema version, assuming v0: {e}")
             return 0
 
-    def _set_schema_version(self, version: int) -> None:
-        self._conn.execute(
+    # ----------------------------------------------------------------
+    # 通用 meta 键值（复用 _schema_meta 表，避免再开一张 _meta 表）
+    # 用于持久化"一次性 sentinel"，如 legacy_json_backfill_done 等。
+    # ----------------------------------------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        """读取 _schema_meta 里的一个键。不存在返回 None。"""
+        if self._conn is None or not key:
+            return None
+        try:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS _schema_meta (key TEXT PRIMARY KEY, value TEXT)"
+            )
+            cur = self._conn.execute("SELECT value FROM _schema_meta WHERE key = ?", (key,))
+            row = cur.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.debug(f"[MemoryStorage] get_meta({key!r}) failed: {e}")
+            return None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """写 _schema_meta 里的一个键。"""
+        if self._conn is None or not key:
+            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS _schema_meta (key TEXT PRIMARY KEY, value TEXT)"
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO _schema_meta (key, value) VALUES (?, ?)",
+                    (key, str(value)),
+                )
+                self._conn.commit()
+            except Exception as e:
+                logger.warning(f"[MemoryStorage] set_meta({key!r}) failed: {e}")
+
+    def _set_schema_version(
+        self,
+        version: int,
+        conn: sqlite3.Connection | None = None,
+        *,
+        commit: bool = True,
+    ) -> None:
+        c = conn or self._conn
+        c.execute(
             "INSERT OR REPLACE INTO _schema_meta (key, value) VALUES ('version', ?)",
             (str(version),),
         )
-        self._conn.commit()
+        if commit:
+            c.commit()
 
     def _migrate_schema(self, from_version: int) -> None:
         """Migrate from old schema to current version.
@@ -126,23 +293,82 @@ class MemoryStorage:
         """
         logger.info(f"[MemoryStorage] Migrating schema v{from_version} → v{_SCHEMA_VERSION}")
 
+        mig_conn: sqlite3.Connection | None = None
         try:
-            self._create_tables()
+            self._backup_before_migration(from_version)
+            mig_conn = sqlite3.connect(str(self._db_path), isolation_level=None)
+            mig_conn.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
+            mig_conn.execute("PRAGMA foreign_keys=ON")
+            mig_conn.execute("BEGIN IMMEDIATE")
+
+            self._create_tables(mig_conn, commit=False, include_fts=False)
 
             if from_version < 2:
-                self._migrate_v1_to_v2()
+                self._migrate_v1_to_v2(mig_conn, commit=False)
+            if from_version < 3:
+                self._migrate_v2_to_v3(mig_conn, commit=False)
+            if from_version < 4:
+                self._migrate_v3_to_v4(mig_conn, commit=False)
+            if from_version < 5:
+                self._migrate_v4_to_v5(mig_conn, commit=False)
 
-            self._set_schema_version(_SCHEMA_VERSION)
+            self._set_schema_version(_SCHEMA_VERSION, conn=mig_conn, commit=False)
+            mig_conn.execute("COMMIT")
+            self._create_fts_objects()
             logger.info("[MemoryStorage] Schema migration complete")
         except Exception:
             try:
-                self._conn.rollback()
+                if mig_conn is not None:
+                    mig_conn.execute("ROLLBACK")
             except Exception:
                 pass
             raise
+        finally:
+            if mig_conn is not None:
+                try:
+                    mig_conn.close()
+                except Exception:
+                    pass
 
-    def _migrate_v1_to_v2(self) -> None:
+    def _backup_before_migration(self, from_version: int) -> Path | None:
+        """Create a best-effort SQLite backup before schema/data migration."""
+        if from_version >= _SCHEMA_VERSION or not self._db_path.exists():
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = self._db_path.with_name(
+            f"{self._db_path.name}.bak.v{from_version}_to_v{_SCHEMA_VERSION}.{timestamp}"
+        )
+        try:
+            with sqlite3.connect(str(backup_path)) as dst:
+                self._conn.backup(dst)
+            logger.info(f"[MemoryStorage] Pre-migration backup created: {backup_path}")
+            self._prune_backups(
+                pattern=f"{self._db_path.name}.bak.v*_to_v*.*",
+                keep=3,
+            )
+            return backup_path
+        except Exception as e:
+            logger.warning(f"[MemoryStorage] SQLite backup API failed: {e}")
+            try:
+                shutil.copy2(self._db_path, backup_path)
+                logger.info(f"[MemoryStorage] Pre-migration file backup created: {backup_path}")
+                self._prune_backups(
+                    pattern=f"{self._db_path.name}.bak.v*_to_v*.*",
+                    keep=3,
+                )
+                return backup_path
+            except Exception as copy_error:
+                logger.warning(f"[MemoryStorage] Pre-migration backup skipped: {copy_error}")
+                return None
+
+    def _migrate_v1_to_v2(
+        self,
+        conn: sqlite3.Connection | None = None,
+        *,
+        commit: bool = True,
+    ) -> None:
         """Add v2 columns to existing memories table."""
+        c = conn or self._conn
         new_columns = [
             ("subject", "TEXT DEFAULT ''"),
             ("predicate", "TEXT DEFAULT ''"),
@@ -154,12 +380,261 @@ class MemoryStorage:
         ]
         for col_name, col_def in new_columns:
             try:
-                self._conn.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
+                c.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
             except sqlite3.OperationalError:
                 pass  # column already exists
-        self._conn.commit()
+        if commit:
+            c.commit()
 
-    def _create_tables(self) -> None:
+    def _migrate_v2_to_v3(
+        self,
+        conn: sqlite3.Connection | None = None,
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Add owner columns without making legacy desktop memories disappear."""
+        c = conn or self._conn
+        for col, default in [("user_id", "'default'"), ("workspace_id", "'default'")]:
+            try:
+                c.execute(f"ALTER TABLE memories ADD COLUMN {col} TEXT DEFAULT {default}")
+            except sqlite3.OperationalError:
+                pass
+
+        # Owner-only updates do not change FTS-indexed content. Older databases may have an
+        # empty external-content FTS table; firing the generic UPDATE trigger during this
+        # migration can make SQLite report a malformed FTS image.
+        c.execute("DROP TRIGGER IF EXISTS memories_fts_au")
+        # 旧版本把用户事实、测试数据和系统经验都写到 global/空 owner。
+        # 不直接激活到当前用户，避免格式不规范或互相冲突的旧记忆污染检索；
+        # 前端会提示用户通过安全导入流程整理这些 legacy_quarantine 记录。
+        c.execute(
+            """
+            UPDATE memories
+            SET scope = 'legacy_quarantine',
+                scope_owner = '',
+                user_id = 'legacy',
+                workspace_id = COALESCE(NULLIF(workspace_id, ''), 'default')
+            WHERE (scope IS NULL OR scope = 'global')
+              AND (scope_owner IS NULL OR scope_owner = '')
+              AND (user_id IS NULL OR user_id = '' OR user_id = 'default')
+            """
+        )
+        try:
+            c.execute("""CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, content, subject, predicate, tags)
+                VALUES ('delete', old.rowid, old.content, old.subject, old.predicate, old.tags);
+                INSERT INTO memories_fts(rowid, content, subject, predicate, tags)
+                VALUES (new.rowid, new.content, new.subject, new.predicate, new.tags);
+            END""")
+        except sqlite3.OperationalError:
+            pass
+        if commit:
+            c.commit()
+
+    def _migrate_v3_to_v4(
+        self,
+        conn: sqlite3.Connection | None = None,
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Phase 0: 把 legacy_quarantine 里的 lifecycle 后台合成产物迁出到
+        pending_consolidation，让真历史旧数据和后台合成数据物理分桶。
+
+        分流规则（保守优先）：
+        - source IN ('daily_consolidation', 'experience_synthesis')
+          → pending_consolidation（lifecycle 自己写的）
+        - 其余 → 留在 legacy_quarantine（视为真历史 v1/v2 数据）
+
+        所有被迁移的记录写入 _memory_scope_audit 表，便于排查和回滚。
+        """
+        c = conn or self._conn
+
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _memory_scope_audit (
+                memory_id TEXT NOT NULL,
+                old_scope TEXT NOT NULL,
+                new_scope TEXT NOT NULL,
+                old_user_id TEXT DEFAULT '',
+                new_user_id TEXT DEFAULT '',
+                reason TEXT NOT NULL,
+                migrated_at TEXT NOT NULL,
+                migration_version TEXT NOT NULL DEFAULT 'v3_to_v4'
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scope_audit_memory ON _memory_scope_audit(memory_id)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scope_audit_version ON _memory_scope_audit(migration_version)"
+        )
+
+        # session 租户索引表（lifecycle 反查租户用），即使本次 migration
+        # 不写入数据，也要保证表结构存在，避免 LifecycleManager / MemoryManager
+        # 启动期就抛 no such table。
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_tenants (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT 'default',
+                workspace_id TEXT NOT NULL DEFAULT 'default',
+                last_updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # 关闭 FTS update 触发器，避免 owner-only 字段更新触发 FTS 重建
+        c.execute("DROP TRIGGER IF EXISTS memories_fts_au")
+        now = datetime.now().isoformat()
+
+        # 先记审计：哪些行将被改 scope
+        c.execute(
+            """
+            INSERT INTO _memory_scope_audit
+                (memory_id, old_scope, new_scope, old_user_id, new_user_id, reason, migrated_at, migration_version)
+            SELECT
+                id, scope, 'pending_consolidation',
+                user_id, user_id,
+                'v3_to_v4_source_lifecycle', ?, 'v3_to_v4'
+            FROM memories
+            WHERE scope = 'legacy_quarantine'
+              AND source IN ('daily_consolidation', 'experience_synthesis')
+            """,
+            (now,),
+        )
+
+        cur_update = c.execute(
+            """
+            UPDATE memories
+            SET scope = 'pending_consolidation',
+                updated_at = ?
+            WHERE scope = 'legacy_quarantine'
+              AND source IN ('daily_consolidation', 'experience_synthesis')
+            """,
+            (now,),
+        )
+        moved = cur_update.rowcount if cur_update.rowcount is not None else 0
+        if moved:
+            logger.info(
+                "[MemoryStorage] v3→v4 split: moved %d rows from legacy_quarantine to "
+                "pending_consolidation (audit recorded)",
+                moved,
+            )
+
+        # v4 backfill：从 conversation_turns 里出现过的所有 session_id 反推登记
+        # session_tenants，避免 v4 升级后旧 unextracted turn 被 lifecycle 误落
+        # 到 pending_consolidation（再被 SHORT_TERM 自清规则 3 天后删掉）。
+        #
+        # 推断策略：
+        # - session_id 形如 ``ns__chat_id__user_id[__thread]``（IM 通道的
+        #   conversation_safe_id 标准形式）→ 取第 3 段当 user_id，workspace 仍
+        #   默认 default（workspace_id 的真值要等 Phase 2a 才会出现）。
+        # - 不符合此格式（如 desktop CLI 的 ``YYYYMMDD_HHMMSS_xxx`` 单段）→
+        #   登记成 (default, default)。Phase 0 的语义已经接受 default 作为
+        #   合法的单用户身份，lifecycle 会正确归属到该用户。
+        # - user_id 段落是 ``default / anonymous / system / legacy / ''`` 时
+        #   也降级为 (default, default)，避免把占位身份当真用户。
+        #
+        # 这一步只补 session_tenants，**不动** memories 表本身，零数据丢失风险。
+        existing_sessions = {
+            row[0]
+            for row in c.execute("SELECT session_id FROM session_tenants").fetchall()
+        }
+        backfill_rows: list[tuple[str, str, str, str]] = []
+        for (session_id,) in c.execute(
+            "SELECT DISTINCT session_id FROM conversation_turns WHERE session_id IS NOT NULL "
+            "AND session_id != ''"
+        ).fetchall():
+            if not session_id or session_id in existing_sessions:
+                continue
+            parts = session_id.split("__")
+            if len(parts) >= 3 and parts[2] and parts[2] not in {
+                "default", "anonymous", "system", "legacy", ""
+            }:
+                user_id = parts[2]
+            else:
+                user_id = "default"
+            backfill_rows.append((session_id, user_id, "default", now))
+
+        if backfill_rows:
+            c.executemany(
+                """
+                INSERT OR IGNORE INTO session_tenants
+                    (session_id, user_id, workspace_id, last_updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                backfill_rows,
+            )
+            logger.info(
+                "[MemoryStorage] v3→v4 backfill: registered %d sessions in session_tenants "
+                "(IM-style parsed: %d, default fallback: %d)",
+                len(backfill_rows),
+                sum(1 for r in backfill_rows if r[1] != "default"),
+                sum(1 for r in backfill_rows if r[1] == "default"),
+            )
+
+        # 恢复 FTS update 触发器
+        try:
+            c.execute(
+                """CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, content, subject, predicate, tags)
+                VALUES ('delete', old.rowid, old.content, old.subject, old.predicate, old.tags);
+                INSERT INTO memories_fts(rowid, content, subject, predicate, tags)
+                VALUES (new.rowid, new.content, new.subject, new.predicate, new.tags);
+            END"""
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        if commit:
+            c.commit()
+
+    def _migrate_v4_to_v5(
+        self,
+        conn: sqlite3.Connection | None = None,
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Add ``conversation_turns.metadata`` JSON column.
+
+        v1.27.15 (plan v1.28 S2 P1-6).  Old schemas had no place to record
+        per-turn metadata, so ``Session.append_marker`` could persist the
+        bare role/content of a ``marker_type="aborted_partial"`` /
+        ``"preempted"`` message but lost the marker_type itself — which
+        meant the memory extraction lifecycle could not distinguish a
+        real assistant turn from a "[task was interrupted]" placeholder
+        and would happily index the placeholder as a long-term memory.
+
+        Idempotent ALTER (only adds the column if not already present, in
+        case the table was just created at v5 in this same session).
+        """
+        c = conn or self._conn
+        # FIX-D (post-S2 audit): do NOT swallow ALTER TABLE failures.  If
+        # we silently continue and then ``_set_schema_version(5)`` bumps
+        # the schema marker, the database lands in a "claims v5 but has
+        # no metadata column" state, causing every subsequent
+        # ``save_turn`` INSERT (11 placeholders against a 10-column
+        # table) to fail with OperationalError.  Letting the exception
+        # propagate makes the migration transaction rollback so the
+        # next startup retries cleanly at v4.
+        cur = c.execute("PRAGMA table_info(conversation_turns)")
+        cols = {row[1] for row in cur.fetchall()}
+        if "metadata" not in cols:
+            c.execute("ALTER TABLE conversation_turns ADD COLUMN metadata TEXT")
+            logger.info(
+                "[MemoryStorage] v4→v5: added conversation_turns.metadata column"
+            )
+        if commit:
+            c.commit()
+
+    def _create_tables(
+        self,
+        conn: sqlite3.Connection | None = None,
+        *,
+        commit: bool = True,
+        include_fts: bool = True,
+    ) -> None:
         """Create all tables, indexes, FTS virtual tables and triggers.
 
         Execution is split into strict phases so that no index / trigger
@@ -169,7 +644,7 @@ class MemoryStorage:
           Phase 2 – CREATE INDEX  (all indexes, including cross-table)
           Phase 3 – FTS5 virtual tables + sync triggers (best-effort)
         """
-        c = self._conn
+        c = conn or self._conn
 
         # ==============================================================
         # Phase 1: CREATE TABLE — all regular tables first
@@ -220,39 +695,18 @@ class MemoryStorage:
             pass
         c.execute("CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent_id)")
 
-        # --- FTS5 full-text index ---
-        try:
-            c.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                    content, subject, predicate, tags,
-                    content=memories, content_rowid=rowid,
-                    tokenize='unicode61'
-                )
-            """)
-        except sqlite3.OperationalError as e:
-            logger.warning(f"[MemoryStorage] FTS5 creation skipped: {e}")
-
-        # FTS5 sync triggers
-        for trigger_sql in [
-            """CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
-                INSERT INTO memories_fts(rowid, content, subject, predicate, tags)
-                VALUES (new.rowid, new.content, new.subject, new.predicate, new.tags);
-            END""",
-            """CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content, subject, predicate, tags)
-                VALUES ('delete', old.rowid, old.content, old.subject, old.predicate, old.tags);
-            END""",
-            """CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content, subject, predicate, tags)
-                VALUES ('delete', old.rowid, old.content, old.subject, old.predicate, old.tags);
-                INSERT INTO memories_fts(rowid, content, subject, predicate, tags)
-                VALUES (new.rowid, new.content, new.subject, new.predicate, new.tags);
-            END""",
-        ]:
+        # v5: 用户/工作区隔离。任何用户事实必须带 owner；legacy 迁移会把旧
+        # global/空 owner 数据移入 legacy_quarantine，避免继续污染当前用户。
+        for col, default in [("user_id", "'default'"), ("workspace_id", "'default'")]:
             try:
-                c.execute(trigger_sql)
+                c.execute(f"ALTER TABLE memories ADD COLUMN {col} TEXT DEFAULT {default}")
             except sqlite3.OperationalError:
                 pass
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_owner "
+            "ON memories(workspace_id, user_id, scope, scope_owner)"
+        )
+
         c.execute("""
             CREATE TABLE IF NOT EXISTS episodes (
                 id TEXT PRIMARY KEY,
@@ -303,6 +757,7 @@ class MemoryStorage:
                 token_estimate INTEGER,
                 episode_id TEXT,
                 extracted BOOLEAN DEFAULT FALSE,
+                metadata TEXT,
                 UNIQUE(session_id, turn_index)
             )
         """)
@@ -356,6 +811,33 @@ class MemoryStorage:
                 model TEXT NOT NULL,
                 dimensions INTEGER DEFAULT 1024,
                 created_at TEXT NOT NULL
+            )
+        """)
+
+        # v4: session_id → 租户映射，lifecycle 后台批处理用这张表反查
+        # 一条 conversation_turns 的 session_id 属于哪个 (user_id, workspace_id)，
+        # 避免裸用 ContextVar 默认值导致后台合成全部落到 default 共享桶。
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS session_tenants (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT 'default',
+                workspace_id TEXT NOT NULL DEFAULT 'default',
+                last_updated_at TEXT NOT NULL
+            )
+        """)
+
+        # v4: 记忆 scope 迁移审计表，记录每条记忆历史上被哪次 migration
+        # 从哪个 scope 移到哪个 scope，含理由和时间戳，便于排查 / 回滚。
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS _memory_scope_audit (
+                memory_id TEXT NOT NULL,
+                old_scope TEXT NOT NULL,
+                new_scope TEXT NOT NULL,
+                old_user_id TEXT DEFAULT '',
+                new_user_id TEXT DEFAULT '',
+                reason TEXT NOT NULL,
+                migrated_at TEXT NOT NULL,
+                migration_version TEXT NOT NULL DEFAULT 'v3_to_v4'
             )
         """)
 
@@ -414,10 +896,23 @@ class MemoryStorage:
         c.execute("CREATE INDEX IF NOT EXISTS idx_attach_direction ON attachments(direction)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_attach_created ON attachments(created_at)")
 
-        # ==============================================================
-        # Phase 3: FTS5 virtual tables + sync triggers (best-effort)
-        # ==============================================================
+        # session_tenants + _memory_scope_audit (v4)
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scope_audit_memory ON _memory_scope_audit(memory_id)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scope_audit_version ON _memory_scope_audit(migration_version)"
+        )
 
+        if include_fts:
+            self._create_fts_objects(c)
+
+        if commit:
+            c.commit()
+
+    def _create_fts_objects(self, conn: sqlite3.Connection | None = None) -> None:
+        """Create FTS5 virtual tables and sync triggers on an already-valid schema."""
+        c = conn or self._conn
         try:
             c.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -475,8 +970,6 @@ class MemoryStorage:
             except sqlite3.OperationalError:
                 pass
 
-        c.commit()
-
     # ======================================================================
     # Semantic Memory CRUD
     # ======================================================================
@@ -494,8 +987,8 @@ class MemoryStorage:
                      access_count, tags, created_at, updated_at, expires_at, metadata,
                      subject, predicate, confidence, decay_rate,
                      last_accessed_at, superseded_by, source_episode_id,
-                     scope, scope_owner, agent_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     scope, scope_owner, agent_id, user_id, workspace_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         memory.get("id", ""),
@@ -520,6 +1013,8 @@ class MemoryStorage:
                         memory.get("scope", "global"),
                         memory.get("scope_owner", ""),
                         memory.get("agent_id", ""),
+                        memory.get("user_id", "default"),
+                        memory.get("workspace_id", "default"),
                     ),
                 )
                 self._conn.commit()
@@ -541,8 +1036,8 @@ class MemoryStorage:
                      access_count, tags, created_at, updated_at, expires_at, metadata,
                      subject, predicate, confidence, decay_rate,
                      last_accessed_at, superseded_by, source_episode_id,
-                     scope, scope_owner, agent_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     scope, scope_owner, agent_id, user_id, workspace_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -568,6 +1063,8 @@ class MemoryStorage:
                             m.get("scope", "global"),
                             m.get("scope_owner", ""),
                             m.get("agent_id", ""),
+                            m.get("user_id", "default"),
+                            m.get("workspace_id", "default"),
                         )
                         for m in memories
                     ],
@@ -579,16 +1076,44 @@ class MemoryStorage:
                     raise
                 logger.error(f"Failed to batch save memories: {e}")
 
-    def load_all(self, scope: str = "global", scope_owner: str = "") -> list[dict]:
+    def load_all(
+        self,
+        scope: str | None = None,
+        scope_owner: str | None = None,
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        active_only: bool = True,
+    ) -> list[dict]:
         if not self._conn:
             return []
         try:
+            conditions: list[str] = []
+            params: list[Any] = []
+            if scope is not None:
+                conditions.append("(scope IS NULL OR scope = ?)")
+                params.append(scope)
+            if scope_owner is not None:
+                conditions.append("(scope_owner IS NULL OR scope_owner = ?)")
+                params.append(scope_owner)
+            if active_only:
+                conditions.extend(
+                    [
+                        "(expires_at IS NULL OR expires_at >= ?)",
+                        "(superseded_by IS NULL OR superseded_by = '')",
+                    ]
+                )
+                params.append(datetime.now().isoformat())
+            if user_id is not None:
+                conditions.append("COALESCE(user_id, '') = ?")
+                params.append(user_id)
+            if workspace_id is not None:
+                conditions.append("COALESCE(workspace_id, 'default') = ?")
+                params.append(workspace_id)
+            where = " AND ".join(conditions) if conditions else "1=1"
             cursor = self._conn.execute(
-                "SELECT * FROM memories "
-                "WHERE (scope IS NULL OR scope = ?) "
-                "AND (scope_owner IS NULL OR scope_owner = ?) "
-                "ORDER BY created_at DESC",
-                (scope, scope_owner),
+                f"SELECT * FROM memories WHERE {where} ORDER BY created_at DESC",
+                params,
             )
             return self._rows_to_dicts(cursor)
         except Exception as e:
@@ -643,6 +1168,10 @@ class MemoryStorage:
             "metadata",
             "scope",
             "scope_owner",
+            "user_id",
+            "workspace_id",
+            "agent_id",
+            "expires_at",
         }
         filtered = {k: v for k, v in updates.items() if k in allowed}
         if not filtered:
@@ -678,8 +1207,11 @@ class MemoryStorage:
         subject: str | None = None,
         scope: str | None = None,
         scope_owner: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        active_only: bool = True,
     ) -> list[dict]:
         if not self._conn:
             return []
@@ -708,6 +1240,16 @@ class MemoryStorage:
         if scope_owner is not None:
             conditions.append("(scope_owner IS NULL OR scope_owner = ?)")
             params.append(scope_owner)
+        if user_id is not None:
+            conditions.append("COALESCE(user_id, '') = ?")
+            params.append(user_id)
+        if workspace_id is not None:
+            conditions.append("COALESCE(workspace_id, 'default') = ?")
+            params.append(workspace_id)
+        if active_only:
+            conditions.append("(expires_at IS NULL OR expires_at >= ?)")
+            params.append(datetime.now().isoformat())
+            conditions.append("(superseded_by IS NULL OR superseded_by = '')")
 
         where = " AND ".join(conditions) if conditions else "1=1"
         params.extend([limit, offset])
@@ -729,6 +1271,9 @@ class MemoryStorage:
         memory_type: str | None = None,
         scope: str | None = None,
         scope_owner: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        active_only: bool = True,
     ) -> int:
         if not self._conn:
             return 0
@@ -744,11 +1289,98 @@ class MemoryStorage:
             if scope_owner is not None:
                 conditions.append("(scope_owner IS NULL OR scope_owner = ?)")
                 params.append(scope_owner)
+            if user_id is not None:
+                conditions.append("COALESCE(user_id, '') = ?")
+                params.append(user_id)
+            if workspace_id is not None:
+                conditions.append("COALESCE(workspace_id, 'default') = ?")
+                params.append(workspace_id)
+            if active_only:
+                conditions.append("(expires_at IS NULL OR expires_at >= ?)")
+                params.append(datetime.now().isoformat())
+                conditions.append("(superseded_by IS NULL OR superseded_by = '')")
             where = " AND ".join(conditions) if conditions else "1=1"
             cur = self._conn.execute(f"SELECT COUNT(*) FROM memories WHERE {where}", params)
             return cur.fetchone()[0]
         except Exception:
             return 0
+
+    SORTABLE_COLUMNS = frozenset({
+        "importance_score", "created_at", "updated_at",
+        "last_accessed_at", "access_count",
+    })
+
+    def query_paged(
+        self,
+        *,
+        memory_type: str | None = None,
+        min_importance: float | None = None,
+        scope: str | None = None,
+        scope_owner: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        sort_by: str = "importance_score",
+        sort_order: str = "desc",
+        limit: int = 50,
+        offset: int = 0,
+        active_only: bool = True,
+    ) -> tuple[list[dict], int]:
+        """Paginated query with SQL-level sorting. Returns (rows, total_count)."""
+        if not self._conn:
+            return [], 0
+
+        if sort_by not in self.SORTABLE_COLUMNS:
+            sort_by = "importance_score"
+        if sort_order.lower() not in ("asc", "desc"):
+            sort_order = "desc"
+
+        conditions: list[str] = []
+        params: list[Any] = []
+
+        if memory_type:
+            conditions.append("type = ?")
+            params.append(memory_type)
+        if min_importance is not None:
+            conditions.append("importance_score >= ?")
+            params.append(min_importance)
+        if scope is not None:
+            conditions.append("(scope IS NULL OR scope = ?)")
+            params.append(scope)
+        if scope_owner is not None:
+            conditions.append("(scope_owner IS NULL OR scope_owner = ?)")
+            params.append(scope_owner)
+        if user_id is not None:
+            conditions.append("COALESCE(user_id, '') = ?")
+            params.append(user_id)
+        if workspace_id is not None:
+            conditions.append("COALESCE(workspace_id, 'default') = ?")
+            params.append(workspace_id)
+        if active_only:
+            conditions.append("(expires_at IS NULL OR expires_at >= ?)")
+            params.append(datetime.now().isoformat())
+            conditions.append("(superseded_by IS NULL OR superseded_by = '')")
+
+        where = " AND ".join(conditions) if conditions else "1=1"
+
+        try:
+            count_cur = self._conn.execute(
+                f"SELECT COUNT(*) FROM memories WHERE {where}", params
+            )
+            total = count_cur.fetchone()[0]
+
+            order = sort_order.upper()
+            page_params = params + [limit, offset]
+            cursor = self._conn.execute(
+                f"SELECT * FROM memories WHERE {where} "
+                f"ORDER BY {sort_by} {order} "
+                f"LIMIT ? OFFSET ?",
+                page_params,
+            )
+            rows = self._rows_to_dicts(cursor)
+            return rows, total
+        except Exception as e:
+            logger.error(f"Failed to query_paged memories: {e}")
+            return [], 0
 
     # ======================================================================
     # FTS5 Search
@@ -760,6 +1392,9 @@ class MemoryStorage:
         limit: int = 10,
         scope: str | None = None,
         scope_owner: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        active_only: bool = True,
     ) -> list[dict]:
         """Full-text search using FTS5 with BM25 ranking, with LIKE fallback for CJK.
 
@@ -778,6 +1413,16 @@ class MemoryStorage:
         if scope_owner is not None:
             scope_clauses.append("(m.scope_owner IS NULL OR m.scope_owner = ?)")
             scope_params.append(scope_owner)
+        if user_id is not None:
+            scope_clauses.append("COALESCE(m.user_id, '') = ?")
+            scope_params.append(user_id)
+        if workspace_id is not None:
+            scope_clauses.append("COALESCE(m.workspace_id, 'default') = ?")
+            scope_params.append(workspace_id)
+        if active_only:
+            scope_clauses.append("(m.expires_at IS NULL OR m.expires_at >= ?)")
+            scope_params.append(datetime.now().isoformat())
+            scope_clauses.append("(m.superseded_by IS NULL OR m.superseded_by = '')")
         scope_where = (" AND " + " AND ".join(scope_clauses)) if scope_clauses else ""
 
         try:
@@ -813,6 +1458,16 @@ class MemoryStorage:
             if scope_owner is not None:
                 where += " AND (scope_owner IS NULL OR scope_owner = ?)"
                 like_params.append(scope_owner)
+            if user_id is not None:
+                where += " AND COALESCE(user_id, '') = ?"
+                like_params.append(user_id)
+            if workspace_id is not None:
+                where += " AND COALESCE(workspace_id, 'default') = ?"
+                like_params.append(workspace_id)
+            if active_only:
+                where += " AND (expires_at IS NULL OR expires_at >= ?)"
+                like_params.append(datetime.now().isoformat())
+                where += " AND (superseded_by IS NULL OR superseded_by = '')"
             like_params.append(limit)
             cursor = self._conn.execute(
                 f"SELECT * FROM memories WHERE {where} LIMIT ?",
@@ -909,14 +1564,42 @@ class MemoryStorage:
         outcome: str | None = None,
         days: int | None = None,
         limit: int = 20,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> list[dict]:
+        """搜索 episodes。
+
+        Phase 2b.5 新增 ``user_id`` / ``workspace_id`` 过滤：通过 INNER JOIN
+        ``session_tenants`` 表把 episode 收敛到给定租户。
+
+        兼容性：
+        - 不传 ``user_id`` 和 ``workspace_id`` 时回退到旧行为（全库扫描），
+          老调用方完全不感知；
+        - 显式传任一参数后，未在 ``session_tenants`` 登记的 session 对应的
+          episode（v3 之前的老数据）会被自然过滤掉 —— 这是有意的安全默认。
+          调用方如果想包含历史孤儿数据，可以在迁徙工具里单独走 raw SQL。
+        """
         if not self._conn:
             return []
         conditions: list[str] = []
         params: list[Any] = []
 
+        use_tenant_filter = user_id is not None or workspace_id is not None
+        table_expr = "episodes"
+        if use_tenant_filter:
+            table_expr = (
+                "episodes INNER JOIN session_tenants st "
+                "ON episodes.session_id = st.session_id"
+            )
+            if user_id is not None:
+                conditions.append("st.user_id = ?")
+                params.append(user_id)
+            if workspace_id is not None:
+                conditions.append("st.workspace_id = ?")
+                params.append(workspace_id)
+
         if session_id:
-            conditions.append("session_id = ?")
+            conditions.append("episodes.session_id = ?" if use_tenant_filter else "session_id = ?")
             params.append(session_id)
         if entity:
             conditions.append("entities LIKE ?")
@@ -935,9 +1618,12 @@ class MemoryStorage:
         where = " AND ".join(conditions) if conditions else "1=1"
         params.append(limit)
 
+        select_cols = "episodes.*" if use_tenant_filter else "*"
+
         try:
             cur = self._conn.execute(
-                f"SELECT * FROM episodes WHERE {where} ORDER BY started_at DESC LIMIT ?",
+                f"SELECT {select_cols} FROM {table_expr} WHERE {where} "
+                "ORDER BY started_at DESC LIMIT ?",
                 params,
             )
             return self._rows_to_dicts(
@@ -1050,6 +1736,224 @@ class MemoryStorage:
                 logger.error(f"Failed to save scratchpad: {e}")
 
     # ======================================================================
+    # Session Tenants (v4)
+    # ======================================================================
+
+    def upsert_session_tenant(
+        self,
+        session_id: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> None:
+        """记录 session_id → (user_id, workspace_id) 映射，供 lifecycle 反查租户。
+
+        每次 MemoryManager.start_session 都会被调用一次。重复写入只刷新时间戳，
+        避免后台批处理时拿不到当前会话归属的 user / workspace 而误落 default。
+        """
+        if not self._conn or not session_id:
+            return
+        u = (user_id or "").strip() or "default"
+        w = (workspace_id or "").strip() or "default"
+        ts = datetime.now().isoformat()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO session_tenants (session_id, user_id, workspace_id, last_updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        workspace_id = excluded.workspace_id,
+                        last_updated_at = excluded.last_updated_at
+                    """,
+                    (session_id, u, w, ts),
+                )
+                self._conn.commit()
+            except Exception as e:
+                if _is_db_locked(e):
+                    raise
+                logger.warning(f"[MemoryStorage] upsert_session_tenant failed: {e}")
+
+    def get_session_tenant(self, session_id: str) -> tuple[str, str] | None:
+        """根据 session_id 查 (user_id, workspace_id)。
+
+        未找到返回 None；调用方应将 None 视为 “租户未知”，把记忆落到
+        pending_consolidation 桶里，避免污染共享 default。
+        """
+        if not self._conn or not session_id:
+            return None
+        try:
+            cur = self._conn.execute(
+                "SELECT user_id, workspace_id FROM session_tenants WHERE session_id = ?",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return (row[0] or "default", row[1] or "default")
+        except Exception as e:
+            logger.debug(f"[MemoryStorage] get_session_tenant failed: {e}")
+            return None
+
+    def iter_owned_session_ids(
+        self,
+        *,
+        user_id: str,
+        workspace_id: str | None = None,
+    ) -> list[str]:
+        """返回 session_tenants 里所有属于 (user_id[, workspace_id]) 的 session_id。
+
+        用于多用户 IM 部署下 JSONL / react_traces 文件级回退路径的 owner
+        过滤 —— 没登记过的 session 自然被排除，即便文件还在磁盘上。
+        """
+        if not self._conn:
+            return []
+        try:
+            if workspace_id is None:
+                cur = self._conn.execute(
+                    "SELECT session_id FROM session_tenants WHERE user_id = ?",
+                    (user_id,),
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT session_id FROM session_tenants "
+                    "WHERE user_id = ? AND workspace_id = ?",
+                    (user_id, workspace_id),
+                )
+            return [row[0] for row in cur.fetchall() if row[0]]
+        except Exception as e:
+            logger.debug(f"[MemoryStorage] iter_owned_session_ids failed: {e}")
+            return []
+
+    def list_known_tenants(self) -> list[tuple[str, str]]:
+        """返回所有已知 (user_id, workspace_id) 组合，供 synthesize 等批处理分组。
+
+        排除 ``legacy / system / anonymous / ''`` 这种 **明确表示"不知道是谁"** 的
+        占位身份。``default`` **保留**：在桌面 / CLI 单用户场景，``default`` 就是
+        合法用户身份，不能被当成共享桶过滤掉。
+        """
+        if not self._conn:
+            return []
+        try:
+            cur = self._conn.execute(
+                """
+                SELECT DISTINCT user_id, workspace_id
+                FROM session_tenants
+                WHERE user_id NOT IN ('legacy', 'system', 'anonymous', '')
+                """
+            )
+            return [(r[0] or "default", r[1] or "default") for r in cur.fetchall()]
+        except Exception as e:
+            logger.debug(f"[MemoryStorage] list_known_tenants failed: {e}")
+            return []
+
+    def migrate_workspace_id(
+        self,
+        *,
+        from_workspace_id: str,
+        to_workspace_id: str,
+        user_id: str,
+        scope: str = "user",
+    ) -> int:
+        """Phase 2a：把同一 (scope, user_id) 下、workspace_id=from 的 memories
+        全部改成 workspace_id=to。返回更新行数。
+
+        典型场景：用户从默认 ``workspace_id="default"`` 切换到项目专属工作区，
+        想把原来共享桶里的记忆"携过来"。
+        - 仅修改 ``memories.workspace_id`` 字段，不动 content / scope / user_id；
+        - 全程在事务内，单语句 UPDATE，失败回滚；
+        - 写入 _memory_scope_audit 表记录每条变更，便于审计与可能的回滚。
+        """
+        if not self._conn:
+            return 0
+        if (
+            not from_workspace_id or not to_workspace_id
+            or from_workspace_id == to_workspace_id
+            or not user_id
+        ):
+            return 0
+        now = datetime.now().isoformat()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                # 先写审计
+                self._conn.execute(
+                    """
+                    INSERT INTO _memory_scope_audit
+                        (memory_id, old_scope, new_scope, old_user_id, new_user_id,
+                         reason, migrated_at, migration_version)
+                    SELECT id, scope, scope, user_id, user_id,
+                           'workspace_migrate:' || ? || '->' || ?,
+                           ?, 'workspace_migrate'
+                    FROM memories
+                    WHERE scope = ? AND user_id = ? AND workspace_id = ?
+                    """,
+                    (from_workspace_id, to_workspace_id, now, scope, user_id, from_workspace_id),
+                )
+                cur = self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET workspace_id = ?, updated_at = ?
+                    WHERE scope = ? AND user_id = ? AND workspace_id = ?
+                    """,
+                    (to_workspace_id, now, scope, user_id, from_workspace_id),
+                )
+                moved = cur.rowcount if cur.rowcount is not None else 0
+                self._conn.execute("COMMIT")
+                if moved:
+                    logger.info(
+                        "[MemoryStorage] workspace migrate: %d rows scope=%s user_id=%s "
+                        "from %s → %s",
+                        moved, scope, user_id, from_workspace_id, to_workspace_id,
+                    )
+                return moved
+            except Exception as e:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                logger.warning(f"[MemoryStorage] migrate_workspace_id failed: {e}")
+                return 0
+
+    def record_scope_audit(
+        self,
+        memory_id: str,
+        *,
+        old_scope: str,
+        new_scope: str,
+        reason: str,
+        old_user_id: str = "",
+        new_user_id: str = "",
+        migration_version: str = "runtime",
+    ) -> None:
+        """记一条 scope 变更审计。runtime 路径下用 migration_version='runtime'。"""
+        if not self._conn or not memory_id:
+            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO _memory_scope_audit
+                        (memory_id, old_scope, new_scope, old_user_id, new_user_id,
+                         reason, migrated_at, migration_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        old_scope or "",
+                        new_scope or "",
+                        old_user_id or "",
+                        new_user_id or "",
+                        reason or "",
+                        datetime.now().isoformat(),
+                        migration_version or "runtime",
+                    ),
+                )
+                self._conn.commit()
+            except Exception as e:
+                logger.debug(f"[MemoryStorage] record_scope_audit failed: {e}")
+
+    # ======================================================================
     # Conversation Turns
     # ======================================================================
 
@@ -1063,19 +1967,41 @@ class MemoryStorage:
         tool_results: list[dict] | None = None,
         timestamp: str | None = None,
         token_estimate: int | None = None,
+        metadata: dict | None = None,
     ) -> None:
+        """Persist a single turn.
+
+        v1.27.15 (P1-6): added ``metadata`` JSON column persistence.
+        Lifecycle extraction reads ``metadata.marker_type`` to skip
+        ``preempted`` / ``aborted_partial`` markers (they should NOT
+        become long-term memories).
+        """
         if not self._conn:
             return
         ts = timestamp or datetime.now().isoformat()
         has_tools = bool(tool_calls)
+        # Only persist non-empty metadata; saves a few bytes per row
+        # and keeps queries that filter ``metadata IS NULL`` meaningful.
+        meta_json: str | None = None
+        if metadata:
+            try:
+                meta_json = json.dumps(metadata, ensure_ascii=False, default=str)
+            except Exception:
+                meta_json = None
+        # Auto-mark marker turns as "extracted" so the lifecycle background
+        # loop never picks them up.  This is the second line of defense
+        # alongside the lifecycle-side filter — even if a future code path
+        # forgets to filter, the marker still won't pollute memory.
+        marker_type = (metadata or {}).get("marker_type")
+        is_marker = marker_type in ("preempted", "aborted_partial")
         with self._lock:
             try:
                 self._conn.execute(
                     """
                     INSERT OR REPLACE INTO conversation_turns
                     (session_id, turn_index, role, content, tool_calls, tool_results,
-                     has_tool_calls, timestamp, token_estimate, extracted)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)
+                     has_tool_calls, timestamp, token_estimate, extracted, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -1087,6 +2013,8 @@ class MemoryStorage:
                         has_tools,
                         ts,
                         token_estimate,
+                        bool(is_marker),
+                        meta_json,
                     ),
                 )
                 self._conn.commit()
@@ -1105,7 +2033,12 @@ class MemoryStorage:
                     "ORDER BY timestamp ASC LIMIT ?",
                     (limit,),
                 )
-                return self._rows_to_dicts(cur, json_fields=["tool_calls", "tool_results"])
+                # v1.27.15: also parse ``metadata`` JSON so callers can
+                # short-circuit on ``marker_type``.
+                return self._rows_to_dicts(
+                    cur,
+                    json_fields=["tool_calls", "tool_results", "metadata"],
+                )
             except Exception as e:
                 logger.error(f"Failed to get unextracted turns: {e}")
                 return []
@@ -1281,33 +2214,70 @@ class MemoryStorage:
         session_id: str | None = None,
         days_back: int = 7,
         limit: int = 20,
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> list[dict]:
-        """按关键词搜索 conversation_turns（content + tool_calls + tool_results）"""
+        """按关键词搜索 conversation_turns（content + tool_calls + tool_results）。
+
+        Phase 2b.5：新增 ``user_id`` / ``workspace_id`` 过滤，通过 JOIN
+        ``session_tenants`` 限定结果到给定租户。和 ``search_episodes`` 一样，
+        不传则保持旧的全库扫描行为（向后兼容）。
+        """
         if not self._conn or not keyword:
             return []
         cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
         pattern = f"%{keyword}%"
+
+        use_tenant_filter = user_id is not None or workspace_id is not None
+        if use_tenant_filter:
+            table_expr = (
+                "conversation_turns AS ct "
+                "INNER JOIN session_tenants AS st ON ct.session_id = st.session_id"
+            )
+            select_cols = (
+                "ct.session_id, ct.turn_index, ct.role, ct.content, "
+                "ct.tool_calls, ct.tool_results, ct.timestamp, ct.episode_id"
+            )
+        else:
+            table_expr = "conversation_turns"
+            select_cols = (
+                "session_id, turn_index, role, content, "
+                "tool_calls, tool_results, timestamp, episode_id"
+            )
+
+        conditions: list[str] = []
+        params: list[Any] = []
+        if use_tenant_filter and user_id is not None:
+            conditions.append("st.user_id = ?")
+            params.append(user_id)
+        if use_tenant_filter and workspace_id is not None:
+            conditions.append("st.workspace_id = ?")
+            params.append(workspace_id)
+        if session_id:
+            conditions.append(
+                "ct.session_id = ?" if use_tenant_filter else "session_id = ?"
+            )
+            params.append(session_id)
+        conditions.append(("ct." if use_tenant_filter else "") + "timestamp >= ?")
+        params.append(cutoff)
+        # LIKE 三选一
+        cols_prefix = "ct." if use_tenant_filter else ""
+        conditions.append(
+            f"({cols_prefix}content LIKE ? OR {cols_prefix}tool_calls LIKE ? "
+            f"OR {cols_prefix}tool_results LIKE ?)"
+        )
+        params.extend([pattern, pattern, pattern])
+        params.append(limit)
+
+        where = " AND ".join(conditions)
+        ordering = "ct.timestamp DESC" if use_tenant_filter else "timestamp DESC"
         try:
-            if session_id:
-                cur = self._conn.execute(
-                    "SELECT session_id, turn_index, role, content, "
-                    "tool_calls, tool_results, timestamp, episode_id "
-                    "FROM conversation_turns "
-                    "WHERE session_id = ? AND timestamp >= ? "
-                    "AND (content LIKE ? OR tool_calls LIKE ? OR tool_results LIKE ?) "
-                    "ORDER BY timestamp DESC LIMIT ?",
-                    (session_id, cutoff, pattern, pattern, pattern, limit),
-                )
-            else:
-                cur = self._conn.execute(
-                    "SELECT session_id, turn_index, role, content, "
-                    "tool_calls, tool_results, timestamp, episode_id "
-                    "FROM conversation_turns "
-                    "WHERE timestamp >= ? "
-                    "AND (content LIKE ? OR tool_calls LIKE ? OR tool_results LIKE ?) "
-                    "ORDER BY timestamp DESC LIMIT ?",
-                    (cutoff, pattern, pattern, pattern, limit),
-                )
+            cur = self._conn.execute(
+                f"SELECT {select_cols} FROM {table_expr} WHERE {where} "
+                f"ORDER BY {ordering} LIMIT ?",
+                params,
+            )
             return self._rows_to_dicts(cur, json_fields=["tool_calls", "tool_results"])
         except Exception as e:
             logger.warning(f"Failed to search turns for '{keyword}': {e}")
@@ -1652,6 +2622,22 @@ class MemoryStorage:
                 logger.error(f"Failed to cleanup expired memories: {e}")
                 return 0
 
+    def get_expired_memory_ids(self) -> list[str]:
+        if not self._conn:
+            return []
+        now = datetime.now().isoformat()
+        try:
+            cursor = self._conn.execute(
+                "SELECT id FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now,),
+            )
+            return [row["id"] for row in self._rows_to_dicts(cursor)]
+        except Exception as e:
+            if _is_db_locked(e):
+                raise
+            logger.error(f"Failed to list expired memories: {e}")
+            return []
+
     def close(self) -> None:
         with self._lock:
             if self._conn:
@@ -1661,6 +2647,96 @@ class MemoryStorage:
         with _instance_lock:
             if _instance_registry.get(key) is self:
                 del _instance_registry[key]
+
+    async def quiesce(self) -> None:
+        """Close the underlying sqlite handle for quarantine to rename files.
+
+        Async signature for consistency with the rest of the quiesce protocol;
+        internally just delegates to :meth:`close`. Idempotent.
+        """
+        import asyncio as _asyncio
+
+        await _asyncio.to_thread(self.close)
+
+    def checkpoint_and_close(self, *, truncate: bool = True) -> None:
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return
+            try:
+                mode = "TRUNCATE" if truncate else "PASSIVE"
+                conn.execute(f"PRAGMA wal_checkpoint({mode})")
+            finally:
+                conn.close()
+                self._conn = None
+        key = str(self._db_path.resolve())
+        with _instance_lock:
+            if _instance_registry.get(key) is self:
+                del _instance_registry[key]
+
+    def create_snapshot_incremental(
+        self,
+        *,
+        max_size_bytes: int = 500 * 1024 * 1024,
+        keep: int = 7,
+    ) -> Path | None:
+        if self._conn is None or not self._db_path.exists():
+            return None
+        if self._is_sync_folder_path() and os.environ.get("SYNAPSE_FORCE_SNAPSHOT") != "1":
+            logger.warning("[MemoryStorage] Snapshot skipped for sync folder path: %s", self._db_path)
+            return None
+        size = self._db_path.stat().st_size
+        if size > max_size_bytes:
+            logger.warning(
+                "[MemoryStorage] Snapshot skipped because db is too large: %s bytes", size
+            )
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshot = self._db_path.with_name(f"{self._db_path.name}.snapshot.{timestamp}")
+        tmp = snapshot.with_suffix(snapshot.suffix + ".tmp")
+        with self._lock:
+            try:
+                dst = sqlite3.connect(str(tmp))
+                try:
+                    self._conn.backup(dst)
+                    dst.commit()
+                finally:
+                    dst.close()
+                tmp.replace(snapshot)
+                check_conn = sqlite3.connect(str(snapshot))
+                try:
+                    row = check_conn.execute("PRAGMA quick_check").fetchone()
+                    if str(row[0] if row else "").lower() != "ok":
+                        snapshot.unlink(missing_ok=True)
+                        raise MemoryStorageUnavailable("schema_corrupt", "snapshot quick_check failed")
+                finally:
+                    check_conn.close()
+                self._prune_backups(pattern=f"{self._db_path.name}.snapshot.*", keep=keep)
+                return snapshot
+            except Exception as e:
+                logger.warning("[MemoryStorage] Snapshot failed: %s", e)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return None
+
+    def _is_sync_folder_path(self) -> bool:
+        text = str(self._db_path).lower()
+        sync_markers = ("onedrive", "dropbox", "google drive", "googledrive")
+        return any(marker in text for marker in sync_markers) or text.startswith("\\\\")
+
+    def _prune_backups(self, *, pattern: str, keep: int) -> None:
+        try:
+            candidates = sorted(
+                self._db_path.parent.glob(pattern),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for path in candidates[keep:]:
+                path.unlink(missing_ok=True)
+        except Exception as e:
+            logger.debug("[MemoryStorage] Backup prune skipped: %s", e)
 
     # ======================================================================
     # Helpers

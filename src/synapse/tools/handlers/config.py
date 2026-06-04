@@ -5,8 +5,16 @@
 - discover: 内省 Settings.model_fields 动态发现可配置项
 - get: 查看当前配置
 - set: 修改配置 (.env + 热重载)
-- add_endpoint / remove_endpoint / test_endpoint: LLM 端点管理
+- add_endpoint / remove_endpoint / select_endpoint / test_endpoint: LLM 端点管理
 - set_ui: UI 偏好 (主题/语言)
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import json
@@ -16,6 +24,8 @@ import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from ...core.policy_v2 import ApprovalClass
 
 if TYPE_CHECKING:
     from ...core.agent import Agent
@@ -105,7 +115,6 @@ _CATEGORY_RULES: list[tuple[tuple[str, ...], str]] = [
     (("im_chain_push",), "IM/思维链推送"),
     (("progress_timeout", "hard_timeout"), "Agent/超时"),
     (("log_",), "日志"),
-    (("whisper_",), "语音识别"),
     (("http_proxy", "https_proxy", "all_proxy", "force_ipv4"), "代理"),
     (("model_download_",), "模型下载"),
     (("embedding_", "search_backend"), "Embedding/记忆搜索"),
@@ -178,6 +187,14 @@ def _unique_env_key(base: str, used: set[str]) -> str:
     return f"{base}_{int(__import__('time').time())}"
 
 
+def _serialize_env_value(value: Any) -> str:
+    """Serialize a config value for .env storage. Uses json.dumps for complex
+    types (list/dict) to produce valid JSON instead of Python repr."""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 def _update_env_content(existing: str, entries: dict[str, str]) -> str:
     """合并 entries 到现有 .env 内容（保留注释和顺序）"""
     lines = existing.splitlines()
@@ -229,6 +246,8 @@ class ConfigHandler:
     """系统配置处理器"""
 
     TOOLS = ["system_config"]
+    # system_config 是修改 .env / 端点配置的入口，归 CONTROL_PLANE
+    TOOL_CLASSES = {"system_config": ApprovalClass.CONTROL_PLANE}
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
@@ -243,9 +262,13 @@ class ConfigHandler:
             elif action == "set":
                 return self._set_config(params)
             elif action == "add_endpoint":
-                return self._add_endpoint(params)
+                return await self._add_endpoint(params)
             elif action == "remove_endpoint":
                 return self._remove_endpoint(params)
+            elif action == "toggle_endpoint":
+                return self._toggle_endpoint(params)
+            elif action == "select_endpoint":
+                return self._select_endpoint(params)
             elif action == "test_endpoint":
                 return await self._test_endpoint(params)
             elif action == "set_ui":
@@ -257,8 +280,8 @@ class ConfigHandler:
             else:
                 return (
                     f"未知的 action: {action}。支持: discover, get, set, "
-                    "add_endpoint, remove_endpoint, test_endpoint, set_ui, "
-                    "manage_provider, extensions"
+                    "add_endpoint, remove_endpoint, toggle_endpoint, select_endpoint, "
+                    "test_endpoint, set_ui, manage_provider, extensions"
                 )
         except Exception as e:
             logger.error(f"[ConfigHandler] action={action} failed: {e}", exc_info=True)
@@ -429,41 +452,42 @@ class ConfigHandler:
     # set: 修改配置
     # ------------------------------------------------------------------
     def _set_config(self, params: dict) -> str:
-        from ...config import Settings, runtime_state, settings
+        from ...config import _PERSISTABLE_KEYS, Settings, runtime_state, settings
 
         updates = params.get("updates")
         if not updates or not isinstance(updates, dict):
             return '❌ updates 参数缺失或格式错误，应为 {"KEY": "value"} 字典'
 
-        # 项目根目录
         project_root = Path(settings.project_root)
         env_path = project_root / ".env"
 
         changes: list[str] = []
         env_entries: dict[str, str] = {}
+        persist_dirty = False
+        persist_changed_fields: set[str] = set()
         restart_needed: list[str] = []
         errors: list[str] = []
+
+        _persistable_set = set(_PERSISTABLE_KEYS)
 
         for env_key, new_value in updates.items():
             field_name = env_key.lower()
 
-            # 黑名单检查
             if field_name in _READONLY_FIELDS:
                 errors.append(f"`{env_key}`: 只读字段，不允许修改")
                 continue
 
-            # 检查字段是否存在
             if field_name not in Settings.model_fields:
                 errors.append(f"`{env_key}`: 未知配置项。可用 action=discover 查看可配置项")
                 continue
 
             field_info = Settings.model_fields[field_name]
 
-            # 类型校验和转换
-            _, err = self._validate_value(field_name, field_info, new_value)
+            validated_value, err = self._validate_value(field_name, field_info, new_value)
             if err:
                 errors.append(f"`{env_key}`: {err}")
                 continue
+            new_value = validated_value
 
             old_value = getattr(settings, field_name, None)
             if _is_sensitive(field_name) and old_value:
@@ -473,7 +497,15 @@ class ConfigHandler:
 
             new_display = _mask_value(new_value) if _is_sensitive(field_name) else str(new_value)
 
-            env_entries[env_key.upper()] = str(new_value)
+            if field_name in _persistable_set:
+                if old_value != new_value:
+                    setattr(settings, field_name, new_value)
+                    persist_changed_fields.add(field_name)
+                persist_dirty = True
+                env_entries[env_key.upper()] = ""
+            else:
+                env_entries[env_key.upper()] = _serialize_env_value(new_value)
+
             changes.append(f"- `{env_key.upper()}`: {old_display} → {new_display}")
 
             if _needs_restart(field_name, field_info):
@@ -484,41 +516,57 @@ class ConfigHandler:
             if not changes:
                 return f"❌ 所有修改都被拒绝:\n{error_lines}"
 
-        # 写入 .env
+        # 写入 .env（原子写入 + 备份）
         if env_entries:
+            from synapse.utils.atomic_io import safe_write
+
             existing = ""
             if env_path.exists():
                 existing = env_path.read_text(encoding="utf-8", errors="replace")
-            new_content = _update_env_content(existing, env_entries)
-            env_path.write_text(new_content, encoding="utf-8")
+            if existing or any(value != "" for value in env_entries.values()):
+                new_content = _update_env_content(existing, env_entries)
+                safe_write(env_path, new_content)
 
-            # 同步到 os.environ
             for key, value in env_entries.items():
                 if value:
                     os.environ[key] = value
                 elif key in os.environ:
                     del os.environ[key]
 
-            # 热重载 settings（reload 已跳过 _PERSISTABLE_KEYS 字段）
             changed_fields = settings.reload()
             logger.info(
-                f"[ConfigHandler] set: updated {len(env_entries)} entries, reloaded fields: {changed_fields}"
+                f"[ConfigHandler] set: updated {len(env_entries)} .env entries, reloaded fields: {changed_fields}"
             )
 
-            # 双重保险：恢复运行时持久化字段（防止旧版 reload 或异常路径覆盖）
-            try:
-                runtime_state.load()
-            except Exception as e:
-                logger.warning(f"[ConfigHandler] runtime_state.load failed: {e}")
+            if not persist_dirty:
+                try:
+                    runtime_state.load()
+                except Exception as e:
+                    logger.warning(f"[ConfigHandler] runtime_state.load failed: {e}")
 
-            # 持久化 runtime_state（如果修改了可持久化的字段）
+        if persist_dirty:
             try:
-                from ...config import _PERSISTABLE_KEYS
-
-                if any(k.lower() in _PERSISTABLE_KEYS for k in env_entries):
-                    runtime_state.save()
+                runtime_state.save()
+                logger.info("[ConfigHandler] set: runtime_state saved (persistable keys updated)")
             except Exception as e:
                 logger.warning(f"[ConfigHandler] runtime_state save failed: {e}")
+
+        if "persona_name" in persist_changed_fields:
+            try:
+                persona_manager = getattr(self.agent, "persona_manager", None)
+                if persona_manager is not None:
+                    persona_manager.switch_preset(settings.persona_name)
+                if hasattr(self.agent, "_invalidate_system_prompt_cache"):
+                    self.agent._invalidate_system_prompt_cache("persona config changed")
+                ctx = getattr(self.agent, "_context", None)
+                if (
+                    ctx is not None
+                    and getattr(ctx, "system", None)
+                    and hasattr(self.agent, "_build_system_prompt")
+                ):
+                    ctx.system = self.agent._build_system_prompt()
+            except Exception as e:
+                logger.warning(f"[ConfigHandler] persona runtime sync failed: {e}")
 
         # 构建响应
         result_lines = ["✅ 配置已更新:\n"] + changes
@@ -534,7 +582,7 @@ class ConfigHandler:
 
     _INT_CONSTRAINTS: dict[str, tuple[int | None, int | None, str]] = {
         "max_iterations": (15, 10000, "最大迭代次数范围 15~10000，推荐 100~300"),
-        "progress_timeout_seconds": (60, None, "无进展超时最小 60 秒"),
+        "progress_timeout_seconds": (0, None, "无进展超时可设 0=禁用；非 0 时建议至少 60 秒"),
         "tool_max_parallel": (1, 32, "并行工具数范围 1~32"),
     }
 
@@ -543,6 +591,8 @@ class ConfigHandler:
         if not spec:
             return None
         lo, hi, msg = spec
+        if field_name == "progress_timeout_seconds" and 0 < value < 60:
+            return f"值 {value} 过小。{msg}"
         if lo is not None and value < lo:
             return f"值 {value} 过小。{msg}"
         if hi is not None and value > hi:
@@ -596,7 +646,7 @@ class ConfigHandler:
     # ------------------------------------------------------------------
     # add_endpoint: 添加 LLM 端点
     # ------------------------------------------------------------------
-    def _add_endpoint(self, params: dict) -> str:
+    async def _add_endpoint(self, params: dict) -> str:
         endpoint_data = params.get("endpoint")
         if not endpoint_data or not isinstance(endpoint_data, dict):
             return "❌ 缺少 endpoint 参数"
@@ -612,13 +662,13 @@ class ConfigHandler:
         api_type = endpoint_data.get("api_type", "")
         base_url = endpoint_data.get("base_url", "")
 
+        provider_defaults = self._get_provider_defaults(provider) or {}
         if not api_type or not base_url:
-            defaults = self._get_provider_defaults(provider)
-            if defaults:
+            if provider_defaults:
                 if not api_type:
-                    api_type = defaults.get("api_type", "openai")
+                    api_type = provider_defaults.get("api_type", "openai")
                 if not base_url:
-                    base_url = defaults.get("base_url", "")
+                    base_url = provider_defaults.get("base_url", "")
 
         if not api_type:
             api_type = "openai"
@@ -630,6 +680,8 @@ class ConfigHandler:
         endpoint_type_map = {"compiler": "compiler_endpoints", "stt": "stt_endpoints"}
         endpoint_type = endpoint_type_map.get(target, "endpoints")
 
+        from synapse.llm.types import normalize_context_window
+
         ep_dict = {
             "name": name,
             "provider": provider,
@@ -638,18 +690,44 @@ class ConfigHandler:
             "model": model,
             "priority": int(endpoint_data.get("priority", 10)),
             "max_tokens": int(endpoint_data.get("max_tokens", 0)),
-            "context_window": int(endpoint_data.get("context_window", 200000)),
+            "context_window": normalize_context_window(
+                endpoint_data.get("context_window"),
+                provider=provider,
+                base_url=base_url,
+            ),
             "timeout": int(endpoint_data.get("timeout", 180)),
         }
+        if "enabled" in endpoint_data:
+            ep_dict["enabled"] = bool(endpoint_data.get("enabled"))
         if endpoint_data.get("capabilities"):
             ep_dict["capabilities"] = endpoint_data["capabilities"]
-        if endpoint_data.get("api_key_env"):
-            ep_dict["api_key_env"] = endpoint_data["api_key_env"]
+        api_key_env = endpoint_data.get("api_key_env") or provider_defaults.get("api_key_env")
+        if api_key_env:
+            ep_dict["api_key_env"] = api_key_env
+
+        from ...llm.endpoint_validation import validate_endpoint_api_key
+
+        key_error = validate_endpoint_api_key(ep_dict, api_key=api_key)
+        if key_error:
+            return f"❌ {key_error}"
+
+        validation_note = ""
+        validation = await self._probe_endpoint_before_enable(ep_dict, api_key)
+        if validation.get("context_window"):
+            ep_dict["context_window"] = int(validation["context_window"])
+        if validation["disable"]:
+            validation_note = (
+                "\n- 预检: 发现授权/额度可能有问题，已按你的配置保留启用；"
+                "如果聊天不可用，请检查 API Key、模型权限或账户余额。"
+            )
+        elif validation["message"]:
+            validation_note = f"\n- 预检: {validation['message']}"
 
         from ...config import settings
+        from ...llm.config import get_default_config_path
         from ...llm.endpoint_manager import EndpointManager
 
-        mgr = EndpointManager(Path(settings.project_root))
+        mgr = EndpointManager(Path(settings.project_root), config_path=get_default_config_path())
         try:
             result = mgr.save_endpoint(
                 endpoint=ep_dict,
@@ -663,6 +741,10 @@ class ConfigHandler:
 
         api_key_env = result.get("api_key_env", "")
         key_info = f"API Key 已存入 .env ({api_key_env})" if api_key_env else "未配置 API Key"
+        context_note = ""
+        if ep_dict.get("context_window"):
+            context_note = f"\n- 上下文窗口: {ep_dict['context_window']} tokens"
+
         return (
             f"✅ 已添加 LLM 端点:\n"
             f"- 名称: {name}\n"
@@ -671,6 +753,9 @@ class ConfigHandler:
             f"- 模型: {model} | 优先级: {ep_dict['priority']}\n"
             f"- {key_info}\n"
             f"- 目标: {target}\n"
+            f"- 状态: {'禁用（待修复配置）' if result.get('enabled') is False else '启用'}"
+            f"{context_note}"
+            f"{validation_note}\n"
             f"- {reload_info}"
         )
 
@@ -688,9 +773,10 @@ class ConfigHandler:
         endpoint_type = endpoint_type_map.get(target, "endpoints")
 
         from ...config import settings
+        from ...llm.config import get_default_config_path
         from ...llm.endpoint_manager import EndpointManager
 
-        mgr = EndpointManager(Path(settings.project_root))
+        mgr = EndpointManager(Path(settings.project_root), config_path=get_default_config_path())
         removed = mgr.delete_endpoint(endpoint_name, endpoint_type=endpoint_type)
 
         if removed is None:
@@ -700,6 +786,110 @@ class ConfigHandler:
 
         reload_info = self._reload_llm_client()
         return f'✅ 已删除端点 "{endpoint_name}" ({target})。{reload_info}'
+
+    def _toggle_endpoint(self, params: dict) -> str:
+        endpoint_name = (params.get("endpoint_name") or "").strip()
+        if not endpoint_name:
+            return "❌ 缺少 endpoint_name 参数"
+
+        target = (params.get("target") or "main").strip()
+        endpoint_type_map = {"compiler": "compiler_endpoints", "stt": "stt_endpoints"}
+        endpoint_type = endpoint_type_map.get(target, "endpoints")
+
+        from ...config import settings
+        from ...llm.config import get_default_config_path
+        from ...llm.endpoint_manager import EndpointManager
+
+        mgr = EndpointManager(Path(settings.project_root), config_path=get_default_config_path())
+        try:
+            updated = mgr.toggle_endpoint(endpoint_name, endpoint_type=endpoint_type)
+        except ValueError as e:
+            return f"❌ {e}"
+
+        reload_info = self._reload_llm_client()
+        state = "启用" if updated.get("enabled", True) else "停用"
+        return f'✅ 已{state}端点 "{endpoint_name}" ({target})。{reload_info}'
+
+    def _resolve_current_conversation_id(self, params: dict) -> str | None:
+        """Resolve the conversation key used by LLM endpoint overrides."""
+        explicit = str(params.get("conversation_id") or "").strip()
+        if explicit:
+            return explicit
+
+        session = getattr(self.agent, "_current_session", None)
+        session_id = getattr(self.agent, "_current_session_id", None)
+        resolver = getattr(self.agent, "_resolve_model_lookup_id", None)
+        if callable(resolver):
+            try:
+                return resolver(session=session, conversation_id=None, session_id=session_id)
+            except Exception as e:
+                logger.debug("[ConfigHandler] conversation resolver failed: %s", e)
+
+        if session is not None:
+            chat_id = getattr(session, "chat_id", "")
+            if chat_id:
+                return str(chat_id)
+            sid = getattr(session, "id", "")
+            if sid:
+                return str(sid)
+        if session_id:
+            return str(session_id)
+        return None
+
+    def _available_main_endpoint_names(self) -> str:
+        try:
+            from ...llm.config import load_endpoints_config
+
+            endpoints, _, _, _ = load_endpoints_config()
+            names = [ep.name for ep in endpoints if getattr(ep, "enabled", True)]
+        except Exception:
+            names = []
+        return ", ".join(names) or "(无)"
+
+    def _select_endpoint(self, params: dict) -> str:
+        """Select a main LLM endpoint for the current conversation.
+
+        This intentionally does not edit ``llm_endpoints.json``. Endpoint
+        creation/removal remains in add/remove/toggle actions; this action only
+        records the user's current model choice.
+        """
+        raw_name = str(params.get("endpoint_name") or "").strip()
+        if not raw_name:
+            available = self._available_main_endpoint_names()
+            return f"❌ 缺少 endpoint_name 参数。可用主端点: {available}"
+
+        brain = getattr(self.agent, "brain", None)
+        if brain is None:
+            return "❌ 当前 Agent 未初始化模型管理能力，无法切换端点"
+
+        conversation_id = self._resolve_current_conversation_id(params)
+
+        if raw_name.lower() in {"auto", "default", "默认", "自动"}:
+            restore = getattr(brain, "restore_default_model", None)
+            if not callable(restore):
+                return "❌ 当前模型客户端不支持恢复默认端点"
+            ok, msg = restore(conversation_id=conversation_id)
+            if ok:
+                scope = "当前会话" if conversation_id else "全局临时设置"
+                return f"✅ 已恢复默认模型（{scope}）。{msg}"
+            return f"ℹ️ {msg}"
+
+        switch = getattr(brain, "switch_model", None)
+        if not callable(switch):
+            return "❌ 当前模型客户端不支持切换端点"
+
+        ok, msg = switch(
+            raw_name,
+            hours=12,
+            reason="system_config:select_endpoint",
+            conversation_id=conversation_id,
+        )
+        if not ok:
+            available = self._available_main_endpoint_names()
+            return f'❌ 无法切换到端点 "{raw_name}": {msg}\n可用主端点: {available}'
+
+        scope = "当前会话" if conversation_id else "全局临时设置"
+        return f'✅ 已切换到端点 "{raw_name}"（{scope}，临时生效）。{msg}'
 
     # ------------------------------------------------------------------
     # test_endpoint: 测试连通性
@@ -736,12 +926,14 @@ class ConfigHandler:
         # 尝试 list models 请求
         from synapse.llm.types import normalize_base_url
 
-        headers = {"Authorization": f"Bearer {api_key}"}
+        headers = {"Authorization": f"Bearer {api_key}", "Accept-Encoding": "gzip, deflate"}
         _base = normalize_base_url(target_ep.base_url)
         if target_ep.api_type == "anthropic":
             headers = {
                 "x-api-key": api_key,
+                "Authorization": f"Bearer {api_key}",
                 "anthropic-version": "2023-06-01",
+                "Accept-Encoding": "gzip, deflate",
             }
             test_url = _base + "/v1/models"
         else:
@@ -774,6 +966,153 @@ class ConfigHandler:
             return f'❌ 端点 "{endpoint_name}" 请求超时 (15s)'
         except Exception as e:
             return f'❌ 端点 "{endpoint_name}" 测试失败: {type(e).__name__}: {e}'
+
+    async def _probe_endpoint_before_enable(self, endpoint: dict, api_key: str) -> dict:
+        """新增端点后的轻量预检。
+
+        仅对明确的认证/授权/额度问题自动禁用；网络波动、超时或 /models
+        不支持只给提示，避免把可用但不支持模型列表的中转站误伤。
+        """
+        if not api_key:
+            return {"disable": False, "message": "", "context_window": None}
+
+        import httpx
+
+        from synapse.llm.providers.base import LLMProvider
+        from synapse.llm.types import normalize_base_url
+
+        base_url = normalize_base_url(str(endpoint.get("base_url") or ""))
+        api_type = str(endpoint.get("api_type") or "openai")
+        if not base_url:
+            return {"disable": False, "message": "", "context_window": None}
+
+        if api_type == "anthropic":
+            test_url = base_url + "/v1/models"
+            headers = {
+                "x-api-key": api_key,
+                "Authorization": f"Bearer {api_key}",
+                "anthropic-version": "2023-06-01",
+                "Accept-Encoding": "gzip, deflate",
+            }
+        else:
+            test_url = base_url + "/models"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Accept-Encoding": "gzip, deflate",
+            }
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=8, follow_redirects=True, trust_env=False
+            ) as client:
+                resp = await client.get(test_url, headers=headers)
+        except httpx.TimeoutException:
+            return {
+                "disable": False,
+                "message": "连通性预检超时，已保留启用状态，后续调用会自动故障切换。",
+                "context_window": None,
+            }
+        except httpx.RequestError:
+            return {
+                "disable": False,
+                "message": "暂时无法连接到该地址，已保留启用状态，后续调用会自动故障切换。",
+                "context_window": None,
+            }
+
+        if resp.status_code < 400:
+            detected_ctx = self._extract_context_window_from_models_response(
+                resp,
+                str(endpoint.get("model") or ""),
+            )
+            if detected_ctx:
+                return {
+                    "disable": False,
+                    "message": f"连通正常，已识别模型上下文约 {detected_ctx} tokens。",
+                    "context_window": detected_ctx,
+                }
+            return {"disable": False, "message": "连通正常。", "context_window": None}
+
+        body = (resp.text or "")[:1000]
+        category = LLMProvider._classify_error(f"HTTP {resp.status_code}\n{body}")
+        if category in ("auth", "quota"):
+            return {"disable": True, "message": body[:240], "context_window": None}
+        return {
+            "disable": False,
+            "message": f"/models 返回 {resp.status_code}，可能是服务商不支持模型列表；已保留启用状态。",
+            "context_window": None,
+        }
+
+    @staticmethod
+    def _extract_context_window_from_models_response(resp: Any, model_name: str) -> int | None:
+        """Best-effort context window detection from OpenAI-compatible /models responses."""
+        try:
+            payload = resp.json()
+        except Exception:
+            return None
+
+        candidates: list[dict] = []
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            if isinstance(data, list):
+                candidates = [item for item in data if isinstance(item, dict)]
+            else:
+                candidates = [payload]
+        elif isinstance(payload, list):
+            candidates = [item for item in payload if isinstance(item, dict)]
+
+        if not candidates:
+            return None
+
+        wanted = (model_name or "").strip().lower()
+        ordered = candidates
+        if wanted:
+            exact = [
+                item
+                for item in candidates
+                if str(item.get("id") or item.get("name") or item.get("model") or "").lower()
+                == wanted
+            ]
+            if exact:
+                ordered = exact + [item for item in candidates if item not in exact]
+
+        keys = {
+            "context_window",
+            "context_length",
+            "max_context_length",
+            "max_context",
+            "context_size",
+            "n_ctx",
+            "max_model_len",
+            "max_sequence_length",
+            "max_position_embeddings",
+        }
+
+        def walk(value: Any) -> int | None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if str(key).lower() in keys:
+                        try:
+                            found = int(item)
+                        except (TypeError, ValueError):
+                            found = 0
+                        if found > 0:
+                            return found
+                for item in value.values():
+                    found = walk(item)
+                    if found:
+                        return found
+            elif isinstance(value, list):
+                for item in value:
+                    found = walk(item)
+                    if found:
+                        return found
+            return None
+
+        for item in ordered:
+            found = walk(item)
+            if found:
+                return found
+        return None
 
     # ------------------------------------------------------------------
     # set_ui: 设置 UI 偏好
@@ -1153,20 +1492,22 @@ class ConfigHandler:
         return "\n".join(lines)
 
     def _reload_llm_client(self) -> str:
-        """热重载 LLM client，返回结果描述"""
-        brain = getattr(self.agent, "brain", None)
-        llm_client = getattr(brain, "_llm_client", None) if brain else None
-        if llm_client is None:
-            return "⚠️ LLM client 未找到，请手动重启服务"
+        """应用 LLM 配置到运行时，返回面向用户的简短描述。"""
+        from ...llm.config import get_default_config_path
+        from ...llm.runtime_config import apply_llm_runtime_config
 
-        try:
-            success = llm_client.reload()
-            if success:
-                count = len(llm_client.endpoints)
-                return f"已热重载 ({count} 个端点生效)"
-            return "⚠️ 热重载返回 false"
-        except Exception as e:
-            return f"⚠️ 热重载失败: {e}"
+        result = apply_llm_runtime_config(
+            agent=self.agent,
+            config_path=get_default_config_path(),
+            reason="llm_config:system_config",
+        )
+        if result.get("status") == "failed":
+            reason = result.get("reason") or "unknown"
+            return f"⚠️ 配置已保存，但当前会话暂未加载新配置（{reason}）"
+        count = result.get("endpoints")
+        if count is not None:
+            return f"已热重载 ({count} 个主端点生效)"
+        return "配置已保存，运行时会在下次会话或服务启动时加载"
 
 
 def create_handler(agent: "Agent"):

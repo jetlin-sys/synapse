@@ -23,6 +23,8 @@ from ..converters.tools import (
     has_text_tool_calls,
     parse_text_tool_calls,
 )
+from ..model_registry import resolve_output_token_budget
+from ..thinking import reasoning_effort_for_depth
 from ..types import (
     AuthenticationError,
     EndpointConfig,
@@ -125,7 +127,13 @@ class OpenAIResponsesProvider(OpenAIProvider):
                 if response.status_code == 401:
                     raise AuthenticationError(f"Authentication failed: {body}", status_code=401)
                 if response.status_code == 429:
-                    raise RateLimitError(f"Rate limit exceeded: {body}", status_code=429)
+                    retry_after = response.headers.get("retry-after")
+                    raw_body = f"{body}\nretry-after: {retry_after}" if retry_after else body
+                    raise RateLimitError(
+                        f"Rate limit exceeded: {body}",
+                        status_code=429,
+                        raw_body=raw_body,
+                    )
                 raise LLMError(
                     f"API error ({response.status_code}): {body}", status_code=response.status_code
                 )
@@ -192,6 +200,11 @@ class OpenAIResponsesProvider(OpenAIProvider):
             request.system,
             provider=self.config.provider,
             enable_thinking=request.enable_thinking,
+            vision_available=self.config.has_capability("vision") and not getattr(
+                self,
+                "_vision_payload_unsupported",
+                False,
+            ),
         )
 
         body: dict = {
@@ -203,12 +216,11 @@ class OpenAIResponsesProvider(OpenAIProvider):
             body["instructions"] = instructions
 
         # max_tokens → max_output_tokens (Responses API 字段名)
-        _max_tokens = request.max_tokens
-        if _max_tokens and _max_tokens > 0:
-            body["max_output_tokens"] = _max_tokens
-        else:
-            _fallback = self.config.max_tokens or 16384
-            body["max_output_tokens"] = _fallback
+        body["max_output_tokens"] = resolve_output_token_budget(
+            self.config.model,
+            request_max_tokens=request.max_tokens,
+            endpoint_max_tokens=self.config.max_tokens,
+        )
 
         # 工具
         if request.tools:
@@ -224,7 +236,14 @@ class OpenAIResponsesProvider(OpenAIProvider):
         # 思考模式 (reasoning)
         if request.enable_thinking and self.config.has_capability("thinking"):
             if request.thinking_depth:
-                body["reasoning"] = {"effort": request.thinking_depth}
+                effort = reasoning_effort_for_depth(
+                    provider=self.config.provider,
+                    base_url=self.base_url,
+                    model=self.config.model,
+                    depth=request.thinking_depth,
+                    allow_max_effort=False,
+                )
+                body["reasoning"] = {"effort": effort or "medium"}
             else:
                 body["reasoning"] = {"effort": "medium"}
 
@@ -320,7 +339,22 @@ class OpenAIResponsesProvider(OpenAIProvider):
             model=data.get("model", self.config.model),
         )
 
-    def _convert_stream_event(self, event: dict) -> dict:
+    @staticmethod
+    def _extract_reasoning_text(value: object) -> str:
+        """Extract visible reasoning summaries from Responses API stream payloads."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(OpenAIResponsesProvider._extract_reasoning_text(item) for item in value)
+        if isinstance(value, dict):
+            for key in ("text", "delta", "content", "summary_text", "reasoning", "thinking"):
+                if key in value:
+                    extracted = OpenAIResponsesProvider._extract_reasoning_text(value.get(key))
+                    if extracted:
+                        return extracted
+        return ""
+
+    def _convert_stream_event(self, event: dict) -> dict | list[dict]:
         """将 Responses API 流式事件转换为内部统一格式。
 
         Responses API 流式事件结构：
@@ -346,6 +380,20 @@ class OpenAIResponsesProvider(OpenAIProvider):
             return {
                 "type": "content_block_delta",
                 "delta": {"type": "text", "text": event.get("delta", "")},
+            }
+
+        # ── 思考摘要增量 ──
+        # Responses API 不暴露完整 CoT（chain-of-thought，模型内部推理），但会
+        # 对部分 reasoning 模型流式返回 summary text；前端按 thinking_delta 展示。
+        if event_type in (
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+            "response.reasoning.delta",
+        ):
+            text = self._extract_reasoning_text(event.get("delta"))
+            return {
+                "type": "content_block_delta",
+                "delta": {"type": "thinking", "text": text},
             }
 
         # ── 工具调用：参数增量 ──
@@ -387,8 +435,17 @@ class OpenAIResponsesProvider(OpenAIProvider):
             }
 
         # ── 新 output item（函数调用的首个事件，含 name 和 call_id）──
-        if event_type == "response.output_item.added":
+        if event_type in ("response.output_item.added", "response.output_item.done"):
             item = event.get("item", {})
+            if item.get("type") == "reasoning":
+                text = self._extract_reasoning_text(
+                    item.get("summary") or item.get("content") or item.get("text")
+                )
+                if text:
+                    return {
+                        "type": "content_block_delta",
+                        "delta": {"type": "thinking", "text": text},
+                    }
             if item.get("type") == "function_call":
                 return {
                     "type": "content_block_delta",
@@ -430,7 +487,17 @@ class OpenAIResponsesProvider(OpenAIProvider):
                             f"Authentication failed: {error_text}", status_code=401
                         )
                     if response.status_code == 429:
-                        raise RateLimitError(f"Rate limit exceeded: {error_text}", status_code=429)
+                        retry_after = response.headers.get("retry-after")
+                        raw_body = (
+                            f"{error_text}\nretry-after: {retry_after}"
+                            if retry_after
+                            else error_text
+                        )
+                        raise RateLimitError(
+                            f"Rate limit exceeded: {error_text}",
+                            status_code=429,
+                            raw_body=raw_body,
+                        )
                     raise LLMError(
                         f"API error ({response.status_code}): {error_text}",
                         status_code=response.status_code,

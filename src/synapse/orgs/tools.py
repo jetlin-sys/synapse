@@ -11,11 +11,28 @@ ORG_NODE_TOOLS: list[dict] = [
     # ── 通信 ──
     {
         "name": "org_send_message",
-        "description": "向指定同事发送消息。优先通过已有连线关系沟通。",
+        "description": (
+            "向指定同事发送消息（提问、回答、反馈、握手——非派活）。\n"
+            "⚠️ 重要：本工具不是用来派任务的。如果你想让某节点完成一项工作并"
+            "返回交付物，**必须**使用 org_delegate_task；否则下属会按聊天处理，"
+            "不会建立 chain，也不会触发 deliverable，导致你后续 wait/accept 全部失效。\n"
+            "适合的使用场景：向同事提问、回答同事问题、抄送进展、握手确认。\n"
+            "若你正在推进一条任务链且 org_delegate_task 因故不可用（例如返回了"
+            "'不能委派给自己'之类的误判），可以将 propagate_chain 设为 true 并"
+            "可选传 task_chain_id 把当前任务链 id 接力给接收方，接收方在交付时"
+            "将使用同一 task_chain_id 调用 org_submit_deliverable，确保链路闭合。"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "to_node": {"type": "string", "description": "目标节点 ID"},
+                "to_node": {
+                    "type": "string",
+                    "description": (
+                        "目标节点的精确 id（与系统提示里组织结构展示的反引号 id 一致）。"
+                        "必须使用精确 id，不要填角色名；如果不确定，先用 "
+                        "org_find_colleague 或 org_get_org_chart 查询。不能写自己的 id。"
+                    ),
+                },
                 "content": {"type": "string", "description": "消息内容"},
                 "msg_type": {
                     "type": "string",
@@ -24,6 +41,23 @@ ORG_NODE_TOOLS: list[dict] = [
                     "default": "question",
                 },
                 "priority": {"type": "integer", "description": "优先级 0=普通 1=紧急 2=最高", "default": 0},
+                "propagate_chain": {
+                    "type": "boolean",
+                    "description": (
+                        "可选。设为 true 时把你当前的 task_chain_id 接力到接收方，"
+                        "接收方完成后用同一 task_chain_id 提交交付物，链路保持闭合。"
+                        "仅在你确实在推进某条任务链且需要让接收方继续这条链时启用。"
+                        "默认 false（普通对话/咨询不要打开）。"
+                    ),
+                    "default": False,
+                },
+                "task_chain_id": {
+                    "type": "string",
+                    "description": (
+                        "可选。propagate_chain=true 时使用的 task_chain_id；"
+                        "不传则自动使用你当前绑定的 chain。已关闭的 chain 不会被接力。"
+                    ),
+                },
             },
             "required": ["to_node", "content"],
         },
@@ -42,11 +76,21 @@ ORG_NODE_TOOLS: list[dict] = [
     },
     {
         "name": "org_delegate_task",
-        "description": "向直属下级分配任务。只能分配给你的直接下属，不能委派给平级同事或自己。与平级协作请用 org_send_message。",
+        "description": (
+            "向直属下级分配任务。只能分配给你的直接下属，不能委派给平级同事或自己。"
+            "与平级协作请用 org_send_message。"
+            "不确定下属 id 时先用 org_get_org_chart 或 org_find_colleague 查询。"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "to_node": {"type": "string", "description": "目标直属下级的节点 ID（必须是你的直接下属）"},
+                "to_node": {
+                    "type": "string",
+                    "description": (
+                        "目标直属下级的精确节点 id（与系统提示里组织结构展示的反引号 id 一致）。"
+                        "必须是你的直接下属，禁止填角色名或自己的 id；名字接近的同事要用精确 id 区分。"
+                    ),
+                },
                 "task": {"type": "string", "description": "任务描述"},
                 "deadline": {"type": "string", "description": "截止时间（ISO 格式，可选）。AI 节点通常在分钟内完成任务，建议设置 5-30 分钟的 deadline"},
                 "priority": {"type": "integer", "default": 0},
@@ -367,19 +411,52 @@ ORG_NODE_TOOLS: list[dict] = [
                     ),
                 },
                 "summary": {"type": "string", "description": "工作过程简述"},
+                "file_attachments": {
+                    "type": "array",
+                    "description": (
+                        "如果本次交付涉及文件（无论通过 write_file / run_shell 产出，"
+                        "或来自插件返回的 local_paths / output_path / video_path 等），"
+                        "必须在此字段声明，否则用户看不到附件。\n"
+                        "- 字段名必须是 file_attachments（不是 attachments）\n"
+                        "- 每项必须含 filename + file_path（必填）\n"
+                        "- file_path 必须是真实存在的本地文件路径，可以相对于"
+                        "组织工作区也可以是绝对路径\n"
+                        "示例：file_attachments=[{\"filename\": \"scene_01.png\","
+                        " \"file_path\": \"data/plugin_assets/hh/.../scene_01.png\"}]"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string", "description": "文件显示名（含扩展名，如 scene_01.png）"},
+                            "file_path": {"type": "string", "description": "文件路径（相对于组织工作区或绝对路径，必须真实存在）"},
+                            "description": {"type": "string", "description": "文件说明（可选）"},
+                        },
+                        "required": ["filename", "file_path"],
+                    },
+                },
             },
             "required": ["deliverable"],
         },
     },
     {
         "name": "org_accept_deliverable",
-        "description": "验收通过下级提交的交付物。",
+        "description": (
+            "验收通过下级提交的交付物，关闭该任务链。\n"
+            "- 收到下级 TASK_DELIVERED 消息后应立即调用本工具关闭 chain；"
+            "未关闭的 chain 会被视作仍在进行中，整个用户指令不会被判定为完成。\n"
+            "- 用 org_list_delegated_tasks 可以查询当前有哪些 chain 处于 delivered 状态待你验收。\n"
+            "- 反模式：把 chain 留在 delivered 而直接给上级写最终回复——这会触发"
+            "watchdog 把任务判为未完成并强制重做。"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "task_chain_id": {"type": "string", "description": "任务链 ID"},
-                "from_node": {"type": "string", "description": "交付人节点 ID"},
-                "feedback": {"type": "string", "description": "验收意见（可选）"},
+                "task_chain_id": {
+                    "type": "string",
+                    "description": "完整的任务链 ID（来自下级 TASK_DELIVERED 消息或 org_list_delegated_tasks）。允许前缀缩写，但前缀必须唯一，否则系统会返回候选列表并要求重试。",
+                },
+                "from_node": {"type": "string", "description": "交付人节点 ID（即下级 node_id）"},
+                "feedback": {"type": "string", "description": "验收意见（可选；不写默认 \"验收通过\"）"},
             },
             "required": ["task_chain_id", "from_node"],
         },
@@ -395,6 +472,38 @@ ORG_NODE_TOOLS: list[dict] = [
                 "reason": {"type": "string", "description": "打回原因和修改要求"},
             },
             "required": ["task_chain_id", "from_node", "reason"],
+        },
+    },
+    {
+        "name": "org_wait_for_deliverable",
+        "description": (
+            "阻塞等待你派出的下级任务完成（用 org_delegate_task 派的）。"
+            "比 org_list_delegated_tasks 轮询高效得多——会在以下任一事件触发时立即返回：\n"
+            "  1) 任意指定的子任务链关闭（被你 accept/reject 或被取消）\n"
+            "  2) 收到下级新消息（提问/升级），需要你立即处理\n"
+            "  3) timeout 到期（默认 60 秒）\n"
+            "  4) 用户取消整个命令\n"
+            "返回值会告诉你：哪些子链已关闭、是否被消息打断、是否超时。"
+            "建议用法：派完一组并行任务后立即 wait，超时后用 org_list_delegated_tasks "
+            "看进度，再决定是继续 wait 还是输出阶段性汇总。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chain_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "要等待的具体任务链 ID 列表（可选）。"
+                        "省略时自动等待你最近派出的所有未关闭子链。"
+                    ),
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "最大等待秒数，默认 60，最大 300。",
+                    "default": 60,
+                },
+            },
         },
     },
     # ── 制度提议 ──
@@ -554,3 +663,49 @@ ORG_NODE_TOOLS: list[dict] = [
         },
     },
 ]
+
+
+def build_org_node_tools(org: "object", node: "object") -> list[dict]:
+    """Return a per-node customized copy of ORG_NODE_TOOLS.
+
+    Customizations applied:
+
+    - ``org_delegate_task.to_node`` gets an ``enum`` limited to the node's
+      direct subordinate ids, physically preventing the LLM from selecting
+      an invalid target (self, peers, grand-children, or non-existing ids).
+    - If the node has no direct subordinates (leaf node), ``org_delegate_task``
+      is dropped from the returned list entirely. Leaf nodes should use
+      ``org_submit_deliverable`` to hand results back upwards.
+    - All other tools are returned by reference without mutation, so there
+      is zero shared-state risk for them.
+
+    Args:
+        org: The owning :class:`Organization` instance. Must expose
+            ``get_children(node_id) -> list[OrgNode]``.
+        node: The :class:`OrgNode` to build tools for. Must expose ``id``.
+
+    Returns:
+        A list of tool definition dicts suitable for injecting into the
+        node's agent tool catalog / ``_tools`` list.
+    """
+    import copy
+
+    children = org.get_children(node.id)
+    child_ids = [c.id for c in children]
+
+    out: list[dict] = []
+    for tpl in ORG_NODE_TOOLS:
+        name = tpl.get("name", "")
+        if name == "org_delegate_task":
+            if not child_ids:
+                continue
+            tool = copy.deepcopy(tpl)
+            props = tool["input_schema"]["properties"]
+            props["to_node"]["enum"] = list(child_ids)
+            hint_ids = ", ".join(f"`{cid}`" for cid in child_ids)
+            base_desc = props["to_node"].get("description", "")
+            props["to_node"]["description"] = f"{base_desc}（只能是：{hint_ids}）"
+            out.append(tool)
+        else:
+            out.append(tpl)
+    return out

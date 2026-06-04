@@ -11,7 +11,7 @@
 
 API Base: https://ilinkai.weixin.qq.com
 CDN Base: https://novac2c.cdn.weixin.qq.com/c2c
-协议参考: @tencent-weixin/openclaw-weixin v2.1.6 (MIT)
+协议参考: @tencent-weixin/openclaw-weixin v2.1.8 (MIT)
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import mimetypes
 import os
 import re
 import struct
+import tempfile
 import time
 import uuid
 from collections import OrderedDict
@@ -74,11 +75,11 @@ DEFAULT_ILINK_BOT_TYPE = "3"
 DEFAULT_CHANNEL_VERSION = "2.0.0"
 
 # ---------------------------------------------------------------------------
-# 协议兼容参数 — 对齐 @tencent-weixin/openclaw-weixin v2.1.6
+# 协议兼容参数 — 对齐 @tencent-weixin/openclaw-weixin v2.1.8
 # 可通过环境变量紧急覆盖，无需改代码
 # ---------------------------------------------------------------------------
 
-OPENCLAW_COMPAT_VERSION = os.environ.get("WECHAT_OPENCLAW_COMPAT_VERSION", "2.1.6")
+OPENCLAW_COMPAT_VERSION = os.environ.get("WECHAT_OPENCLAW_COMPAT_VERSION", "2.1.8")
 ILINK_APP_ID = os.environ.get("WECHAT_ILINK_APP_ID", "bot")
 
 
@@ -102,6 +103,13 @@ BACKOFF_DELAY_S = 30.0
 RETRY_DELAY_S = 2.0
 SESSION_PAUSE_DURATION_S = 3600  # 1 hour
 SESSION_EXPIRED_ERRCODE = -14
+
+# Permanent / non-retryable iLink Bot return codes. Re-trying these
+# only buys ~75s of delay (4 attempts × exponential 5+10+20+40 backoff)
+# without any chance of success — the server has already rejected the
+# request for a non-transient reason (e.g. chat_id unreachable, no
+# friend relationship, no fresh context_token, malformed param).
+NON_RETRYABLE_RET_CODES: frozenset[int] = frozenset({-2, SESSION_EXPIRED_ERRCODE})
 
 UPLOAD_MAX_RETRIES = 3
 CONFIG_CACHE_TTL_S = 86400  # 24h
@@ -409,6 +417,25 @@ def _try_silk_to_wav(silk_path: Path) -> Path | None:
     return None
 
 
+def _voice_duration_seconds(path: Path) -> int:
+    """估算语音时长（秒），供 iLink voice_item 使用。"""
+    try:
+        import wave
+
+        with wave.open(str(path), "rb") as w:
+            rate = w.getframerate()
+            n = w.getnframes()
+            if rate:
+                return max(1, min(300, int(n / rate)))
+    except Exception:
+        pass
+    try:
+        raw = path.stat().st_size
+        return max(1, min(300, raw // 1600))
+    except OSError:
+        return 1
+
+
 def _guess_mime(filepath: str) -> str:
     mime, _ = mimetypes.guess_type(filepath)
     return mime or "application/octet-stream"
@@ -488,7 +515,7 @@ class WeChatAdapter(ChannelAdapter):
         "streaming": False,
         "send_image": True,
         "send_file": True,
-        "send_voice": False,
+        "send_voice": True,
         "send_video": True,
         "delete_message": False,
         "edit_message": False,
@@ -1178,14 +1205,17 @@ class WeChatAdapter(ChannelAdapter):
                 "context_token": ctx_token or None,
             }
         }
+        token_hint = " (no context_token cached for this chat)" if not ctx_token else ""
         for attempt in range(1, SEND_RATE_LIMIT_RETRIES + 1):
             await self._rate_limit_wait(to)
             resp = await self._api_post("ilink/bot/sendmessage", body)
             try:
                 self._check_send_response(resp, action="sendmessage(text)")
                 break
-            except RuntimeError:
-                if resp.get("ret") == SESSION_EXPIRED_ERRCODE:
+            except RuntimeError as exc:
+                if resp.get("ret") in NON_RETRYABLE_RET_CODES:
+                    if token_hint and token_hint not in str(exc):
+                        raise RuntimeError(str(exc) + token_hint) from exc
                     raise
                 if attempt < SEND_RATE_LIMIT_RETRIES:
                     delay = SEND_RATE_LIMIT_BASE_DELAY_S * (2 ** (attempt - 1))
@@ -1196,6 +1226,8 @@ class WeChatAdapter(ChannelAdapter):
                     await asyncio.sleep(delay)
                     body["msg"]["client_id"] = f"synapse-wechat-{uuid.uuid4().hex[:12]}"
                 else:
+                    if token_hint and token_hint not in str(exc):
+                        raise RuntimeError(str(exc) + token_hint) from exc
                     raise
         self._send_count += 1
         logger.info(f"{self.channel_name}: text sent to={_redact_id(to)}, len={len(text)}")
@@ -1252,6 +1284,17 @@ class WeChatAdapter(ChannelAdapter):
                     "video_size": uploaded["filesize_cipher"],
                 },
             }
+        elif mime.startswith("audio/"):
+            vsec = _voice_duration_seconds(Path(file_path))
+            item = {
+                "type": ITEM_VOICE,
+                "voice_item": {
+                    "aeskey": aeskey_hex,
+                    "media": media_ref,
+                    "voice_time": vsec,
+                    "mid_size": uploaded["filesize_cipher"],
+                },
+            }
         else:
             fname = Path(file_path).name
             item = {
@@ -1282,7 +1325,7 @@ class WeChatAdapter(ChannelAdapter):
                 self._check_send_response(resp, action="sendmessage(media)")
                 break
             except RuntimeError:
-                if resp.get("ret") == SESSION_EXPIRED_ERRCODE:
+                if resp.get("ret") in NON_RETRYABLE_RET_CODES:
                     raise
                 if attempt < SEND_RATE_LIMIT_RETRIES:
                     delay = SEND_RATE_LIMIT_BASE_DELAY_S * (2 ** (attempt - 1))
@@ -1311,6 +1354,69 @@ class WeChatAdapter(ChannelAdapter):
             caption=caption or "",
             ctx_token=ctx_token,
         )
+
+    def _prepare_voice_file_for_wechat(self, voice_path: str) -> tuple[str, list[Path]]:
+        """返回可上传的 SILK 路径及需在发送后删除的临时文件。"""
+        import io
+        import wave
+
+        src = Path(voice_path)
+        if not src.exists():
+            raise FileNotFoundError(f"Voice file not found: {voice_path}")
+        cleanup: list[Path] = []
+        if src.suffix.lower() in (".silk", ".slk"):
+            return str(src), cleanup
+        try:
+            import pilk  # type: ignore[import-untyped]
+        except ImportError as e:
+            raise ImportError(
+                "发送微信语音需要 pilk。请在设置中心修复 Synapse 运行环境"
+                "（或在源码开发环境安装 qqbot optional extra），不要直接污染宿主 Python。"
+            ) from e
+        raw_bytes = src.read_bytes()
+        pcm_data: bytes
+        sample_rate = 24000
+        try:
+            with wave.open(io.BytesIO(raw_bytes)) as wf:
+                sample_rate = wf.getframerate()
+                pcm_data = wf.readframes(wf.getnframes())
+        except wave.Error:
+            pcm_data = raw_bytes
+        fd_pcm, pcm_name = tempfile.mkstemp(suffix=".pcm", prefix="wechat_v_")
+        fd_silk, silk_name = tempfile.mkstemp(suffix=".silk", prefix="wechat_v_")
+        os.close(fd_pcm)
+        os.close(fd_silk)
+        tmp_pcm = Path(pcm_name)
+        tmp_silk = Path(silk_name)
+        cleanup.extend([tmp_pcm, tmp_silk])
+        try:
+            tmp_pcm.write_bytes(pcm_data)
+            pilk.encode(str(tmp_pcm), str(tmp_silk), pcm_rate=sample_rate, tencent=True)
+        except Exception:
+            for p in cleanup:
+                p.unlink(missing_ok=True)
+            raise
+        return str(tmp_silk), cleanup
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        voice_path: str,
+        caption: str | None = None,
+    ) -> str:
+        silk_path, cleanup = self._prepare_voice_file_for_wechat(voice_path)
+        try:
+            ctx_token = self._resolve_context_token(chat_id)
+            return await self._send_media_by_mime(
+                chat_id,
+                silk_path,
+                "audio/silk",
+                caption=caption or "",
+                ctx_token=ctx_token,
+            )
+        finally:
+            for p in cleanup:
+                p.unlink(missing_ok=True)
 
     # ==================== Typing ====================
     # iLink Bot API 不支持通过同一 client_id 更新消息（API 按 client_id 去重），
@@ -1458,6 +1564,8 @@ class WeChatAdapter(ChannelAdapter):
             media_type = UPLOAD_IMAGE
         elif mime.startswith("video/"):
             media_type = UPLOAD_VIDEO
+        elif mime.startswith("audio/"):
+            media_type = UPLOAD_VOICE
         else:
             media_type = UPLOAD_FILE
 

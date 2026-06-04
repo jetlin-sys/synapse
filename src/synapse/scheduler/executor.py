@@ -10,10 +10,13 @@
 
 import asyncio
 import contextlib
+import inspect
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from ..memory.json_utils import coerce_text
 from .task import ScheduledTask
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,21 @@ class TaskExecutor:
         self.persona_manager = None
         self.memory_manager = None
         self.proactive_engine = None  # 复用 agent 上的实例，保留 _last_user_interaction 状态
+
+    @staticmethod
+    def _metadata_bool(task: ScheduledTask, key: str, default: bool) -> bool:
+        """Read bool-like scheduler metadata values from persisted JSON safely."""
+
+        value = (task.metadata or {}).get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return bool(value)
 
     def _escape_telegram_chars(self, text: str) -> str:
         """
@@ -310,7 +328,9 @@ class TaskExecutor:
 
 只回复 NO_ACTION 或 NEEDS_ACTION，不要有其他内容。"""
 
-                response = await brain.think(check_prompt, usage_scene="check_if_needs_execution")
+                response = await brain.think(
+                    check_prompt, enable_thinking=False, max_tokens=16
+                )
                 result = response.content.strip().upper()
 
                 needs_action = "NEEDS_ACTION" in result
@@ -353,15 +373,26 @@ class TaskExecutor:
             task: 要执行的任务
             skip_end_notification: 是否跳过结束通知（用于从提醒升级的情况）
         """
-        # 检查是否是系统任务（需要特殊处理）
-        if task.action and task.action.startswith("system:"):
-            return await self._execute_system_task(task)
-
         agent = None
         im_context_set = False
         try:
+            # 系统任务只负责产出结果，通知仍走统一路径，避免完成结果只写历史不发 IM。
+            if task.action and task.action.startswith("system:"):
+                system_success, system_result = await self._execute_system_task(task)
+                if not skip_end_notification:
+                    delivered = await self._send_end_notification(
+                        task,
+                        success=system_success,
+                        message=system_result,
+                    )
+                    if not delivered:
+                        error_msg = "任务已完成，但结果通知发送失败，请检查 IM 通道连接状态。"
+                        logger.warning(f"TaskExecutor: system task {task.id} result delivery failed")
+                        return False, error_msg
+                return system_success, system_result
+
             # 1. 创建 Agent
-            agent = await self._create_agent()
+            agent = await self._create_agent(task.agent_profile_id)
 
             # 1.5. 防递归：禁止任务内再创建定时任务
             if task.no_schedule_tools:
@@ -391,11 +422,115 @@ class TaskExecutor:
                         f"TaskExecutor: using task-level timeout {task_timeout}s "
                         f"(default: {self.timeout_seconds}s)"
                     )
+            # C12 §14.2 + §14.3: install an unattended PolicyContext so the
+            # PolicyEngineV2 step 11 routes through ``_handle_unattended``.
+            # The strategy is taken from ``task.metadata.unattended_strategy``
+            # (per-task override) or falls back to engine config default.
+            # ContextVar propagation: the ContextVar set here is inherited by
+            # ``self._run_agent → agent.execute_task_from_message → execute_batch``
+            # via Python's standard asyncio task copy semantics.
+            #
+            # C12 §14.7 (R3-5): if the task is being resumed after an owner
+            # approval, ``task.metadata["replay_authorizations"]`` carries
+            # 30s-TTL replay records (written by /api/pending_approvals/resolve).
+            # Lift them into the PolicyContext so engine step 7 ``replay`` can
+            # match and shortcut the same tool+params to ALLOW without re-asking.
+            import os as _os
+            from pathlib import Path as _Path
+
+            from ..core.policy_v2.context import (
+                PolicyContext,
+                ReplayAuthorization,
+                reset_current_context,
+                set_current_context,
+            )
+
+            _strategy = ""
+            _replay_auths_raw: list = []
+            if task.metadata and isinstance(task.metadata, dict):
+                raw = task.metadata.get("unattended_strategy")
+                if isinstance(raw, str):
+                    _strategy = raw
+                _replay_auths_raw = list(
+                    task.metadata.get("replay_authorizations", []) or []
+                )
+
+            # C12 §14.7: only lift NON-expired replay auths into the
+            # PolicyContext. Engine step 7 ignores expired entries
+            # anyway (auth.is_active(now=)), but pre-filtering keeps the
+            # ctx list short — engine iterates every entry per tool
+            # call, so for a long-lived task with many past approvals
+            # this matters.
+            import time as _time
+
+            _now_for_replay = _time.time()
+            _replay_auths: list[ReplayAuthorization] = []
+            for ra in _replay_auths_raw:
+                if isinstance(ra, ReplayAuthorization):
+                    if ra.expires_at > _now_for_replay:
+                        _replay_auths.append(ra)
+                elif isinstance(ra, dict):
+                    try:
+                        _exp = float(ra.get("expires_at", 0))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "TaskExecutor: skipping malformed replay auth %r", ra
+                        )
+                        continue
+                    if _exp <= _now_for_replay:
+                        continue
+                    try:
+                        _replay_auths.append(
+                            ReplayAuthorization(
+                                expires_at=_exp,
+                                original_message=str(ra.get("original_message", "")),
+                                confirmation_id=str(ra.get("confirmation_id", "")),
+                                operation=str(ra.get("operation", "")),
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "TaskExecutor: skipping malformed replay auth %r", ra
+                        )
+
+            # workspace_roots = security.workspace.paths（用户配置）∪ task cwd。
+            # 不再用单一 cwd 覆盖用户配置——计划任务必须遵守安全页定义的工作区
+            # 边界，与对话路径一致。
             try:
-                result = await asyncio.wait_for(
+                from synapse.core.policy_v2 import get_config_v2 as _get_cfg
+
+                _cfg_roots = tuple(_Path(p) for p in _get_cfg().workspace.paths)
+            except Exception:
+                _cfg_roots = ()
+            _cwd_root = _Path(_os.getcwd())
+            _ws_seen: set[str] = set()
+            _ws_list: list[_Path] = []
+            for _p in (*_cfg_roots, _cwd_root):
+                _k = str(_p)
+                if _k not in _ws_seen:
+                    _ws_seen.add(_k)
+                    _ws_list.append(_p)
+            _policy_ctx = PolicyContext(
+                # ScheduledTask has no first-class ``session_id`` field —
+                # fall back to a synthetic id derived from task.id.
+                session_id=getattr(task, "session_id", None) or f"task:{task.id}",
+                workspace_roots=tuple(_ws_list),
+                channel="scheduler",
+                is_owner=True,  # scheduler-owned tasks act on behalf of owner
+                is_unattended=True,
+                unattended_strategy=_strategy,
+                # user_message is the task prompt; engine step 7 replay match
+                # is by equality, and scheduler reruns the same prompt verbatim
+                # — so a recorded auth.original_message == prompt → ALLOW.
+                user_message=task.prompt or "",
+                replay_authorizations=_replay_auths,
+            )
+            _ctx_token = set_current_context(_policy_ctx)
+            try:
+                agent_success, result = await asyncio.wait_for(
                     self._run_agent(agent, prompt), timeout=task_timeout
                 )
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 timeout_display = (
                     f"{task_timeout // 60} 分钟" if task_timeout >= 60 else f"{task_timeout} 秒"
                 )
@@ -404,11 +539,47 @@ class TaskExecutor:
                 if not skip_end_notification:
                     await self._send_end_notification(task, success=False, message=error_msg)
                 return False, error_msg
+            except Exception as exc:  # noqa: BLE001
+                # C12 §14.5: catch DeferredApprovalRequired before the generic
+                # handler below so we report it as a distinct outcome (paused,
+                # not failed). Caller (Scheduler) sees a special prefix and
+                # transitions task to AWAITING_APPROVAL rather than FAILED.
+                from ..core.policy_v2.exceptions import DeferredApprovalRequired
+
+                if isinstance(exc, DeferredApprovalRequired):
+                    logger.info(
+                        "TaskExecutor: task %s deferred awaiting owner approval "
+                        "(pending=%s strategy=%s)",
+                        task.id,
+                        exc.pending_id,
+                        exc.unattended_strategy,
+                    )
+                    pending_marker = (
+                        f"[awaiting_approval] pending_id={exc.pending_id} "
+                        f"strategy={exc.unattended_strategy or 'defer_to_owner'}"
+                    )
+                    # Do NOT send a regular end notification — owner is being
+                    # notified separately via pending_approval_created SSE / IM card.
+                    return False, pending_marker
+                # Other exceptions go to the outer handler below
+                raise
+            finally:
+                reset_current_context(_ctx_token)
 
             # 5. 发送结果通知（如果需要）
+            if not agent_success:
+                if not skip_end_notification:
+                    await self._send_end_notification(task, success=False, message=result)
+                logger.warning(f"TaskExecutor: task {task.id} failed via agent result: {result}")
+                return False, result
+
             agent_sent = getattr(agent, "_task_message_sent", False)
             if not agent_sent and not skip_end_notification:
-                await self._send_end_notification(task, success=True, message=result)
+                delivered = await self._send_end_notification(task, success=True, message=result)
+                if not delivered:
+                    error_msg = "任务已完成，但结果通知发送失败，请检查 IM 通道连接状态。"
+                    logger.warning(f"TaskExecutor: task {task.id} result delivery failed")
+                    return False, error_msg
 
             logger.info(f"TaskExecutor: task {task.id} completed successfully")
             return True, result
@@ -434,19 +605,23 @@ class TaskExecutor:
             return
 
         # 检查是否启用开始通知
-        if not task.metadata.get("notify_on_start", True):
+        if not self._metadata_bool(task, "notify_on_start", True):
             logger.debug(f"Task {task.id} has start notification disabled")
             return
 
         try:
             notification = f"🚀 开始执行任务: {task.name}\n\n请稍候，我正在处理中..."
 
-            await self.gateway.send(
+            delivered = await self._send_gateway_text(
                 channel=task.channel_id,
                 chat_id=task.chat_id,
                 text=notification,
+                reliable=False,
             )
-            logger.info(f"Sent start notification for task {task.id}")
+            if delivered:
+                logger.info(f"Sent start notification for task {task.id}")
+            else:
+                logger.info(f"Start notification for task {task.id} was not immediately delivered")
 
         except Exception as e:
             logger.error(f"Failed to send start notification: {e}")
@@ -456,9 +631,14 @@ class TaskExecutor:
         task: ScheduledTask,
         success: bool,
         message: str,
-    ) -> None:
+    ) -> bool:
         """发送任务结束通知（IM 通道 + 桌面通知）"""
-        # 桌面通知（独立于 IM 通道，始终尝试）
+        notify_on_complete = self._metadata_bool(task, "notify_on_complete", True)
+        if not notify_on_complete:
+            logger.debug(f"Task {task.id} has completion notification disabled")
+            return True
+
+        # 桌面通知（独立于 IM 通道，但仍尊重 notify_on_complete）
         try:
             from ..config import settings
 
@@ -473,33 +653,91 @@ class TaskExecutor:
         except Exception as e:
             logger.debug(f"Desktop notification failed for task {task.id}: {e}")
 
-        # IM 通道通知
-        if not task.channel_id or not task.chat_id or not self.gateway:
+        # IM 通道通知。没有配置目标通道时只做桌面通知不视为失败；但已经配置
+        # channel/chat_id 却缺少 gateway 时，不能把“未发送”记录成成功。
+        if not task.channel_id or not task.chat_id:
             logger.debug(f"Task {task.id} has no notification channel configured")
-            return
+            return True
 
-        if not task.metadata.get("notify_on_complete", True):
-            logger.debug(f"Task {task.id} has completion notification disabled")
-            return
+        if not self.gateway:
+            logger.warning(
+                f"TaskExecutor: task {task.id} has target channel "
+                f"{task.channel_id}/{task.chat_id} but no gateway is attached"
+            )
+            return False
 
-        try:
-            status = "✅ 任务完成" if success else "❌ 任务失败"
-            notification = f"""{status}: {task.name}
+        status = "✅ 任务完成" if success else "❌ 任务失败"
+        notification = f"""{status}: {task.name}
 
 结果:
 {message}
 """
 
-            await self.gateway.send(
+        delivered = await self._deliver_task_notification(task, notification)
+        if delivered:
+            logger.info(f"Sent end notification for task {task.id}")
+            return True
+
+        logger.warning(
+            f"TaskExecutor: end notification for task {task.id} was not delivered "
+            f"({task.channel_id}/{task.chat_id})"
+        )
+        return False
+
+    async def _deliver_task_notification(self, task: ScheduledTask, text: str) -> bool:
+        """投递任务通知；主通道失败时尝试已知 IM 目标，保持单一通知入口。"""
+        primary = (task.channel_id, task.chat_id)
+        if task.channel_id and task.chat_id:
+            if await self._send_gateway_text(
                 channel=task.channel_id,
                 chat_id=task.chat_id,
-                text=notification,
-            )
+                text=text,
+                user_id=task.user_id or "system",
+            ):
+                return True
 
-            logger.info(f"Sent end notification for task {task.id}")
+        for channel, chat_id in self._find_all_im_targets():
+            if (channel, chat_id) == primary:
+                continue
+            if await self._send_gateway_text(channel=channel, chat_id=chat_id, text=text):
+                logger.info(
+                    f"TaskExecutor: notification for {task.id} delivered via fallback "
+                    f"{channel}/{chat_id}"
+                )
+                return True
 
+        return False
+
+    async def _send_gateway_text(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        text: str,
+        user_id: str = "system",
+        reliable: bool = True,
+    ) -> bool:
+        """Return True only for immediate delivery, not platform-side queued sends."""
+        if not self.gateway:
+            return False
+        try:
+            if reliable and hasattr(self.gateway, "send_text_reliably"):
+                return bool(
+                    await self.gateway.send_text_reliably(
+                        channel=channel,
+                        chat_id=chat_id,
+                        text=text,
+                        user_id=user_id,
+                    )
+                )
+
+            result = await self.gateway.send(channel=channel, chat_id=chat_id, text=text)
+            if isinstance(result, str):
+                return bool(result)
+            return result is not None
         except Exception as e:
-            logger.error(f"Failed to send end notification: {e}")
+            logger.warning(f"TaskExecutor: send failed for {channel}/{chat_id}: {e}")
+            return False
 
     async def _setup_im_context(self, agent: Any, task: ScheduledTask) -> bool:
         """
@@ -539,10 +777,25 @@ class TaskExecutor:
         except Exception as e:
             logger.warning(f"Failed to cleanup IM context: {e}")
 
-    async def _create_agent(self) -> Any:
+    async def _create_agent(self, agent_profile_id: str = "default") -> Any:
         """创建 Agent 实例（不启动 scheduler，避免重复执行任务）"""
         if self.agent_factory:
+            try:
+                params = inspect.signature(self.agent_factory).parameters
+                if params:
+                    return self.agent_factory(agent_profile_id)
+            except (TypeError, ValueError):
+                pass
             return self.agent_factory()
+
+        profile_id = agent_profile_id or "default"
+        if profile_id != "default":
+            profile = self._resolve_agent_profile(profile_id)
+            if profile is not None:
+                from ..agents.factory import AgentFactory
+
+                return await AgentFactory().create(profile)
+            logger.warning("Unknown scheduled task agent_profile_id=%r, using default", profile_id)
 
         from ..core.agent import Agent
 
@@ -550,7 +803,21 @@ class TaskExecutor:
         await agent.initialize(start_scheduler=False)
         return agent
 
-    async def _run_agent(self, agent: Any, prompt: str) -> str:
+    def _resolve_agent_profile(self, profile_id: str) -> Any | None:
+        """Resolve an AgentProfile for scheduled task execution."""
+        from ..agents.presets import SYSTEM_PRESETS
+        from ..agents.profile import get_profile_store
+
+        for preset in SYSTEM_PRESETS:
+            if preset.id == profile_id:
+                return preset
+        try:
+            return get_profile_store().get(profile_id)
+        except Exception:
+            logger.debug("Failed to load agent profile %r", profile_id, exc_info=True)
+            return None
+
+    async def _run_agent(self, agent: Any, prompt: str) -> tuple[bool, str]:
         """
         运行 Agent（使用 Ralph 模式）
 
@@ -559,13 +826,29 @@ class TaskExecutor:
         """
         # 优先使用 Ralph 模式（execute_task_from_message）
         if hasattr(agent, "execute_task_from_message"):
-            result = await agent.execute_task_from_message(prompt, usage_scene="scheduler_execute_task")
+            # Scheduler owns start/end delivery. Prevent Agent's generic
+            # desktop completion toast from producing a second notification.
+            # 必须用 try/finally 包住整个执行段：旧实现只在调用前 set，
+            # 一旦 set 自身或 execute_task_from_message 抛异常，
+            # 标志状态会泄漏到下一次复用同一 agent 实例的调用，
+            # 边缘情况下还可能漏 set，让 Agent 内部再弹一条桌面通知。
+            try:
+                agent._suppress_desktop_task_notification = True
+            except Exception as e:
+                logger.warning(f"Failed to set _suppress_desktop_task_notification on agent: {e}")
+            try:
+                result = await agent.execute_task_from_message(prompt)
+            finally:
+                with contextlib.suppress(Exception):
+                    agent._suppress_desktop_task_notification = False
             if isinstance(result, str):
-                return result
-            return result.data if result.success else (result.error or "Unknown error")
+                return True, result
+            if result.success:
+                return True, str(result.data or "")
+            return False, result.error or "Unknown error"
         # 降级到普通 chat
         elif hasattr(agent, "chat"):
-            return await agent.chat(prompt)
+            return True, await agent.chat(prompt)
         else:
             raise ValueError("Agent does not have execute_task_from_message or chat method")
 
@@ -586,41 +869,71 @@ class TaskExecutor:
         - system:proactive_heartbeat - 活人感心跳
         - system:workspace_backup - 定时工作区备份
         - system:memory_nudge_review - 周期性记忆回顾
-        - system:sync_owner_work_orders - 研发负责人工单快照同步（研发云）
         """
         action = task.action
         logger.info(f"Executing system task: {action}")
 
+        from ..config import settings
+        from ..core.token_tracking import (
+            TokenBudgetState,
+            reset_token_budget,
+            set_token_budget,
+            token_budget_status,
+        )
+
         # 系统任务也需要超时保护，避免 selfcheck 等任务无限运行
         SYSTEM_TASK_TIMEOUTS = {
-            "system:daily_selfcheck": 300,  # 5 分钟
+            "system:daily_selfcheck": max(settings.scheduler_task_timeout, 1200),
             "system:daily_memory": 1800,  # 30 分钟（含 LLM review 大量记忆）
             "system:workspace_backup": 300,  # 5 分钟
             "system:memory_nudge_review": 120,  # 2 分钟（轻量 LLM 审视）
-            "system:sync_owner_work_orders": 1800,  # 30 分钟（Playwright + 串行拉研发云）
         }
         timeout = SYSTEM_TASK_TIMEOUTS.get(action)
+        budget_tokens = (
+            settings.scheduler_background_token_budget
+            if action
+            in {"system:daily_selfcheck", "system:daily_memory", "system:memory_nudge_review"}
+            else 0
+        )
+        budget_token = set_token_budget(
+            TokenBudgetState(name=action or "system_task", max_tokens=budget_tokens)
+            if budget_tokens > 0
+            else None
+        )
 
         try:
             if action == "system:daily_memory":
                 coro = self._system_daily_memory()
             elif action == "system:daily_selfcheck":
-                coro = self._system_daily_selfcheck()
+                soft_timeout = max(timeout - 30, 1) if timeout else None
+                coro = self._system_daily_selfcheck(soft_timeout)
             elif action == "system:proactive_heartbeat":
                 return await self._system_proactive_heartbeat(task)
             elif action == "system:workspace_backup":
                 coro = self._system_workspace_backup()
             elif action == "system:memory_nudge_review":
                 coro = self._system_memory_nudge_review()
-            elif action == "system:sync_owner_work_orders":
-                coro = self._system_sync_owner_work_orders()
             else:
                 return False, f"Unknown system action: {action}"
 
             if timeout:
                 try:
                     return await asyncio.wait_for(coro, timeout=timeout)
-                except (asyncio.TimeoutError, TimeoutError):
+                except TimeoutError:
+                    if action == "system:daily_memory":
+                        result_msg = (
+                            "记忆整理超过系统保护时长，已停止本轮整理。"
+                            "如果之前已有进度，下次会从已保存的位置继续。"
+                        )
+                        logger.warning(f"TaskExecutor: {result_msg}")
+                        return True, result_msg
+                    if action == "system:daily_selfcheck":
+                        result_msg = (
+                            "系统自检超过后台保护时长，已停止本轮检查。"
+                            "已保存的部分报告会保留，后续问题下次继续处理。"
+                        )
+                        logger.warning(f"TaskExecutor: {result_msg}")
+                        return True, result_msg
                     error_msg = f"System task {action} timed out after {timeout}s"
                     logger.error(f"TaskExecutor: {error_msg}")
                     return False, error_msg
@@ -630,6 +943,17 @@ class TaskExecutor:
         except Exception as e:
             logger.error(f"System task {action} failed: {e}")
             return False, str(e)
+        finally:
+            status = token_budget_status()
+            if status.get("enabled"):
+                logger.info(
+                    "System task token budget: action=%s used=%s max=%s exceeded=%s",
+                    action,
+                    status.get("used_tokens"),
+                    status.get("max_tokens"),
+                    status.get("exceeded"),
+                )
+            reset_token_budget(budget_token)
 
     async def _system_daily_memory(self) -> tuple[bool, str]:
         """
@@ -675,7 +999,26 @@ class TaskExecutor:
                 )
                 logger.debug("Created fallback MemoryManager for consolidation")
 
-            result = await mm.consolidate_daily()
+            result = await mm.consolidate_daily(
+                checkpoint=tracker.get_memory_consolidation_checkpoint(),
+                checkpoint_callback=tracker.record_memory_consolidation_checkpoint,
+                time_budget_seconds=1500,
+            )
+
+            if result.get("partial"):
+                llm_review = result.get("llm_review") or {}
+                processed_batches = llm_review.get("processed_batches", 0)
+                total_batches = llm_review.get("total_batches", 0)
+                summary = (
+                    "记忆整理已安全暂停，进度已保存，下次会继续:\n"
+                    f"- 已提取: {result.get('unextracted_processed', 0)}\n"
+                    f"- 已去重: {result.get('duplicates_removed', 0)}\n"
+                    f"- 记忆审查批次: {processed_batches}/{total_batches}\n"
+                    f"- 说明: {result.get('reason', '本轮时间预算已用完')}\n"
+                    f"- 时间范围: {since.strftime('%m-%d %H:%M') if since else '全部'} → {until.strftime('%m-%d %H:%M')}"
+                )
+                logger.info(f"Memory consolidation paused with checkpoint: {result}")
+                return True, summary
 
             tracker.record_memory_consolidation(result)
 
@@ -718,6 +1061,11 @@ class TaskExecutor:
         """
         try:
             from ..config import settings
+            from ..core.token_tracking import (
+                TokenTrackingContext,
+                reset_tracking_context,
+                set_tracking_context,
+            )
 
             if not settings.memory_nudge_enabled or settings.memory_nudge_interval <= 0:
                 return True, "Memory nudge disabled, skipping"
@@ -737,7 +1085,7 @@ class TaskExecutor:
                 return True, "No recent conversation turns to review"
 
             conversation_text = "\n".join(
-                f"[{t.get('role', 'unknown')}]: {t.get('content', '')[:500]}"
+                f"[{t.get('role', 'unknown')}]: {coerce_text(t.get('content'))[:500]}"
                 for t in recent_turns
                 if t.get("content")
             )
@@ -761,15 +1109,62 @@ class TaskExecutor:
                 f"Conversation:\n{conversation_text}"
             )
 
-            response = await brain.think_lightweight(review_prompt, max_tokens=2048, usage_scene="memory_nudge_review_lightweight")
+            _tracking_token = set_tracking_context(
+                TokenTrackingContext(
+                    session_id="system_memory_nudge",
+                    request_id="system_memory_nudge",
+                    turn_id=f"system_memory_nudge:{int(time.time() * 1000)}",
+                    operation_type="background_memory_nudge",
+                    operation_detail="system_memory_nudge",
+                    channel="scheduler",
+                    user_id="system",
+                    agent_profile_id="system",
+                )
+            )
+            try:
+                response = await brain.think_lightweight(review_prompt, max_tokens=2048)
+            finally:
+                reset_tracking_context(_tracking_token)
             raw = response.content.strip()
 
             import json
+            import re as _re
 
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
-            memories = json.loads(raw)
+            # Fix-7：best-effort JSON 解析。
+            # 旧实现 json.loads(raw) 一遇到 LLM 返回的非法 JSON（哪怕只是
+            # 多了一行 prose/单条尾随逗号）就抛 JSONDecodeError，导致整个
+            # nudge 任务失败 → fail_count + missed_count 持续累积。
+            #
+            # 新策略（仍然保守）：
+            #   1. 直接 loads 成功 → 用结果；
+            #   2. 失败 → 抓出第一个 [ ... ] JSON 数组重新尝试；
+            #   3. 仍失败 → 不视为任务失败，记 warning 并返回成功 +
+            #      "skipped" 信息，让 scheduler 不再累积失败计数。
+            memories: list | None = None
+            try:
+                memories = json.loads(raw)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    "[memory_nudge] LLM returned non-JSON, attempting array "
+                    "extraction (err=%s, raw_preview=%r)",
+                    str(e)[:120],
+                    raw[:200],
+                )
+                m = _re.search(r"\[\s*(?:\{.*?\}\s*,?\s*)*\]", raw, _re.DOTALL)
+                if m:
+                    try:
+                        memories = json.loads(m.group(0))
+                    except json.JSONDecodeError:
+                        memories = None
+                if memories is None:
+                    return (
+                        True,
+                        "LLM returned malformed JSON; skipping this round "
+                        "(no failure count, will retry next interval).",
+                    )
             if not isinstance(memories, list):
                 return True, "LLM returned non-list response, skipping"
 
@@ -830,6 +1225,11 @@ class TaskExecutor:
         """
         try:
             from ..config import settings
+            from ..core.token_tracking import (
+                TokenTrackingContext,
+                reset_tracking_context,
+                set_tracking_context,
+            )
 
             engine = self.proactive_engine
             if not engine:
@@ -861,7 +1261,22 @@ class TaskExecutor:
                 )
 
             # 执行心跳
-            result = await engine.heartbeat()
+            _tracking_token = set_tracking_context(
+                TokenTrackingContext(
+                    session_id=task.id or "system_proactive_heartbeat",
+                    request_id=task.id or "system_proactive_heartbeat",
+                    turn_id=f"{task.id or 'system_proactive_heartbeat'}:{int(time.time() * 1000)}",
+                    operation_type="background_proactive_heartbeat",
+                    operation_detail="system_proactive_heartbeat",
+                    channel="scheduler",
+                    user_id="system",
+                    agent_profile_id="system",
+                )
+            )
+            try:
+                result = await engine.heartbeat()
+            finally:
+                reset_tracking_context(_tracking_token)
 
             if not result:
                 return True, "Heartbeat check passed, no message needed"
@@ -917,7 +1332,10 @@ class TaskExecutor:
             logger.error(f"Proactive heartbeat failed: {e}")
             return False, str(e)
 
-    async def _system_daily_selfcheck(self) -> tuple[bool, str]:
+    async def _system_daily_selfcheck(
+        self,
+        max_runtime_seconds: int | None = None,
+    ) -> tuple[bool, str]:
         """
         执行系统自检
 
@@ -951,7 +1369,10 @@ class TaskExecutor:
             # 2. 执行自检（传入时间范围，复用 agent 的 memory_manager 避免 DB 锁冲突）
             brain = Brain()
             checker = SelfChecker(brain=brain, memory_manager=self.memory_manager)
-            report = await checker.run_daily_check(since=since)
+            report = await checker.run_daily_check(
+                since=since,
+                max_runtime_seconds=max_runtime_seconds,
+            )
 
             # 2.1 生成 Markdown 报告文本（用于 IM 推送）
             report_md = None
@@ -1014,6 +1435,8 @@ class TaskExecutor:
                 f"- 分析范围: {time_range_info}\n"
                 f"- 报告推送: {push_info}"
             )
+            if getattr(report, "partial", False):
+                summary += f"\n- 状态: 部分完成（{getattr(report, 'status_note', '')}）"
 
             logger.info(
                 f"Selfcheck completed: {report.total_errors} errors, {report.fix_success} fixed"
@@ -1053,28 +1476,6 @@ class TaskExecutor:
         except Exception as e:
             logger.error(f"Workspace backup failed: {e}")
             return False, str(e)
-
-    async def _system_sync_owner_work_orders(self) -> tuple[bool, str]:
-        """从研发云同步负责人需求快照（``userinfo.encryption``）；无凭据时跳过，不计为失败。"""
-        try:
-            from synapse.api.routes.dev_iwhalecloud import sync_owner_orders_from_local_userinfo
-
-            r = await sync_owner_orders_from_local_userinfo()
-        except Exception as e:
-            logger.error(f"sync_owner_work_orders failed: {e}")
-            return False, str(e)
-
-        ec = r.get("errorcode", 500)
-        if ec != 0:
-            return False, str(r.get("message", "sync_owner_work_orders_error"))
-
-        data = r.get("data")
-        if isinstance(data, dict) and data.get("skipped"):
-            reason = str(data.get("reason", "skipped"))
-            logger.info("sync_owner_work_orders skipped: %s", reason)
-            return True, f"[SKIP] {reason}"
-
-        return True, "工单快照已同步"
 
     def _find_all_im_targets(self) -> list[tuple[str, str]]:
         """
@@ -1166,7 +1567,7 @@ class TaskExecutor:
 
         Args:
             task: 任务
-        suppress_send_to_chat: 是否禁止通过旧范式“工具发消息”（兼容旧参数；文本由网关自动发送）
+        suppress_send_to_chat: 兼容旧参数；当前仅用于提示系统会兜底转发文本。
         """
         # 基础 prompt
         prompt = task.prompt
@@ -1185,9 +1586,9 @@ class TaskExecutor:
         if task.channel_id and task.chat_id:
             context_parts.append("")
             if suppress_send_to_chat:
-                # 禁止发消息，由系统统一处理
                 context_parts.append(
-                    "注意: 不要尝试通过工具发送文本消息；系统会自动发送结果通知。请直接返回执行结果。"
+                    "请优先把用户需要看到的最终结果完整写在回复正文中，系统会尝试转发；"
+                    "如果任务明确需要主动告知、交付附件或结合 IM 上下文互动，可以使用可用的 IM/交付工具。"
                 )
             else:
                 context_parts.append(

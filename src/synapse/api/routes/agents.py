@@ -8,6 +8,8 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from synapse.memory.json_utils import coerce_text
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -116,9 +118,16 @@ class ProfileCreateRequest(BaseModel):
     custom_prompt: str = Field("", max_length=5000)
     category: str = Field("", max_length=30)
     preferred_endpoint: str | None = Field(None, max_length=200)
+    endpoint_policy: Literal["prefer", "require"] = "prefer"
     identity_mode: Literal["shared", "custom"] = "shared"
     memory_mode: Literal["shared", "isolated"] = "shared"
+    # Phase 2b.2：memory_isolation 是 memory_mode 的语义化别名（推荐前端切到这个）。
+    # 同时传两个时，memory_isolation 优先（与 AgentProfile.from_dict 行为一致）。
+    memory_isolation: Literal["shared", "isolated"] | None = None
     memory_inherit_global: bool = True
+    runtime_env_mode: Literal["shared", "agent", "custom"] = "shared"
+    runtime_env_dependencies: list[str] = Field(default_factory=list)
+    runtime_env_python: str | None = Field(None, max_length=1000)
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -137,9 +146,15 @@ class ProfileUpdateRequest(BaseModel):
     custom_prompt: str | None = Field(None, max_length=5000)
     category: str | None = Field(None, max_length=30)
     preferred_endpoint: str | None = Field(None, max_length=200)
+    endpoint_policy: Literal["prefer", "require"] | None = None
     identity_mode: Literal["shared", "custom"] | None = None
     memory_mode: Literal["shared", "isolated"] | None = None
+    # Phase 2b.2：memory_isolation 同上
+    memory_isolation: Literal["shared", "isolated"] | None = None
     memory_inherit_global: bool | None = None
+    runtime_env_mode: Literal["shared", "agent", "custom"] | None = None
+    runtime_env_dependencies: list[str] | None = None
+    runtime_env_python: str | None = Field(None, max_length=1000)
 
 
 class ProfileVisibilityRequest(BaseModel):
@@ -156,24 +171,27 @@ def _mask_credential_value(value: str) -> str:
 
 
 def _mask_bot_credentials(bot: dict) -> dict:
+    from synapse.utils.redaction import redact_value
+
     result = dict(bot)
     creds = result.get("credentials")
     if isinstance(creds, dict):
-        result["credentials"] = {
-            k: _mask_credential_value(v) if isinstance(v, str) else v
-            for k, v in creds.items()
-        }
+        result["credentials"] = redact_value(creds)
     return result
 
 
 def _unmask_credentials(submitted: dict, stored: dict) -> dict:
     """Restore original values when the submitted value matches its masked form."""
+    from synapse.utils.redaction import REDACTION
+
     result = dict(submitted)
     for key, new_val in submitted.items():
         if not isinstance(new_val, str) or key not in stored:
             continue
         stored_val = stored.get(key)
-        if isinstance(stored_val, str) and new_val == _mask_credential_value(stored_val):
+        if isinstance(stored_val, str) and (
+            new_val == REDACTION or new_val == _mask_credential_value(stored_val)
+        ):
             result[key] = stored_val
     return result
 
@@ -412,12 +430,13 @@ async def list_agent_profiles(include_hidden: bool = False):
     Query params:
         include_hidden: if True, also return hidden profiles (default False).
     """
-    from synapse.agents.presets import SYSTEM_PRESETS
-    from synapse.agents.profile import get_profile_store
     from synapse.config import settings
 
     if not settings.multi_agent_enabled:
         return {"profiles": [], "multi_agent_enabled": False}
+
+    from synapse.agents.presets import SYSTEM_PRESETS
+    from synapse.agents.profile import get_profile_store
 
     store = get_profile_store()
     stored_map = {p.id: p for p in store.list_all(include_hidden=True)}
@@ -450,11 +469,12 @@ async def list_agent_profiles(include_hidden: bool = False):
 @router.post("/api/agents/profiles")
 async def create_agent_profile(body: ProfileCreateRequest):
     """Create a new custom agent profile."""
-    from synapse.agents.profile import AgentProfile, AgentType, SkillsMode, get_profile_store
     from synapse.config import settings
 
     if not settings.multi_agent_enabled:
         raise HTTPException(status_code=400, detail="Multi-agent mode is not enabled")
+
+    from synapse.agents.profile import AgentProfile, AgentType, SkillsMode, get_profile_store
 
     valid_modes = {"all", "inclusive", "exclusive"}
     if body.skills_mode not in valid_modes:
@@ -494,9 +514,14 @@ async def create_agent_profile(body: ProfileCreateRequest):
         color=body.color,
         category=body.category,
         preferred_endpoint=body.preferred_endpoint,
+        endpoint_policy=body.endpoint_policy,
         identity_mode=body.identity_mode,
-        memory_mode=body.memory_mode,
+        # Phase 2b.2：优先使用新别名 memory_isolation，回退到旧 memory_mode。
+        memory_mode=body.memory_isolation or body.memory_mode,
         memory_inherit_global=body.memory_inherit_global,
+        runtime_env_mode=body.runtime_env_mode,
+        runtime_env_dependencies=body.runtime_env_dependencies,
+        runtime_env_python=body.runtime_env_python,
         created_by="user",
     )
 
@@ -508,11 +533,12 @@ async def create_agent_profile(body: ProfileCreateRequest):
 @router.put("/api/agents/profiles/{profile_id}")
 async def update_agent_profile(profile_id: str, body: ProfileUpdateRequest, request: Request):
     """Update a custom agent profile (system profiles have restricted updates)."""
-    from synapse.agents.profile import get_profile_store
     from synapse.config import settings
 
     if not settings.multi_agent_enabled:
         raise HTTPException(status_code=400, detail="Multi-agent mode is not enabled")
+
+    from synapse.agents.profile import get_profile_store
 
     if body.skills_mode is not None:
         valid_modes = {"all", "inclusive", "exclusive"}
@@ -539,11 +565,12 @@ async def update_agent_profile(profile_id: str, body: ProfileUpdateRequest, requ
 @router.delete("/api/agents/profiles/{profile_id}")
 async def delete_agent_profile(profile_id: str):
     """Delete a custom agent profile."""
-    from synapse.agents.profile import get_profile_store
     from synapse.config import settings
 
     if not settings.multi_agent_enabled:
         raise HTTPException(status_code=400, detail="Multi-agent mode is not enabled")
+
+    from synapse.agents.profile import get_profile_store
 
     store = get_profile_store()
 
@@ -562,12 +589,13 @@ async def delete_agent_profile(profile_id: str):
 @router.post("/api/agents/profiles/{profile_id}/reset")
 async def reset_agent_profile(profile_id: str, request: Request):
     """Reset a system agent profile to its factory defaults."""
-    from synapse.agents.presets import get_preset_by_id
-    from synapse.agents.profile import get_profile_store
     from synapse.config import settings
 
     if not settings.multi_agent_enabled:
         raise HTTPException(status_code=400, detail="Multi-agent mode is not enabled")
+
+    from synapse.agents.presets import get_preset_by_id
+    from synapse.agents.profile import get_profile_store
 
     preset = get_preset_by_id(profile_id)
     if preset is None:
@@ -599,10 +627,6 @@ async def reset_agent_profile(profile_id: str, request: Request):
 async def update_profile_visibility(profile_id: str, body: ProfileVisibilityRequest):
     """Show or hide an agent profile (works for both SYSTEM and CUSTOM)."""
     from synapse.agents.profile import get_profile_store
-    from synapse.config import settings
-
-    if not settings.multi_agent_enabled:
-        raise HTTPException(status_code=400, detail="Multi-agent mode is not enabled")
 
     store = get_profile_store()
     try:
@@ -717,21 +741,58 @@ async def get_profile_memory_stats(profile_id: str):
     if not db_path.exists():
         return {"exists": False, "semantic_count": 0, "db_size_bytes": 0}
 
-    import aiosqlite
+    from synapse.storage.safe_sqlite import SQLiteUnavailable, safe_open_async_ctx
 
     semantic_count = 0
+    degraded = False
+    degraded_reason: str | None = None
     try:
-        async with aiosqlite.connect(str(db_path)) as db:
+        async with safe_open_async_ctx(
+            db_path,
+            want_wal=False,
+            run_quick_check=True,
+            foreign_keys=False,
+        ) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM semantic_memories")
             row = await cursor.fetchone()
             semantic_count = row[0] if row else 0
-    except Exception:
-        pass
+    except SQLiteUnavailable as e:
+        degraded = True
+        degraded_reason = e.reason
+        logger.warning(
+            "[Agents API] profile memory stats degraded for %s: reason=%s",
+            profile_id,
+            e.reason,
+        )
+        # Surface this in the unified DegradedBanner too. The registry
+        # key is per-profile so two simultaneously-broken profiles
+        # render as two separate banner entries. ``manual_quarantine``
+        # is intentional — there is no generic quarantine target for
+        # arbitrary profile dirs, so the repair is operator-driven.
+        try:
+            from synapse.storage.degraded import registry as _degraded
+
+            _degraded.register(
+                f"profile_memory:{profile_id}",
+                e.reason or "unknown",
+                repair="manual_quarantine",
+                details=(e.details or "")[:200] or None,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.debug(
+            "[Agents API] profile memory stats query failed for %s: %s",
+            profile_id,
+            e,
+        )
 
     return {
         "exists": True,
         "semantic_count": semantic_count,
         "db_size_bytes": db_path.stat().st_size,
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
     }
 
 
@@ -893,7 +954,7 @@ async def get_topology(request: Request):
                             )
                             for m in msgs:
                                 if m.get("role") == "user":
-                                    conv_title = (m.get("content") or "")[:60]
+                                    conv_title = coerce_text(m.get("content"))[:60]
                     except Exception:
                         pass
 
@@ -1006,7 +1067,7 @@ async def get_topology(request: Request):
                     msgs = getattr(sess.context, "messages", None) or []
                     for m in msgs:
                         if isinstance(m, dict) and m.get("role") == "user":
-                            conv_title = (m.get("content") or "")[:60]
+                            conv_title = coerce_text(m.get("content"))[:60]
 
                     seen_ids.add(sid)
                     nodes.append(

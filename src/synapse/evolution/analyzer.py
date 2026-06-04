@@ -80,7 +80,7 @@ class NeedAnalyzer:
 
 只返回 JSON，不要解释。"""
 
-        response = await self.brain.think(analysis_prompt, usage_scene="analyze_task")
+        response = await self.brain.think(analysis_prompt)
 
         # 解析响应
         import json
@@ -170,7 +170,7 @@ class NeedAnalyzer:
     "solutions": ["方案1", "方案2", ...]
 }}"""
 
-        response = await self.brain.think(prompt, usage_scene="analyze_gap")
+        response = await self.brain.think(prompt)
 
         import json
 
@@ -241,3 +241,4 @@ class NeedAnalyzer:
             suggestions.append(suggestion)
 
         return suggestions
+

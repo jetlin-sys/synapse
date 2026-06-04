@@ -6,7 +6,7 @@ CRUD + 模板 + 节点管理 + 生命周期 + 命令 + 记忆 + 事件
 
 from __future__ import annotations
 
-import asyncio
+import asyncio as _asyncio
 import hashlib
 import json
 import logging
@@ -19,6 +19,16 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from synapse.core.engine_bridge import to_engine
+from synapse.memory.json_utils import coerce_text
+from synapse.orgs.command_service import (
+    ForwardTarget,
+    OrgCommandConflict,
+    OrgCommandError,
+    OrgCommandRequest,
+    OrgCommandSource,
+    OrgCommandSurface,
+    OrgOutputScope,
+)
 
 ALLOWED_AVATAR_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml"}
 MAX_AVATAR_SIZE = 2 * 1024 * 1024  # 2 MB
@@ -30,11 +40,17 @@ _LIM_API = 2000
 
 _VALID_DECISIONS = {"approve", "reject", "批准", "拒绝"}
 
-# In-memory store for async command tracking.
-# Keys are command_id (str), values are dicts with status/result/progress.
-_command_store: dict[str, dict[str, Any]] = {}
-_CMD_TTL = 3600  # purge commands older than 1 hour
 
+def _log_task_exception(task: _asyncio.Task) -> None:  # type: ignore[type-arg]
+    """Retrieve and log unhandled exceptions from fire-and-forget asyncio tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "[OrgAPI] fire-and-forget task %s raised: %s",
+            task.get_name(), exc, exc_info=exc,
+        )
 
 def _safe_int(value: str | None, default: int) -> int:
     """Parse query param to int, returning *default* on failure."""
@@ -53,11 +69,95 @@ def _get_manager(request: Request):
     return mgr
 
 
+def _raise_org_name_conflict(exc: Any) -> None:
+    """把 :class:`OrgNameConflictError` 转成统一格式的 409 HTTP 响应。
+
+    所有创建/更新/复制/从模板创建路径共用这个 helper，保证错误体结构一致
+    （前端可统一识别 ``detail.code == "org_name_conflict"``）。
+    """
+    raise HTTPException(
+        409,
+        {
+            "code": "org_name_conflict",
+            "message": (
+                f"已存在同名组织「{exc.name}」，请改个名字。"
+                "为了在聊天和 IM 中能用名字直接调用组织，组织名字必须全局唯一。"
+            ),
+            "name": exc.name,
+            "conflict_org_id": exc.conflict_org_id,
+        },
+    )
+
+
 def _get_runtime(request: Request):
     rt = getattr(request.app.state, "org_runtime", None)
     if rt is None:
         raise HTTPException(503, "OrgRuntime not initialized")
     return rt
+
+
+def _get_command_service(request: Request):
+    svc = getattr(request.app.state, "org_command_service", None)
+    if svc is None:
+        raise HTTPException(503, "OrgCommandService not initialized")
+    return svc
+
+
+def _require_org_running(rt, org_id: str):
+    """校验组织处于可接受外部指令的状态。
+
+    只有 ACTIVE/RUNNING 允许；其它状态返回 409，前端应据此弹出
+    "请先启动组织"的提示，而不是让 runtime 在未经用户确认的情况下自动启动。
+
+    DORMANT/ARCHIVED → 请先启动；
+    PAUSED          → 请先恢复；
+    组织不存在       → 404。
+    """
+    from synapse.orgs.models import OrgStatus
+
+    org = rt.get_org(org_id)
+    if not org:
+        raise HTTPException(404, "Organization not found")
+
+    if org.status in (OrgStatus.ACTIVE, OrgStatus.RUNNING):
+        return org
+
+    status_value = org.status.value if hasattr(org.status, "value") else str(org.status)
+
+    if org.status == OrgStatus.PAUSED:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "org_paused",
+                "org_id": org_id,
+                "status": status_value,
+                "message": "组织当前已暂停，请先恢复组织后再下发指令。",
+                "guidance": "点击组织控制面板中的 [恢复] 按钮。",
+            },
+        )
+
+    if org.status == OrgStatus.ARCHIVED:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "org_archived",
+                "org_id": org_id,
+                "status": status_value,
+                "message": "组织已归档，无法下发指令。",
+                "guidance": "请先取消归档（unarchive）并启动组织。",
+            },
+        )
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "org_not_running",
+            "org_id": org_id,
+            "status": status_value,
+            "message": "组织尚未启动，无法下发指令或与节点通讯。",
+            "guidance": "请先点击控制面板中的 [启动] 按钮启动组织后再试。",
+        },
+    )
 
 
 # ---- Organization CRUD ----
@@ -73,7 +173,12 @@ async def list_orgs(request: Request, include_archived: bool = False):
 async def create_org(request: Request):
     mgr = _get_manager(request)
     body = await request.json()
-    org = mgr.create(body)
+    from synapse.orgs.manager import OrgNameConflictError
+
+    try:
+        org = mgr.create(body)
+    except OrgNameConflictError as exc:
+        _raise_org_name_conflict(exc)
     return org.to_dict()
 
 
@@ -130,6 +235,22 @@ async def list_templates(request: Request):
     return mgr.list_templates()
 
 
+@router.get("/plugin-workbench-templates")
+async def list_plugin_workbench_templates(request: Request):
+    """List available "workbench" templates derived from loaded plugins.
+
+    A workbench template = a loaded plugin that registered at least one LLM
+    tool. The frontend OrgEditor uses these to seed pre-configured leaf
+    OrgNode instances whose ``external_tools`` directly reference the
+    plugin's tool names.
+    """
+    from synapse.orgs.plugin_workbench_templates import build_workbench_templates
+
+    agent = getattr(request.app.state, "agent", None)
+    pm = getattr(agent, "_plugin_manager", None) if agent else None
+    return build_workbench_templates(pm)
+
+
 @router.get("/templates/{template_id}")
 async def get_template(request: Request, template_id: str):
     mgr = _get_manager(request)
@@ -146,10 +267,14 @@ async def create_from_template(request: Request):
     template_id = body.pop("template_id", None)
     if not template_id:
         raise HTTPException(400, "template_id is required")
+    from synapse.orgs.manager import OrgNameConflictError
+
     try:
         org = mgr.create_from_template(template_id, overrides=body)
     except FileNotFoundError:
         raise HTTPException(404, f"Template not found: {template_id}")
+    except OrgNameConflictError as exc:
+        _raise_org_name_conflict(exc)
     return org.to_dict()
 
 
@@ -214,7 +339,8 @@ async def import_org(request: Request, file: UploadFile = File(...)):
 @router.get("/{org_id}")
 async def get_org(request: Request, org_id: str):
     mgr = _get_manager(request)
-    org = mgr.get(org_id)
+    rt = getattr(request.app.state, "org_runtime", None)
+    org = rt.get_org_snapshot(org_id) if rt and hasattr(rt, "get_org_snapshot") else mgr.get(org_id)
     if org is None:
         raise HTTPException(404, f"Organization not found: {org_id}")
     return org.to_dict()
@@ -226,6 +352,7 @@ async def update_org(request: Request, org_id: str):
     if mgr.get(org_id) is None:
         raise HTTPException(404, f"Organization not found: {org_id}")
     body = await request.json()
+    from synapse.orgs.manager import OrgNameConflictError
     rt = getattr(request.app.state, "org_runtime", None)
     live_org = (
         rt._active_orgs.get(org_id)
@@ -242,6 +369,8 @@ async def update_org(request: Request, org_id: str):
             }
     try:
         org = mgr.update(org_id, body)
+    except OrgNameConflictError as exc:
+        _raise_org_name_conflict(exc)
     except (ValueError, TypeError, KeyError) as e:
         raise HTTPException(400, f"Invalid org data: {e}")
     if live_node_state:
@@ -276,7 +405,12 @@ async def duplicate_org(request: Request, org_id: str):
         raise HTTPException(404, f"Organization not found: {org_id}")
     body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
     new_name = body.get("name")
-    org = mgr.duplicate(org_id, new_name=new_name)
+    from synapse.orgs.manager import OrgNameConflictError
+
+    try:
+        org = mgr.duplicate(org_id, new_name=new_name)
+    except OrgNameConflictError as exc:
+        _raise_org_name_conflict(exc)
     return org.to_dict()
 
 
@@ -538,175 +672,99 @@ async def reset_org(request: Request, org_id: str):
 # ---- User commands (async) ----
 
 
-def _purge_old_commands() -> None:
-    """Remove finished commands older than _CMD_TTL."""
-    now = time.time()
-    stale = [
-        cid
-        for cid, cmd in _command_store.items()
-        if (cmd["status"] in ("done", "error") and now - cmd["created_at"] > _CMD_TTL)
-        or (cmd["status"] == "running" and now - cmd["created_at"] > _CMD_TTL * 2)
-    ]
-    for cid in stale:
-        _command_store.pop(cid, None)
-
-
-def _bridge_session_chat_id(org_id: str, target_node_id: str | None) -> str:
-    """Compute the frontend-matching chat_id.
-
-    Must stay in sync with OrgChatPanel.sessionId():
-      nodeId ? `org_${orgId}_node_${nodeId}` : `org_${orgId}`
-    """
-    return f"org_{org_id}_node_{target_node_id}" if target_node_id else f"org_{org_id}"
-
-
-def _bridge_persist_user_message(
-    sm, org_id: str, target_node_id: str | None, content: str,
-) -> None:
-    """Persist user command to session IMMEDIATELY so it survives even if execution fails."""
-    if not sm:
-        return
-    chat_id = _bridge_session_chat_id(org_id, target_node_id)
-    try:
-        session = sm.get_session(
-            channel="desktop", chat_id=chat_id, user_id="desktop_user",
-            create_if_missing=True,
-        )
-        if session:
-            session.add_message("user", content)
-            sm.mark_dirty()
-    except Exception as exc:
-        logger.warning("[OrgCmd] failed to persist user message to session: %s", exc)
-
-
-def _bridge_persist_result(
-    sm, org_id: str, target_node_id: str | None, result: dict,
-) -> None:
-    """Persist command result (assistant reply or error) to session."""
-    if not sm:
-        return
-    chat_id = _bridge_session_chat_id(org_id, target_node_id)
-    try:
-        session = sm.get_session(
-            channel="desktop", chat_id=chat_id, user_id="desktop_user",
-            create_if_missing=True,
-        )
-        if not session:
-            return
-        if result.get("error"):
-            session.add_message("system", f"命令执行失败: {result['error']}")
-        elif result.get("result"):
-            text = result["result"]
-            if isinstance(text, dict):
-                text = text.get("result") or text.get("error") or str(text)
-            session.add_message("assistant", str(text))
-        sm.mark_dirty()
-    except Exception as exc:
-        logger.warning("[OrgCmd] failed to persist result to session: %s", exc)
-
-
 @router.post("/{org_id}/command")
 async def send_command(request: Request, org_id: str):
     """Submit a command to the organization. Returns immediately with a
-    command_id that the frontend can use to poll for progress / result."""
-    rt = _get_runtime(request)
+    command_id that the frontend can use to poll for progress / result.
+
+    若组织未启动（DORMANT/PAUSED/ARCHIVED），返回 409 让前端提示用户先
+    启动组织，而不是让 runtime 默默自动启动。
+    """
+    svc = _get_command_service(request)
     body = await request.json()
     content = body.get("content", "")
     target_node = body.get("target_node_id")
     if not content:
         raise HTTPException(400, "content is required")
-
-    _purge_old_commands()
-
-    command_id = uuid.uuid4().hex[:12]
-    _command_store[command_id] = {
-        "command_id": command_id,
-        "org_id": org_id,
-        "status": "running",
-        "result": None,
-        "error": None,
-        "created_at": time.time(),
-        "updated_at": time.time(),
-    }
-
-    sm = getattr(request.app.state, "session_manager", None)
-
-    # Persist user message IMMEDIATELY — survives even if execution crashes
-    _bridge_persist_user_message(sm, org_id, target_node, content)
-
-    async def _run() -> None:
-        from synapse.api.routes.websocket import broadcast_event
-
-        try:
-            result = await rt.send_command(org_id, target_node, content)
-            _command_store[command_id].update(
-                status="done", result=result, updated_at=time.time(),
+    source = OrgCommandSource(
+        channel=str(body.get("source_channel") or "desktop"),
+        chat_id=str(body.get("source_chat_id") or svc.bridge_session_chat_id(org_id, target_node)),
+        user_id=str(body.get("source_user_id") or "desktop_user"),
+        thread_id=body.get("source_thread_id"),
+        client_id=str(body.get("client_id") or ""),
+        display_name=str(body.get("display_name") or ""),
+    )
+    # 解析 ``forward_to``：指挥台可让一条命令把"完成 / 取消"通知再投递到
+    # 一个或多个 IM 频道。每一项是 ``{channel, chat_id, thread_id?,
+    # bot_instance_id?, label?}``，channel 必须命中已注册的 IM 适配器。
+    forward_targets: list[ForwardTarget] = []
+    raw_forward = body.get("forward_to") or []
+    if isinstance(raw_forward, list):
+        for item in raw_forward[:8]:
+            ft = ForwardTarget.from_dict(item)
+            if ft is not None:
+                forward_targets.append(ft)
+    try:
+        return svc.submit(
+            OrgCommandRequest(
+                org_id=org_id,
+                content=content,
+                target_node_id=target_node,
+                source=source,
+                origin_surface=OrgCommandSurface.ORG_CONSOLE,
+                output_scope=OrgOutputScope.CONSOLE_FULL,
+                replace_existing=bool(body.get("replace_existing")),
+                continue_previous=bool(body.get("continue_previous")),
+                forward_to=forward_targets,
             )
-            _bridge_persist_result(sm, org_id, target_node, result)
-            try:
-                root_id = target_node or "root"
-                if not rt._has_active_delegations(org_id, root_id):
-                    inbox = rt.get_inbox(org_id)
-                    result_text = (result or {}).get("result", "")
-                    inbox.push_task_complete(
-                        org_id, root_id,
-                        content[:60],
-                        result_text[:300] if result_text else "命令已完成",
-                    )
-            except Exception:
-                pass
-            try:
-                await broadcast_event(
-                    "org:command_done",
-                    {
-                        "org_id": org_id,
-                        "command_id": command_id,
-                        "result": result,
-                    },
-                )
-            except Exception:
-                logger.warning("[OrgCmd] broadcast org:command_done failed", exc_info=True)
-        except Exception as exc:
-            _command_store[command_id].update(
-                status="error", error=str(exc), updated_at=time.time(),
-            )
-            _bridge_persist_result(sm, org_id, target_node, {"error": str(exc)})
-            try:
-                await broadcast_event(
-                    "org:command_done",
-                    {
-                        "org_id": org_id,
-                        "command_id": command_id,
-                        "error": str(exc),
-                    },
-                )
-            except Exception:
-                logger.warning("[OrgCmd] broadcast error event failed", exc_info=True)
-
-    from synapse.core.engine_bridge import get_engine_loop
-
-    engine_loop = get_engine_loop()
-    if engine_loop is not None:
-        asyncio.run_coroutine_threadsafe(_run(), engine_loop)
-    else:
-        asyncio.create_task(_run())
-
-    return {"command_id": command_id, "status": "running"}
+        )
+    except OrgCommandConflict as exc:
+        raise HTTPException(
+            exc.status_code,
+            {
+                "code": "org_command_conflict",
+                "message": str(exc),
+                "command_id": exc.command_id,
+            },
+        )
+    except OrgCommandError as exc:
+        raise HTTPException(exc.status_code, str(exc))
 
 
 @router.get("/{org_id}/commands/{command_id}")
 async def get_command_status(request: Request, org_id: str, command_id: str):
     """Poll the status of an async command."""
-    cmd = _command_store.get(command_id)
-    if not cmd or cmd["org_id"] != org_id:
+    result = _get_command_service(request).get_status(org_id, command_id)
+    if result is None:
         raise HTTPException(404, "Command not found")
-    return {
-        "command_id": cmd["command_id"],
-        "status": cmd["status"],
-        "result": cmd["result"],
-        "error": cmd["error"],
-        "elapsed_s": round(time.time() - cmd["created_at"], 1),
-    }
+    return result
+
+
+@router.post("/{org_id}/commands/{command_id}/cancel")
+async def cancel_command(request: Request, org_id: str, command_id: str):
+    """用户主动强制终止当前在跑的组织命令。
+
+    流程：
+      1. 校验 ``command_id`` 属于本 org，已完成/出错则幂等返回 ``already_done``。
+      2. 在 engine loop 上 await ``runtime.cancel_user_command(org_id, command_id)``：
+         置 tracker.user_cancelled+auto_stopped+completed.set() 并 soft_stop_org。
+      3. 后台 ``_run`` 会因 tracker.completed 触发，正常走完落库 + 广播
+         ``org:command_done``（result 含 ``cancelled_by_user=True``），前端
+         自动收尾，无需此处再清理 ``_command_store``。
+
+    组织保持 RUNNING，用户可立即再发送新指令。
+    """
+    svc = _get_command_service(request)
+    try:
+        result = await to_engine(svc.cancel(org_id, command_id))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.warning("[OrgCmd] cancel_command failed: %s", e, exc_info=True)
+        raise HTTPException(500, f"cancel failed: {e}")
+    if result is None:
+        raise HTTPException(404, "Command not found")
+    return result
 
 
 @router.post("/{org_id}/broadcast")
@@ -716,6 +774,7 @@ async def broadcast_to_org(request: Request, org_id: str):
     content = body.get("content", "")
     if not content:
         raise HTTPException(400, "content is required")
+    _require_org_running(rt, org_id)
     result = await to_engine(
         rt.handle_org_tool(
             "org_broadcast",
@@ -812,7 +871,7 @@ async def get_node_thinking(request: Request, org_id: str, node_id: str):
                 if msg.get("from_node") == node_id
                 else msg.get("from_node"),
                 "msg_type": msg.get("msg_type", ""),
-                "content": msg.get("content", "")[:_LIM_API],
+                "content": coerce_text(msg.get("content"))[:_LIM_API],
             }
         )
     timeline.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
@@ -851,6 +910,7 @@ async def preview_node_prompt(request: Request, org_id: str, node_id: str):
         blackboard_summary=blackboard_summary,
         dept_summary=dept_summary,
         node_summary=node_summary,
+        root_intent=rt.get_active_root_intent(org_id),
     )
 
     from synapse.orgs.tool_categories import expand_tool_categories
@@ -1079,6 +1139,208 @@ async def query_events(request: Request, org_id: str):
         limit=limit,
     )
     return events
+
+
+# ---- Activity stream (unified timeline across IM / desktop / org console) ----
+
+_ACTIVITY_INTERESTING_EVENTS: frozenset[str] = frozenset({
+    "user_command",
+    "user_command_cancelled",
+    "task_assigned",
+    "task_completed",
+    "task_cancelled",
+    "broadcast",
+    "node_activated",
+    "command_phase",
+    "workbench_tool_started",
+    "workbench_tool_succeeded",
+    "workbench_tool_failed",
+})
+
+_ACTIVITY_KIND_BY_EVENT: dict[str, str] = {
+    "user_command": "user_command",
+    "user_command_cancelled": "user_command_cancelled",
+    "task_assigned": "delegate",
+    "task_completed": "task_completed",
+    "task_cancelled": "task_cancelled",
+    "broadcast": "broadcast",
+    "node_activated": "node_activated",
+    "command_phase": "command_phase",
+    "workbench_tool_started": "workbench_started",
+    "workbench_tool_succeeded": "workbench_succeeded",
+    "workbench_tool_failed": "workbench_failed",
+}
+
+
+def _activity_preview(text: Any, limit: int = 240) -> str:
+    """Trim long content for an activity feed."""
+    if text is None:
+        return ""
+    s = str(text)
+    if len(s) <= limit:
+        return s
+    return s[:limit].rstrip() + "…"
+
+
+@router.get("/{org_id}/activity")
+async def query_activity(request: Request, org_id: str):
+    """Unified activity feed for the org command console.
+
+    Merges (in time-descending order):
+      - Org event store entries (user_command / task_assigned /
+        task_completed / broadcast / workbench_* / command_phase …).
+      - Inter-node messages from ``logs/communications.jsonl``
+        (org_send_message / org_reply_message).
+      - Recent command_service rows so IM-originated commands surface
+        on the desktop console even before any event has fired.
+
+    Designed for the OrgChatPanel "whole-org timeline" view so the user
+    sees every input source (IM, desktop chat, org console) and every
+    node-to-node exchange in a single feed — regardless of which chat
+    surface the command was issued from.
+    """
+    rt = _get_runtime(request)
+    mgr = _get_manager(request)
+    limit = max(1, min(_safe_int(request.query_params.get("limit"), 100), 500))
+    since = request.query_params.get("since")
+
+    items: list[dict[str, Any]] = []
+
+    # --- Events ----------------------------------------------------------
+    try:
+        es = rt.get_event_store(org_id)
+        ev_kinds = (
+            request.query_params.get("kind")
+            or request.query_params.get("event_type")
+        )
+        events: list[dict[str, Any]] = []
+        if ev_kinds:
+            for kind in ev_kinds.split(","):
+                events.extend(
+                    es.query(event_type=kind.strip(), since=since, limit=limit)
+                    or []
+                )
+        else:
+            events = es.query(since=since, limit=limit * 3) or []
+        for ev in events:
+            evt_type = str(ev.get("event_type") or "")
+            if evt_type not in _ACTIVITY_INTERESTING_EVENTS:
+                continue
+            data = ev.get("data") or {}
+            metadata = ev.get("metadata") or {}
+            kind = _ACTIVITY_KIND_BY_EVENT.get(evt_type, evt_type)
+            from_node = ev.get("actor")
+            to_node = (
+                data.get("to")
+                or data.get("to_node")
+                or data.get("target_node_id")
+                or None
+            )
+            content_raw = (
+                data.get("task")
+                or data.get("content")
+                or data.get("prompt")
+                or data.get("result_preview")
+                or data.get("summary")
+                or ""
+            )
+            items.append({
+                "id": ev.get("event_id"),
+                "ts": ev.get("timestamp"),
+                "kind": kind,
+                "source": {
+                    "surface": metadata.get("origin_surface") or "org",
+                    "channel": metadata.get("channel") or "",
+                    "display_name": metadata.get("display_name") or "",
+                },
+                "from_node": from_node,
+                "to_node": to_node,
+                "content": _activity_preview(content_raw),
+                "command_id": data.get("command_id"),
+                "chain_id": data.get("chain_id") or data.get("root_chain_id"),
+                "event_type": evt_type,
+            })
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Activity] event store query failed: %s", exc)
+
+    # --- Inter-node messages --------------------------------------------
+    try:
+        comm_log = mgr._org_dir(org_id) / "logs" / "communications.jsonl"
+        if comm_log.is_file():
+            text = comm_log.read_text(encoding="utf-8")
+            for line in reversed(text.strip().split("\n")):
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                items.append({
+                    "id": msg.get("id") or msg.get("message_id"),
+                    "ts": msg.get("ts") or msg.get("timestamp"),
+                    "kind": "message",
+                    "source": {"surface": "org", "channel": "", "display_name": ""},
+                    "from_node": msg.get("from_node"),
+                    "to_node": msg.get("to_node"),
+                    "content": _activity_preview(msg.get("content")),
+                    "command_id": msg.get("metadata", {}).get("command_id"),
+                    "chain_id": msg.get("metadata", {}).get("task_chain_id"),
+                    "event_type": "communication",
+                    "msg_type": msg.get("msg_type"),
+                })
+                if len(items) >= limit * 3:
+                    break
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Activity] communications log read failed: %s", exc)
+
+    # --- Recent commands from command_service --------------------------
+    try:
+        svc = getattr(request.app.state, "org_command_service", None)
+        if svc is None:
+            from synapse.orgs.command_service import get_command_service
+            svc = get_command_service()
+        if svc is not None:
+            for cmd_id, cmd in svc.commands.items():
+                if cmd.get("org_id") != org_id:
+                    continue
+                src = cmd.get("source") or {}
+                items.append({
+                    "id": f"cmd_{cmd_id}",
+                    "ts": cmd.get("created_at"),
+                    "kind": "command",
+                    "source": {
+                        "surface": cmd.get("origin_surface") or "org_console",
+                        "channel": src.get("channel") or "",
+                        "display_name": src.get("display_name") or "",
+                    },
+                    "from_node": src.get("user_id") or "user",
+                    "to_node": cmd.get("target_node_id") or cmd.get("root_node_id"),
+                    "content": "",
+                    "command_id": cmd_id,
+                    "chain_id": None,
+                    "event_type": "command_state",
+                    "status": cmd.get("status"),
+                    "phase": cmd.get("phase"),
+                })
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Activity] command_service snapshot failed: %s", exc)
+
+    def _ts_key(item: dict[str, Any]) -> float:
+        ts = item.get("ts")
+        if isinstance(ts, int | float):
+            return float(ts)
+        if isinstance(ts, str) and ts:
+            try:
+                from datetime import datetime
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return 0.0
+        return 0.0
+
+    items.sort(key=_ts_key, reverse=True)
+    if len(items) > limit:
+        items = items[:limit]
+    return {"items": items, "count": len(items)}
 
 
 # ---- Messages (communication log) ----
@@ -1407,6 +1669,7 @@ async def org_status_stream(request: Request, org_id: str):
 @router.post("/{org_id}/heartbeat/trigger")
 async def trigger_heartbeat(request: Request, org_id: str):
     rt = _get_runtime(request)
+    _require_org_running(rt, org_id)
     hb = rt.get_heartbeat()
     result = await hb.trigger_heartbeat(org_id)
     return result
@@ -1415,6 +1678,7 @@ async def trigger_heartbeat(request: Request, org_id: str):
 @router.post("/{org_id}/standup/trigger")
 async def trigger_standup(request: Request, org_id: str):
     rt = _get_runtime(request)
+    _require_org_running(rt, org_id)
     hb = rt.get_heartbeat()
     result = await hb.trigger_standup(org_id)
     return result
@@ -1426,6 +1690,7 @@ async def trigger_standup(request: Request, org_id: str):
 @router.post("/{org_id}/nodes/{node_id}/schedules/{schedule_id}/trigger")
 async def trigger_schedule(request: Request, org_id: str, node_id: str, schedule_id: str):
     rt = _get_runtime(request)
+    _require_org_running(rt, org_id)
     scheduler = rt.get_scheduler()
     result = await scheduler.trigger_once(org_id, node_id, schedule_id)
     return result
@@ -1487,6 +1752,7 @@ async def list_reports(request: Request, org_id: str):
 @router.post("/{org_id}/im-reply")
 async def handle_im_reply(request: Request, org_id: str):
     rt = _get_runtime(request)
+    _require_org_running(rt, org_id)
     notifier = rt.get_notifier()
     body = await request.json()
     text = body.get("text", "")
@@ -1912,7 +2178,10 @@ async def create_task(request: Request, org_id: str, project_id: str):
 
 @router.post("/{org_id}/projects/{project_id}/tasks/{task_id}/dispatch")
 async def dispatch_task(request: Request, org_id: str, project_id: str, task_id: str):
-    """Dispatch a user-created task to the organization for execution."""
+    """Dispatch a user-created task to the organization for execution.
+
+    组织未启动时返回 409，让前端提示用户先启动组织。
+    """
     store = _get_project_store(request, org_id)
     task_data, proj_data = store.get_task(task_id)
     if not task_data:
@@ -1921,9 +2190,7 @@ async def dispatch_task(request: Request, org_id: str, project_id: str, task_id:
         raise HTTPException(404, "Task not found in this project")
 
     runtime = _get_runtime(request)
-    org = runtime.get_org(org_id)
-    if not org:
-        raise HTTPException(404, "Organization not found or not running")
+    org = _require_org_running(runtime, org_id)
 
     prompt = (
         f"请执行以下项目任务:\n"
@@ -1944,9 +2211,10 @@ async def dispatch_task(request: Request, org_id: str, project_id: str, task_id:
 
     import asyncio
 
-    asyncio.ensure_future(
+    _t = asyncio.ensure_future(
         to_engine(runtime.send_command(org_id, target_node_id, prompt, chain_id=chain_id)),
     )
+    _t.add_done_callback(_log_task_exception)
 
     return {"ok": True, "task_id": task_id, "chain_id": chain_id, "dispatched": True}
 
@@ -2276,3 +2544,4 @@ async def global_inbox_act(request: Request, msg_id: str):
         if msg:
             return msg.to_dict()
     raise HTTPException(404, "Message not found or not an approval")
+

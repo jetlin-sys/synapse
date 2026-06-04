@@ -17,6 +17,64 @@ logger = logging.getLogger(__name__)
 class Settings(BaseSettings):
     """应用配置"""
 
+    # === HTTP API 网络绑定与访问控制（PR-L1: 默认仅本机, lan_mode 显式开启） ===
+    api_host: str = Field(
+        default="127.0.0.1",
+        description=(
+            "HTTP API 绑定地址。默认 127.0.0.1（仅本机访问）；"
+            "若需被同网段其他机器访问，请改为 0.0.0.0 并同时开启 api_lan_mode。"
+            "环境变量 API_HOST 仍可覆盖此值，但出于安全审计目的建议改在配置里显式设置。"
+        ),
+    )
+    api_port: int = Field(default=18900, description="HTTP API 监听端口")
+    api_lan_mode: bool = Field(
+        default=False,
+        description=(
+            "是否暴露到局域网。默认 False=只监听 127.0.0.1。"
+            "开启后会自动把 host 改成 0.0.0.0，同时强制要求设置 web_access 密码或 api_token，"
+            "否则启动会失败（避免无密码裸奔）。"
+        ),
+    )
+    api_token: str = Field(
+        default="",
+        description=(
+            "API 共享访问令牌（可选）。设置后非本机请求必须在 Authorization: Bearer <token> "
+            "或 X-Synapse-Token 头里携带它，作为 web_access 密码之外的二次校验。"
+            "首次开启 lan_mode 时若未填写会自动生成一个 32 字符 token 并写入 .env。"
+        ),
+    )
+
+    grep_timeout_sec: int = Field(
+        default=30,
+        ge=5,
+        le=600,
+        description="单次 grep（文件内容搜索）最大耗时（秒），超时返回提示以避免 worker 被大目录卡住。",
+    )
+
+    # PR-R1: 系统 prompt / catalog header 的语言。
+    # 取值 "zh"（中文，默认）/ "en"（英文）。tool_catalog header、AGENTS.md 段
+    # 引导文本等会按此切换；工具自身的 description 仍按工具定义里的语言。
+    prompt_lang: str = Field(
+        default="zh",
+        description="System prompt 主语言：'zh' 中文 / 'en' 英文。",
+    )
+
+    # PR-T1: 灰度开关（feature flags）配置入口。
+    # core/feature_flags.py 会读取这里的 dict，作为持久化的 flag 覆盖源；
+    # 优先级：runtime override > 环境变量 SYNAPSE_FF_DISABLE/ENABLE >
+    #         settings.feature_flags > 代码内默认值。
+    # 在 .env / synapse.toml 里这样写就能关掉本批新行为之一：
+    #   FEATURE_FLAGS={"text_replace_on_restart_v1": false}
+    # 解析失败永不阻断启动；不在此处写白名单，未知 flag 直接被 is_enabled 当作 False。
+    feature_flags: dict = Field(
+        default_factory=dict,
+        description=(
+            "灰度开关 dict，用于覆盖 core/feature_flags.py 中的默认值。"
+            "可在配置文件 / 环境变量 FEATURE_FLAGS（JSON）中按 flag_name=true/false 设置，"
+            "便于一键回退某个治本修复到老路径。"
+        ),
+    )
+
     # Anthropic API
     anthropic_api_key: str = Field(default="", description="Anthropic API Key")
     anthropic_base_url: str = Field(
@@ -34,9 +92,9 @@ class Settings(BaseSettings):
     # Agent 配置
     agent_name: str = Field(default="Synapse", description="Agent 名称")
     max_iterations: int = Field(
-        default=100,
+        default=300,
         ge=5,
-        description="Ralph 循环最大迭代次数（最小值 5，默认 100）",
+        description="Ralph/ReAct 循环最大迭代次数（最终防死循环硬上限；默认 300，复杂任务可调到 500+）",
     )
 
     # Plan 模式建议阈值（ComplexitySignal.score 达到此值时建议用户使用 Plan 模式）
@@ -54,31 +112,89 @@ class Settings(BaseSettings):
     )
 
     # === 任务超时策略 ===
-    # 目标：避免“卡死”而不是限制长任务。推荐使用“无进展超时”。
-    # - progress_timeout_seconds: 若连续超过该时间没有任何进展（LLM返回/工具完成/迭代推进），视为卡死。
-    # - hard_timeout_seconds: 可选硬上限（默认关闭=0）。仅作为最终兜底，避免无限任务。
+    # 默认对齐 Claude Code 哲学：CLI/IM 真人对话场景不做"agent 自检自杀"，
+    # 卡死由用户主动按"停止"/Esc 中断。仅在程序化场景（CI/SDK 批跑）需要兜底时打开。
+    # - progress_timeout_seconds: 若连续超过该时间没有任何进展（LLM返回/工具完成/迭代推进），视为卡死。0=禁用。
+    # - hard_timeout_seconds: 任务硬上限（仅在确定要限制总时长时启用）。0=禁用。
     progress_timeout_seconds: int = Field(
-        default=1200,
-        description="无进展超时阈值（秒）。超过该时间无进展则触发超时处理（默认 1200）",
+        default=0,
+        description="无进展超时阈值（秒），0=禁用（默认）。建议值 1200（20 分钟）",
     )
     hard_timeout_seconds: int = Field(
         default=0,
-        description="硬超时上限（秒，0=禁用）。仅作为最终兜底，避免无限任务",
+        description="硬超时上限（秒），0=禁用（默认）。仅作为最终兜底，避免无限任务",
+    )
+
+    # === Conversation Concurrency / Double-texting（v1.27.14, plan: conversation concurrency v1.28）===
+    # 同一 conversation_id 上短时间内重发的语义。每 channel 一个策略：
+    #   reject    — 旧任务在跑就 409 拒绝（不同 client 永远走这条）
+    #   queue     — 排在旧任务后面串行执行（默认，最稳）
+    #   interrupt — cancel 旧任务再开新流（需要 double_texting_allow_interrupt=True）
+    #   steer     — 把新消息注入到正在跑的 turn（实验性）
+    # 默认全部 queue/reject，避免对正在跑的 shell/browser 工具误中断。
+    # S4（v1.28.2）把工具 interruptBehavior 标注做完后，再考虑把 desktop 默认切到 interrupt。
+    double_texting_default: str = Field(
+        default="queue",
+        description="默认 double-texting 策略（reject/queue/interrupt/steer），未配 per-channel 时使用。",
+    )
+    double_texting_per_channel: dict = Field(
+        default_factory=lambda: {
+            "feishu": "reject",
+            "wework": "reject",
+            "wework_ws": "reject",
+            "telegram": "queue",
+            "dingtalk": "reject",
+            "qqbot": "queue",
+            "onebot": "queue",
+            "wechat": "reject",
+            "desktop": "queue",
+            "cli": "queue",
+        },
+        description="按 channel 名维度的 double-texting 策略覆盖；缺省回落到 double_texting_default。",
+    )
+    double_texting_allow_interrupt: bool = Field(
+        default=False,
+        description=(
+            "Feature flag：是否允许 INTERRUPT 策略真的 cancel 当前任务。"
+            "默认 False，任何 INTERRUPT 请求在 caller 层降级为 QUEUE。"
+            "S4（v1.28.2）完成工具 interrupt_behavior 标注后，可安全开启。"
+        ),
+    )
+    preempt_settle_timeout_ms: int = Field(
+        default=6000,
+        ge=500,
+        le=120000,
+        description=(
+            "preempt/queue 等旧任务 settled 的超时（毫秒）。"
+            "超时后老协程标记 abandoned，新流继续。"
+            "建议 > 最长工具 soft-timeout。"
+        ),
+    )
+    preempt_block_tool_extension_ms: int = Field(
+        default=24000,
+        ge=0,
+        le=600000,
+        description=(
+            "QUEUE wait 第一次 timeout 时，若老 task 仍有 block 类工具在跑"
+            "（write_file / run_shell / browser_click 等会留下副作用的工具），"
+            "再延长这么多毫秒等一次。覆盖大多数长写场景；第二次 timeout 才"
+            "硬 cancel。设为 0 即关闭延长机制（保持 v1.28.2 之前的行为）。"
+            "v1.28.2 FOLLOW-UP-S4-A。"
+        ),
     )
 
     # === ForceToolCall（工具护栏）===
-    # 当模型在“可能需要工具”的任务中只给文本不调用工具时，Agent 可追问 1 次以推动工具调用。
-    # 设为 0 可完全关闭该行为（推荐 IM 闲聊/客服式对话场景）。
+    # 默认信任模型自主判断是否需要工具；仅由意图分析或用户配置显式开启追问。
     force_tool_call_max_retries: int = Field(
-        default=2,
+        default=0,
         description="当模型未调用工具时，最多追问要求调用工具的次数（0=禁用，信任模型自主判断）",
     )
     force_tool_call_im_floor: int = Field(
-        default=2,
+        default=0,
         description="IM 通道的 ForceToolCall 最低重试次数（0=与全局一致，不强制下限）",
     )
     confirmation_text_max_retries: int = Field(
-        default=2,
+        default=1,
         description="工具执行后无可见文本时的最大追问次数（0=禁用）",
     )
 
@@ -88,6 +204,104 @@ class Settings(BaseSettings):
     tool_max_parallel: int = Field(
         default=1,
         description="单轮并行工具调用最大并发数（默认 1=串行；>1 启用并行）",
+    )
+    tool_hard_timeout_seconds: int = Field(
+        default=0,
+        description="普通工具调用硬超时（秒），0=不限时（默认，由用户/工具自身中断控制）",
+    )
+    long_running_tool_timeout_seconds: int = Field(
+        default=0,
+        description="长耗时工具（shell/browser/org 等）硬超时（秒），0=不限时（默认）",
+    )
+    tool_result_max_chars: int = Field(
+        default=32000,
+        ge=1000,
+        description="单个工具结果进入模型前的兜底截断字符数；完整内容会保存到 overflow 文件",
+    )
+    tool_overflow_max_files: int = Field(
+        default=200,
+        ge=10,
+        description="工具超长输出 overflow 目录保留的最大文件数",
+    )
+    run_shell_default_block_timeout_ms: int = Field(
+        default=30000,
+        ge=0,
+        description="run_shell 未显式设置 block_timeout_ms/timeout 时的阻塞等待毫秒数；0=立即后台化",
+    )
+    run_shell_max_block_timeout_ms: int = Field(
+        default=1800000,
+        ge=0,
+        description="run_shell 兼容 timeout 参数换算后的最大阻塞等待毫秒数；0=不额外钳制",
+    )
+    powershell_default_timeout_seconds: int = Field(
+        default=120,
+        ge=0,
+        description="run_powershell 默认等待时间（秒）；0=不设置子进程超时",
+    )
+    powershell_max_timeout_seconds: int = Field(
+        default=1800,
+        ge=0,
+        description="run_powershell 显式 timeout 的最大值（秒）；0=不额外钳制",
+    )
+    cli_command_timeout_seconds: int = Field(
+        default=300,
+        ge=0,
+        description="CLI-Anything 普通命令默认等待时间（秒）；0=不设置子进程超时",
+    )
+    opencli_command_timeout_seconds: int = Field(
+        default=300,
+        ge=0,
+        description="OpenCLI list/doctor 默认等待时间（秒）；0=不设置子进程超时",
+    )
+    opencli_task_timeout_seconds: int = Field(
+        default=900,
+        ge=0,
+        description="OpenCLI run 默认等待时间（秒）；0=不设置子进程超时",
+    )
+    read_file_default_limit: int = Field(
+        default=2000,
+        ge=1,
+        description="read_file 未指定 limit 时默认读取的行数",
+    )
+    web_search_attempt_timeout_seconds: int = Field(
+        default=25,
+        ge=0,
+        description=(
+            "web_search/news_search 单次外部搜索源等待上限（秒），0=不限。"
+            "超时只跳过本次搜索等待并把结果交给模型继续决策，不判定整个任务失败"
+        ),
+    )
+
+    # === 搜索源（Provider）配置 ===
+    # 调度规则见 src/synapse/tools/web_search/runtime.py：
+    #   - web_search_provider 留空 → 按 auto_detect_order 走可用源 fallback
+    #   - 指定 id → 严格走该源，失败不 fallback
+    # 命名带 `_API_KEY` / `_BASE_URL` 的敏感字段由前端 password input 自行保护显示
+    web_search_provider: str = Field(
+        default="",
+        description=(
+            "激活的搜索源 ID（bocha / tavily / searxng / jina / duckduckgo）；"
+            "留空=按优先级自动检测可用源"
+        ),
+    )
+    bocha_api_key: str = Field(
+        default="",
+        description="博查 Bocha 搜索 API Key（国内推荐，申请：https://api.bochaai.com）",
+    )
+    tavily_api_key: str = Field(
+        default="",
+        description="Tavily 搜索 API Key（海外推荐，申请：https://app.tavily.com/home）",
+    )
+    jina_api_key: str = Field(
+        default="",
+        description="Jina 搜索 API Key（可选，无 Key 也能用但限速）",
+    )
+    searxng_base_url: str = Field(
+        default="",
+        description=(
+            "SearXNG 自部署实例地址，例如 http://localhost:8080；"
+            "需开启 server.formats.json 才能返回 JSON"
+        ),
     )
 
     allow_parallel_tools_with_interrupt_checks: bool = Field(
@@ -146,15 +360,6 @@ class Settings(BaseSettings):
     )
     database_path: str = Field(default="data/agent.db", description="数据库路径")
 
-    # === RD 研发会议室 ===
-    # 会议室主持人提示词规则文件（绝对路径或相对 cwd）。
-    # 留空 → 使用 src/synapse/rd_meeting/prompts/meeting_room_rules.md。
-    # 私有化部署 / 多租户可指向自定义版本以覆盖默认规则。
-    rd_meeting_rules_path: str = Field(
-        default="",
-        description="会议室主持人提示词规则文件路径，留空使用内置 prompts/meeting_room_rules.md",
-    )
-
     # === 日志配置 ===
     log_level: str = Field(default="INFO", description="日志级别")
     log_dir: str = Field(default="logs", description="日志目录")
@@ -167,29 +372,19 @@ class Settings(BaseSettings):
     )
     log_to_console: bool = Field(default=True, description="是否输出到控制台")
     log_to_file: bool = Field(default=True, description="是否输出到文件")
-
-    # === Whisper 语音识别 ===
-    whisper_enabled: bool = Field(
-        default=False,
-        description="是否启用本地 Whisper 语音识别（模型较大，占用内存高；关闭后使用在线 STT）",
-    )
-    whisper_model: str = Field(
-        default="base", description="Whisper 模型 (tiny/base/small/medium/large)"
-    )
-    whisper_language: str = Field(
-        default="zh",
-        description=(
-            "Whisper 语音识别语言: "
-            "zh(中文) | en(英文，自动使用更小更快的 .en 模型) | "
-            "auto(自动检测语言) | 其他语言代码"
-        ),
-    )
+    llm_debug_enabled: bool = Field(default=True, description="是否保存 LLM 请求/响应调试快照")
+    llm_debug_retention_days: int = Field(default=3, description="LLM 调试快照保留天数")
+    llm_debug_max_size_mb: int = Field(default=512, description="LLM 调试快照目录最大体积（MB）")
 
     # === 全局代理配置 ===
     # 用于 LLM API 请求的代理（如果透明代理不生效）
     http_proxy: str = Field(default="", description="HTTP 代理地址 (如 http://127.0.0.1:7890)")
     https_proxy: str = Field(default="", description="HTTPS 代理地址 (如 http://127.0.0.1:7890)")
     all_proxy: str = Field(default="", description="全局代理地址（优先级高于 http/https proxy）")
+    no_proxy: str = Field(
+        default="",
+        description="不走代理的地址（逗号分隔，支持 IP / CIDR / 域名后缀，如 192.168.0.0/16,.internal）",
+    )
 
     # === IPv4 强制模式 ===
     # 某些 VPN（如 LetsTAP）不支持 IPv6，启用此选项强制使用 IPv4
@@ -252,9 +447,19 @@ class Settings(BaseSettings):
 
     # === MCP 配置 ===
     mcp_enabled: bool = Field(default=True, description="是否启用 MCP (Model Context Protocol)")
-    mcp_timeout: int = Field(default=60, description="MCP 工具调用超时时间（秒），默认 60 秒")
+    mcp_timeout: int = Field(
+        default=0,
+        ge=0,
+        description="MCP 工具/资源/提示词调用超时时间（秒），0=不限制；连接超时单独由 mcp_connect_timeout 控制",
+    )
     mcp_connect_timeout: int = Field(
-        default=30, description="MCP 服务器连接超时时间（秒），默认 30 秒"
+        default=60,
+        description=(
+            "MCP 服务器连接超时时间（秒），默认 60 秒。"
+            "stdio 服务器（如 chrome-devtools-mcp 通过 npx 启动）首次连接需要"
+            "下载 npm 包并完成 JSON-RPC initialize 握手，过短的超时会导致用户"
+            "在慢网络下看到误导性的连接失败。"
+        ),
     )
     mcp_auto_connect: bool = Field(default=False, description="启动时是否自动连接所有 MCP 服务器")
 
@@ -262,6 +467,14 @@ class Settings(BaseSettings):
     scheduler_timezone: str = Field(default="Asia/Shanghai", description="调度器时区")
     scheduler_task_timeout: int = Field(
         default=1200, description="定时任务执行超时时间（秒），默认 1200 秒（20分钟）"
+    )
+    scheduler_background_token_budget: int = Field(
+        default=120000,
+        description="单次后台系统任务的 token 预算，达到后在安全检查点暂停（0=不限制）",
+    )
+    scheduler_selfcheck_fix_token_budget: int = Field(
+        default=60000,
+        description="单次自检自动修复的 token 预算，达到后跳过后续自动修复（0=不限制）",
     )
 
     # === 记忆整理配置 ===
@@ -383,7 +596,7 @@ class Settings(BaseSettings):
 
     # === 会话配置 ===
     session_timeout_minutes: int = Field(default=30, description="会话超时时间（分钟）")
-    session_max_history: int = Field(default=50, description="会话最大历史消息数")
+    session_max_history: int = Field(default=2000, description="会话消息硬上限（日常由 metadata trim 控制体积）")
     session_storage_path: str = Field(default="data/sessions", description="会话存储路径")
 
     # === 多 Agent 模式 (Beta) ===
@@ -392,8 +605,12 @@ class Settings(BaseSettings):
         description="多Agent模式 (Beta)，开启后支持多Agent协作、专用Agent、IM多Bot等",
     )
     coordinator_mode_enabled: bool = Field(
-        default=False,
-        description="协调者模式 (CC-3)：启用后，role=coordinator 的 Agent 仅能委派/规划，不能直接执行文件/命令操作",
+        default=True,
+        description=(
+            "协调者模式 (CC-3)：启用后，role=coordinator 的 Agent 仅能委派/规划，"
+            "不能直接执行文件/命令操作。组织模式下的协调者节点（有下级的节点）"
+            "始终启用协调者提示词，与本开关解耦。"
+        ),
     )
 
     # IM 多 Bot 配置（多Agent模式下支持同一通道类型多个Bot实例）
@@ -436,7 +653,7 @@ class Settings(BaseSettings):
     )
 
     # === 活人感引擎配置 ===
-    proactive_enabled: bool = Field(default=True, description="是否启用活人感模式")
+    proactive_enabled: bool = Field(default=False, description="是否启用活人感模式")
     proactive_max_daily_messages: int = Field(default=3, description="每日最多主动消息数")
     proactive_min_interval_minutes: int = Field(
         default=120, description="两条主动消息最短间隔（分钟）"
@@ -544,21 +761,79 @@ class Settings(BaseSettings):
         default=5000,
         description="触发单条工具结果独立压缩的 token 阈值",
     )
+    context_real_usage_decay: float = Field(
+        default=0.9,
+        ge=0.1,
+        le=1.0,
+        description="用上一轮真实 input_tokens 反向校准上下文压力时的衰减系数",
+    )
+    context_token_anomaly_threshold: int = Field(
+        default=80000,
+        description="单轮 LLM usage 触发强制压缩/降载的阈值（不是直接终止阈值）。值越大越宽松，长任务建议 ≥80000",
+    )
+    context_token_anomaly_max_recoveries: int = Field(
+        default=3,
+        ge=0,
+        description="单任务内 token 异常触发后允许强制压缩恢复的次数，超过后才允许硬终止；长任务建议 3~5",
+    )
+    context_hard_terminate_ratio: float = Field(
+        default=0.98,
+        ge=0.5,
+        le=0.99,
+        description=(
+            "硬终止比例：单轮 input+output tokens 占模型上下文窗口的此比例时，"
+            "LoopBudgetGuard 才允许真正终止任务（0.5~0.99，越大越宽松）。"
+            "如果当前压力安全且未到此比例，即使触发了 token 异常阈值也只压缩不终止"
+        ),
+    )
+    context_cached_summary_chars: int = Field(
+        default=2400,
+        description="缓存/聚合工具结果摘要的默认字符预算",
+    )
+    context_tool_results_total_chars: int = Field(
+        default=80000,
+        description="单轮工具结果进入上下文前的总字符预算（后续会按上下文压力动态调整）",
+    )
+    api_tools_schema_budget_tokens: int = Field(
+        default=12000,
+        description="发送给 LLM API 的 tools schema 估算 token 预算，超出后动态 defer 非核心工具",
+    )
+    same_tool_call_limit: int = Field(
+        default=0,
+        ge=0,
+        description="同一工具同参数在单任务内允许执行的最大次数，0=不限（默认）。建议值 8~12",
+    )
+    readonly_stagnation_limit: int = Field(
+        default=0,
+        ge=0,
+        description="只读探索连续无新信息的软提醒轮数，0=禁用（默认）。建议值 3",
+    )
+    readonly_stagnation_hard_limit: int = Field(
+        default=0,
+        ge=0,
+        description="只读探索连续无新信息的硬终止轮数，0=禁用（默认）。建议值 10~15",
+    )
 
     # === Harness 配置 ===
+    # 默认全部关闭/不限，对齐 Claude Code 风格（CLI 真人场景不强加业务护栏）。
+    # 仅在程序化场景（CI/SDK 批跑、定时任务、组织看门狗等）需要兜底时打开。
     supervisor_enabled: bool = Field(
-        default=True, description="是否启用运行时监督器 (RuntimeSupervisor)"
+        default=False,
+        description="是否启用运行时监督器 (RuntimeSupervisor)，默认关闭。开启后会在工具抖动/编辑抖动/推理死循环等模式被检测到时主动干预",
     )
-    task_budget_tokens: int = Field(default=0, description="单次任务最大 token 消耗 (0=不限制)")
-    task_budget_cost: float = Field(default=0.0, description="单次任务最大成本 USD (0=不限制)")
+    task_budget_tokens: int = Field(default=0, description="单次任务最大 token 消耗，0=不限（默认）")
+    task_budget_cost: float = Field(default=0.0, description="单次任务最大成本 USD，0=不限（默认）")
     task_budget_duration: int = Field(
-        default=0, description="单次任务最大时长秒 (0=不限制)"
+        default=0,
+        description="单次任务最大时长（秒），0=不限（默认）。建议值 600~3600",
     )
     task_budget_iterations: int = Field(
-        default=0, description="单次任务最大迭代次数 (0=不限制)"
+        default=0,
+        description="单次任务最大迭代次数，0=不限（默认）。max_iterations 仍是 ReAct 循环硬上限",
     )
     task_budget_tool_calls: int = Field(
-        default=0, description="单次任务最大工具调用次数 (0=不限制)"
+        default=0,
+        description="单次任务最大工具调用次数，0=不限（默认）。建议值 100~300",
     )
 
     # === 追踪配置 ===
@@ -571,6 +846,107 @@ class Settings(BaseSettings):
     # === 评估配置 ===
     evaluation_enabled: bool = Field(default=False, description="是否启用每日自动评估")
     evaluation_output_dir: str = Field(default="data/evaluation", description="评估报告输出目录")
+
+    # === 组织编排 · 任务链终止防护 ===
+    # 这组开关用于防止：
+    # 1) 同一 chain 被重复交付/验收导致附件与交付物重复；
+    # 2) 任务验收完成后节点仍被后续消息唤醒、自主启动新的 ReAct 循环；
+    # 3) 任务完成后自动向上级发送"已完成"通知从而引发新的父级推理。
+    # 默认全部开启；如需回退旧行为只需将对应项设为 false。
+    org_reject_resubmit_after_accept: bool = Field(
+        default=True,
+        description="禁止在 chain 已 accepted/delivered 之后再次 submit_deliverable",
+    )
+    org_suppress_closed_chain_reactivation: bool = Field(
+        default=True,
+        description="chain 已关闭(accepted/rejected/cancelled)时抑制其消息触发 ReAct 重新激活",
+    )
+    org_post_task_notify_parent: bool = Field(
+        default=False,
+        description="任务完成时是否自动向父节点发送[通知]：False 表示不主动唤醒父级",
+    )
+
+    # === 组织编排 · 多层级指挥治理（org-orchestration-fix） ===
+    # 这组开关用于治理"CEO -> CMO -> 多个执行者 -> CMO 汇总 -> CEO 回包"
+    # 这类多层级指挥场景，解决以下根因：
+    #   1) 子链 chain_id 默认 _now_iso()，导致父子链断裂、tracker 子树失明
+    #   2) 协调者用 org_send_message(question) 派任务，绕过 chain 注册
+    #   3) Supervisor 把合法 poll 当死循环 TERMINATE
+    #   4) 缺少阻塞等待原语，协调者只能轮询
+    #   5) 完成判定一次性 set，CEO 拿不到最终汇总
+    # 默认全部开启；任一项设为 false 可一键回退到旧行为，旧代码路径保留。
+    org_chain_parent_enforced: bool = Field(
+        default=True,
+        description=(
+            "强制 chain 父子关系：delegate 时为子任务新建 chain 并挂到 caller "
+            "current chain 之下；submit 强制复用 caller current chain；"
+            "tracker 完成判定走整棵子树。关闭后回退到旧的'复用 caller chain'语义。"
+        ),
+    )
+    org_question_task_guard: bool = Field(
+        default=True,
+        description=(
+            "拦截协调者用 org_send_message(question) 派发任务的反模式："
+            "若 sender 有下属且消息文本含'撰写/优化/产出/完成/给出/生成'等任务措辞，"
+            "拒绝发送并提示改用 org_delegate_task。"
+        ),
+    )
+    org_supervisor_poll_whitelist: bool = Field(
+        default=True,
+        description=(
+            "Supervisor 对 org_list_delegated_tasks / org_wait_for_deliverable "
+            "等合法轮询/等待工具，抬高重复阈值且最高仅 NUDGE，绝不 TERMINATE。"
+        ),
+    )
+    org_wait_primitive_enabled: bool = Field(
+        default=True,
+        description=(
+            "启用 org_wait_for_deliverable 工具：协调者派完任务后可阻塞等待"
+            "下级交付，避免 org_list_delegated_tasks 轮询触发 Supervisor 死循环。"
+        ),
+    )
+    org_root_post_summary: bool = Field(
+        default=True,
+        description=(
+            "用户命令完成判定的两阶段状态机：所有子链关闭 + root IDLE 时，"
+            "先 push 一条 task_complete 到 root inbox 唤醒 root 产出最终汇总，"
+            "等 root 二次 IDLE 后再 set completed。关闭后退回到一阶段判定。"
+        ),
+    )
+
+    # === 组织编排 · 用户命令生命周期看门狗 ===
+    # 用户通过 send_command 下发一条顶层指令后，完成判定由事件驱动
+    # （所有委派链 chain 关闭 + root IDLE + root inbox 空）。下列时间参数
+    # 仅用于看门狗：防止组织真正卡死（LLM 挂起、死锁）时命令无限挂起。
+    # 任一进度信号（token / 工具完成 / 节点状态切换 / chain 事件）到达
+    # 都会让 warn/autostop 计时器归零，因此长时但持续产出的任务不会被误停。
+    # 默认启用软看门狗：只看“连续无真实进展”，不按总时长硬杀。
+    # 真正持续产出的长任务会不断刷新进度，不会被这些阈值中断。
+    org_command_stuck_warn_secs: int = Field(
+        default=900,
+        description="连续无真实进度多久（秒）记录 stuck_warning，0=禁用。默认 900",
+    )
+    org_command_stuck_autostop_secs: int = Field(
+        default=3600,
+        description="连续无真实进度多久（秒）兜底 soft_stop 组织，0=禁用。默认 3600",
+    )
+    org_command_timeout_secs: int = Field(
+        default=0,
+        description="单条命令最长运行时间（秒）硬上限，0=不限时（默认，不用总时长限制长任务）",
+    )
+    # ── 死锁早停（独立于 stuck_warn / stuck_autostop） ──
+    # 当组织"看似空跑"持续 N 秒后立即收口，不必等 autostop_secs 兜底。
+    # 触发条件：没有忙节点 + 没有待处理 mailbox + root 节点 IDLE + 仍有未关闭 chain。
+    # 这种状态下没有任何 agent 在工作，也没有消息会再来唤醒任何节点，再等下去
+    # 100% 是空跑。比 autostop_secs（默认 3600s）更激进，但比 warn_secs（默认
+    # 900s）更温和。
+    org_command_deadlock_grace_secs: int = Field(
+        default=90,
+        description=(
+            "全员 IDLE + 无消息 + 仍有 open chain 持续多久（秒）后判定为死锁并立即收口，"
+            "0=禁用。默认 90"
+        ),
+    )
 
     @model_validator(mode="after")
     def _enforce_min_max_iterations(self) -> "Settings":
@@ -799,6 +1175,19 @@ _PERSISTABLE_KEYS: list[str] = [
     "force_tool_call_max_retries",
     "force_tool_call_im_floor",
     "confirmation_text_max_retries",
+    "tool_hard_timeout_seconds",
+    "long_running_tool_timeout_seconds",
+    "tool_result_max_chars",
+    "tool_overflow_max_files",
+    "run_shell_default_block_timeout_ms",
+    "run_shell_max_block_timeout_ms",
+    "powershell_default_timeout_seconds",
+    "powershell_max_timeout_seconds",
+    "cli_command_timeout_seconds",
+    "opencli_command_timeout_seconds",
+    "opencli_task_timeout_seconds",
+    "read_file_default_limit",
+    "web_search_attempt_timeout_seconds",
     "always_load_tools",
     "always_load_categories",
 ]
@@ -825,19 +1214,21 @@ class RuntimeState:
     def save(self) -> None:
         """把当前 settings 中的可持久化字段写入 JSON 文件（原子写入 + 备份）。"""
         from .utils.atomic_io import safe_json_write
+        from .utils.redaction import redact_value
 
         data: dict = {}
         for key in _PERSISTABLE_KEYS:
             data[key] = getattr(settings, key)
         try:
             safe_json_write(self.state_file, data)
-            logger.info(f"[RuntimeState] Saved: {data}")
+            logger.info(f"[RuntimeState] Saved: {redact_value(data)}")
         except Exception as e:
             logger.error(f"[RuntimeState] Failed to save: {e}")
 
     def load(self) -> None:
         """从 JSON 文件恢复设置到 settings 单例，仅覆盖可持久化字段（支持 .bak 回退）。"""
         from .utils.atomic_io import read_json_safe
+        from .utils.redaction import redact_value
 
         data = read_json_safe(self.state_file)
         if data is None:
@@ -851,7 +1242,9 @@ class RuntimeState:
                     new_val = data[key]
                     if old_val != new_val:
                         setattr(settings, key, new_val)
-                        applied.append(f"{key}: {old_val} -> {new_val}")
+                        applied.append(
+                            f"{key}: {redact_value(old_val)} -> {redact_value(new_val)}"
+                        )
             if applied:
                 logger.info(f"[RuntimeState] Restored: {'; '.join(applied)}")
             else:
@@ -860,8 +1253,57 @@ class RuntimeState:
             logger.error(f"[RuntimeState] Failed to load: {e}")
 
 
+def _create_settings_safe() -> Settings:
+    """Create the global Settings instance with recovery for poisoned .env files.
+
+    If a field in .env has an unparseable value (e.g. Python repr instead of JSON
+    for complex types), remove that field from .env and retry. This handles the
+    case where _PERSISTABLE_KEYS fields were incorrectly written to .env by older
+    code — those fields are managed by RuntimeState, not .env.
+    """
+    import re
+
+    max_retries = 3
+    last_err: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return Settings()
+        except Exception as e:
+            last_err = e
+            if attempt == max_retries:
+                break
+
+            err_msg = str(e)
+            logger.error(f"[Config] Settings init failed (attempt {attempt + 1}): {err_msg}")
+
+            env_path = Path.cwd() / ".env"
+            if not env_path.exists():
+                break
+
+            field_match = re.search(r'field "(\w+)"', err_msg)
+            if not field_match:
+                break
+
+            bad_field = field_match.group(1).upper()
+            logger.warning(f"[Config] Removing poisoned key '{bad_field}' from .env and retrying")
+
+            try:
+                lines = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                cleaned = [
+                    ln for ln in lines
+                    if not ln.strip().startswith(f"{bad_field}=")
+                ]
+                env_path.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+            except Exception as io_err:
+                logger.error(f"[Config] Failed to repair .env: {io_err}")
+                break
+
+    raise last_err  # type: ignore[misc]
+
+
 # 全局配置实例
-settings = Settings()
+settings = _create_settings_safe()
 
 # 全局运行时状态管理器
 runtime_state = RuntimeState()

@@ -10,11 +10,21 @@ MCP 处理器
 - connect_mcp_server: 连接服务器
 - disconnect_mcp_server: 断开服务器
 - reload_mcp_servers: 重新加载所有配置
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
+from ...core.policy_v2 import ApprovalClass
 from ..mcp_workspace import (
     add_server_to_workspace,
     reload_all_servers,
@@ -41,6 +51,19 @@ class MCPHandler:
         "disconnect_mcp_server",
         "reload_mcp_servers",
     ]
+
+    # C7 explicit ApprovalClass —— call_mcp_tool 是任意外部代码执行入口
+    # （MCP server 由用户自行配置，不可信任为只读），归 EXEC_CAPABLE
+    TOOL_CLASSES = {
+        "call_mcp_tool": ApprovalClass.EXEC_CAPABLE,
+        "list_mcp_servers": ApprovalClass.READONLY_GLOBAL,
+        "get_mcp_instructions": ApprovalClass.READONLY_GLOBAL,
+        "add_mcp_server": ApprovalClass.CONTROL_PLANE,
+        "remove_mcp_server": ApprovalClass.DESTRUCTIVE,
+        "connect_mcp_server": ApprovalClass.CONTROL_PLANE,
+        "disconnect_mcp_server": ApprovalClass.CONTROL_PLANE,
+        "reload_mcp_servers": ApprovalClass.CONTROL_PLANE,
+    }
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
@@ -106,9 +129,27 @@ class MCPHandler:
             self._sync_catalog(server)
 
         if result.success:
-            return f"✅ MCP 工具调用成功:\n{result.data}"
+            from ...utils.credential_redact import redact_credentials
+
+            safe_data = redact_credentials(str(result.data)) if result.data else ""
+            envelope = _build_mcp_envelope(
+                status="ok",
+                server=server,
+                tool=mcp_tool_name,
+                auto_connected=auto_connected,
+                reconnected=bool(getattr(result, "reconnected", False)),
+            )
+            return f"✅ MCP 工具调用成功:\n{safe_data}\n\n{envelope}"
         else:
-            return f"❌ MCP 工具调用失败: {result.error}"
+            envelope = _build_mcp_envelope(
+                status="error",
+                server=server,
+                tool=mcp_tool_name,
+                auto_connected=auto_connected,
+                reconnected=bool(getattr(result, "reconnected", False)),
+                error=str(result.error or ""),
+            )
+            return f"❌ MCP 工具调用失败: {result.error}\n\n{envelope}"
 
     async def _list_servers(self, params: dict) -> str:
         """列出 MCP 服务器及其工具"""
@@ -329,6 +370,34 @@ class MCPHandler:
             f"  之前已连接的 {counts['previously_connected']} 个服务器已断开\n\n"
             f"使用 `connect_mcp_server(server)` 重新连接"
         )
+
+
+def _build_mcp_envelope(
+    *,
+    status: str,
+    server: str,
+    tool: str,
+    auto_connected: bool = False,
+    reconnected: bool = False,
+    error: str = "",
+) -> str:
+    """Render a stable provenance envelope for downstream parsers.
+
+    Mirrors the ``[SYNAPSE_SOURCE]`` pattern used by web_fetch / browser:
+    a single line ``[SYNAPSE_MCP] {json}`` carrying server, tool, status
+    and connection lifecycle hints. Frontend / chat route can lift this into
+    structured `mcp_call` events without scraping the natural-language reply.
+    """
+    payload: dict[str, Any] = {
+        "status": status,
+        "server": server,
+        "tool": tool,
+        "auto_connected": auto_connected,
+        "reconnected": reconnected,
+    }
+    if error:
+        payload["error"] = error[:400]
+    return f"[SYNAPSE_MCP] {json.dumps(payload, ensure_ascii=False)}"
 
 
 def create_handler(agent: "Agent"):

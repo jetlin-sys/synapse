@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,7 @@ from ..config import settings
 
 # 记忆系统
 from ..memory import MemoryManager
+from ..memory.json_utils import coerce_text
 
 # Prompt 编译管线 (v2)
 # 技能系统 (SKILL.md 规范)
@@ -92,7 +94,9 @@ from ..tools.shell import ShellTool
 from ..tools.web import WebTool
 from .agent_state import AgentState
 from .brain import Brain, Context
+from .confirmation_state import get_confirmation_store
 from .context_manager import ContextManager
+from .context_manager import _CancelledError as _CtxCancelledError
 from .context_utils import get_max_context_tokens as _shared_get_max_context_tokens
 from .context_utils import get_raw_context_window as _shared_get_raw_context_window
 from .errors import UserCancelledError
@@ -101,11 +105,15 @@ from .prompt_assembler import PromptAssembler
 from .ralph import RalphLoop, Task, TaskResult
 from .reasoning_engine import ReasoningEngine
 from .response_handler import (
+    INTERNAL_TRACE_MARKERS,
+    INTERNAL_TRACE_SECTION_PREFIXES,
+    INTERNAL_TRACE_SECTION_TERMINATORS,
     ResponseHandler,
     clean_llm_response,
     parse_intent_tag,
     strip_thinking_tags,
 )
+from .risk_intent import RiskIntentResult, RiskLevel, TargetKind, classify_risk_intent
 from .skill_manager import SkillManager
 from .task_monitor import RETROSPECT_PROMPT, TaskMonitor
 from .token_tracking import (
@@ -115,6 +123,7 @@ from .token_tracking import (
     set_tracking_context,
 )
 from .tool_executor import ToolExecutor
+from .trusted_paths import consume_session_trust, is_trusted_workspace_path
 from .user_profile import get_profile_manager
 
 _DESKTOP_AVAILABLE: bool | None = None  # None = not yet checked
@@ -145,6 +154,540 @@ def _ensure_desktop():
 
 logger = logging.getLogger(__name__)
 
+
+# v1.28 S4: process-wide flag so the tool-interrupt-behavior startup warn
+# only fires once even when multi-agent fan-out creates several Agents in
+# the same process.  See ``_init_handlers`` for the consumer.
+_INTERRUPT_BEHAVIOR_WARN_DONE: bool = False
+
+
+def _resolve_force_tool_policy(intent: Any) -> tuple[int | None, bool]:
+    """Return (force_tool_retries, tool_evidence_required) for the reasoning engine.
+
+    P0-2 阶段 2（修正版）：拆解三种语义，停止把 requires_tools/force_tool 等同于"要证据"
+    -----------------------------------------------------------------------
+    旧逻辑：requires_tools / force_tool / evidence_required 任意一个为 True
+            就 evidence_required=True，触发 ForceToolCall(1) + 重试（已被阶段 1 弱化）
+            + 阶段 0 disclaimer。导致大量"我决定让你用工具"和"我必须有工具证据"的语义混淆。
+
+    新逻辑（语义拆解）：
+    - force_tool=True   → "建议尽量调工具"：允许 2 次 ForceToolCall 提示，但不要求证据
+    - evidence_required → "必须有工具证据才能信"：1 次 soft nudge + 走阶段 0 disclaimer
+    - requires_tools    → "需要工具来执行任务"，但不一定需要证据；不再单独触发硬性策略
+                          （由 force_tool 涵盖典型场景）
+
+    返回 (None, False) 表示完全不强制，让 LLM 自主决定。
+    """
+    if not intent:
+        return None, False
+
+    evidence_required = bool(getattr(intent, "evidence_required", False))
+    force_tool = bool(getattr(intent, "force_tool", False))
+
+    if force_tool:
+        return 2, False  # 允许 2 次 ForceToolCall 重试，但不要求 evidence
+    if evidence_required:
+        return 1, True   # 1 次柔性提示，evidence_required 走阶段 0 disclaimer
+    return 0, False
+
+
+def _looks_like_explicit_no_tool_request(message: str) -> bool:
+    text = (message or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "不要调用工具",
+            "不要用工具",
+            "不调用工具",
+            "无需调用工具",
+            "不需要调用工具",
+            "直接用纯文本",
+            "直接纯文本",
+            "直接回复",
+            "纯文本回复",
+            "no tools",
+            "without tools",
+            "without using tools",
+            "do not use tools",
+            "don't use tools",
+            "plain text",
+        )
+    )
+
+
+_TASK_RESULT_META_MARKERS = (
+    "任务已完成",
+    "已完成任务",
+    "执行完成",
+    "已整理完毕",
+    "呈现如上",
+    "输出如上",
+    "系统会自动",
+    "自动推送",
+    "无需额外操作",
+    "如需调整",
+    "如需其他",
+    "随时告诉我",
+    "the task is complete",
+    "shown above",
+    "already presented",
+    "automatically send",
+)
+
+_TASK_PROGRESS_ONLY_MARKERS = (
+    "我来执行",
+    "我将执行",
+    "我先",
+    "先访问",
+    "先查询",
+    "正在处理",
+    "请稍候",
+    "让我先",
+    "let me ",
+    "i will ",
+    "i'll ",
+)
+
+
+def _task_response_quality(text: str) -> int:
+    """Score how useful a task response is as the user-visible final result.
+
+    The score is only used to choose between candidate final answers. It should
+    not reject model output outright; the runtime should stay permissive and
+    preserve the most useful text the model already produced.
+    """
+    normalized = (text or "").strip()
+    if not normalized:
+        return -10_000
+
+    lower = normalized.lower()
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    score = min(len(normalized), 6000) // 20
+
+    # Structure usually means this is the actual deliverable, not just a status.
+    score += sum(1 for line in lines if line.startswith(("#", "##", "###"))) * 18
+    score += sum(1 for line in lines if line.startswith(("-", "*", "1.", "2.", "3."))) * 8
+    score += sum(1 for line in lines if "|" in line) * 5
+
+    meta_hits = sum(1 for marker in _TASK_RESULT_META_MARKERS if marker in lower)
+    if meta_hits:
+        score -= meta_hits * (45 if len(normalized) < 1200 else 15)
+
+    return score
+
+
+def _prefer_task_final_response(candidate: str, current: str) -> bool:
+    """Return True if candidate is a better task final answer than current."""
+    candidate = (candidate or "").strip()
+    current = (current or "").strip()
+    if not candidate:
+        return False
+    if not current:
+        return True
+
+    cand_lower = candidate.lower()
+    cand_meta = any(marker in cand_lower for marker in _TASK_RESULT_META_MARKERS)
+    if cand_meta and len(candidate) < len(current) * 0.7:
+        return False
+
+    return _task_response_quality(candidate) > _task_response_quality(current)
+
+
+def _looks_like_progress_only_task_text(text: str) -> bool:
+    """Detect short transition text that should get one gentle chance to continue."""
+    normalized = (text or "").strip()
+    if not normalized or len(normalized) > 320:
+        return False
+    lower = normalized.lower()
+    has_progress_marker = any(marker in lower for marker in _TASK_PROGRESS_ONLY_MARKERS)
+    has_result_structure = any(
+        line.strip().startswith(("#", "-", "*", "1.", "2.", "3."))
+        for line in normalized.splitlines()
+    )
+    return has_progress_marker and not has_result_structure
+
+
+_REPLAY_REQUEST_MARKERS = (
+    "展示全",
+    "展示完全",
+    "显示全",
+    "显示完全",
+    "没有展示全",
+    "没展示全",
+    "没有展示完全",
+    "没显示全",
+    "没有显示全",
+    "没显示完",
+    "没有显示完",
+    "被截断",
+    "截断了",
+    "补全",
+    "完整报告",
+    "完整结论",
+    "完整内容",
+    "全文",
+    "全部内容",
+)
+
+_REPLAY_CONTEXT_MARKERS = (
+    "你的",
+    "上面",
+    "刚才",
+    "之前",
+    "上一轮",
+    "报告",
+    "结论",
+    "结果",
+    "内容",
+    "回答",
+)
+
+_REANALYZE_MARKERS = (
+    "重新分析",
+    "重新排查",
+    "重新调查",
+    "重新检索",
+    "重新读取",
+    "从头分析",
+    "从头排查",
+    "再分析",
+    "再排查",
+)
+
+_PREVIOUS_ANSWER_REPLAY_HINT = (
+    "[系统提示] 用户当前是在要求继续展示或完整重放上一轮已经生成的结果。"
+    "请优先复用上文最近的 assistant 回复、已交付附件或历史中保存的结论，"
+    "直接从缺失处继续或完整重放；不要重新调用工具、重新检索或重新分析，"
+    "除非用户明确要求重新分析。"
+)
+
+
+def _looks_like_previous_answer_replay_request(message: str, history_messages: list[dict]) -> bool:
+    """Whether a follow-up asks to show the previous answer fully, not redo the task."""
+    text = (message or "").strip()
+    if not text or not any(msg.get("role") == "assistant" for msg in history_messages):
+        return False
+
+    normalized = re.sub(r"\s+", "", text).lower()
+    if any(marker in normalized for marker in _REANALYZE_MARKERS):
+        return False
+
+    has_replay_marker = any(marker in normalized for marker in _REPLAY_REQUEST_MARKERS)
+    has_context_marker = any(marker in normalized for marker in _REPLAY_CONTEXT_MARKERS)
+    asks_to_show_again = (
+        ("重新展示" in normalized or "重新显示" in normalized or "再发" in normalized)
+        and has_context_marker
+    )
+    asks_to_continue_previous = (
+        ("继续" in normalized or "接着" in normalized)
+        and ("展示" in normalized or "显示" in normalized or "输出" in normalized)
+        and has_context_marker
+    )
+    return (has_replay_marker and has_context_marker) or asks_to_show_again or asks_to_continue_previous
+
+
+def _apply_previous_answer_replay_hint(message: str) -> str:
+    if not message or message.startswith(_PREVIOUS_ANSWER_REPLAY_HINT):
+        return message
+    return f"{_PREVIOUS_ANSWER_REPLAY_HINT}\n\n{message}"
+
+
+_EXTERNAL_TOOL_MARKERS: tuple[str, ...] = (
+    # ---- 直接的"调用工具/读写文件/上网"动作 ----
+    "读取",
+    "读文件",
+    "查看文件",
+    "搜索",
+    "联网",
+    "网页",
+    "下载",
+    "保存",
+    "写入",
+    "创建文件",
+    "生成文件",
+    "附件",
+    "运行",
+    "执行命令",
+    "调用工具",
+    # ---- "做一份/写一份/出一份" 类需要落盘交付的产出动词 ----
+    # 这些动词单独出现就强烈暗示"产出可交付物"——纯模型对话很少使用，
+    # 真正的纯写作场景（"写一首诗"/"翻译一句话"）走 _looks_like_explicit_no_tool_request
+    # 显式排除，或由调用方传 task_type=analysis 覆盖。
+    "做一份",
+    "做个",
+    "做一个",
+    "写一份",
+    "写个",
+    "写一个",
+    "出一份",
+    "出个",
+    "整理一份",
+    "整理出",
+    "汇总一份",
+    "汇总出",
+    "梳理一份",
+    "梳理出",
+    "输出一份",
+    "输出文件",
+    "生成一份",
+    "产出",
+    "交付",
+    # ---- 协作 / 研究 / 报告 类（团队语境的强信号） ----
+    "策划",
+    "排期",
+    "选题",
+    "调研",
+    "竞品",
+    "行业分析",
+    "市场分析",
+    "数据分析",
+    "趋势分析",
+    "可行性",
+    "立项",
+    "需求分析",
+    "评测",
+    "对比",
+    "宣传",
+    "运营",
+    "上线",
+    "发布",
+    # ---- 英文动词 ----
+    "api",
+    "mcp",
+    "read file",
+    "search",
+    "web",
+    "download",
+    "write file",
+    "save",
+    "run command",
+    "call tool",
+    "create a",
+    "make a plan",
+    "draft a",
+    "produce a",
+    "deliver a",
+    "generate a",
+    "write a report",
+    "research",
+    "analyze",
+    "compare",
+)
+
+
+def _looks_like_external_tool_request(message: str) -> bool:
+    """Conservative guard for sub-agent delegation.
+
+    Sub-agents skip the full IntentAnalyzer for latency.  Only explicit external
+    action/evidence requests should force tools; otherwise the model can still
+    call tools if useful, but plain writing/analysis is accepted as text.
+
+    History: the original 5/8 keyword list (read file / search / write file /
+    api / mcp …) missed common Chinese phrasings like "做一份 X 计划", "整理
+    一下", "出个报告", which let coordinator nodes silently bypass delegation
+    (root agents would write the deliverable themselves instead of dispatching
+    to subordinates). The expanded list here covers the high-frequency Chinese
+    "produce a deliverable" verbs without forcing tools on plain chit-chat.
+
+    NOTE: organization coordinator nodes are also forced via a separate
+    structural path (``Agent._prepare_session_context`` checks
+    ``_is_org_coordinator``); this keyword check is the secondary safety net
+    for non-org sub-agents.
+    """
+    text = (message or "").lower()
+    if not text.strip():
+        return False
+    if _looks_like_explicit_no_tool_request(text):
+        return False
+    return any(marker in text for marker in _EXTERNAL_TOOL_MARKERS)
+
+
+# ---- 本地图片附件 → data URL（BUG-1 修复） ----
+# 上传到 /api/uploads/<name> 的图片只能在本机通过 HTTP 访问，
+# 远端云模型（通义/OpenAI vision）无法回调 127.0.0.1，会报 InvalidParameter。
+# 本函数把这类本地 URL 解析回磁盘文件并转为 data URL；超过阈值或失败时返回 None。
+_LOCAL_UPLOAD_RE = re.compile(
+    r"^(?:https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?::\d+)?)?/api/uploads/([\w\-.]+)$",
+    re.IGNORECASE,
+)
+_INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 5 MB，超出走文本降级
+
+
+_DATA_URI_RE = re.compile(
+    r"^data:(?P<mime>[^;,]+)?(?P<params>(?:;[^,]*)*),(?P<data>.*)$",
+    re.DOTALL,
+)
+
+
+def _maybe_inline_local_image(att_url: str, att_mime: str) -> str | None:
+    """If *att_url* points to a locally served upload, return a base64 data URL.
+
+    Returns None when the URL is not local, file is missing/too large, or
+    any IO error occurs — caller falls back to its existing degraded path.
+    """
+    if not att_url or att_url.startswith("data:"):
+        return None
+    m = _LOCAL_UPLOAD_RE.match(att_url.strip())
+    if not m:
+        return None
+    filename = m.group(1)
+    try:
+        from ..api.routes.upload import get_upload_dir
+
+        upload_dir = get_upload_dir().resolve()
+        filepath = (upload_dir / filename).resolve()
+        filepath.relative_to(upload_dir)  # 防穿越
+        if not filepath.is_file():
+            return None
+        size = filepath.stat().st_size
+        if size > _INLINE_IMAGE_MAX_BYTES:
+            logger.info(
+                "[InlineImage] skip %s: %.1f MB exceeds limit",
+                filename, size / 1024 / 1024,
+            )
+            return None
+        mime = att_mime or ""
+        if not mime.startswith("image/"):
+            import mimetypes
+            mime = mimetypes.guess_type(str(filepath))[0] or "image/png"
+        data = filepath.read_bytes()
+        b64 = base64.b64encode(data).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except Exception as exc:
+        logger.warning("[InlineImage] failed to inline %s: %s", att_url, exc)
+        return None
+
+
+def _safe_attachment_stem(filename: str) -> str:
+    stem = Path(filename or "attachment").stem or "attachment"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    return stem[:80] or "attachment"
+
+
+def _save_data_uri_attachment(
+    att_url: str,
+    *,
+    att_name: str,
+    att_mime: str,
+) -> dict[str, Any] | None:
+    """Persist non-media data URI attachments and return a short local reference.
+
+    Desktop/API clients should normally upload files through /api/upload. This
+    fallback prevents old clients from replaying large base64 payloads into the
+    LLM prompt while still preserving the file for tools to inspect.
+    """
+    match = _DATA_URI_RE.match((att_url or "").strip())
+    if not match:
+        return None
+
+    try:
+        import mimetypes
+        from urllib.parse import unquote_to_bytes
+
+        from ..api.routes.upload import (
+            BLOCKED_EXTENSIONS,
+            MAX_UPLOAD_SIZE,
+            get_upload_dir,
+        )
+
+        mime = (att_mime or match.group("mime") or "application/octet-stream").strip()
+        payload = match.group("data") or ""
+        params = (match.group("params") or "").lower()
+        if ";base64" in params:
+            raw = base64.b64decode(payload, validate=False)
+        else:
+            raw = unquote_to_bytes(payload)
+
+        if len(raw) > MAX_UPLOAD_SIZE:
+            logger.warning(
+                "[DesktopAttachment] data URI attachment %s exceeds upload limit: %.1f MB",
+                att_name,
+                len(raw) / 1024 / 1024,
+            )
+            return None
+
+        original = Path(att_name or "attachment")
+        suffix = original.suffix.lower()
+        if suffix in BLOCKED_EXTENSIONS:
+            suffix = ".bin"
+        if not suffix:
+            suffix = mimetypes.guess_extension(mime) or ".bin"
+
+        filename = (
+            f"{int(time.time())}_{uuid.uuid4().hex[:8]}_"
+            f"{_safe_attachment_stem(att_name)}{suffix}"
+        )
+        filepath = get_upload_dir() / filename
+        filepath.write_bytes(raw)
+        return {
+            "url": f"/api/uploads/{filename}",
+            "local_path": str(filepath),
+            "mime_type": mime,
+            "size": len(raw),
+        }
+    except Exception as exc:
+        logger.warning(
+            "[DesktopAttachment] failed to persist data URI attachment %s: %s",
+            att_name,
+            exc,
+        )
+        return None
+
+
+def _format_desktop_attachment_reference(
+    *,
+    att_type: str,
+    att_name: str,
+    att_mime: str,
+    att_url: str,
+    att_local_path: str | None = None,
+    att_size: int | None = None,
+) -> str:
+    """Return a prompt-safe text reference for non-image/video attachments."""
+    if (att_url or "").strip().startswith("data:"):
+        saved = _save_data_uri_attachment(att_url, att_name=att_name, att_mime=att_mime)
+        if saved:
+            return (
+                f"[附件: {att_name} ({saved['mime_type']})，"
+                f"已保存到本地路径: {saved['local_path']}，"
+                f"URL: {saved['url']}，大小: {saved['size']} bytes。"
+                "如需读取内容，请使用文件或数据处理工具打开该本地路径。]"
+            )
+        return (
+            f"[附件: {att_name} ({att_mime or att_type}) 是内联 data URI，"
+            "为避免超大 base64 内容进入模型上下文，已隐藏原始内容。"
+            "请使用上传文件 URL 或重新上传附件后继续处理。]"
+        )
+
+    local_path = att_local_path
+    if not local_path and att_url:
+        try:
+            from ..api.routes.upload import resolve_upload_path
+
+            resolved = resolve_upload_path(att_url)
+            if resolved:
+                local_path = str(resolved)
+                att_size = resolved.stat().st_size
+        except Exception as exc:
+            logger.debug("[DesktopAttachment] failed to resolve upload path %s: %s", att_url, exc)
+
+    if att_type == "document":
+        label = "文档"
+    elif att_type == "voice" or (att_mime or "").startswith("audio/"):
+        label = "音频"
+    else:
+        label = "附件"
+
+    size_text = f"，大小: {att_size} bytes" if att_size is not None else ""
+    if local_path:
+        return (
+            f"[{label}: {att_name} ({att_mime or att_type})，"
+            f"已保存到本地路径: {local_path}，URL: {att_url or '无'}{size_text}。"
+            "如需读取、转写或分析，请直接使用文件/音频处理工具打开该本地路径。]"
+        )
+    return f"[{label}: {att_name} ({att_mime or att_type})] URL: {att_url}"
+
+
 # 上下文管理常量（部分迁移至 context_manager.py，压缩相关仍需就地定义）
 from .context_manager import CHARS_PER_TOKEN, CHUNK_MAX_TOKENS
 
@@ -161,23 +704,10 @@ SMALL_CTX_CORE_TOOLS = {
     "list_directory",
     "grep",
     "ask_user",
+    "tool_search",
     "get_tool_info",
+    "get_session_context",
 }
-# SKILL 类工具集合：调用这些工具时 input.skill_name 表征被使用的 SKILL，
-# 用于在 TaskState.skills_executed 中聚合"近期使用的 SKILL"。
-# 仅取**实际触发 SKILL 执行**的核心动词，list/search 等仅做发现，不计入。
-_SKILL_AWARE_TOOL_NAMES = frozenset(
-    {
-        "get_skill_info",
-        "run_skill_script",
-        "get_skill_reference",
-        "read_skill_file",
-        "reload_skill",
-        "unload_skill",
-    }
-)
-
-
 # 中等上下文窗口模型额外包含的工具
 MEDIUM_CTX_EXTRA_TOOLS = {
     "add_memory",
@@ -194,6 +724,273 @@ MEDIUM_CTX_EXTRA_TOOLS = {
     "glob",
     "delete_file",
 }
+
+MINIMAL_PROMPT_TOOLS = {
+    "ask_user",
+    "tool_search",
+    "get_session_context",
+    "read_file",
+    "list_directory",
+    "grep",
+    "glob",
+    "semantic_search",
+    "web_search",
+    "web_fetch",
+}
+
+
+@dataclass(frozen=True)
+class PromptStrategy:
+    profile: Any
+    prompt_mode: Any
+    skip_catalogs: bool = False
+    memory_scope: Any = None
+    catalog_scope: list[str] = field(default_factory=list)
+    include_project_guidelines: bool = False
+
+def _classify_risk_intent(intent: Any, message: str) -> RiskIntentResult:
+    """Single source of truth for the pre-ReAct risk gate."""
+    return classify_risk_intent(message, intent)
+
+
+def _consume_risk_authorization(session: Any, message: str) -> bool:
+    """Check + consume session-level risk authorization.
+
+    When the user previously confirmed a high-risk request that had no
+    controlled execution entry (see ``chat.py::_RiskAuthorizedReplay``),
+    the chat handler stamps the session metadata with::
+
+        risk_authorized_replay = {
+            "expires_at": <epoch_seconds>,
+            "confirmation_id": ...,
+            "original_message": ...,
+        }
+
+    PR-A2 also writes a structured ``risk_authorized_intent`` (see
+    :class:`AuthorizedIntent`). Both are checked here for backward
+    compatibility; whichever matches is consumed in a single-use fashion.
+
+    Single-use + short TTL (30s) avoids granting blanket future authority.
+    """
+    if session is None or not message:
+        return False
+    consumed_any = False
+    try:
+        stamp = session.get_metadata("risk_authorized_replay")
+    except Exception:
+        stamp = None
+    if isinstance(stamp, dict):
+        expired = False
+        try:
+            expired = float(stamp.get("expires_at", 0)) < time.time()
+        except (TypeError, ValueError):
+            expired = True
+        msg_match = (
+            (stamp.get("original_message") or "").strip()
+            == (message or "").strip()
+        )
+        if expired:
+            try:
+                session.set_metadata("risk_authorized_replay", None)
+            except Exception:
+                pass
+        elif msg_match:
+            try:
+                session.set_metadata("risk_authorized_replay", None)
+            except Exception:
+                pass
+            consumed_any = True
+        # mismatch + not expired: 保留 stamp，等正确的消息再来消费
+        # （改动原因：原实现 mismatch 也清掉，会让"先 a 再 b"场景误清 a 的授权）
+
+    # 结构化 AuthorizedIntent（PR-A2）
+    try:
+        intent_data = session.get_metadata("risk_authorized_intent")
+    except Exception:
+        intent_data = None
+    if isinstance(intent_data, dict):
+        try:
+            from .risk_intent import AuthorizedIntent
+
+            intent = AuthorizedIntent.from_dict(intent_data)
+        except Exception:
+            intent = None
+        if intent is None or intent.is_expired(time.time()):
+            try:
+                session.set_metadata("risk_authorized_intent", None)
+            except Exception:
+                pass
+        else:
+            msg_match = (intent.original_message or "").strip() == (message or "").strip()
+            if msg_match:
+                # 把 intent 暂存到 session，供 prompt builder 注入到 system prompt；
+                # 实际"消费"在 ToolExecutor 路由完成后再做（保证拿到 scope）。
+                try:
+                    session.set_metadata(
+                        "risk_authorized_intent_active",
+                        intent.to_dict(),
+                    )
+                    session.set_metadata("risk_authorized_intent", None)
+                except Exception:
+                    pass
+                consumed_any = True
+    return consumed_any
+
+
+# Targets that still require RiskGate confirmation even under trust (yolo) mode.
+#普通用户文件 / 桌面文件 / 未知目标 在信任模式下放行；
+# 安全策略 / 死亡开关 / 安全白名单 / shell 命令 / 已知受保护文件 仍要 confirm。
+# 真正的系统/密钥目录与 CRITICAL shell 由 PolicyEngine baseline 兜底拦截。
+_TRUST_MODE_MUST_CONFIRM_TARGETS = frozenset(
+    {
+        TargetKind.SECURITY_USER_ALLOWLIST,
+        TargetKind.SECURITY_POLICY,
+        TargetKind.DEATH_SWITCH,
+        TargetKind.PROTECTED_FILE,
+        TargetKind.SHELL_COMMAND,
+    }
+)
+
+
+def _check_trust_mode_skip(risk_intent: RiskIntentResult | None) -> str | None:
+    """Skip the pre-LLM RiskGate confirm when the user has chosen trust mode
+    and the intent only touches ordinary user data (e.g. desktop files).
+
+    Sensitive targets (security policy, allowlists, shell commands, protected
+    files) still go through the normal confirm flow even in trust mode.
+
+    C7：保守语义 —— **必须 v1 和 v2 都报 TRUST 才 skip**。
+    - 正常生产链路：reset_policy_engine 已同步 v1+v2（C6），两层值始终一致
+    - 异常链路：若任一层（如 admin UI 直接改 v1 但 v2 还没刷新）报非 trust，
+      宁可让用户多确认一次，也不要在策略不一致时静默放行
+    - v2 不可用：退化到 v1（v1 缺失才返回 None，等同未启用 trust）
+    """
+    if risk_intent is None:
+        return None
+    if risk_intent.target_kind in _TRUST_MODE_MUST_CONFIRM_TARGETS:
+        return None
+
+    # C8b-5: 之前用 v1 ``pe._is_trust_mode()`` + v2 双查 + "保守优先"。
+    # C8b-4 后 v2 ``read_permission_mode_label()`` 已是 SoT，v1
+    # ``_frontend_mode`` 字段已删，二者不再可能 desync——双查无意义。
+    # v2 helper 自带 fail-soft fallback (v2 layer 未初始化时回 "yolo")，
+    # 故失败时退化为"未启用 trust"（fallback 是 "yolo" 但属于 fail-safe，
+    # 真正 v2 异常时不应该误信任）：用显式 try/except 区分 normal vs error。
+    try:
+        from .policy_v2 import ConfirmationMode
+        from .policy_v2.global_engine import get_config_v2
+
+        mode_value = get_config_v2().confirmation.mode
+        is_trust = (
+            mode_value == ConfirmationMode.TRUST or str(mode_value) == "trust"
+        )
+    except Exception:
+        return None  # v2 不可用 → 当作未启用 trust（保守）
+
+    if is_trust:
+        return "trust_mode"
+    return None
+
+
+def _check_trusted_path_skip(
+    session: Any,
+    message: str,
+    risk_intent: RiskIntentResult | None,
+) -> str | None:
+    """Decide whether the current request can skip the risk gate due to a
+    trusted-path or session-level grant (Fix-11).
+
+    Returns a human-readable reason string when skipped, or ``None`` when the
+    normal risk gate must run. **Never** returns a skip reason for
+    ``RiskLevel.HIGH`` — that bar (sensitive targets / shell hard verbs)
+    requires explicit confirmation regardless of trust state.
+    """
+    if risk_intent is None or not message:
+        return None
+    if risk_intent.risk_level == RiskLevel.HIGH:
+        return None
+
+    try:
+        if is_trusted_workspace_path(message):
+            return "trusted_workspace_path"
+    except Exception:
+        pass
+
+    try:
+        op_value = (
+            risk_intent.operation_kind.value
+            if hasattr(risk_intent.operation_kind, "value")
+            else str(risk_intent.operation_kind)
+        )
+        if consume_session_trust(session, message=message, operation=op_value):
+            return "session_grant"
+    except Exception:
+        pass
+
+    return None
+
+
+def _build_destructive_intent_question(message: str, classification: RiskIntentResult | None = None) -> str:
+    """生成高危确认提示。
+
+    PR-1.1：两步式 summary。先把用户的长描述抽成 ≤30 字的"准备执行 X"
+    摘要 + scope，再给三选项；避免直接抛出原始 message 让用户读不懂。
+    """
+    target = (message or "").strip()
+    summary = _summarize_destructive_action(target, classification)
+    options = "回复 **继续** / **只查看** / **取消** 三选一。"
+    if classification is not None:
+        op = (
+            classification.operation_kind.value
+            if hasattr(classification.operation_kind, "value")
+            else str(classification.operation_kind or "")
+        )
+        target_kind = (
+            classification.target_kind.value
+            if hasattr(classification.target_kind, "value")
+            else str(classification.target_kind or "")
+        )
+        meta_parts = []
+        if op and op not in ("none", "unknown"):
+            meta_parts.append(f"op={op}")
+        if target_kind and target_kind not in ("unknown",):
+            meta_parts.append(f"target={target_kind}")
+        meta_line = f"（{', '.join(meta_parts)}）" if meta_parts else ""
+    else:
+        meta_line = ""
+
+    return (
+        f"准备执行：**{summary}** {meta_line}\n\n"
+        "这个动作可能改动文件 / 配置 / 权限，做完不一定能撤回，先确认一下。\n"
+        f"{options}"
+    )
+
+
+_DESTRUCTIVE_VERBS = (
+    "删除", "删掉", "清空", "清除", "重置", "覆盖", "禁用", "关闭",
+    "卸载", "销毁", "格式化",
+)
+
+
+def _summarize_destructive_action(text: str, classification: Any | None = None) -> str:
+    """Best-effort one-line summary of a destructive request (≤30 chars)."""
+    raw = (text or "").strip()
+    if not raw:
+        return "未指定操作"
+    if len(raw) <= 30:
+        return raw
+    # 尝试切到第一句
+    for sep in ("。", "\n", "；", ";", "！", "!"):
+        idx = raw.find(sep)
+        if 5 <= idx <= 30:
+            return raw[:idx].strip() or raw[:30] + "…"
+    # 找到第一个动词 + 下文
+    for verb in _DESTRUCTIVE_VERBS:
+        i = raw.find(verb)
+        if i != -1:
+            tail = raw[i : i + 28]
+            return tail + ("…" if len(raw) > i + 28 else "")
+    return raw[:28] + "…"
 
 # Prompt Compiler 系统提示词（两段式 Prompt 第一阶段）
 PROMPT_COMPILER_SYSTEM = """【角色】
@@ -251,6 +1048,24 @@ risks_or_ambiguities:
   - 未指定如何处理包含非数值数据的列
   - 未指定输出格式（打印到控制台还是保存到文件）
 ```"""
+
+
+# ─────────────────────────────────────────────────────────────
+# 进程级"主 Agent"引用 —— AgentFactory 创建 sub-agent 时按需读取
+# 用于 share_from 机制（见 Agent._attach_shared_runtime）。
+# 只在主 Agent 完成一次"完整初始化"（非 lightweight）后设置，
+# 防止 sub-agent 拿到一个还没加载完插件的 parent。
+# ─────────────────────────────────────────────────────────────
+_PRIMARY_AGENT: "Agent | None" = None
+
+
+def set_primary_agent(agent: "Agent | None") -> None:
+    global _PRIMARY_AGENT
+    _PRIMARY_AGENT = agent
+
+
+def get_primary_agent() -> "Agent | None":
+    return _PRIMARY_AGENT
 
 
 class Agent:
@@ -392,13 +1207,23 @@ class Agent:
         )
 
         # 初始化基础工具
-        self.shell_tool = ShellTool()
+        # 显式传入 settings.project_root，确保 Windows 自启动场景不会落到 System32。
+        self.shell_tool = ShellTool(default_cwd=str(settings.project_root))
         self.file_tool = FileTool()
         self.web_tool = WebTool()
 
         # 初始化技能系统 (SKILL.md 规范)
+        from ..skills.categories import CategoryRegistry
+        from ..skills.category_store import CategoryStore
+
         self.skill_registry = SkillRegistry()
-        self.skill_loader = SkillLoader(self.skill_registry)
+        self.skill_category_registry = CategoryRegistry()
+        self._category_store = CategoryStore()
+        self.skill_category_registry.set_store(self._category_store)
+        self.skill_loader = SkillLoader(
+            self.skill_registry,
+            category_registry=self.skill_category_registry,
+        )
 
         # F6/F9: usage tracker + watcher (created early, wired after load)
         from ..skills.usage import SkillUsageTracker
@@ -409,6 +1234,7 @@ class Agent:
         self.skill_catalog = SkillCatalog(
             self.skill_registry,
             usage_tracker=self._skill_usage_tracker,
+            category_registry=self.skill_category_registry,
         )
 
         # F8: conditional activation manager
@@ -448,12 +1274,10 @@ class Agent:
 
             _all_tools.extend(_DT)
         from ..tools.definitions.agent import AGENT_TOOLS
-        from ..tools.definitions.meeting_room import MEETING_ROOM_TOOLS
         from ..tools.definitions.org_setup import ORG_SETUP_TOOLS
 
         _all_tools.extend(AGENT_TOOLS)
         _all_tools.extend(ORG_SETUP_TOOLS)
-        _all_tools.extend(MEETING_ROOM_TOOLS)
         if opencli_available():
             from ..tools.definitions.opencli import OPENCLI_TOOLS as _OC
 
@@ -481,9 +1305,13 @@ class Agent:
             embedding_api_model=settings.embedding_api_model,
             agent_id=self.name,
         )
+        self._memory_backends: dict[str, dict] = {}
+        self.memory_manager.set_plugin_backends(self._memory_backends)
+        self._active_agent_lifecycle_runs: dict[str, dict[str, Any]] = {}
 
         # 用户档案管理器
         self.profile_manager = get_profile_manager()
+        self.memory_manager.profile_manager = self.profile_manager
 
         # ==================== 人格系统 + 活人感 + 表情包 ====================
         from ..tools.sticker import StickerEngine
@@ -552,14 +1380,12 @@ class Agent:
             logger.info(f"CLI-Anything tools enabled ({len(CLI_ANYTHING_TOOLS)} tools)")
 
         from ..tools.definitions.agent import AGENT_TOOLS
-        from ..tools.definitions.meeting_room import MEETING_ROOM_TOOLS
         from ..tools.definitions.org_setup import ORG_SETUP_TOOLS
 
         self._tools.extend(AGENT_TOOLS)
         self._tools.extend(ORG_SETUP_TOOLS)
-        self._tools.extend(MEETING_ROOM_TOOLS)
         logger.info(
-            f"Multi-agent tools enabled ({len(AGENT_TOOLS) + len(ORG_SETUP_TOOLS) + len(MEETING_ROOM_TOOLS)} tools)"
+            f"Multi-agent tools enabled ({len(AGENT_TOOLS) + len(ORG_SETUP_TOOLS)} tools)"
         )
 
         # Platform hub tools (Agent Hub + Skill Store, only when enabled)
@@ -586,8 +1412,23 @@ class Agent:
         # are promoted from deferred to full-schema in _effective_tools.
         self._discovered_tools: set[str] = set()
 
+        # Per-session system prompt cache (hermes-style).
+        # Key = (conv_id, mode, skip_catalogs); value = prompt string.
+        # Invalidated by _invalidate_system_prompt_cache() on memory/mode/
+        # compression events.  Avoids re-running the full prompt assembly
+        # pipeline every turn when only the user message changes.
+        self._system_prompt_cache: dict[tuple, str] = {}
+        self._system_prompt_cache_dirty = True
+
         # Sub-agent call flag: set by orchestrator._call_agent()
         self._is_sub_agent_call = False
+        # Organization coordinator flag: set by ``orgs.runtime._create_node_agent``
+        # iff the node has direct subordinates. Used by
+        # ``_prepare_session_context`` to keep the coordinator strictly in
+        # delegation mode (force_tool=True) and by orchestrator to pick the
+        # coordinator-mode prompt independent of the global
+        # ``coordinator_mode_enabled`` flag.
+        self._is_org_coordinator = False
         # Agent tool names to exclude when running as sub-agent
         self._agent_tool_names = frozenset(
             {"delegate_to_agent", "delegate_parallel", "create_agent", "spawn_agent"}
@@ -604,8 +1445,14 @@ class Agent:
 
         # Agent profile and custom prompt (set by AgentFactory)
         self._agent_profile = None
+        self._agent_profile_id = "default"
+        self._runtime_env_mode = "shared"
+        self._runtime_env_dependencies: list[str] = []
+        self._runtime_env_python: str | None = None
+        self._execution_env_spec = None
         self._custom_prompt_suffix: str = ""
         self._preferred_endpoint: str | None = None
+        self._endpoint_policy: str = "prefer"
 
         # Plan mode exit pending — keyed by conversation_id
         # Set by exit_plan_mode tool, consumed by chat_with_session_stream
@@ -646,13 +1493,14 @@ class Agent:
             memory_manager=self.memory_manager,
         )
 
-        # 技能管理器（委托自 _install_skill / _load_installed_skills 等）
+        # 技能管理器（仅负责从 Git/URL 落盘 + 首次 loader.load_skill）。
+        # 刷新目录缓存、通知 Pool、广播 SkillEvent 统一由 ``propagate_skill_change`` 负责，
+        # 此处不再传入回调，避免半套刷新路径。
         self.skill_manager = SkillManager(
             skill_registry=self.skill_registry,
             skill_loader=self.skill_loader,
             skill_catalog=self.skill_catalog,
             shell_tool=self.shell_tool,
-            on_skill_loaded=self._on_skill_manager_loaded,
         )
 
         # 插件目录（在 _load_plugins 中设置）
@@ -680,7 +1528,51 @@ class Agent:
             plan_exit_pending=self._plan_exit_pending,
         )
 
+    def configure_runtime_environment(self, profile) -> None:
+        """Apply AgentProfile runtime policy to tools created during __init__.
+
+        Agent instances are initialized before AgentFactory applies profile
+        filters. This hook lets the factory attach the stable profile id and an
+        optional managed agent venv without changing legacy shared behavior.
+        """
+        self._agent_profile = profile
+        self._agent_profile_id = getattr(profile, "id", "default") or "default"
+        self._runtime_env_mode = getattr(profile, "runtime_env_mode", "shared") or "shared"
+        self._runtime_env_dependencies = list(
+            getattr(profile, "runtime_env_dependencies", []) or []
+        )
+        self._runtime_env_python = getattr(profile, "runtime_env_python", None)
+        self._execution_env_spec = None
+
+        if self._runtime_env_mode == "agent":
+            try:
+                from ..runtime_envs import resolve_agent_env
+
+                self._execution_env_spec = resolve_agent_env(
+                    self._agent_profile_id,
+                    deps=self._runtime_env_dependencies,
+                )
+            except Exception as exc:
+                logger.warning("Failed to resolve agent runtime env for %s: %s", self._agent_profile_id, exc)
+
+        if hasattr(self.shell_tool, "execution_env_spec"):
+            self.shell_tool.execution_env_spec = self._execution_env_spec
+            self.shell_tool.runtime_env_mode = self._runtime_env_mode
+
         logger.info(f"Agent '{self.name}' created (with refactored sub-modules)")
+
+    # 永远不会因为 intent-driven defer 被剔除的工具分类。
+    #
+    # 这两类是 Synapse 在每一轮里都需要的"基础能力"：
+    # - ``System``：``ask_user`` / ``schedule_task`` 等控制流工具，没有它们
+    #   LLM 没办法触发追问或排程，体验直接退化。
+    # - ``Memory``：``memory_search`` / ``memory_recall`` 之类，被裁掉就等于
+    #   切断了"我曾经记住过 X"的入口，会导致明显的健忘 bug。
+    #
+    # 暴露成类常量主要是为了：(1) 单测 / 文档可以直接 import 看到；
+    # (2) 用户在 ``settings.always_load_categories`` 里追加新分类时不必
+    # 重复列举这两类。运行时会和 ``settings.always_load_categories`` 取并集。
+    _ALWAYS_KEEP_CATEGORIES: tuple[str, ...] = ("System", "Memory")
 
     @property
     def _effective_tools(self) -> list[dict]:
@@ -693,6 +1585,7 @@ class Agent:
            - Intent hints can un-defer specific categories
            - IM sessions auto-include IM Channel category
            - User settings.always_load_tools / always_load_categories override defer
+             (always_load_categories 自动并入 ``_ALWAYS_KEEP_CATEGORIES``)
            - _discovered_tools (from tool_search) override defer
            - Deferred tools stay in list but marked _deferred=True (schema omitted by Brain)
         3. Context window: reduce set for small models
@@ -709,6 +1602,7 @@ class Agent:
                 len(self._tools),
                 len(tools),
             )
+        tools = self._dedupe_tools_by_name(tools, source="_effective_tools")
         if self._is_sub_agent_call:
             tools = [t for t in tools if t.get("name") not in self._agent_tool_names]
 
@@ -716,15 +1610,65 @@ class Agent:
         if cron_disabled:
             tools = [t for t in tools if t.get("name") not in cron_disabled]
 
+        selfcheck_allowed = getattr(self, "_selfcheck_allowed_tools", None)
+        if selfcheck_allowed:
+            tools = [t for t in tools if t.get("name") in selfcheck_allowed]
+
         intent = getattr(self, "_current_intent", None)
         intent_hints = set(intent.tool_hints) if intent and intent.tool_hints else set()
+        if intent:
+            from .intent_analyzer import IntentType, PromptDepth
+
+            prompt_depth = getattr(intent, "prompt_depth", None)
+            requires_tools = bool(getattr(intent, "requires_tools", False))
+            force_tool = bool(getattr(intent, "force_tool", False))
+            task_type = str(getattr(intent, "task_type", "") or "").lower()
+            user_message = str(getattr(self, "_current_user_message", "") or "").lower()
+            explicit_no_tools = any(
+                marker in user_message
+                for marker in (
+                    "不要调用工具",
+                    "不要用工具",
+                    "不调用工具",
+                    "无需调用工具",
+                    "no tools",
+                    "without tools",
+                )
+            )
+            if explicit_no_tools and not requires_tools and not force_tool:
+                self._last_minimal_toolset = True
+                if hasattr(self, "tool_catalog"):
+                    self.tool_catalog.set_deferred_tools(set())
+                logger.info("[Agent] no-tool intent: user explicitly requested no tool calls")
+                return []
+            minimal_prompt = (
+                intent.intent in (IntentType.CHAT, IntentType.QUERY, IntentType.FOLLOW_UP)
+                and not requires_tools
+                and not force_tool
+                and not intent_hints
+                and prompt_depth in (PromptDepth.FAST, PromptDepth.MINIMAL)
+                or (
+                    intent.intent == IntentType.FOLLOW_UP
+                    and task_type in ("analysis", "question", "other")
+                    and not requires_tools
+                    and not force_tool
+                    and not intent_hints
+                )
+            )
+            if minimal_prompt:
+                tools = [t for t in tools if t.get("name") in MINIMAL_PROMPT_TOOLS]
+            self._last_minimal_toolset = minimal_prompt
 
         session_type = getattr(self, "_current_session_type", "cli")
         if session_type == "im":
             intent_hints.add("IM Channel")
 
         user_always_tools = frozenset(settings.always_load_tools)
-        user_always_cats = frozenset(settings.always_load_categories)
+        # 把 ``_ALWAYS_KEEP_CATEGORIES`` 和用户自己配的 ``always_load_categories``
+        # 取并集，作为最终的 always-keep 类别集合（System / Memory 始终在内）。
+        user_always_cats = frozenset(
+            list(settings.always_load_categories) + list(self._ALWAYS_KEEP_CATEGORIES)
+        )
         discovered = getattr(self, "_discovered_tools", set())
 
         hint_names: set[str] = set()
@@ -739,14 +1683,23 @@ class Agent:
             cat = tool.get("category", "")
 
             tool.pop("_deferred", None)
+            tool.pop("_always_available", None)
+            tool.pop("_promoted", None)
 
             if name in discovered:
+                tool["_promoted"] = True
                 continue
             if name in user_always_tools:
+                tool["_promoted"] = True
                 continue
             if cat and cat in user_always_cats:
+                tool["_promoted"] = True
                 continue
             if intent_hints and hasattr(self, "tool_catalog") and name in hint_names:
+                tool["_promoted"] = True
+                continue
+            if name in MINIMAL_PROMPT_TOOLS:
+                tool["_always_available"] = True
                 continue
 
             if _should_defer(name, cat) or tool.get("should_defer", False):
@@ -777,6 +1730,38 @@ class Agent:
             tools = [t for t in tools if t.get("name") in allowed_ctx]
 
         return tools
+
+    @staticmethod
+    def _dedupe_tools_by_name(tools: list[dict], *, source: str) -> list[dict]:
+        """Keep tool names unique before sending them toward provider schemas.
+
+        Provider APIs such as DeepSeek reject duplicate tool names.  Tool lists
+        can be assembled from built-ins, plugins, skills and optional integrations,
+        so this is a conservative invariant at the aggregation boundary.
+        """
+        seen: set[str] = set()
+        result: list[dict] = []
+        duplicates: list[str] = []
+
+        for tool in tools:
+            name = tool.get("name")
+            if not name:
+                continue
+            if name in seen:
+                duplicates.append(str(name))
+                continue
+            seen.add(str(name))
+            result.append(tool)
+
+        if duplicates:
+            logger.warning(
+                "[Agent] %s: removed %d duplicate tool definition(s): %s",
+                source,
+                len(duplicates),
+                sorted(set(duplicates)),
+            )
+
+        return result
 
     def _derive_tool_hints_from_profile(self) -> list[str]:
         """Derive tool category hints from the agent profile's skills list.
@@ -863,7 +1848,7 @@ class Agent:
 
         async def _run_one(tc: dict, idx: int) -> tuple[int, dict, str | None, list | None]:
             tool_name = tc.get("name", "")
-            tool_input = tc.get("input") or {}
+            tool_input = tc.get("input", tc.get("arguments", {})) or {}
             tool_use_id = tc.get("id", "")
 
             if self._task_cancelled:
@@ -984,36 +1969,23 @@ class Agent:
 
                 logger.info(f"[Tool] {tool_name} → {result_str}")
 
-                # 记录 SKILL 类工具调用（供能力卡片 / 上下文 Drawer 聚合展示）。
-                # 串行/并行下 list.append 均原子安全（CPython GIL），顺序不严格但统计用足够。
-                if tool_name in _SKILL_AWARE_TOOL_NAMES:
-                    try:
-                        _skill_arg = (
-                            str(tool_input.get("skill_name") or "").strip()
-                            if isinstance(tool_input, dict)
-                            else ""
-                        )
-                        if _skill_arg and self.agent_state and self.agent_state.current_task:
-                            _script_arg = ""
-                            if isinstance(tool_input, dict):
-                                _script_arg = str(tool_input.get("script_name") or "").strip()
-                            self.agent_state.current_task.record_skill_execution(
-                                tool_name=tool_name,
-                                skill_name=_skill_arg,
-                                script_name=_script_arg,
-                            )
-                    except Exception as _skill_track_exc:  # pragma: no cover
-                        logger.debug(
-                            "record_skill_execution failed for %s: %s", tool_name, _skill_track_exc
-                        )
-
-                if capture_delivery_receipts and tool_name == "deliver_artifacts" and result_str:
+                # 与 tool_executor 对齐：直接交付、子节点提交、父节点验收
+                # 中继交付都让 TaskVerify 看到真实的交付证据。
+                if (
+                    capture_delivery_receipts
+                    and tool_name in (
+                        "deliver_artifacts",
+                        "org_submit_deliverable",
+                        "org_accept_deliverable",
+                    )
+                    and result_str
+                ):
                     try:
                         import json as _json
 
                         parsed = _json.loads(result_str)
                         rs = parsed.get("receipts") if isinstance(parsed, dict) else None
-                        if isinstance(rs, list):
+                        if isinstance(rs, list) and rs:
                             receipts = rs
                     except Exception:
                         receipts = None
@@ -1037,7 +2009,6 @@ class Agent:
                 return idx, out, None, None
             finally:
                 dt_ms = int((time.time() - t0) * 1000)
-                # 会议室 activity 由 ToolExecutor.execute_batch 统一落盘，避免重复记录
                 if task_monitor:
                     if use_parallel_safe_monitor:
                         async with self._task_monitor_lock:
@@ -1074,16 +2045,40 @@ class Agent:
                 delivery_receipts = receipts
         return tool_results, executed_tool_names, delivery_receipts
 
-    async def initialize(self, start_scheduler: bool = True, lightweight: bool = False) -> None:
+    async def initialize(
+        self,
+        start_scheduler: bool = True,
+        lightweight: bool = False,
+        share_from: "Agent | None" = None,
+    ) -> None:
         """
         初始化 Agent
 
         Args:
             start_scheduler: 是否启动定时任务调度器（定时任务执行时应设为 False）
             lightweight: 轻量模式（sub-agent），跳过预热、表情包、人格特征等非必要初始化
+            share_from: 共享一个已经完成初始化的"主 Agent"的注册表 —— skills /
+                MCP / plugins / tool catalog 全部通过引用复用，跳过 ``_load_*``
+                与 ``rebuild_engine_v2``。**仅供 lightweight=True 的 sub-agent
+                使用**。系统工具处理器（filesystem / memory / shell 等）仍绑定
+                到当前 Agent 自身的 file_tool / memory_manager，所以 org 工作
+                空间隔离不受影响；只有"重操作"——遍历技能目录、初始化
+                DashScope client、启动后台轮询协程——被去掉。
+
+                这是 AIGC 工作室"每跳一个 sub-agent 就重挂 124 个工具 + 22 个
+                插件"性能 bug 的根因修复（见 2026-05-18 编排优化方案 P0-A）。
         """
         if self._initialized:
             return
+
+        if share_from is not None and not lightweight:
+            # share_from 隐含 lightweight：full-init 路径会再次跑一遍
+            # _load_plugins，等于白白浪费 share_from 的缓存。这里直接报错让
+            # 调用方修正而不是悄悄退化。
+            raise ValueError(
+                "share_from requires lightweight=True; full initialization "
+                "would defeat the purpose of sharing the parent's registry."
+            )
 
         # 初始化 token 用量追踪
         init_token_tracking(str(settings.db_full_path))
@@ -1097,6 +2092,28 @@ class Agent:
 
         # 加载身份文档
         self.identity.load()
+
+        if share_from is not None:
+            self._attach_shared_runtime(share_from)
+            # 启动记忆会话（sub-agent 独享 session_id，但底层 store 通常
+            # 仍是主 Agent 的，除非 factory 后续 apply 了 memory_isolation）。
+            session_id = (
+                datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
+            )
+            self.memory_manager.start_session(session_id)
+            self._current_session_id = session_id
+            if hasattr(self, "_memory_handler"):
+                self._memory_handler.reset_guide()
+            # 重建 system prompt（用共享的 catalog 引用）
+            self._context.system = self._build_system_prompt()
+            self._initialized = True
+            logger.info(
+                "Agent '%s' initialized via share_from='%s' "
+                "(skills/MCP/plugins reused from parent, no reload)",
+                self.name,
+                share_from.name,
+            )
+            return
 
         # 加载已安装的技能
         await self._load_installed_skills()
@@ -1118,6 +2135,33 @@ class Agent:
                 await self._plugin_manager.hook_registry.dispatch("on_init", agent=self)
             except Exception as e:
                 logger.debug(f"on_init hook dispatch error: {e}")
+
+        # C10：handler/skill/mcp/plugin 全部加载完毕 → 让 ApprovalClassifier 拿到
+        # 4 个 lookup。explicit_lookup 已由 _register_default_handlers 注入到模块缓存，
+        # 这里只补 skill/mcp/plugin，不需要重传 explicit_lookup（global_engine
+        # 缓存语义保证）。失败降级到启发式分类，**绝不**让一个坏 manifest /
+        # SKILL.md 拖垮 agent 启动。
+        try:
+            from .policy_v2.global_engine import rebuild_engine_v2
+
+            rebuild_engine_v2(
+                skill_lookup=self.skill_registry.get_tool_class,
+                mcp_lookup=self.mcp_client.get_tool_class,
+                plugin_lookup=(
+                    self._plugin_manager.get_tool_class
+                    if hasattr(self, "_plugin_manager") and self._plugin_manager is not None
+                    else None
+                ),
+            )
+            logger.info(
+                "[PolicyV2] global engine rebuilt with skill/mcp/plugin lookups (C10)"
+            )
+        except Exception as exc:
+            logger.warning(
+                "[PolicyV2] failed to inject skill/mcp/plugin lookups: %s — "
+                "those sources will fall back to handler/heuristic classification",
+                exc,
+            )
 
         # 启动记忆会话
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
@@ -1165,11 +2209,22 @@ class Agent:
                 logger.debug(f"[Sticker] initialization skipped/failed: {e}")
 
         # === 从记忆系统加载 PERSONA_TRAIT ===
+        # Phase 3：用 iter_cached 替代直接遍历 _memories，自动排除
+        # legacy_quarantine / pending_consolidation 这两个隔离桶 ——
+        # persona_trait 是塑造 Agent 人格的高优先级数据，绝不能让旧版本身份
+        # 冲突的 trait 或后台合成产物悄悄混进来。
         try:
+            iter_cached = getattr(self.memory_manager, "iter_cached", None)
+            if iter_cached is None:
+                cached_iter = (
+                    m for m in self.memory_manager._memories.values()
+                )  # 老接口降级（理论上 v4+ 都走 iter_cached）
+            else:
+                cached_iter = iter_cached()
             persona_memories = [
                 m.to_dict()
-                for m in self.memory_manager._memories.values()
-                if m.type.value == "persona_trait"
+                for m in cached_iter
+                if getattr(getattr(m, "type", None), "value", "") == "persona_trait"
             ]
             if persona_memories:
                 self.persona_manager.load_traits_from_memories(persona_memories)
@@ -1207,6 +2262,140 @@ class Agent:
             f"{total_mcp} MCP servers"
             f"{f' (builtin: {self._builtin_mcp_count})' if self._builtin_mcp_count else ''}"
         )
+        # 第一个完成 full init 的 Agent 注册为进程"主"。AgentFactory 创建
+        # sub-agent 时会用它做 share_from，省去重复加载技能 / 插件。
+        if get_primary_agent() is None:
+            set_primary_agent(self)
+            logger.debug(
+                "[share_from] registered '%s' as the process primary agent.",
+                self.name,
+            )
+
+    def _attach_shared_runtime(self, parent: "Agent") -> None:
+        """让 sub-agent 直接复用主 Agent 已经初始化好的注册表/客户端/目录。
+
+        被 ``initialize(share_from=parent)`` 调用。原本每个 sub-agent 都要重新
+        ``_load_installed_skills`` → ``_load_plugins`` → ``rebuild_engine_v2``，
+        意味着 happyhorse-video 这种"启动会建 SQLite + DashScope client + 后台
+        轮询协程"的插件被反复 boot/cancel —— 直接体现为日志里每跳一个 sub-agent
+        就出现一次 ``Initialized 30 handlers with 124 tools`` 和 7~8 次
+        ``Registered 22 tools``，整段编排被白白拖慢 5~10 倍，并且 DashScope
+        轮询任务被反复 cancel 导致照片说话永远卡在 pending。
+
+        共享策略：
+        - 技能 / MCP / 插件目录：直接复用引用（同一份内存对象）。
+        - 工具定义列表 ``_tools``：把 parent 多出的工具（一般是插件/技能
+          动态注册的）补进来，复用 parent 的描述。
+        - 插件 handler：在 self.handler_registry 里 mirror 一份引用，
+          让 ``self.tool_executor`` 走自身 registry 也能命中插件工具。
+        - 系统 handler（filesystem/memory/...）：**不复用** —— 仍绑定到
+          sub-agent 自身的 file_tool/memory_manager，保证 org workspace 隔离。
+        """
+        # 标记：shutdown 时不要 unload 共享的 PluginManager
+        self._owns_plugin_manager = False
+        self._shared_runtime_from = parent
+
+        # 技能系统
+        self.skill_registry = parent.skill_registry
+        self.skill_loader = parent.skill_loader
+        self.skill_category_registry = parent.skill_category_registry
+        self._category_store = parent._category_store
+        self._skill_usage_tracker = parent._skill_usage_tracker
+        self.skill_catalog = parent.skill_catalog
+        self._skill_activation = parent._skill_activation
+        # SkillManager 中的 registry/catalog 引用同步到共享对象，这样
+        # sub-agent 自己调 skill_manager.install_skill 也是写在共享 registry。
+        if hasattr(self, "skill_manager"):
+            self.skill_manager.skill_registry = parent.skill_registry
+            self.skill_manager.skill_catalog = parent.skill_catalog
+            self.skill_manager.skill_loader = parent.skill_loader
+        # SkillGenerator 同步
+        if hasattr(self, "skill_generator"):
+            self.skill_generator.skill_registry = parent.skill_registry
+
+        # MCP
+        self.mcp_client = parent.mcp_client
+        self.mcp_catalog = parent.mcp_catalog
+        self.browser_manager = parent.browser_manager
+        self.pw_tools = parent.pw_tools
+        self._builtin_mcp_count = parent._builtin_mcp_count
+
+        # 插件
+        self._plugin_manager = parent._plugin_manager
+        self.plugin_catalog = parent.plugin_catalog
+
+        # 把 parent 多出来的工具定义补进 self._tools（差集 by name）
+        own_names = {t.get("name") for t in self._tools if isinstance(t, dict)}
+        added = 0
+        for tool_def in parent._tools:
+            if not isinstance(tool_def, dict):
+                continue
+            name = tool_def.get("name")
+            if not name or name in own_names:
+                continue
+            self._tools.append(tool_def)
+            own_names.add(name)
+            added += 1
+
+        # 镜像 plugin handler 到 self.handler_registry，让 sub-agent
+        # 自己的 tool_executor 路由能命中插件工具。
+        # PluginAPI.register_tools 使用 ``plugin_{plugin_id}`` 命名格式，
+        # 这里按前缀识别。
+        try:
+            parent_reg = parent.handler_registry
+            own_reg = self.handler_registry
+            for handler_name, handler in list(parent_reg._handlers.items()):
+                if not handler_name.startswith("plugin_"):
+                    continue
+                if handler_name in own_reg._handlers:
+                    continue
+                tool_names = parent_reg.get_handler_tools(handler_name)
+                if not tool_names:
+                    continue
+                own_reg.register(handler_name, handler, tool_names=tool_names)
+            # 同步技能 → 系统 handler 的映射（_update_skill_tools 已经在
+            # parent 里跑过；这里把 _tool_to_handler 里所有 sub-agent 自己
+            # registry 没覆盖的映射补齐，主要是 system skill）。
+            for tool_name, hname in parent_reg._tool_to_handler.items():
+                if tool_name in own_reg._tool_to_handler:
+                    continue
+                if hname in own_reg._handlers:
+                    own_reg.map_tool_to_handler(tool_name, hname)
+        except Exception as exc:
+            logger.warning("Failed to mirror plugin handlers from parent: %s", exc)
+
+        # 重建 ToolCatalog 以反映合并后的工具列表
+        try:
+            self.tool_catalog = ToolCatalog(self._tools)
+        except Exception:
+            logger.exception("Failed to rebuild tool_catalog after sharing")
+
+        # 同步 prompt_assembler / tool_executor / reasoning_engine 中的引用
+        pa = getattr(self, "prompt_assembler", None)
+        if pa is not None:
+            pa._tool_catalog = self.tool_catalog
+            pa._skill_catalog = self.skill_catalog
+            pa._mcp_catalog = self.mcp_catalog
+            pa._plugin_catalog = self.plugin_catalog
+
+        if hasattr(self, "tool_executor") and self.tool_executor is not None:
+            self.tool_executor._plugin_hooks = self._plugin_manager.hook_registry if self._plugin_manager else None
+            self.tool_executor._plugin_manager = self._plugin_manager
+
+        if hasattr(self, "reasoning_engine") and self.reasoning_engine is not None:
+            self.reasoning_engine._plugin_hooks = (
+                self._plugin_manager.hook_registry if self._plugin_manager else None
+            )
+
+        # 让 memory_manager.retrieval_engine 也能走 plugin hook
+        if self.memory_manager and hasattr(self.memory_manager, "retrieval_engine") and self._plugin_manager:
+            self.memory_manager.retrieval_engine._plugin_hooks = self._plugin_manager.hook_registry
+
+        logger.info(
+            "[share_from] sub-agent '%s' attached to parent '%s': "
+            "+%d tool defs, plugins/skills/mcp shared by reference",
+            self.name, parent.name, added,
+        )
 
     async def _load_plugins(self) -> None:
         """Load plugins from data/plugins/ directory."""
@@ -1215,7 +2404,7 @@ class Agent:
         plugins_dir = Path(settings.project_root) / "data" / "plugins"
         state_path = Path(settings.project_root) / "data" / "plugin_state.json"
 
-        memory_backends: dict = {}
+        memory_backends: dict = getattr(self, "_memory_backends", {})
         search_backends: dict = {}
 
         if self.memory_manager:
@@ -1252,6 +2441,11 @@ class Agent:
             state_path=state_path,
             host_refs=host_refs,
         )
+        # 标记：本 Agent 是 PluginManager 的"主"——shutdown 时负责
+        # dispatch on_shutdown / unload。share_from 路径的 sub-agent 不会
+        # 走到这里，其 _owns_plugin_manager 在 _attach_shared_runtime 里
+        # 被显式设为 False。
+        self._owns_plugin_manager = True
 
         await self._plugin_manager.load_all()
 
@@ -1269,6 +2463,7 @@ class Agent:
             self.reasoning_engine._plugin_hooks = self._plugin_manager.hook_registry
         if hasattr(self, "tool_executor") and self.tool_executor:
             self.tool_executor._plugin_hooks = self._plugin_manager.hook_registry
+            self.tool_executor._plugin_manager = self._plugin_manager
 
         from ..plugins.catalog import PluginCatalog
 
@@ -1392,9 +2587,6 @@ class Agent:
             logger.info("CLI-Anything handler registered (cli-anything-* tools detected)")
 
         self.handler_registry.register("agent", create_agent_tool_handler(self))
-        from ..tools.handlers.meeting_room import create_meeting_room_handler
-
-        self.handler_registry.register("meeting_room", create_meeting_room_handler(self))
         from ..tools.handlers.org_setup import create_handler as create_org_setup_handler
 
         self.handler_registry.register("org_setup", create_org_setup_handler(self))
@@ -1402,6 +2594,43 @@ class Agent:
         logger.info(
             f"Initialized {len(self.handler_registry._handlers)} handlers with {len(self.handler_registry._tool_to_handler)} tools"
         )
+
+        # v1.28 S4: surface any tools missing from
+        # ``_INTERRUPT_BEHAVIOR_MAP`` so contributors notice drift.  Runs
+        # at most once per process — sub-agents share the same warning
+        # state via module-level flag, otherwise multi-agent fan-out
+        # would spam the same warning N times.  Cheap to call (just dict
+        # lookups), but no point doing it more than once.
+        global _INTERRUPT_BEHAVIOR_WARN_DONE
+        if not _INTERRUPT_BEHAVIOR_WARN_DONE:
+            try:
+                from .tool_interrupt_behavior import warn_unclassified_tools
+
+                warn_unclassified_tools(self.handler_registry.list_tools())
+            except Exception as exc:
+                logger.debug("[S4] startup warn skipped: %s", exc)
+            finally:
+                _INTERRUPT_BEHAVIOR_WARN_DONE = True
+
+        # C7：handler 全部注册完毕 → 让 PolicyEngineV2 classifier 拿到
+        # SystemHandlerRegistry.get_tool_class 作 explicit_lookup。这样 handler
+        # 类的 TOOL_CLASSES 显式声明（C7.6 大批量补的）会优先于启发式生效。
+        # rebuild_engine_v2 会重新读 YAML + 重建 classifier；只调一次即可。
+        try:
+            from .policy_v2.global_engine import rebuild_engine_v2
+
+            rebuild_engine_v2(explicit_lookup=self.handler_registry.get_tool_class)
+            logger.info(
+                "[PolicyV2] global engine rebuilt with explicit_lookup "
+                "(%d tools have explicit ApprovalClass)",
+                len(self.handler_registry._tool_classes),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[PolicyV2] failed to inject explicit_lookup: %s — "
+                "classifier will fall back to heuristics",
+                exc,
+            )
 
     async def _load_installed_skills(self) -> None:
         """
@@ -1463,28 +2692,14 @@ class Agent:
             logger.debug("Failed to start skill watcher: %s", e)
 
     def _on_skills_dir_changed(self) -> None:
-        """F9: Callback when skill files change on disk."""
+        """F9: Watchdog 回调（运行在 watcher 的独立 Timer 线程中）。
+
+        全部刷新逻辑收敛到 ``propagate_skill_change``；此回调只负责跨线程调度。
+        """
         try:
-            from ..skills.watcher import clear_all_skill_caches
+            from ..skills.events import SkillEvent
 
-            clear_all_skill_caches()
-            loaded = self.skill_loader.load_all(settings.project_root)
-            self.skill_catalog.invalidate_cache()
-            self._skill_catalog_text = self.skill_catalog.generate_catalog()
-            self._update_skill_tools()
-
-            # F8: refresh conditional activation registry
-            if hasattr(self, "_skill_activation"):
-                self._skill_activation.clear()
-                for skill in self.skill_registry.list_enabled():
-                    if skill.paths or skill.fallback_for_toolsets:
-                        self._skill_activation.register_conditional(skill)
-                self._sync_available_toolsets()
-
-            from ..skills.events import SkillEvent, notify_skills_changed
-
-            notify_skills_changed(SkillEvent.HOT_RELOAD)
-            logger.info("Hot-reloaded %d skills after file change", loaded)
+            self.propagate_skill_change(SkillEvent.HOT_RELOAD)
         except Exception as e:
             logger.warning("Skill hot-reload failed: %s", e)
 
@@ -1496,9 +2711,9 @@ class Agent:
         if hasattr(self, "_skill_activation"):
             self._skill_activation.clear()
         try:
-            from .policy import get_policy_engine
+            from .policy_v2 import get_skill_allowlist_manager
 
-            get_policy_engine().clear_skill_allowlists()
+            get_skill_allowlist_manager().clear()
         except Exception:
             pass
 
@@ -1574,10 +2789,105 @@ class Agent:
         except (ImportError, AttributeError):
             pass
 
-    def _on_skill_manager_loaded(self) -> None:
-        """SkillManager 安装完技能后的回调：同步映射 + 通知池。"""
-        self._update_skill_tools()
-        self.notify_pools_skills_changed()
+    def propagate_skill_change(
+        self,
+        action: "Any" = None,
+        *,
+        rescan: bool = True,
+    ) -> None:
+        """技能状态变更的唯一刷新入口。
+
+        调用方（API 路由、工具处理器、配置端点、watchdog 回调、SkillManager 安装）
+        触达任何会影响技能可见性 / 内容的操作后，**必须且只能**通过此方法完成刷新，
+        从而保证：
+          1. Parser / Loader 内部缓存被清空，磁盘改动能被下一次 ``load_all`` 看见；
+          2. ``data/skills.json`` 定义的 external_allowlist 被重新应用；
+          3. ``SkillCatalog`` 与 ``_skill_catalog_text`` 与注册表保持一致；
+          4. 系统 skill 的 tool→handler 映射同步到 handler_registry；
+          5. F8 条件激活注册表刷新；
+          6. CLI 长驻路径使用的 ``_context.system`` 缓存失效重建；
+          7. 全局 Agent 实例池版本号自增，使 Desktop Chat 下条请求拿到新 Agent；
+          8. 跨层 ``notify_skills_changed`` 仅此处触发（API HTTP 缓存 + WebSocket 广播）。
+
+        Args:
+            action: ``SkillEvent`` 枚举或字符串，仅用于广播与日志，不影响刷新路径。
+            rescan: 为 False 时跳过 ``loader.load_all``，仅走 allowlist→catalog→pool
+                刷新链（启停 / 配置面板场景常用，避免重复扫描）。
+        """
+        from ..skills.events import SkillEvent, notify_skills_changed
+        from ..skills.watcher import clear_all_skill_caches
+
+        clear_all_skill_caches()
+
+        if rescan:
+            try:
+                self.skill_loader.load_all(settings.project_root)
+            except Exception as e:
+                logger.warning("propagate_skill_change: load_all failed: %s", e)
+
+        try:
+            from ..skills.allowlist_io import read_allowlist
+            from ..skills.preset_utils import collect_preset_referenced_skills
+
+            _, external_allowlist = read_allowlist()
+            effective = self.skill_loader.compute_effective_allowlist(external_allowlist)
+            agent_skills = collect_preset_referenced_skills()
+            self.skill_loader.prune_external_by_allowlist(
+                effective, agent_referenced_skills=agent_skills
+            )
+        except Exception as e:
+            logger.warning("propagate_skill_change: allowlist apply failed: %s", e)
+
+        try:
+            self.skill_catalog.invalidate_cache()
+            self._skill_catalog_text = self.skill_catalog.generate_catalog()
+        except Exception as e:
+            logger.warning("propagate_skill_change: catalog rebuild failed: %s", e)
+
+        try:
+            self._invalidate_system_prompt_cache("skill change")
+        except Exception as e:
+            logger.warning("propagate_skill_change: prompt cache invalidation failed: %s", e)
+
+        try:
+            self._update_skill_tools()
+        except Exception as e:
+            logger.warning("propagate_skill_change: tool mapping update failed: %s", e)
+
+        try:
+            if hasattr(self, "_skill_activation"):
+                self._skill_activation.clear()
+                for skill in self.skill_registry.list_enabled():
+                    if skill.paths or skill.fallback_for_toolsets:
+                        self._skill_activation.register_conditional(skill)
+                self._sync_available_toolsets()
+        except Exception as e:
+            logger.warning("propagate_skill_change: activation refresh failed: %s", e)
+
+        try:
+            if getattr(self, "_initialized", False):
+                ctx = getattr(self, "_context", None)
+                if ctx is not None and getattr(ctx, "system", None):
+                    ctx.system = self._build_system_prompt()
+        except Exception as e:
+            logger.warning("propagate_skill_change: system prompt rebuild failed: %s", e)
+
+        try:
+            Agent.notify_pools_skills_changed()
+        except Exception as e:
+            logger.warning("propagate_skill_change: pool notify failed: %s", e)
+
+        try:
+            action_value: str
+            if isinstance(action, SkillEvent):
+                action_value = action.value
+            elif isinstance(action, str) and action:
+                action_value = action
+            else:
+                action_value = SkillEvent.RELOAD.value
+            notify_skills_changed(action_value)
+        except Exception as e:
+            logger.debug("propagate_skill_change: notify_skills_changed failed: %s", e)
 
     async def _install_skill(
         self,
@@ -1643,6 +2953,7 @@ class Agent:
                         description=server.name or "",
                         transport=transport,
                         url=server.url or "",
+                        headers=dict(server.headers or {}),
                         cwd=server.config_dir or "",
                     )
                 )
@@ -1706,6 +3017,94 @@ class Agent:
 
             if synced_any:
                 logger.info("MCP catalog refreshed after auto-connect tool discovery")
+
+        self._register_mcp_memory_providers()
+
+    def _register_mcp_memory_providers(self) -> None:
+        """Register opt-in MCP servers as memory providers on the main memory path."""
+        if not getattr(self, "memory_manager", None) or not getattr(self, "mcp_catalog", None):
+            return
+
+        try:
+            from ..memory.mcp_provider import MCPMemoryProvider
+        except Exception as e:
+            logger.debug("[MCPMemory] provider adapter unavailable: %s", e)
+            return
+
+        retrieval_sources = getattr(self.memory_manager.retrieval_engine, "_external_sources", None)
+        memory_backends = getattr(self, "_memory_backends", None)
+        if retrieval_sources is None or memory_backends is None:
+            return
+
+        existing_sources = {
+            getattr(source, "source_name", "") for source in retrieval_sources
+        }
+
+        for server in self.mcp_catalog.servers:
+            provider_cfg = getattr(server, "memory_provider", None) or {}
+            if not provider_cfg or provider_cfg.get("enabled", True) is False:
+                continue
+
+            tools = self._resolve_mcp_memory_tools(server, provider_cfg)
+            if not tools.get("search") and not tools.get("record_turn") and not tools.get("store"):
+                logger.warning(
+                    "[MCPMemory] %s marked as memoryProvider but no memory tools were found",
+                    server.identifier,
+                )
+                continue
+
+            mode = str(provider_cfg.get("mode") or "augment").lower()
+            if mode not in {"augment", "replace"}:
+                mode = "augment"
+
+            provider = MCPMemoryProvider(
+                client=self.mcp_client,
+                server=server.identifier,
+                tools=tools,
+                mode=mode,
+                default_limit=int(provider_cfg.get("limit") or 5),
+            )
+
+            key = f"mcp:{server.identifier}"
+            memory_backends[key] = {"backend": provider, "replace": provider.replace}
+            if not provider.replace and provider.source_name not in existing_sources:
+                retrieval_sources.append(provider)
+                existing_sources.add(provider.source_name)
+            logger.info(
+                "[MCPMemory] registered %s as %s memory provider",
+                server.identifier,
+                mode,
+            )
+
+    @staticmethod
+    def _resolve_mcp_memory_tools(server: Any, provider_cfg: dict) -> dict[str, str]:
+        configured = provider_cfg.get("tools") or {}
+        if not isinstance(configured, dict):
+            configured = {}
+
+        tool_names = {getattr(t, "name", "") for t in getattr(server, "tools", [])}
+
+        def pick(purpose: str, candidates: tuple[str, ...]) -> str:
+            explicit = configured.get(purpose)
+            if explicit:
+                return str(explicit)
+            for name in candidates:
+                if name in tool_names:
+                    return name
+            return ""
+
+        record_turn = pick(
+            "record_turn",
+            ("record_turn", "add_message", "save_message", "add_conversation"),
+        )
+        return {
+            "search": pick("search", ("search_memory", "search_memories", "retrieve_memory")),
+            "store": pick("store", ("add_memory", "store_memory", "save_memory")),
+            "delete": pick("delete", ("delete_memory", "remove_memory")),
+            "start_session": pick("start_session", ("start_session", "begin_session")),
+            "end_session": pick("end_session", ("end_session", "finish_session")),
+            "record_turn": record_turn,
+        }
 
     async def _start_builtin_mcp_servers(self) -> None:
         """启动内置浏览器服务 (Playwright，独立于 MCP 体系)"""
@@ -1819,7 +3218,6 @@ class Agent:
         - 记忆整理（凌晨 3:00，适应期内每 N 小时一次）
         - 系统自检（凌晨 4:00）
         - 活人感心跳（每 30 分钟）
-        - 工单快照同步（每 1 小时）
         """
         from ..config import settings
         from ..scheduler import ScheduledTask, TriggerType
@@ -1885,7 +3283,10 @@ class Agent:
                     existing_memory_task.action = "system:daily_memory"
                     changed = True
                 # 适应期 ↔ 正常期切换时，更新触发器
-                if existing_memory_task.trigger_type != desired_trigger:
+                user_custom_trigger = bool(
+                    (existing_memory_task.metadata or {}).get("user_custom_trigger")
+                )
+                if existing_memory_task.trigger_type != desired_trigger and not user_custom_trigger:
                     await self.task_scheduler.update_task(
                         memory_task_id,
                         {
@@ -1898,6 +3299,8 @@ class Agent:
                     logger.info(
                         f"Switched memory task trigger to {desired_trigger.value}: {desired_desc}"
                     )
+                elif user_custom_trigger:
+                    logger.info("Keeping user-customized memory task trigger")
                 if changed:
                     await self.task_scheduler.save()
 
@@ -1930,24 +3333,35 @@ class Agent:
                 if changed:
                     await self.task_scheduler.save()
 
-        # 任务 3: 活人感心跳（每 30 分钟触发）
+        # 任务 3: 活人感心跳（默认关闭；用户显式启用 proactive_enabled 后注册）
         try:
-            if "system_proactive_heartbeat" not in existing_ids:
-                heartbeat_task = ScheduledTask(
-                    id="system_proactive_heartbeat",
-                    name="活人感心跳",
-                    trigger_type=TriggerType.INTERVAL,
-                    trigger_config={"interval_minutes": 30},
-                    action="system:proactive_heartbeat",
-                    prompt="检查是否需要发送主动消息（问候/提醒/跟进）",
-                    description="定时检查并发送主动消息",
-                    task_type=TaskType.TASK,
-                    enabled=True,
-                    deletable=False,
-                    metadata={"notify_on_start": False, "notify_on_complete": False},
-                )
-                await self.task_scheduler.add_task(heartbeat_task)
-                logger.info("Registered system task: proactive_heartbeat (every 30 min)")
+            heartbeat_task_id = "system_proactive_heartbeat"
+            if settings.proactive_enabled:
+                interval_min = max(120, int(settings.proactive_min_interval_minutes or 120))
+                if heartbeat_task_id not in existing_ids:
+                    heartbeat_task = ScheduledTask(
+                        id=heartbeat_task_id,
+                        name="活人感心跳",
+                        trigger_type=TriggerType.INTERVAL,
+                        trigger_config={"interval_minutes": interval_min},
+                        action="system:proactive_heartbeat",
+                        prompt="检查是否需要发送主动消息（问候/提醒/跟进）",
+                        description="定时检查并发送主动消息",
+                        task_type=TaskType.TASK,
+                        enabled=True,
+                        deletable=False,
+                        metadata={"notify_on_start": False, "notify_on_complete": False},
+                    )
+                    await self.task_scheduler.add_task(heartbeat_task)
+                    logger.info(
+                        "Registered system task: proactive_heartbeat (every %s min)",
+                        interval_min,
+                    )
+            else:
+                existing_heartbeat = self.task_scheduler.get_task(heartbeat_task_id)
+                if existing_heartbeat and existing_heartbeat.enabled:
+                    await self.task_scheduler.disable_task(heartbeat_task_id)
+                    logger.info("Disabled proactive_heartbeat task (feature disabled in settings)")
         except Exception as e:
             logger.warning(f"Failed to register proactive_heartbeat task: {e}")
 
@@ -2016,42 +3430,22 @@ class Agent:
         except Exception as e:
             logger.warning(f"Failed to register workspace_backup task: {e}")
 
-        # 任务 6: 研发负责人工单快照（每小时）
-        try:
-            wo_sync_id = "system_sync_owner_work_orders"
-            if wo_sync_id not in existing_ids:
-                wo_task = ScheduledTask(
-                    id=wo_sync_id,
-                    name="工单快照同步",
-                    trigger_type=TriggerType.INTERVAL,
-                    trigger_config={"interval_minutes": 60},
-                    action="system:sync_owner_work_orders",
-                    prompt="从研发云同步负责人需求列表并写入本地快照",
-                    description="每小时同步工单快照（依赖 userinfo.encryption）",
-                    task_type=TaskType.TASK,
-                    enabled=True,
-                    deletable=False,
-                    metadata={"notify_on_start": False, "notify_on_complete": False},
-                )
-                await self.task_scheduler.add_task(wo_task)
-                logger.info("Registered system task: sync_owner_work_orders (every 60 min)")
-            else:
-                existing_wo = self.task_scheduler.get_task(wo_sync_id)
-                if existing_wo:
-                    changed = False
-                    if existing_wo.deletable:
-                        existing_wo.deletable = False
-                        changed = True
-                    if getattr(existing_wo, "action", None) != "system:sync_owner_work_orders":
-                        existing_wo.action = "system:sync_owner_work_orders"
-                        changed = True
-                    if changed:
-                        await self.task_scheduler.save()
-        except Exception as e:
-            logger.warning(f"Failed to register sync_owner_work_orders task: {e}")
+    def _build_system_prompt(
+        self,
+        task_description: str = "",
+        session_type: str = "cli",
+    ) -> str:
+        """构建系统提示词（统一使用编译管线 v2）。"""
+        return self._build_system_prompt_compiled_sync(task_description, session_type=session_type)
 
     def _resolve_agent_voice(self) -> str:
-        """SOUL/identity 块中 ``{{agent_name}}`` 应展开为的显示名。"""
+        """Return the display name that SOUL.md's ``{{agent_name}}`` should expand to.
+
+        Priority: profile's localized display name → profile.name → self.name →
+        ``settings.agent_name`` (legacy fallback). The string is what the LLM
+        will read as its own self-reference inside SOUL.md, so it should match
+        what the user sees in the chat header and the Agents list.
+        """
         profile = getattr(self, "_agent_profile", None)
         if profile is not None:
             try:
@@ -2067,14 +3461,6 @@ class Agent:
         if isinstance(agent_name, str) and agent_name.strip():
             return agent_name.strip()
         return getattr(settings, "agent_name", "") or ""
-
-    def _build_system_prompt(
-        self,
-        task_description: str = "",
-        session_type: str = "cli",
-    ) -> str:
-        """构建系统提示词（统一使用编译管线 v2）。"""
-        return self._build_system_prompt_compiled_sync(task_description, session_type=session_type)
 
     def _build_system_prompt_compiled_sync(
         self, task_description: str = "", session_type: str = "cli"
@@ -2095,8 +3481,161 @@ class Agent:
         )
         if self._custom_prompt_suffix:
             prompt += f"\n\n{self._custom_prompt_suffix}"
+        prompt += self._build_runtime_env_prompt_section()
         prompt += self._build_multi_agent_prompt_section()
         return prompt
+
+    def _build_runtime_env_prompt_section(self) -> str:
+        mode = getattr(self, "_runtime_env_mode", "shared") or "shared"
+        profile_id = getattr(self, "_agent_profile_id", "default") or "default"
+        spec = getattr(self, "_execution_env_spec", None)
+        if spec is None:
+            env_line = "当前 Agent 使用共享 `agent-venv` fallback；不要把长期任务依赖随意安装到共享环境。"
+        else:
+            env_line = (
+                f"当前 AgentProfile `{profile_id}` 使用独立 Python 环境 "
+                f"`{spec.venv_path}`；该 Agent 的临时 Python/pip 依赖应优先进入此环境。"
+            )
+        return (
+            "\n\n### Agent Python 环境策略\n"
+            f"- runtime_env_mode: `{mode}`\n"
+            f"- {env_line}\n"
+            "- 操作用户项目时，先检查项目自己的 `.venv`、`pyproject.toml`、`requirements.txt`、`uv.lock`，优先遵守项目环境。\n"
+            "- 运行 skill 预置 Python 脚本时，优先使用 skill 声明的 Python 环境和依赖。"
+        )
+
+    def _resolve_model_lookup_id(
+        self,
+        *,
+        session: "Session | None" = None,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str | None:
+        """Return the key used by per-conversation LLM endpoint overrides."""
+        if conversation_id:
+            return conversation_id
+        if session is not None:
+            chat_id = getattr(session, "chat_id", "")
+            if chat_id:
+                return str(chat_id)
+        if session_id:
+            return session_id
+        if session is not None:
+            sid = getattr(session, "id", "")
+            if sid:
+                return str(sid)
+        return None
+
+    def _current_model_info_for_turn(
+        self,
+        *,
+        session: "Session | None" = None,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        lookup_id = self._resolve_model_lookup_id(
+            session=session,
+            conversation_id=conversation_id,
+            session_id=session_id,
+        )
+        try:
+            info = self.brain.get_current_model_info(conversation_id=lookup_id)
+        except Exception as exc:
+            logger.debug("[ModelSwitch] Failed to resolve effective model: %s", exc)
+            return {}
+        return dict(info) if isinstance(info, dict) else {}
+
+    def _record_effective_model_metadata(
+        self,
+        *,
+        session: "Session | None",
+        selected_endpoint: str | None,
+        endpoint_policy: str = "prefer",
+        model_info: dict[str, Any],
+    ) -> None:
+        if session is None or not model_info:
+            return
+        effective = {
+            "selected_endpoint": selected_endpoint or "",
+            "effective_endpoint": str(model_info.get("name", "") or ""),
+            "effective_model": str(model_info.get("model", "") or ""),
+            "effective_provider": str(model_info.get("provider", "") or ""),
+            "endpoint_policy": endpoint_policy or "prefer",
+            "is_override": bool(model_info.get("is_override")),
+            "is_fallback": bool(
+                selected_endpoint
+                and model_info.get("name")
+                and model_info.get("name") != selected_endpoint
+            ),
+        }
+        try:
+            session.set_metadata("selected_endpoint", selected_endpoint or "")
+            session.set_metadata("endpoint_policy", endpoint_policy or "prefer")
+            session.set_metadata("effective_model", effective)
+        except Exception as exc:
+            logger.debug("[ModelSwitch] Failed to persist effective model metadata: %s", exc)
+
+    def _apply_endpoint_override_for_turn(
+        self,
+        *,
+        endpoint_override: str | None,
+        endpoint_policy: str = "prefer",
+        session: "Session | None",
+        conversation_id: str | None,
+        session_id: str | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Apply the UI-selected endpoint before prompt construction.
+
+        This keeps the system prompt, session metadata, trace model and actual
+        LLM request aligned. Invalid endpoints remain soft: we log and continue
+        with normal fallback selection instead of blocking the user.
+        """
+        lookup_id = self._resolve_model_lookup_id(
+            session=session,
+            conversation_id=conversation_id,
+            session_id=session_id,
+        )
+        if endpoint_override:
+            llm_client = getattr(self.brain, "_llm_client", None)
+            if llm_client and hasattr(llm_client, "switch_model"):
+                ok, msg = llm_client.switch_model(
+                    endpoint_name=endpoint_override,
+                    hours=0.05,
+                    reason=reason,
+                    conversation_id=lookup_id,
+                    policy=endpoint_policy,
+                )
+                if ok:
+                    logger.info(
+                        "[ModelSwitch] Applied endpoint %s before prompt build (conversation=%s)",
+                        endpoint_override,
+                        lookup_id or "",
+                    )
+                else:
+                    logger.warning(
+                        "[ModelSwitch] Endpoint %s unavailable before prompt build: %s",
+                        endpoint_override,
+                        msg,
+                    )
+            else:
+                logger.warning(
+                    "[ModelSwitch] Ignoring endpoint %s because no switch-capable client exists",
+                    endpoint_override,
+                )
+
+        model_info = self._current_model_info_for_turn(
+            session=session,
+            conversation_id=lookup_id,
+            session_id=session_id,
+        )
+        self._record_effective_model_metadata(
+            session=session,
+            selected_endpoint=endpoint_override,
+            endpoint_policy=endpoint_policy,
+            model_info=model_info,
+        )
+        return model_info
 
     async def _build_system_prompt_compiled(
         self,
@@ -2104,6 +3643,8 @@ class Agent:
         session_type: str = "cli",
         tools_enabled: bool = True,
         session: "Session | None" = None,
+        mode: str | None = None,
+        conversation_id: str | None = None,
     ) -> str:
         """
         使用编译管线构建系统提示词 (v2)
@@ -2129,10 +3670,14 @@ class Agent:
         intent = getattr(self, "_current_intent", None)
         _mem_keywords = intent.memory_keywords if intent else None
 
+        model_lookup_id = self._resolve_model_lookup_id(
+            session=session,
+            conversation_id=conversation_id,
+        )
+        model_info: dict[str, Any] = {}
         model_display = ""
         try:
-            conv_id = session.id if session else None
-            model_info = self.brain.get_current_model_info(conversation_id=conv_id)
+            model_info = self.brain.get_current_model_info(conversation_id=model_lookup_id)
             if isinstance(model_info, dict) and "model" in model_info:
                 model_display = model_info["model"]
         except Exception:
@@ -2148,57 +3693,141 @@ class Agent:
                     "channel": getattr(session, "channel", "unknown"),
                     "chat_type": getattr(session, "chat_type", "private"),
                     "message_count": len(session.context.messages) if session.context else 0,
+                    "working_facts": getattr(session.context, "working_facts", {}) if session.context else {},
+                    "effective_model": session.get_metadata("effective_model", {}),
                     "has_sub_agents": bool(sub_records),
                     "sub_agent_count": len(sub_records),
                     "language": getattr(session_config, "language", "zh")
                     if session_config
                     else "zh",
                 }
+                # PR-A2：把活跃的授权意图传给 prompt builder，让它注入到 system prompt
+                try:
+                    intent_data = session.get_metadata("risk_authorized_intent_active")
+                    if isinstance(intent_data, dict) and intent_data:
+                        session_context["authorized_intent"] = intent_data
+                except Exception:
+                    pass
+                # P0-2 阶段 2：把规则启发式 evidence_recommended 信号传给 prompt builder。
+                # 仅当 intent 自评 evidence_required=False 且规则路径推荐时，
+                # 在 prompt 末尾追加"建议查工具/否则声明来源"的软提示，
+                # 形成 阶段 1 log-only + 阶段 3 来源标签 闭环。
+                try:
+                    if intent is not None:
+                        _ev_required = bool(getattr(intent, "evidence_required", False))
+                        _ev_recommended = bool(getattr(intent, "evidence_recommended", False))
+                        if _ev_recommended and not _ev_required:
+                            session_context["evidence_recommended"] = True
+                except Exception:
+                    pass
             except Exception:
                 pass
 
-        _effective_mode = getattr(self.tool_executor, "_current_mode", "agent")
-        _model_id = getattr(self.brain, "model", "")
-        _skip_catalogs = False
-        if intent:
-            from .intent_analyzer import IntentType
-
-            if intent.intent == IntentType.CHAT:
-                _effective_mode = "ask"
-                _skip_catalogs = True
-            elif intent.intent == IntentType.QUERY:
-                _skip_catalogs = True
+        _effective_mode = mode or getattr(self.tool_executor, "_current_mode", "agent")
+        _model_id = model_display or getattr(self.brain, "model", "")
+        _has_image_atts = getattr(self, "_has_pending_image_attachments", False)
 
         from ..prompt.budget import estimate_tokens
-        from ..prompt.builder import PromptProfile, PromptTier, resolve_tier
+        from ..prompt.builder import resolve_tier
 
         _user_input_tokens = estimate_tokens(task_description) if task_description else 0
-        _prompt_profile = self._resolve_prompt_profile(intent, session_type)
         _prompt_tier = resolve_tier(ctx_window)
-
-        prompt = await self.prompt_assembler.build_system_prompt_compiled(
-            task_description,
+        _strategy = self._resolve_prompt_strategy(
+            intent,
             session_type=session_type,
-            context_window=ctx_window,
-            is_sub_agent=self._is_sub_agent_call,
-            tools_enabled=tools_enabled,
-            memory_keywords=_mem_keywords,
-            model_display_name=model_display,
-            session_context=session_context,
             mode=_effective_mode,
-            model_id=_model_id,
-            skip_catalogs=_skip_catalogs,
-            user_input_tokens=_user_input_tokens,
-            prompt_profile=_prompt_profile,
-            prompt_tier=_prompt_tier,
-            agent_voice=self._resolve_agent_voice(),
+            has_image_attachments=_has_image_atts,
         )
+        _prompt_profile = _strategy.profile
+        _skip_catalogs = _strategy.skip_catalogs
+        _intent_tool_hints = list(getattr(intent, "tool_hints", []) or [])
+
+        # Session-level system prompt cache: reuse when the structural
+        # parameters (mode, catalogs, profile) haven't changed.  Memory
+        # keywords and intent tool hints vary per turn so the cache key includes them.
+        _conv_id = model_lookup_id or (session.id if session else "")
+        try:
+            _working_facts_cache_key = json.dumps(
+                (session_context or {}).get("working_facts", {}),
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            )
+        except Exception:
+            _working_facts_cache_key = ""
+        _resolved_voice = self._resolve_agent_voice()
+        _cache_key = (
+            _conv_id,
+            _effective_mode,
+            _skip_catalogs,
+            _prompt_profile,
+            _prompt_tier,
+            _strategy.prompt_mode,
+            _strategy.memory_scope,
+            tuple(sorted(_strategy.catalog_scope)),
+            _strategy.include_project_guidelines,
+            model_info.get("name", "") if isinstance(model_info, dict) else "",
+            model_display,
+            model_info.get("provider", "") if isinstance(model_info, dict) else "",
+            bool(model_info.get("is_override")) if isinstance(model_info, dict) else False,
+            tuple(sorted(_intent_tool_hints)),
+            tuple(sorted(_mem_keywords)) if _mem_keywords else (),
+            _working_facts_cache_key,
+            bool((session_context or {}).get("evidence_recommended", False)),
+            _resolved_voice,
+        )
+
+        if (
+            not self._system_prompt_cache_dirty
+            and _cache_key in self._system_prompt_cache
+        ):
+            prompt = self._system_prompt_cache[_cache_key]
+            logger.debug("[Agent] system prompt cache HIT (key=%s)", _cache_key[:3])
+        else:
+            prompt = await self.prompt_assembler.build_system_prompt_compiled(
+                task_description,
+                session_type=session_type,
+                context_window=ctx_window,
+                is_sub_agent=self._is_sub_agent_call,
+                tools_enabled=tools_enabled,
+                memory_keywords=_mem_keywords,
+                model_display_name=model_display,
+                session_context=session_context,
+                mode=_effective_mode,
+                model_id=_model_id,
+                skip_catalogs=_skip_catalogs,
+                user_input_tokens=_user_input_tokens,
+                prompt_profile=_prompt_profile,
+                prompt_tier=_prompt_tier,
+                prompt_mode=_strategy.prompt_mode,
+                memory_scope=_strategy.memory_scope,
+                catalog_scope=_strategy.catalog_scope,
+                include_project_guidelines=_strategy.include_project_guidelines,
+                intent_tool_hints=_intent_tool_hints,
+                agent_voice=_resolved_voice,
+            )
+            self._system_prompt_cache[_cache_key] = prompt
+            self._system_prompt_cache_dirty = False
+
+        self._last_effective_mode = _effective_mode
+        self._last_tool_policy_source = "prompt_build"
         if self._custom_prompt_suffix:
             prompt += f"\n\n{self._custom_prompt_suffix}"
+        prompt += self._build_runtime_env_prompt_section()
         prompt += self._build_multi_agent_prompt_section()
         return prompt
 
-    def _resolve_prompt_profile(self, intent: Any, session_type: str) -> "PromptProfile":
+    def _invalidate_system_prompt_cache(self, reason: str = "") -> None:
+        """Mark system prompt cache dirty so it rebuilds on next turn."""
+        if self._system_prompt_cache:
+            self._system_prompt_cache.clear()
+            logger.debug(
+                "[Agent] system prompt cache invalidated%s",
+                f" ({reason})" if reason else "",
+            )
+        self._system_prompt_cache_dirty = True
+
+    def _resolve_prompt_profile(self, intent: Any, session_type: str) -> Any:
         """Determine PromptProfile from intent and session type."""
         from ..prompt.builder import PromptProfile
 
@@ -2210,6 +3839,58 @@ class Agent:
             if intent.intent in (IntentType.CHAT, IntentType.QUERY):
                 return PromptProfile.CONSUMER_CHAT
         return PromptProfile.LOCAL_AGENT
+
+    def _resolve_prompt_strategy(
+        self,
+        intent: Any,
+        *,
+        session_type: str,
+        mode: str,
+        has_image_attachments: bool = False,
+    ) -> PromptStrategy:
+        """Resolve prompt assembly strategy from the structured intent contract."""
+        from ..prompt.builder import PromptMode, PromptProfile
+        from .intent_analyzer import IntentType, MemoryScope, PromptDepth
+
+        profile = self._resolve_prompt_profile(intent, session_type)
+        prompt_mode = PromptMode.FULL
+        skip_catalogs = False
+        memory_scope = getattr(intent, "memory_scope", MemoryScope.RELEVANT) if intent else MemoryScope.RELEVANT
+        catalog_scope = list(getattr(intent, "catalog_scope", []) or [])
+        include_project_guidelines = bool(getattr(intent, "requires_project_context", False))
+
+        prompt_depth = getattr(intent, "prompt_depth", PromptDepth.STANDARD) if intent else PromptDepth.STANDARD
+        requires_tools = bool(getattr(intent, "requires_tools", False))
+
+        if intent and intent.intent in (IntentType.CHAT, IntentType.QUERY):
+            profile = PromptProfile.CONSUMER_CHAT
+            prompt_mode = PromptMode.MINIMAL
+            memory_scope = MemoryScope.PINNED_ONLY
+            if not requires_tools:
+                skip_catalogs = False
+                catalog_scope = ["index"]
+            if intent.intent == IntentType.CHAT and not has_image_attachments and mode == "agent":
+                mode = "ask"
+
+        if prompt_depth in (PromptDepth.FAST, PromptDepth.MINIMAL):
+            prompt_mode = PromptMode.MINIMAL
+            if memory_scope == MemoryScope.FULL:
+                memory_scope = MemoryScope.RELEVANT
+
+        if mode in ("ask", "plan") and not requires_tools:
+            catalog_scope = ["index"]
+
+        if session_type == "im":
+            profile = PromptProfile.IM_ASSISTANT
+
+        return PromptStrategy(
+            profile=profile,
+            prompt_mode=prompt_mode,
+            skip_catalogs=skip_catalogs,
+            memory_scope=memory_scope,
+            catalog_scope=catalog_scope,
+            include_project_guidelines=include_project_guidelines,
+        )
 
     def _build_multi_agent_prompt_section(self) -> str:
         """Generate a system prompt section describing the multi-agent system.
@@ -2233,6 +3914,14 @@ class Agent:
                 "**禁止**使用 delegate_to_agent、delegate_parallel、create_agent、"
                 "spawn_agent 等委派工具。不要创建或委派其他 Agent。\n"
                 "直接用你自己的专业工具（如 web_search、browser、read_file 等）完成任务。\n"
+                "\n"
+                "### 数据结论零伪造原则（必须遵守）\n"
+                "- 若任务要求数值/统计/模拟/计算结果，必须通过平台命令工具"
+                "（Windows 用 run_powershell，其他环境用 run_shell）执行 python，"
+                "或调用对应工具获得，不得凭经验估算。\n"
+                "- 任何没有工具输出佐证的数字、百分比、均值、标准差、概率一律视为违规。\n"
+                "- 无法获得真实数据时，明确返回：\"无法执行：<具体原因>，建议 <替代方案>\"，"
+                "禁止编造数据占位。\n"
             )
 
         profile = self._agent_profile
@@ -2293,7 +3982,8 @@ class Agent:
 - message 必须包含充分上下文，让目标 Agent 独立完成
 - 结果返回后整合并用你自己的语气回复用户
 - 委派深度上限 5 层，每会话最多 5 个动态 Agent
-- 对话历史中的 [子Agent工作总结] 和 [执行摘要] 是已完成的事实，不要重复执行"""
+- 对话历史中的 <<DELEGATION_TRACE>> 和 <<TOOL_TRACE>>（旧版 [子Agent工作总结] / [执行摘要]）是已完成的事实，不要重复执行
+- **重要**：这两个 marker 是系统注入的、由真实工具凭证支撑的回放摘要；不要在你自己的回复中模仿这种格式编造执行结果"""
 
     def _generate_tools_text(self) -> str:
         """
@@ -2585,7 +4275,44 @@ class Agent:
                 f"(system_prompt={'custom' if system_prompt else 'default'}, "
                 f"tools={len(_tools) if _tools else 0})"
             )
+            self._invalidate_system_prompt_cache("context compression")
         return result
+
+    async def _compress_context_for_prepare(
+        self,
+        messages: list[dict],
+        *,
+        session_id: str,
+        conversation_id: str | None = None,
+    ) -> list[dict]:
+        """Compress session history during prepare without reusing stale cancel signals."""
+        active_task = None
+        if self.agent_state:
+            active_task = self.agent_state.get_task_for_session(session_id)
+
+        current_cancel_event = getattr(self.context_manager, "_cancel_event", None)
+        if not active_task or current_cancel_event is not active_task.cancel_event:
+            self.context_manager.set_cancel_event(None)
+
+        try:
+            return await self._compress_context(messages, conversation_id=conversation_id)
+        except _CtxCancelledError:
+            active_task = (
+                self.agent_state.get_task_for_session(session_id) if self.agent_state else None
+            )
+            if active_task and (active_task.cancelled or bool(active_task.cancel_reason.strip())):
+                raise UserCancelledError(
+                    reason=active_task.cancel_reason or "用户请求停止",
+                    source="prepare_context_compress",
+                ) from None
+
+            logger.warning(
+                "[Session:%s] Prepare context compression cancelled without active task "
+                "cancellation. Fallback to uncompressed context.",
+                session_id or conversation_id,
+            )
+            self.context_manager.set_cancel_event(None)
+            return messages
 
     async def _compress_large_tool_results(
         self, messages: list[dict], threshold: int = LARGE_TOOL_RESULT_THRESHOLD
@@ -2731,6 +4458,7 @@ class Agent:
 
         _tt = set_tracking_context(
             TokenTrackingContext(
+                session_id=getattr(self, "_current_conversation_id", "") or getattr(self, "_current_session_id", "") or "",
                 operation_type="context_compress",
                 operation_detail=context_type,
             )
@@ -2748,7 +4476,6 @@ class Agent:
                         }
                     ],
                     use_thinking=False,
-                    usage_scene="_llm_compress_text",
                 )
             )
 
@@ -2898,6 +4625,7 @@ class Agent:
 
             _tt2 = set_tracking_context(
                 TokenTrackingContext(
+                    session_id=getattr(self, "_current_conversation_id", "") or getattr(self, "_current_session_id", "") or "",
                     operation_type="context_compress",
                     operation_detail=f"chunk_{i}",
                 )
@@ -2927,7 +4655,6 @@ class Agent:
                             }
                         ],
                         use_thinking=False,
-                        usage_scene="_summarize_messages_chunked",
                     )
                 )
 
@@ -3116,7 +4843,7 @@ class Agent:
         )
         return truncated
 
-    async def chat(self, message: str, session_id: str | None = None, usage_scene: str = "unknown") -> str:
+    async def chat(self, message: str, session_id: str | None = None) -> str:
         """
         对话接口 - 委托给 chat_with_session() 复用完整处理链路
 
@@ -3151,7 +4878,6 @@ class Agent:
             session_id=session_id or self._cli_session.id,
             session=self._cli_session,
             gateway=None,  # CLI 无 Gateway
-            usage_scene=usage_scene,
         )
 
         # 记录 Assistant 响应到 Session（工具执行摘要作为独立字段）
@@ -3179,6 +4905,22 @@ class Agent:
         return response
 
     # ==================== 会话流水线: 共享准备 / 收尾 / 入口 ====================
+
+    @staticmethod
+    def _resolve_memory_workspace_id(session: Any | None) -> str:
+        """Choose the memory workspace for a session.
+
+        Phase 2a：抽到 ``memory.workspace_resolver`` 模块。
+
+        默认行为保持与 v3 一致：IM session 用 bot namespace、desktop/api/cli/web
+        用 "default"。当用户**显式 opt-in**（环境变量
+        ``SYNAPSE_DESKTOP_PROJECT_WORKSPACE=1`` 或 session.metadata
+        ``memory_workspace_mode='project'``）时才切到项目哈希工作区，
+        让不同项目目录下的桌面对话互相隔离。
+        """
+        from ..memory.workspace_resolver import resolve_memory_workspace_id
+
+        return resolve_memory_workspace_id(session)
 
     async def _prepare_session_context(
         self,
@@ -3235,8 +4977,22 @@ class Agent:
             )
             conversation_safe_id = _memory_key.replace(":", "__")
             conversation_safe_id = re.sub(r'[/\\+=%?*<>|"\x00-\x1f]', "_", conversation_safe_id)
-            if getattr(self.memory_manager, "_current_session_id", None) != conversation_safe_id:
-                self.memory_manager.start_session(conversation_safe_id)
+            memory_workspace_id = self._resolve_memory_workspace_id(session)
+            if (
+                getattr(self.memory_manager, "_current_session_id", None) != conversation_safe_id
+                or getattr(self.memory_manager, "_current_workspace_id", None) != memory_workspace_id
+            ):
+                self.memory_manager.start_session(
+                    conversation_safe_id,
+                    user_id=getattr(session, "user_id", None) if session else None,
+                    workspace_id=memory_workspace_id,
+                    focus_terms=getattr(getattr(session, "context", None), "focus_terms", None),
+                )
+                attach_session = getattr(self.memory_manager, "attach_session_context", None)
+                if callable(attach_session):
+                    attach_session(session)
+                if session is not None:
+                    session.set_metadata("memory_workspace_id", memory_workspace_id)
                 if hasattr(self, "_memory_handler"):
                     self._memory_handler.reset_guide()
                 # 1.5 新会话时清空 Scratchpad 工作记忆，避免跨会话泄漏
@@ -3245,7 +5001,9 @@ class Agent:
                     if store and hasattr(store, "save_scratchpad"):
                         from ..memory.types import Scratchpad as _SpClear
 
-                        store.save_scratchpad(_SpClear(user_id="default"))
+                        store.save_scratchpad(
+                            _SpClear(user_id=getattr(session, "user_id", "default") if session else "default")
+                        )
                         logger.debug(
                             f"[Session] Cleared scratchpad for new conversation {conversation_id}"
                         )
@@ -3282,6 +5040,21 @@ class Agent:
 
         # 5. User turn memory record
         self.memory_manager.record_turn("user", message)
+        if session and hasattr(session, "context"):
+            try:
+                from .working_facts import extract_working_facts, merge_working_facts
+
+                turn_no = len(getattr(session.context, "messages", []) or [])
+                updates = extract_working_facts(message, source_turn=turn_no)
+                if updates:
+                    session.context.working_facts = merge_working_facts(
+                        getattr(session.context, "working_facts", {}),
+                        updates,
+                    )
+                    self._invalidate_system_prompt_cache("working facts updated")
+                    logger.info("[Session:%s] Working facts updated: %s", session_id, list(updates))
+            except Exception as exc:
+                logger.debug("[Session:%s] Working facts extraction failed: %s", session_id, exc)
 
         # 6. Trait mining
         if hasattr(self, "trait_miner") and self.trait_miner and self.trait_miner.brain:
@@ -3290,66 +5063,61 @@ class Agent:
                     self.trait_miner.mine_from_message(message, role="user"),
                     timeout=10,
                 )
-                for trait in mined_traits:
-                    store = getattr(self.memory_manager, "store", None)
-                    if store:
-                        existing = store.query_semantic(memory_type="persona_trait", limit=50)
-                        found = False
-                        for old in existing:
-                            if old.content.startswith(f"{trait.dimension}="):
-                                store.update_semantic(
-                                    old.id,
-                                    {
-                                        "content": f"{trait.dimension}={trait.preference}",
-                                        "importance_score": max(
-                                            old.importance_score, trait.confidence
-                                        ),
-                                    },
-                                )
-                                found = True
-                                break
-                        if found:
-                            continue
-                    from ..memory.types import Memory, MemoryPriority, MemoryType
+                from .persona import persist_trait_to_memory
 
-                    mem = Memory(
-                        type=MemoryType.PERSONA_TRAIT,
-                        priority=MemoryPriority.LONG_TERM,
-                        content=f"{trait.dimension}={trait.preference}",
-                        source=trait.source,
-                        tags=[f"dimension:{trait.dimension}", f"preference:{trait.preference}"],
-                        importance_score=trait.confidence,
-                    )
-                    self.memory_manager.add_memory(mem)
+                for trait in mined_traits:
+                    persist_trait_to_memory(self.memory_manager, trait)
                 if mined_traits:
                     logger.debug(f"[TraitMiner] Mined {len(mined_traits)} traits from user message")
             except Exception as e:
                 logger.debug(f"[TraitMiner] Mining failed (non-critical): {e}")
 
         # 7. IntentAnalyzer (unified intent analysis — all messages go through LLM)
-        #    Sub-agents skip IntentAnalyzer: they receive structured task instructions
-        #    from the parent, always TASK intent, always need tools.
+        #    Sub-agents skip the full analyzer for latency, but they are not
+        #    automatically forced into tools: many delegated jobs are pure writing
+        #    or analysis tasks where a direct text answer is the correct output.
         from .intent_analyzer import IntentAnalyzer, IntentResult, IntentType
 
         if self._is_sub_agent_call:
             _profile_hints = self._derive_tool_hints_from_profile()
-            # 会议室 Worker：委派正文已在 user 消息，勿再写入 TaskDefinition 以免 system 尾部重复
-            _sub_task_def = ""
-            if not getattr(self, "_org_context", None):
-                _sub_task_def = message[:600]
+            _requires_tools = _looks_like_external_tool_request(message)
+
+            # Structural override for organization coordinator nodes: any node
+            # that has direct subordinates (set by ``runtime._create_node_agent``
+            # via ``_is_org_coordinator``) must use tools — its only legitimate
+            # outputs are ``org_delegate_task`` / ``org_wait_for_deliverable``
+            # / ``org_accept_deliverable`` / ``org_submit_deliverable``.
+            # Without this override the relaxed force-tool policy (5/8) lets
+            # the editor-in-chief / CEO / tech-lead style root nodes "do the
+            # work themselves" by calling write_file directly, bypassing the
+            # team. Keyword detection alone is not enough because users often
+            # phrase requests as "帮我做一份 X" without any external-tool
+            # marker, so we anchor the contract to the org topology.
+            _is_org_coord = bool(getattr(self, "_is_org_coordinator", False))
+            if _is_org_coord:
+                _requires_tools = True
+
+            # P0-2 阶段 2：子 Agent 路径不再硬绑定 evidence_required=_requires_tools
+            # _requires_tools 仅表示"任务期望调工具"，不等价于"必须有工具证据才能信"。
+            # 否则纯子 Agent 闲聊/QA 也会被误判为证据敏感，触发阶段 0 disclaimer。
             intent_result = IntentResult(
                 intent=IntentType.TASK,
                 confidence=1.0,
-                task_definition=_sub_task_def,
-                task_type="action",
-                tool_hints=_profile_hints,
+                task_definition=message[:600],
+                task_type="action" if _requires_tools else "analysis",
+                tool_hints=_profile_hints if _requires_tools else [],
                 memory_keywords=[],
-                force_tool=True,
+                force_tool=_requires_tools,
+                requires_tools=_requires_tools,
+                evidence_required=False,
+                evidence_recommended=_requires_tools,
                 todo_required=False,
             )
             logger.info(
                 f"[Session:{session_id}] Sub-agent: skipping IntentAnalyzer, "
-                f"forced TASK intent, profile_tool_hints={_profile_hints}"
+                f"requires_tools={_requires_tools}, "
+                f"is_org_coordinator={_is_org_coord}, "
+                f"profile_tool_hints={_profile_hints}"
             )
         else:
             if not hasattr(self, "_intent_analyzer"):
@@ -3373,6 +5141,23 @@ class Agent:
                 intent_result = _make_default(message)
 
         self._current_intent = intent_result
+        self._current_user_message = message
+        # BUG-EFF-4 守卫：本轮是否带图片附件。CHAT 意图通常被强制降级为 ask
+        # （省 token 设计），但带附件时降级会砍掉 vision 工具，导致用户看到
+        # "图片在哪？"之类的回复。这里记录一个轻量标志供 _build_system_prompt_compiled
+        # 判断是否抑制降级。其他非 chat 入口路径不会进入 _prepare_session_context，
+        # 标志默认 False，对它们零影响。
+        try:
+            self._has_pending_image_attachments = bool(attachments) and any(
+                (
+                    (getattr(a, "type", "") or "") == "image"
+                    or (getattr(a, "mime_type", "") or "").startswith("image/")
+                    or (getattr(a, "url", "") or "").startswith("data:image/")
+                )
+                for a in attachments
+            )
+        except Exception:
+            self._has_pending_image_attachments = False
         compiler_summary = intent_result.task_definition
         compiled_message = message
         logger.info(
@@ -3505,7 +5290,7 @@ class Agent:
 
             def _fp(m: dict) -> str:
                 return _hl.md5(
-                    f"{m.get('role', '')}:{(m.get('content', '') or '')[:200]}".encode(
+                    f"{m.get('role', '')}:{coerce_text(m.get('content', ''))[:200]}".encode(
                         errors="replace"
                     )
                 ).hexdigest()
@@ -3526,41 +5311,59 @@ class Agent:
                 )
             history_messages = deduped
 
-        _STRIP_MARKERS = ["\n\n[子Agent工作总结]", "\n\n[执行摘要]"]
+        # 内部 trace marker 已集中到 ``response_handler.INTERNAL_TRACE_*``，
+        # 此处仅复用常量，保持原有 strip 行为（按 marker 前后切分、按下一段
+        # 起始符寻找右边界）。新增 marker 时改 ``response_handler.py`` 即可。
         _RE_TIME_PREFIX = re.compile(r"^\[\d{1,2}:\d{2}\]\s")
 
         messages: list[dict] = []
         for msg in history_messages:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
+            content = coerce_text(msg.get("content", ""))
             ts = msg.get("timestamp", "")
+            # 标记为「仅 UI 展示，不喂 LLM」的消息（例如风险确认/取消的系统回执），
+            # 跳过以避免污染上下文，导致下一轮 LLM 模仿"已确认高危..."口吻。
+            # UI 端依然能正常显示——history 物理上没删，只是不进 LLM messages。
+            if msg.get("transient_for_llm") or msg.get("transient"):
+                continue
             if role == "assistant":
-                for _marker in _STRIP_MARKERS:
+                for _marker in INTERNAL_TRACE_SECTION_PREFIXES:
                     while _marker in content:
                         idx = content.index(_marker)
                         before = content[:idx]
                         after = content[idx + len(_marker) :]
                         next_section = -1
-                        for sep in ("\n\n[", "\n\n##", "\n\n---"):
+                        for sep in INTERNAL_TRACE_SECTION_TERMINATORS:
                             pos = after.find(sep)
                             if pos != -1 and (next_section == -1 or pos < next_section):
                                 next_section = pos
                         content = before + after[next_section:] if next_section != -1 else before
-                if content.startswith("[执行摘要]") or content.startswith("[子Agent工作总结]"):
+                if any(content.startswith(m) for m in INTERNAL_TRACE_MARKERS):
                     content = ""
                 # 从 metadata 还原 tool_summary（跨轮工具上下文恢复）
                 _tool_summary = msg.get("tool_summary")
                 if _tool_summary and isinstance(_tool_summary, str) and content:
+                    _tool_summary = self._sanitize_replayed_tool_summary(_tool_summary)
+                    from .policy_v2.prompt_hardening import wrap_external_content
+
+                    _tool_summary = wrap_external_content(_tool_summary, source="tool_trace")
                     content = content.rstrip() + "\n\n" + _tool_summary
             if role in ("user", "assistant") and content:
-                if ts and isinstance(content, str):
-                    try:
-                        t = datetime.fromisoformat(ts)
-                        time_prefix = f"[{t.strftime('%H:%M')}] "
-                        if not _RE_TIME_PREFIX.match(content):
-                            content = time_prefix + content
-                    except Exception:
-                        pass
+                if isinstance(content, str) and not _RE_TIME_PREFIX.match(content):
+                    # 给每条历史消息补 [HH:MM] 时间戳。
+                    # ts 可能缺失（旧消息 / 外部注入），此时用 message["created_at"]
+                    # / 兜底"now"，确保每条历史都有可读时间锚点。
+                    fallback_ts = msg.get("created_at") or msg.get("ts") or ""
+                    raw_ts = ts or fallback_ts
+                    t_obj = None
+                    if raw_ts:
+                        try:
+                            t_obj = datetime.fromisoformat(str(raw_ts))
+                        except Exception:
+                            t_obj = None
+                    if t_obj is None:
+                        t_obj = datetime.now()
+                    content = f"[{t_obj.strftime('%H:%M')}] " + content
                 if messages and messages[-1]["role"] == role:
                     messages[-1]["content"] += "\n" + content
                 else:
@@ -3570,12 +5373,17 @@ class Agent:
         if session and hasattr(session, "context"):
             sub_records = getattr(session.context, "sub_agent_records", None)
             if sub_records and messages:
+                from .policy_v2.prompt_hardening import wrap_external_content
+
                 summary_parts = []
                 for r in sub_records:
                     name = r.get("agent_name", "unknown")
                     preview = r.get("result_preview", "")
                     if preview:
-                        summary_parts.append(f"- {name}: {preview[:500]}")
+                        wrapped_preview = wrap_external_content(
+                            preview[:500], source=f"sub_agent_preview:{name}"
+                        )
+                        summary_parts.append(f"- {name}:\n{wrapped_preview}")
                 if summary_parts:
                     delegation_summary = "\n\n[委派任务执行记录]\n" + "\n".join(summary_parts)
                     for i in range(len(messages) - 1, -1, -1):
@@ -3590,11 +5398,53 @@ class Agent:
             f"{len(messages)} history msgs, has_history={_has_history}"
         )
 
+        if (
+            isinstance(compiled_message, str)
+            and _looks_like_previous_answer_replay_request(message, messages)
+        ):
+            compiled_message = _apply_previous_answer_replay_hint(compiled_message)
+            logger.info(
+                "[Session:%s] Previous-answer replay hint applied for follow-up request",
+                session_id,
+            )
+
         # 当前用户消息（支持多模态）
         pending_images = session.get_metadata("pending_images") if session else None
         pending_videos = session.get_metadata("pending_videos") if session else None
         pending_audio = session.get_metadata("pending_audio") if session else None
         pending_files = session.get_metadata("pending_files") if session else None
+        from .current_turn import CurrentTurnInput, SessionObjectRegistry
+
+        current_turn = CurrentTurnInput.from_inputs(
+            compiled_message,
+            pending_images=pending_images,
+            pending_videos=pending_videos,
+            pending_audio=pending_audio,
+            pending_files=pending_files,
+            attachments=attachments,
+        )
+        object_registry = (
+            session.get_metadata("_session_object_registry") if session is not None else None
+        )
+        if not isinstance(object_registry, SessionObjectRegistry):
+            registry_state = (
+                session.get_metadata("session_object_registry") if session is not None else None
+            )
+            if session is None:
+                object_registry = getattr(self, "_session_object_registry", None)
+            if not isinstance(object_registry, SessionObjectRegistry):
+                object_registry = SessionObjectRegistry.from_dict(registry_state)
+        if not isinstance(object_registry, SessionObjectRegistry):
+            object_registry = SessionObjectRegistry()
+
+        current_turn.with_recent_objects(object_registry.resolve_for_turn(current_turn))
+        object_registry.register_turn(current_turn)
+        self._session_object_registry = object_registry
+        if session is not None:
+            with contextlib.suppress(Exception):
+                session.set_metadata("_session_object_registry", object_registry)
+                session.set_metadata("session_object_registry", object_registry.to_dict())
+        self._current_turn_input = current_turn
 
         # 处理 PDF/文档文件 — 如果 LLM 支持 PDF 则构建 DocumentBlock，否则降级提取文本
         document_blocks = []
@@ -3638,7 +5488,7 @@ class Agent:
                             f"[Session:{session_id}] PDF text extraction empty, path provided"
                         )
 
-        # 三级音频决策：LLM原生audio > 在线STT > 本地Whisper
+        # 二级音频决策：LLM原生audio > 在线STT
         audio_blocks = []
         if pending_audio:
             llm_client = getattr(self.brain, "_llm_client", None)
@@ -3681,7 +5531,7 @@ class Agent:
                         local_path = aud.get("local_path", "")
                         existing_transcription = aud.get("transcription")
                         if existing_transcription:
-                            continue  # 已有 Whisper 结果，不重复调用
+                            continue  # 已有转写结果，不重复调用
                         if local_path and Path(local_path).exists():
                             try:
                                 stt_result = await stt_client.transcribe(local_path)
@@ -3698,11 +5548,13 @@ class Agent:
                                     )
                             except Exception as e:
                                 logger.warning(f"[Session:{session_id}] Online STT failed: {e}")
-                # Tier 3: 本地 Whisper（已由 Gateway 处理，transcription 已在 input_text 中）
-                # 不需要额外操作
+                # Gateway 已处理的转写结果已包含在 input_text 中
 
         if _has_history and compiled_message and isinstance(compiled_message, str):
             compiled_message = f"[最新消息]\n{compiled_message}"
+
+        if isinstance(compiled_message, str):
+            compiled_message = current_turn.inject_into_message(compiled_message)
 
         # === 角色交替保护 ===
         # 如果历史末尾是 user 消息（通常由上下文边界标记产生），
@@ -3735,6 +5587,8 @@ class Agent:
                 att_url = getattr(att, "url", None) or ""
                 att_name = getattr(att, "name", None) or "file"
                 att_mime = getattr(att, "mime_type", None) or att_type
+                att_local_path = getattr(att, "local_path", None) or None
+                att_size = getattr(att, "size", None) or None
 
                 is_image = (
                     att_type == "image"
@@ -3749,7 +5603,17 @@ class Agent:
 
                 if is_image and att_url:
                     if _desk_has_vision:
-                        content_blocks.append({"type": "image_url", "image_url": {"url": att_url}})
+                        # 本地 /api/uploads/* URL 远端模型访问不到，先转 data URL
+                        _inlined = _maybe_inline_local_image(att_url, att_mime)
+                        _final_url = _inlined or att_url
+                        if _inlined is None and _LOCAL_UPLOAD_RE.match(att_url.strip()):
+                            _degraded_notices.append(
+                                f"[图片 {att_name} 体积过大或读取失败，已降级为文本，请缩小后重试]"
+                            )
+                        else:
+                            content_blocks.append(
+                                {"type": "image_url", "image_url": {"url": _final_url}}
+                            )
                     else:
                         _degraded_notices.append(
                             f"[用户发送了图片 {att_name}，当前模型不支持图片输入]"
@@ -3761,18 +5625,18 @@ class Agent:
                         _degraded_notices.append(
                             f"[用户发送了视频 {att_name}，当前模型不支持视频输入]"
                         )
-                elif att_type == "document" and att_url:
-                    content_blocks.append(
-                        {
-                            "type": "text",
-                            "text": f"[文档: {att_name} ({att_mime})] URL: {att_url}",
-                        }
-                    )
                 elif att_url:
                     content_blocks.append(
                         {
                             "type": "text",
-                            "text": f"[附件: {att_name} ({att_mime})] URL: {att_url}",
+                            "text": _format_desktop_attachment_reference(
+                                att_type=att_type,
+                                att_name=att_name,
+                                att_mime=att_mime,
+                                att_url=att_url,
+                                att_local_path=att_local_path,
+                                att_size=att_size,
+                            ),
                         }
                     )
 
@@ -3915,7 +5779,11 @@ class Agent:
         )
 
         # 11. Context compression
-        messages = await self._compress_context(messages)
+        messages = await self._compress_context_for_prepare(
+            messages,
+            session_id=session_id,
+            conversation_id=conversation_id,
+        )
 
         # 12. TaskMonitor creation
         task_monitor = TaskMonitor(
@@ -3937,7 +5805,126 @@ class Agent:
         session_type = "im" if _channel and _channel not in ("cli", "desktop") else "cli"
         self._current_session_type = session_type
 
+        extra_context = await self._dispatch_agent_run_start(
+            session_id=session_id,
+            conversation_id=conversation_id,
+            session=session,
+            message=message,
+            messages=messages,
+            session_type=session_type,
+            mode=mode,
+        )
+        if extra_context:
+            self._append_lifecycle_context(messages, extra_context)
+
         return messages, session_type, task_monitor, conversation_id, im_tokens
+
+    async def _dispatch_agent_run_start(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str,
+        session: Any,
+        message: str,
+        messages: list[dict],
+        session_type: str,
+        mode: str,
+    ) -> list[str]:
+        """Fire per-turn start hooks and collect optional context snippets."""
+        hooks = getattr(getattr(self, "_plugin_manager", None), "hook_registry", None)
+        run_key = conversation_id or session_id
+        # 防御：mock / 子类化测试可能绕过 ``Agent.__init__``。
+        if not isinstance(getattr(self, "_active_agent_lifecycle_runs", None), dict):
+            self._active_agent_lifecycle_runs = {}
+        self._active_agent_lifecycle_runs[run_key] = {
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "session": session,
+            "message": message,
+            "session_type": session_type,
+            "mode": mode,
+        }
+        if hooks is None:
+            return []
+
+        kwargs = {
+            "agent": self,
+            "session": session,
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "message": message,
+            "messages": messages,
+            "session_type": session_type,
+            "mode": mode,
+        }
+        results: list[str] = []
+        for hook_name in ("before_agent_run", "before_agent_start"):
+            try:
+                hook_results = await hooks.dispatch(hook_name, **kwargs)
+                results.extend(r for r in hook_results if isinstance(r, str) and r.strip())
+            except Exception as e:
+                logger.debug("%s hook error (ignored): %s", hook_name, e)
+        return results
+
+    @staticmethod
+    def _append_lifecycle_context(messages: list[dict], snippets: list[str]) -> None:
+        text = "\n\n[External Memory Context]\n" + "\n".join(snippets)
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = content + text
+                return
+            if isinstance(content, list):
+                content.append({"type": "text", "text": text.strip()})
+                return
+        messages.append({"role": "user", "content": text.strip()})
+
+    async def _finish_agent_run_lifecycle_once(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str | None = None,
+        response_text: str = "",
+        success: bool = True,
+        error: str = "",
+        status: str = "completed",
+    ) -> None:
+        run_key = conversation_id or session_id
+        # 测试 / 子类化场景里偶尔会绕过 ``Agent.__init__`` 直接 mock，
+        # 防御性地确保字典存在，避免 AttributeError 把整条 chat 链路拉炸。
+        runs = getattr(self, "_active_agent_lifecycle_runs", None)
+        if not isinstance(runs, dict):
+            return
+        payload = runs.pop(run_key, None)
+        if payload is None and conversation_id:
+            payload = runs.pop(session_id, None)
+        if payload is None:
+            return
+
+        hooks = getattr(getattr(self, "_plugin_manager", None), "hook_registry", None)
+        if hooks is None:
+            return
+
+        kwargs = {
+            "agent": self,
+            "session": payload.get("session"),
+            "session_id": payload.get("session_id") or session_id,
+            "conversation_id": payload.get("conversation_id") or conversation_id,
+            "message": payload.get("message", ""),
+            "response": response_text,
+            "success": success,
+            "error": error,
+            "status": status,
+            "session_type": payload.get("session_type", ""),
+            "mode": payload.get("mode", ""),
+        }
+        for hook_name in ("after_agent_run", "agent_end"):
+            try:
+                await hooks.dispatch(hook_name, **kwargs)
+            except Exception as e:
+                logger.debug("%s hook error (ignored): %s", hook_name, e)
 
     async def _finalize_session(
         self,
@@ -4035,6 +6022,14 @@ class Agent:
             except Exception as e:
                 logger.debug(f"[Session:{session_id}] memory end_session failed: {e}")
 
+        await self._finish_agent_run_lifecycle_once(
+            session_id=session_id,
+            conversation_id=getattr(self, "_current_conversation_id", None),
+            response_text=response_text,
+            success=True,
+            status="completed",
+        )
+
         # 5. Cleanup（总是执行，放在 finally 中由调用方保证）
         # 注意：此方法不做 cleanup，cleanup 统一在 _cleanup_session_state() 中
 
@@ -4047,6 +6042,7 @@ class Agent:
         """
         self._current_task_definition = ""
         self._current_task_query = ""
+        self._current_user_message = ""
         self._current_session_type = "cli"
         if im_tokens is not None:
             with contextlib.suppress(Exception):
@@ -4074,13 +6070,18 @@ class Agent:
                 self.agent_state.reset_task(session_id=_ct_key)
 
         # P1-7: 清理 PolicyEngine 会话状态 + ToolExecutor 待确认缓存
+        # C8b-3：v1 ``pe.cleanup_session()`` 拆为 v2 两件事
+        # （bus 删 pending + SessionAllowlistManager 清 session 临时白名单）
         try:
-            from .policy import get_policy_engine
+            from .policy_v2 import get_session_allowlist_manager
+            from .ui_confirm_bus import get_ui_confirm_bus
 
-            _pe = get_policy_engine()
+            _bus = get_ui_confirm_bus()
+            _sess_mgr = get_session_allowlist_manager()
             for _clean_id in (_sid, _conv_id):
                 if _clean_id:
-                    _pe.cleanup_session(_clean_id)
+                    _bus.cleanup_session(_clean_id)
+            _sess_mgr.clear()
         except Exception:
             pass
         if hasattr(self, "tool_executor") and hasattr(self.tool_executor, "_pending_confirms"):
@@ -4091,6 +6092,10 @@ class Agent:
             self._pending_cancels.pop(_sid, None)
         if self._current_conversation_id:
             self._pending_cancels.pop(self._current_conversation_id, None)
+        with contextlib.suppress(Exception):
+            from ..logging import get_session_log_buffer
+
+            get_session_log_buffer().clear_current_session()
         self._current_session_id = None
         self._current_conversation_id = None
 
@@ -4121,9 +6126,9 @@ class Agent:
         *,
         mode: str = "agent",
         endpoint_override: str | None = None,
+        endpoint_policy: str | None = None,
         thinking_mode: str | None = None,
         thinking_depth: str | None = None,
-        usage_scene: str,
     ) -> str:
         """
         使用外部 Session 历史进行对话（用于 IM / CLI 通道）。
@@ -4139,8 +6144,9 @@ class Agent:
             gateway: MessageGateway 对象
             mode: 交互模式 (ask/plan/agent)，默认 agent
             endpoint_override: 端点覆盖（为 None 时使用 _preferred_endpoint）
+            endpoint_policy: 端点策略，prefer=优先使用并允许故障切换，require=严格只用该端点
             thinking_mode: 思考模式覆盖 ('auto'/'on'/'off'/None)
-            thinking_depth: 思考深度 ('low'/'medium'/'high'/None)
+            thinking_depth: 思考深度 ('low'/'medium'/'high'/'max'/None)
 
         Returns:
             Agent 响应
@@ -4148,7 +6154,18 @@ class Agent:
         if not self._initialized:
             await self.initialize()
 
+        explicit_endpoint = endpoint_override
         endpoint_override = endpoint_override or self._preferred_endpoint
+        if endpoint_override:
+            endpoint_policy = (
+                endpoint_policy
+                if explicit_endpoint
+                else self._endpoint_policy if endpoint_override == self._preferred_endpoint else "prefer"
+            )
+        else:
+            endpoint_policy = "prefer"
+        if endpoint_policy not in {"prefer", "require"}:
+            endpoint_policy = "prefer"
 
         # === 停止指令检测 ===
         message_lower = message.strip().lower()
@@ -4162,29 +6179,22 @@ class Agent:
         conversation_id = self._resolve_conversation_id(session, session_id)
         self._current_conversation_id = conversation_id
 
-        # 清理上一轮残留的任务状态（按 session 隔离）
-        _prev_task = None
-        _reset_key = session_id
-        if self.agent_state:
-            _prev_task = self.agent_state.get_task_for_session(session_id)
-        if not _prev_task and self.agent_state:
-            _prev_task = self.agent_state.current_task
-            if _prev_task:
-                _reset_key = _prev_task.session_id or _prev_task.task_id
-        if _prev_task:
-            if _prev_task.cancelled or not _prev_task.is_active:
-                logger.info(
-                    f"[Session:{session_id}] Resetting stale task "
-                    f"(cancelled={_prev_task.cancelled}, status={_prev_task.status.value}, "
-                    f"reset_key={_reset_key!r})"
-                )
-                self.agent_state.reset_task(session_id=_reset_key)
-            else:
-                _prev_task.clear_skip()
-                await _prev_task.drain_user_inserts()
-
-        # 清除上一轮残留的 pending_cancels（disconnect watcher 可能在清理后写入）
-        self._pending_cancels.pop(session_id, None) if session_id else None
+        # v1.27.14 (plan: conversation concurrency v1.28, S1.3 + S1.4):
+        # 把旧的 "clear_skip + drain_user_inserts 让两个并发请求共享同一个
+        # TaskState" 反模式替换为显式 preempt/queue 协议。详见
+        # :meth:`_preempt_or_queue_prev_task`。
+        # FIX 1: 传入 conversation_id，reason_stream / run 用它作 task key。
+        _preempt_decision = await self._preempt_or_queue_prev_task(
+            session_id=session_id,
+            session=session,
+            conversation_id=conversation_id,
+        )
+        logger.debug(
+            "[ChatSync] preempt decision for session=%s conv=%s: %s",
+            session_id,
+            conversation_id,
+            _preempt_decision,
+        )
 
         # 用户主动发新消息 → 无条件清除所有端点冷却期，不让上一轮的错误阻塞本轮
         llm_client = getattr(self.brain, "_llm_client", None)
@@ -4192,6 +6202,44 @@ class Agent:
             llm_client.reset_all_cooldowns(force_all=True)
 
         im_tokens = None
+        # C7: 安装 PolicyContext ContextVar，让本轮所有下游 evaluate_via_v2
+        # 调用（permission.check_permission / reasoning_engine 双路径）拿到
+        # 与 v1 RiskGate 同源的 ctx：confirmation_mode（trust/strict/...）+
+        # session_role（mode→role）+ replay/trusted_path 快照（engine 只读，
+        # 消费仍由 _consume_risk_authorization 在 agent.py 完成）。
+        _policy_ctx_token = None
+        try:
+            from .policy_v2 import get_current_context as _pv2_get_ctx
+            from .policy_v2 import set_current_context as _pv2_set_ctx
+            from .policy_v2.adapter import build_policy_context as _pv2_build_ctx
+
+            # C13 §15.4 + R5-16: sub-agent 入口检测父 ctx（ContextVar 跨
+            # asyncio.create_task 已自动透传），存在时走 derive_child 继承
+            # root_user_id / delegate_chain / safety_immune / replay；不再
+            # 重新从 sub-agent 自己的 session 推断（sub-agent 仍共享 parent
+            # 的 session 对象，但 root_user_id / delegate_chain 这些只能从
+            # 父 ctx 拿到）。顶层 agent（_is_sub_agent_call=False）走原路径。
+            _parent_ctx = None
+            if getattr(self, "_is_sub_agent_call", False):
+                _parent_ctx = _pv2_get_ctx()
+            _policy_ctx = _pv2_build_ctx(
+                session=session,
+                session_id=conversation_id or session_id or "",
+                mode=mode,
+                user_message=message,
+                channel=getattr(session, "channel", None) or "desktop",
+                parent_ctx=_parent_ctx,
+                child_agent_name=(
+                    getattr(self, "_agent_profile_id", None) if _parent_ctx else None
+                ),
+            )
+            _policy_ctx_token = _pv2_set_ctx(_policy_ctx)
+        except Exception as _ctx_exc:
+            logger.debug(
+                "[PolicyV2] failed to install ContextVar (sync path): %s; "
+                "downstream evaluate_via_v2 will use fallback ctx",
+                _ctx_exc,
+            )
         try:
             # 准备阶段前检查：仅捕获 prepare 开始前一刻的取消信号
             if self._is_session_cancelled(session_id):
@@ -4202,20 +6250,27 @@ class Agent:
                 return "✅ 好的，已停止当前任务。"
 
             # === 共享准备 ===
-            (
-                messages,
-                session_type,
-                task_monitor,
-                conversation_id,
-                im_tokens,
-            ) = await self._prepare_session_context(
-                message=message,
-                session_messages=session_messages,
-                session_id=session_id,
-                session=session,
-                gateway=gateway,
-                conversation_id=conversation_id,
-            )
+            try:
+                (
+                    messages,
+                    session_type,
+                    task_monitor,
+                    conversation_id,
+                    im_tokens,
+                ) = await self._prepare_session_context(
+                    message=message,
+                    session_messages=session_messages,
+                    session_id=session_id,
+                    session=session,
+                    gateway=gateway,
+                    conversation_id=conversation_id,
+                )
+            except UserCancelledError:
+                logger.info(
+                    f"[Session:{session_id}] Cancelled during prepare compression, "
+                    "returning stop acknowledgement"
+                )
+                return "✅ 好的，已停止当前任务。"
 
             # 准备阶段后检查（含 pending cancel）
             _conv_cancel_id = conversation_id or session_id
@@ -4264,8 +6319,73 @@ class Agent:
             _intent = getattr(self, "_current_intent", None)
             _fast_usage = None
             _fast_handled = False
+            _allow_lightweight_fast_reply = not endpoint_override
 
-            if _intent and _intent.intent == _IT.CHAT and getattr(_intent, "fast_reply", False):
+            _risk_intent = _classify_risk_intent(_intent, message) if _intent else None
+            _risk_pre_authorized = _consume_risk_authorization(session, message)
+            if _risk_pre_authorized:
+                logger.info(
+                    "[RiskIntentGate] sync path skipped — user pre-authorized "
+                    "(session=%s, message=%r)",
+                    session_id,
+                    message[:200],
+                )
+            else:
+                _trusted_skip_reason = _check_trusted_path_skip(session, message, _risk_intent)
+                if _trusted_skip_reason:
+                    _risk_pre_authorized = True
+                    logger.info(
+                        "[RiskIntentGate] sync path skipped — trusted (reason=%s, "
+                        "session=%s, message=%r)",
+                        _trusted_skip_reason,
+                        session_id,
+                        message[:200],
+                    )
+                else:
+                    _trust_mode_reason = _check_trust_mode_skip(_risk_intent)
+                    if _trust_mode_reason:
+                        _risk_pre_authorized = True
+                        logger.info(
+                            "[RiskIntentGate] sync path skipped — %s "
+                            "(session=%s, target=%s, op=%s, message=%r)",
+                            _trust_mode_reason,
+                            session_id,
+                            getattr(_risk_intent.target_kind, "value", _risk_intent.target_kind),
+                            getattr(_risk_intent.operation_kind, "value", _risk_intent.operation_kind),
+                            message[:200],
+                        )
+            if (
+                mode == "agent"
+                and _intent
+                and not getattr(self, "_is_sub_agent_call", False)
+                and _risk_intent
+                and _risk_intent.requires_confirmation
+                and not _risk_pre_authorized
+            ):
+                response_text = _build_destructive_intent_question(message, _risk_intent)
+                get_confirmation_store().create(
+                    conversation_id=session_id,
+                    original_message=message,
+                    classification=_risk_intent.to_dict(),
+                    request_id=f"{session_id}:sync",
+                )
+                self.reasoning_engine._last_exit_reason = "ask_user"
+                # Fix-14：风险早退路径未发起 LLM 调用，必须显式清空上一轮的
+                # ReAct trace，否则 _finalize_session → _extract_usage_summary
+                # 会读到上轮残留 trace，把上轮 token 用量当成这次的并下发，
+                # 让前端误以为"询问确认这一步也烧了 14 万 token"。
+                try:
+                    self.reasoning_engine._last_react_trace = []
+                except Exception:
+                    pass
+                _fast_handled = True
+
+            if (
+                _allow_lightweight_fast_reply
+                and _intent
+                and _intent.intent == _IT.CHAT
+                and getattr(_intent, "fast_reply", False)
+            ):
                 # Ultra-fast path: rule-based greeting only, use lightweight model
                 try:
                     _identity_snippet = ""
@@ -4283,7 +6403,6 @@ class Agent:
                     _fast_resp = await self.brain.think_lightweight(
                         prompt=message,
                         system=_fast_system,
-                        usage_scene="fast_reply",
                     )
                     _fast_usage = _fast_resp.usage
                     response_text = (
@@ -4296,7 +6415,12 @@ class Agent:
                     response_text = "你好！有什么我可以帮你的吗？"
                     _fast_handled = True
 
-            elif _intent and _intent.intent == _IT.QUERY and getattr(_intent, "fast_reply", False):
+            elif (
+                _allow_lightweight_fast_reply
+                and _intent
+                and _intent.intent == _IT.QUERY
+                and getattr(_intent, "fast_reply", False)
+            ):
                 # Fast-path for simple factual queries (math, date, definitions)
                 # No tools passed → LLM answers directly
                 try:
@@ -4326,7 +6450,6 @@ class Agent:
                     _fast_resp = await self.brain.think_lightweight(
                         prompt=message,
                         system=_fast_system,
-                        usage_scene="fast_query",
                     )
                     _fast_usage = _fast_resp.usage
                     response_text = clean_llm_response(
@@ -4350,8 +6473,9 @@ class Agent:
                     progress_callback=_progress_cb,
                     session=session,
                     endpoint_override=endpoint_override,
+                    endpoint_policy=endpoint_policy,
                     intent_result=_intent,
-                    usage_scene=usage_scene,
+                    mode=mode,
                 )
 
             # === flush 残留的 IM 进度消息，确保思维链先于回答到达 ===
@@ -4372,15 +6496,39 @@ class Agent:
             # fast_reply 不经过 ReasoningEngine，trace 为空导致 _last_usage_summary = {}。
             # 从 Response.usage 补充。
             if _fast_handled and not self._last_usage_summary and isinstance(_fast_usage, dict):
+                _fast_in = _fast_usage.get("input_tokens", 0)
+                _fast_out = _fast_usage.get("output_tokens", 0)
                 self._last_usage_summary = {
-                    "input_tokens": _fast_usage.get("input_tokens", 0),
-                    "output_tokens": _fast_usage.get("output_tokens", 0),
-                    "total_tokens": _fast_usage.get("input_tokens", 0) + _fast_usage.get("output_tokens", 0),
+                    "input_tokens": _fast_in,
+                    "output_tokens": _fast_out,
+                    "total_tokens": _fast_in + _fast_out,
+                    "billable_input_tokens": _fast_in,
+                    "billable_output_tokens": _fast_out,
+                    "billable_total_tokens": _fast_in + _fast_out,
                 }
 
             return response_text
         finally:
+            await self._finish_agent_run_lifecycle_once(
+                session_id=session_id,
+                conversation_id=locals().get("conversation_id"),
+                response_text=locals().get("response_text", ""),
+                success=False,
+                status="aborted",
+            )
             self._cleanup_session_state(im_tokens)
+            # C7: 清 PolicyContext ContextVar（避免跨 task 泄漏；FastAPI worker
+            # 复用 task 时若不 reset，下一轮会读到上轮 ctx 数据）
+            if _policy_ctx_token is not None:
+                try:
+                    from .policy_v2 import reset_current_context as _pv2_reset_ctx
+
+                    _pv2_reset_ctx(_policy_ctx_token)
+                except Exception:
+                    logger.debug(
+                        "[PolicyV2] failed to reset ContextVar (sync path)",
+                        exc_info=True,
+                    )
 
     async def chat_with_session_stream(
         self,
@@ -4393,10 +6541,12 @@ class Agent:
         plan_mode: bool = False,
         mode: str = "agent",
         endpoint_override: str | None = None,
+        endpoint_policy: str | None = None,
         attachments: list | None = None,
         thinking_mode: str | None = None,
         thinking_depth: str | None = None,
-        usage_scene: str,
+        request_id: str = "",
+        turn_id: str = "",
     ):
         """
         流式版 chat_with_session，yield SSE 事件字典。
@@ -4415,17 +6565,29 @@ class Agent:
             plan_mode: 是否启用 Plan 模式 (deprecated, use mode)
             mode: 交互模式 (ask/plan/agent)
             endpoint_override: 端点覆盖
+            endpoint_policy: 端点策略，prefer=优先使用并允许故障切换，require=严格只用该端点
             attachments: Desktop Chat 附件列表
             thinking_mode: 思考模式覆盖 ('auto'/'on'/'off'/None)
-            thinking_depth: 思考深度 ('low'/'medium'/'high'/None)
-            usage_scene: 使用场景
+            thinking_depth: 思考深度 ('low'/'medium'/'high'/'max'/None)
+
         Yields:
             SSE 事件字典 {"type": "...", ...}
         """
         if not self._initialized:
             await self.initialize()
 
+        explicit_endpoint = endpoint_override
         endpoint_override = endpoint_override or self._preferred_endpoint
+        if endpoint_override:
+            endpoint_policy = (
+                endpoint_policy
+                if explicit_endpoint
+                else self._endpoint_policy if endpoint_override == self._preferred_endpoint else "prefer"
+            )
+        else:
+            endpoint_policy = "prefer"
+        if endpoint_policy not in {"prefer", "require"}:
+            endpoint_policy = "prefer"
 
         # === 停止指令检测 ===
         message_lower = message.strip().lower()
@@ -4445,29 +6607,20 @@ class Agent:
         conversation_id = self._resolve_conversation_id(session, session_id)
         self._current_conversation_id = conversation_id
 
-        # 清理上一轮残留的任务状态（按 session 隔离）
-        _prev_task = None
-        _reset_key = session_id
-        if self.agent_state:
-            _prev_task = self.agent_state.get_task_for_session(session_id)
-        if not _prev_task and self.agent_state:
-            _prev_task = self.agent_state.current_task
-            if _prev_task:
-                _reset_key = _prev_task.session_id or _prev_task.task_id
-        if _prev_task:
-            if _prev_task.cancelled or not _prev_task.is_active:
-                logger.info(
-                    f"[Session:{session_id}] Resetting stale task "
-                    f"(cancelled={_prev_task.cancelled}, status={_prev_task.status.value}, "
-                    f"reset_key={_reset_key!r})"
-                )
-                self.agent_state.reset_task(session_id=_reset_key)
-            else:
-                _prev_task.clear_skip()
-                await _prev_task.drain_user_inserts()
-
-        # 清除上一轮残留的 pending_cancels（disconnect watcher 可能在清理后写入）
-        self._pending_cancels.pop(session_id, None) if session_id else None
+        # v1.27.14 (plan: conversation concurrency v1.28, S1.3 + S1.4):
+        # 与 chat_with_session 同源；详见 :meth:`_preempt_or_queue_prev_task`。
+        # FIX 1: 传入 conversation_id，reason_stream / run 用它作 task key。
+        _preempt_decision = await self._preempt_or_queue_prev_task(
+            session_id=session_id,
+            session=session,
+            conversation_id=conversation_id,
+        )
+        logger.debug(
+            "[ChatStream] preempt decision for session=%s conv=%s: %s",
+            session_id,
+            conversation_id,
+            _preempt_decision,
+        )
 
         # 用户主动发新消息 → 无条件清除所有端点冷却期
         llm_client = getattr(self.brain, "_llm_client", None)
@@ -4476,6 +6629,36 @@ class Agent:
 
         im_tokens = None
         _reply_text = ""
+        # C7: 安装 PolicyContext ContextVar（streaming 路径，与 sync 路径
+        # 同源；详见 chat_with_session 同名块注释）
+        _policy_ctx_token = None
+        try:
+            from .policy_v2 import get_current_context as _pv2_get_ctx
+            from .policy_v2 import set_current_context as _pv2_set_ctx
+            from .policy_v2.adapter import build_policy_context as _pv2_build_ctx
+
+            # C13 §15.4 + R5-16: stream 路径与 sync 路径同源，见 chat_with_session
+            # 同名块的注释。
+            _parent_ctx = None
+            if getattr(self, "_is_sub_agent_call", False):
+                _parent_ctx = _pv2_get_ctx()
+            _policy_ctx = _pv2_build_ctx(
+                session=session,
+                session_id=conversation_id or session_id or "",
+                mode=mode,
+                user_message=message,
+                channel=getattr(session, "channel", None) or "desktop",
+                parent_ctx=_parent_ctx,
+                child_agent_name=(
+                    getattr(self, "_agent_profile_id", None) if _parent_ctx else None
+                ),
+            )
+            _policy_ctx_token = _pv2_set_ctx(_policy_ctx)
+        except Exception as _ctx_exc:
+            logger.debug(
+                "[PolicyV2] failed to install ContextVar (stream path): %s",
+                _ctx_exc,
+            )
         try:
             # 立即发送心跳，让前端知道请求已被接收（准备阶段可能包含多个 LLM 调用）
             yield {"type": "heartbeat"}
@@ -4491,22 +6674,31 @@ class Agent:
                 return
 
             # === 共享准备 ===
-            (
-                messages,
-                session_type,
-                task_monitor,
-                conversation_id,
-                im_tokens,
-            ) = await self._prepare_session_context(
-                message=message,
-                session_messages=session_messages,
-                session_id=session_id,
-                session=session,
-                gateway=gateway,
-                conversation_id=conversation_id,
-                attachments=attachments,
-                mode=mode,
-            )
+            try:
+                (
+                    messages,
+                    session_type,
+                    task_monitor,
+                    conversation_id,
+                    im_tokens,
+                ) = await self._prepare_session_context(
+                    message=message,
+                    session_messages=session_messages,
+                    session_id=session_id,
+                    session=session,
+                    gateway=gateway,
+                    conversation_id=conversation_id,
+                    attachments=attachments,
+                    mode=mode,
+                )
+            except UserCancelledError:
+                logger.info(
+                    f"[Session:{session_id}] Cancelled during prepare compression, "
+                    "returning stop acknowledgement"
+                )
+                yield {"type": "text_delta", "content": "✅ 好的，已停止当前任务。"}
+                yield {"type": "done"}
+                return
 
             yield {"type": "heartbeat"}
 
@@ -4533,18 +6725,41 @@ class Agent:
             if not task_description:
                 task_description = self._get_last_user_request(messages).strip()
 
+            _endpoint_override_for_engine = endpoint_override
+            if endpoint_override:
+                self._apply_endpoint_override_for_turn(
+                    endpoint_override=endpoint_override,
+                    endpoint_policy=endpoint_policy,
+                    session=session,
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    reason=f"chat endpoint override: {endpoint_override}",
+                )
+                # Already applied before prompt construction; avoid re-applying
+                # the same override in ReasoningEngine for this Agent path.
+                _endpoint_override_for_engine = None
+            else:
+                self._apply_endpoint_override_for_turn(
+                    endpoint_override=None,
+                    endpoint_policy="prefer",
+                    session=session,
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    reason="chat endpoint auto",
+                )
+
             system_prompt = await self._build_system_prompt_compiled(
                 task_description=task_description,
                 session_type=session_type,
                 session=session,
+                mode=mode,
+                conversation_id=conversation_id,
             )
 
-            # 注入 TaskDefinition（研发会议室 _org_context 已在 system 含工单/节点上下文，
-            # 委派内容保留在 user 消息即可，避免与 [任务背景][任务指令] 重复）
-            if not getattr(self, "_org_context", None):
-                task_def = (getattr(self, "_current_task_definition", "") or "").strip()
-                if task_def:
-                    system_prompt += f"\n\n## Developer: TaskDefinition\n{task_def}\n"
+            # 注入 TaskDefinition
+            task_def = (getattr(self, "_current_task_definition", "") or "").strip()
+            if task_def:
+                system_prompt += f"\n\n## Developer: TaskDefinition\n{task_def}\n"
 
             base_system_prompt = system_prompt
 
@@ -4575,17 +6790,101 @@ class Agent:
 
             _intent = getattr(self, "_current_intent", None)
 
-            # Intent-driven ForceToolCall for streaming path
-            _force_tool_retries = None
-            if _intent:
-                if _intent.intent in (_IT.CHAT, _IT.QUERY):
-                    _force_tool_retries = 0
-                elif _intent.force_tool:
-                    pass
-                else:
-                    _force_tool_retries = max(
-                        0, getattr(settings, "force_tool_call_max_retries", 2) - 1
+            _risk_intent = _classify_risk_intent(_intent, message) if _intent else None
+            _risk_pre_authorized = _consume_risk_authorization(session, message)
+            if _risk_pre_authorized:
+                logger.info(
+                    "[RiskIntentGate] stream path skipped — user pre-authorized "
+                    "(session=%s, conversation=%s, message=%r)",
+                    session_id,
+                    conversation_id,
+                    message[:200],
+                )
+            else:
+                _trusted_skip_reason = _check_trusted_path_skip(session, message, _risk_intent)
+                if _trusted_skip_reason:
+                    _risk_pre_authorized = True
+                    logger.info(
+                        "[RiskIntentGate] stream path skipped — trusted "
+                        "(reason=%s, session=%s, conversation=%s, message=%r)",
+                        _trusted_skip_reason,
+                        session_id,
+                        conversation_id,
+                        message[:200],
                     )
+                else:
+                    _trust_mode_reason = _check_trust_mode_skip(_risk_intent)
+                    if _trust_mode_reason:
+                        _risk_pre_authorized = True
+                        logger.info(
+                            "[RiskIntentGate] stream path skipped — %s "
+                            "(session=%s, conversation=%s, target=%s, op=%s, message=%r)",
+                            _trust_mode_reason,
+                            session_id,
+                            conversation_id,
+                            getattr(_risk_intent.target_kind, "value", _risk_intent.target_kind),
+                            getattr(_risk_intent.operation_kind, "value", _risk_intent.operation_kind),
+                            message[:200],
+                        )
+            if (
+                mode == "agent"
+                and _intent
+                and not getattr(self, "_is_sub_agent_call", False)
+                and _risk_intent
+                and _risk_intent.requires_confirmation
+                and not _risk_pre_authorized
+            ):
+                pending = get_confirmation_store().create(
+                    conversation_id=conversation_id,
+                    original_message=message,
+                    classification=_risk_intent.to_dict(),
+                    request_id=request_id or f"{conversation_id}:stream",
+                )
+                question_text = _build_destructive_intent_question(message, _risk_intent)
+                _reply_text = question_text
+                self.reasoning_engine._last_exit_reason = "ask_user"
+                # Fix-14：streaming 路径风险早退同样需清空上轮 trace，
+                # 避免 done 事件 usage 字段复用上一轮真实调用的 token 用量。
+                try:
+                    self.reasoning_engine._last_react_trace = []
+                except Exception:
+                    pass
+                logger.warning(
+                    "[RiskIntentGate] blocked free-form streaming execution before ReAct "
+                    "(session=%s, conversation=%s, confirmation=%s, risk=%s, message=%r)",
+                    session_id,
+                    conversation_id,
+                    pending.confirmation_id,
+                    _risk_intent.to_dict(),
+                    message[:200],
+                )
+                yield {
+                    "type": "ask_user",
+                    "question": question_text,
+                    "conversation_id": conversation_id,
+                    "confirmation_id": pending.confirmation_id,
+                    "risk_intent": _risk_intent.to_dict(),
+                    "options": [
+                        {"id": "confirm_continue", "label": "继续"},
+                        {"id": "inspect_only", "label": "只查看"},
+                        {"id": "cancel", "label": "取消"},
+                    ],
+                }
+                yield {"type": "done"}
+                await self._finalize_session(
+                    response_text=_reply_text,
+                    session=session,
+                    session_id=session_id,
+                    task_monitor=task_monitor,
+                )
+                return
+
+            # Intent-driven ForceToolCall for streaming path.
+            # Simple queries stay lightweight, but evidence-seeking queries must
+            # produce a real tool trace before the final answer is accepted.
+            _force_tool_retries, _tool_evidence_required = _resolve_force_tool_policy(_intent)
+            if _looks_like_explicit_no_tool_request(message):
+                _force_tool_retries, _tool_evidence_required = 0, False
 
             _agent_profile_id = "default"
             if session and hasattr(session, "context"):
@@ -4594,40 +6893,127 @@ class Agent:
                 )
 
             _fast_usage = None
+            _request_id = request_id or f"{conversation_id}:stream"
+            _turn_id = turn_id or f"{conversation_id}:{int(time.time() * 1000)}"
+            _allow_lightweight_fast_reply = not endpoint_override
 
-            if _intent and _intent.intent == _IT.CHAT and getattr(_intent, "fast_reply", False):
-                # Ultra-fast path: rule-based greeting only, use lightweight model
+            # 决定 fast-path 是否启用思考链：
+            # - thinking_mode == "on"：用户显式开启 → 同步开思维链
+            # - 其它（off/auto/None）：fast-path 仍优先轻量速回，不开思考
+            _fast_enable_think = _thinking_mode == "on"
+
+            async def _run_fast_reply_stream(
+                _system: str,
+                *,
+                log_prefix: str,
+                fallback_text: str | None,
+                result_holder: dict,
+            ):
+                """统一的 fast-reply 流式执行器。
+
+                优先 ``brain.think_lightweight_stream`` 走真流式 token；流式失败或空回
+                时回退到非流式 ``think_lightweight``，确保用户始终能收到回复。
+                由于 async generator 无法 ``return`` 值，最终的 ``text/usage/ok``
+                通过 ``result_holder`` 字典回传给调用方。
+                """
+                _stream_text = ""
+                _stream_failed = False
+                # —— 路径 A：尝试真流式 ——
                 try:
-                    _identity_snippet = ""
-                    if hasattr(self, "identity") and hasattr(self.identity, "get_system_prompt"):
-                        _identity_snippet = (
-                            self.identity.get_system_prompt(include_active_task=False) or ""
-                        )[:500]
-
-                    _fast_system = (
-                        f"{_identity_snippet}\n\n"
-                        "用户发来了一条简短的问候/确认消息。请用你的人设风格简短回复，"
-                        "不要使用任何工具，不要过度展开。保持轻松自然，1-3句话即可。"
-                    ).strip()
-
-                    _fast_response = await self.brain.think_lightweight(
+                    async for _evt in self.brain.think_lightweight_stream(
                         prompt=message,
-                        system=_fast_system,
-                        usage_scene="fast_reply",
+                        system=_system,
+                        enable_thinking=_fast_enable_think,
+                    ):
+                        _et = _evt.get("type")
+                        if _et == "text_delta":
+                            _piece = _evt.get("content", "")
+                            if _piece:
+                                _stream_text += _piece
+                                yield _evt
+                        elif _et in ("thinking_delta", "thinking_end"):
+                            yield _evt
+                        elif _et == "error":
+                            _stream_failed = True
+                            logger.warning(
+                                f"[{log_prefix}] streaming reported error: "
+                                f"{_evt.get('message', '')}"
+                            )
+                        elif _et == "done":
+                            break
+                except Exception as exc:
+                    _stream_failed = True
+                    logger.warning(f"[{log_prefix}] streaming path failed: {exc}")
+
+                _cleaned = clean_llm_response(_stream_text) if _stream_text else ""
+                if _cleaned and not _stream_failed:
+                    result_holder["text"] = _cleaned
+                    result_holder["usage"] = None
+                    result_holder["ok"] = True
+                    return
+
+                # —— 路径 B：流式失败或为空 → 回退到一次性非流式 ——
+                try:
+                    _resp = await self.brain.think_lightweight(
+                        prompt=message,
+                        system=_system,
                     )
-                    _fast_usage = _fast_response.usage
-                    _reply_text = clean_llm_response(
-                        _fast_response.content if _fast_response.content else ""
-                    )
-                    if _reply_text:
-                        yield {"type": "text_delta", "content": _reply_text}
-                    else:
-                        yield {"type": "text_delta", "content": "你好！有什么我可以帮你的吗？"}
-                        _reply_text = "你好！有什么我可以帮你的吗？"
-                except Exception as e:
-                    logger.error(f"[FastReply] Failed: {e}")
-                    yield {"type": "text_delta", "content": "你好！有什么我可以帮你的吗？"}
-                    _reply_text = "你好！有什么我可以帮你的吗？"
+                    _fb_text = clean_llm_response(_resp.content if _resp.content else "")
+                    if _fb_text:
+                        # 流式没吐过有效字符时才补发整段，避免内容重复
+                        if not _stream_text.strip():
+                            yield {"type": "text_delta", "content": _fb_text}
+                        result_holder["text"] = _fb_text
+                        result_holder["usage"] = _resp.usage
+                        result_holder["ok"] = True
+                        return
+                except Exception as exc:
+                    logger.error(f"[{log_prefix}] non-stream fallback also failed: {exc}")
+
+                # —— 路径 C：所有路径失败 ——
+                if fallback_text:
+                    if not _stream_text.strip():
+                        yield {"type": "text_delta", "content": fallback_text}
+                    result_holder["text"] = fallback_text
+                    result_holder["usage"] = None
+                    result_holder["ok"] = True
+                    return
+                # QUERY 路径要求 fall through 到完整 agent
+                result_holder["text"] = _cleaned or ""
+                result_holder["usage"] = None
+                result_holder["ok"] = False
+
+            if (
+                _allow_lightweight_fast_reply
+                and _intent
+                and _intent.intent == _IT.CHAT
+                and getattr(_intent, "fast_reply", False)
+            ):
+                # Ultra-fast path: rule-based greeting only, use lightweight model.
+                # 改造为流式：用户开启「流式」/「思维链」开关时，问候也走打字机效果。
+                _identity_snippet = ""
+                if hasattr(self, "identity") and hasattr(self.identity, "get_system_prompt"):
+                    _identity_snippet = (
+                        self.identity.get_system_prompt(include_active_task=False) or ""
+                    )[:500]
+
+                _fast_system = (
+                    f"{_identity_snippet}\n\n"
+                    "用户发来了一条简短的问候/确认消息。请用你的人设风格简短回复，"
+                    "不要使用任何工具，不要过度展开。保持轻松自然，1-3句话即可。"
+                ).strip()
+
+                _holder: dict = {"text": "", "usage": None, "ok": False}
+                async for _evt in _run_fast_reply_stream(
+                    _fast_system,
+                    log_prefix="FastReply",
+                    fallback_text="你好！有什么我可以帮你的吗？",
+                    result_holder=_holder,
+                ):
+                    yield _evt
+                _reply_text = _holder["text"]
+                _fast_usage = _holder["usage"]
+
                 yield {"type": "done"}
 
                 await self._finalize_session(
@@ -4637,58 +7023,61 @@ class Agent:
                     task_monitor=task_monitor,
                 )
                 if not self._last_usage_summary and isinstance(_fast_usage, dict):
+                    _fi = _fast_usage.get("input_tokens", 0)
+                    _fo = _fast_usage.get("output_tokens", 0)
                     self._last_usage_summary = {
-                        "input_tokens": _fast_usage.get("input_tokens", 0),
-                        "output_tokens": _fast_usage.get("output_tokens", 0),
-                        "total_tokens": _fast_usage.get("input_tokens", 0) + _fast_usage.get("output_tokens", 0),
+                        "input_tokens": _fi,
+                        "output_tokens": _fo,
+                        "total_tokens": _fi + _fo,
+                        "billable_input_tokens": _fi,
+                        "billable_output_tokens": _fo,
+                        "billable_total_tokens": _fi + _fo,
                     }
                 return
 
-            if _intent and _intent.intent == _IT.QUERY and getattr(_intent, "fast_reply", False):
+            if (
+                _allow_lightweight_fast_reply
+                and _intent
+                and _intent.intent == _IT.QUERY
+                and getattr(_intent, "fast_reply", False)
+            ):
                 # Fast-path for simple factual queries (math, date, definitions)
                 # No tools passed → LLM answers directly; empty response falls through
                 # to full agent path below.
-                _query_ok = False
+                _runtime_info = ""
                 try:
-                    _runtime_info = ""
-                    try:
-                        from ..prompt.builder import _build_runtime_section
+                    from ..prompt.builder import _build_runtime_section
 
-                        _runtime_info = _build_runtime_section() or ""
-                    except Exception:
-                        pass
+                    _runtime_info = _build_runtime_section() or ""
+                except Exception:
+                    pass
 
-                    _identity_snippet = ""
-                    if hasattr(self, "identity") and hasattr(self.identity, "get_system_prompt"):
-                        _identity_snippet = (
-                            self.identity.get_system_prompt(include_active_task=False) or ""
-                        )[:500]
+                _identity_snippet = ""
+                if hasattr(self, "identity") and hasattr(self.identity, "get_system_prompt"):
+                    _identity_snippet = (
+                        self.identity.get_system_prompt(include_active_task=False) or ""
+                    )[:500]
 
-                    _fast_system = (
-                        f"{_identity_snippet}\n\n"
-                        f"{_runtime_info}\n\n"
-                        "用户提出了一个简单的知识/计算/日期问题。"
-                        "请直接给出准确、简洁的回答。不要使用任何工具。"
-                        "如果涉及日期/时间，请根据上面的运行环境信息回答。"
-                    ).strip()
+                _fast_system = (
+                    f"{_identity_snippet}\n\n"
+                    f"{_runtime_info}\n\n"
+                    "用户提出了一个简单的知识/计算/日期问题。"
+                    "请直接给出准确、简洁的回答。不要使用任何工具。"
+                    "如果涉及日期/时间，请根据上面的运行环境信息回答。"
+                ).strip()
 
-                    logger.info(f"[FastQuery-Stream] Answering '{message}' without tools")
-                    _fast_response = await self.brain.think_lightweight(
-                        prompt=message,
-                        system=_fast_system,
-                        usage_scene="fast_query",
-                    )
-                    _fast_usage = _fast_response.usage
-                    _reply_text = clean_llm_response(
-                        _fast_response.content if _fast_response.content else ""
-                    )
-                    if _reply_text:
-                        yield {"type": "text_delta", "content": _reply_text}
-                        _query_ok = True
-                    else:
-                        logger.warning("[FastQuery-Stream] Empty response, falling back to full agent")
-                except Exception as e:
-                    logger.warning(f"[FastQuery-Stream] Failed ({e}), falling back to full agent")
+                logger.info(f"[FastQuery-Stream] Answering '{message}' without tools")
+                _holder = {"text": "", "usage": None, "ok": False}
+                async for _evt in _run_fast_reply_stream(
+                    _fast_system,
+                    log_prefix="FastQuery-Stream",
+                    fallback_text=None,  # QUERY 失败要 fall through 到完整 agent
+                    result_holder=_holder,
+                ):
+                    yield _evt
+                _reply_text = _holder["text"]
+                _fast_usage = _holder["usage"]
+                _query_ok = _holder["ok"]
 
                 if _query_ok:
                     yield {"type": "done"}
@@ -4699,10 +7088,15 @@ class Agent:
                         task_monitor=task_monitor,
                     )
                     if not self._last_usage_summary and isinstance(_fast_usage, dict):
+                        _qi = _fast_usage.get("input_tokens", 0)
+                        _qo = _fast_usage.get("output_tokens", 0)
                         self._last_usage_summary = {
-                            "input_tokens": _fast_usage.get("input_tokens", 0),
-                            "output_tokens": _fast_usage.get("output_tokens", 0),
-                            "total_tokens": _fast_usage.get("input_tokens", 0) + _fast_usage.get("output_tokens", 0),
+                            "input_tokens": _qi,
+                            "output_tokens": _qo,
+                            "total_tokens": _qi + _qo,
+                            "billable_input_tokens": _qi,
+                            "billable_output_tokens": _qo,
+                            "billable_total_tokens": _qi + _qo,
                         }
                     return
 
@@ -4731,7 +7125,13 @@ class Agent:
                 if messages and isinstance(messages[-1], dict):
                     messages = list(messages)
                     last = dict(messages[-1])
-                    last["content"] = (last.get("content") or "") + soft_hint
+                    existing = last.get("content")
+                    if isinstance(existing, list):
+                        last["content"] = existing + [
+                            {"type": "text", "text": soft_hint}
+                        ]
+                    else:
+                        last["content"] = (existing or "") + soft_hint
                     messages[-1] = last
 
             async for event in self.reasoning_engine.reason_stream(
@@ -4744,15 +7144,17 @@ class Agent:
                 session_type=session_type,
                 plan_mode=plan_mode,
                 mode=mode,
-                endpoint_override=endpoint_override,
+                endpoint_override=_endpoint_override_for_engine,
                 conversation_id=conversation_id,
                 thinking_mode=_thinking_mode,
                 thinking_depth=_thinking_depth,
                 agent_profile_id=_agent_profile_id,
                 session=session,
                 force_tool_retries=_force_tool_retries,
+                tool_evidence_required=_tool_evidence_required,
                 is_sub_agent=getattr(self, "_is_sub_agent_call", False),
-                usage_scene=usage_scene,
+                request_id=_request_id,
+                turn_id=_turn_id,
             ):
                 # 收集回复文本（用于 session 保存 & memory）
                 if event.get("type") == "text_delta":
@@ -4774,7 +7176,25 @@ class Agent:
             yield {"type": "error", "message": str(e)[:500]}
             yield {"type": "done"}
         finally:
+            await self._finish_agent_run_lifecycle_once(
+                session_id=session_id,
+                conversation_id=locals().get("conversation_id"),
+                response_text=locals().get("_reply_text", ""),
+                success=False,
+                status="aborted",
+            )
             self._cleanup_session_state(im_tokens)
+            # C7: 清 PolicyContext ContextVar（streaming 路径）
+            if _policy_ctx_token is not None:
+                try:
+                    from .policy_v2 import reset_current_context as _pv2_reset_ctx
+
+                    _pv2_reset_ctx(_policy_ctx_token)
+                except Exception:
+                    logger.debug(
+                        "[PolicyV2] failed to reset ContextVar (stream path)",
+                        exc_info=True,
+                    )
 
     def _handle_plan_exit_pending(
         self,
@@ -4871,17 +7291,45 @@ class Agent:
 
         在 _finalize_session 中调用，提前缓存结果。
         cleanup 释放大对象后，chat.py 仍可读取此摘要而不依赖完整 trace。
+
+        Fix-13：字段同时输出新旧两套名字（前端兼容窗口期）：
+
+        ============================  =============================
+        旧字段 (deprecated)            新字段 (Fix-13)
+        ============================  =============================
+        ``input_tokens``              ``billable_input_tokens``
+        ``output_tokens``             ``billable_output_tokens``
+        ``total_tokens``              ``billable_total_tokens``
+        ``context_tokens``            ``history_context_tokens``
+        ``context_limit``             ``history_context_limit``
+        ============================  =============================
+
+        旧字段保留至前端切换完成；OpenAPI schema 在响应注释中标注新名为
+        权威字段，旧名字段已 deprecated。
         """
         if not trace:
             return {}
         total_in = sum(t.get("tokens", {}).get("input", 0) for t in trace)
         total_out = sum(t.get("tokens", {}).get("output", 0) for t in trace)
+        usage_estimated = any(bool(t.get("usage_estimated")) for t in trace)
+        usage_sources = {
+            str(t.get("usage_source"))
+            for t in trace
+            if str(t.get("usage_source") or "").strip()
+        }
         summary = {
             "input_tokens": total_in,
             "output_tokens": total_out,
             "total_tokens": total_in + total_out,
         }
-        # 估算上下文 token 数
+        if usage_estimated:
+            summary["usage_estimated"] = True
+        else:
+            summary["billable_input_tokens"] = total_in
+            summary["billable_output_tokens"] = total_out
+            summary["billable_total_tokens"] = total_in + total_out
+        if usage_sources:
+            summary["usage_source"] = "mixed" if len(usage_sources) > 1 else next(iter(usage_sources))
         try:
             re = self.reasoning_engine
             ctx_mgr = getattr(self, "context_manager", None) or getattr(
@@ -4889,8 +7337,12 @@ class Agent:
             )
             if ctx_mgr and hasattr(ctx_mgr, "get_max_context_tokens"):
                 msgs = getattr(re, "_last_working_messages", None) or []
-                summary["context_tokens"] = ctx_mgr.estimate_messages_tokens(msgs) if msgs else 0
-                summary["context_limit"] = ctx_mgr.get_max_context_tokens()
+                ctx_tokens = ctx_mgr.estimate_messages_tokens(msgs) if msgs else 0
+                ctx_limit = ctx_mgr.get_max_context_tokens()
+                summary["context_tokens"] = ctx_tokens
+                summary["context_limit"] = ctx_limit
+                summary["history_context_tokens"] = ctx_tokens
+                summary["history_context_limit"] = ctx_limit
         except Exception:
             pass
         return summary
@@ -4907,14 +7359,18 @@ class Agent:
         """
         从最新的 react_trace 生成工具执行摘要文本。
 
-        返回格式:
+        返回格式（**内部 marker**，前端不渲染，LLM 不应模仿）:
 
-          [子Agent工作总结]      (仅多Agent委派时存在)
+          <<DELEGATION_TRACE>>      (仅多Agent委派时存在)
           1. [网探] 任务: ... | 状态: ✅完成 | 交付文件: ...
           2. [文助] 任务: ... | 状态: ✅完成 | 交付文件: ...
 
-          [执行摘要]
+          <<TOOL_TRACE>>
           - tool_name({key: val}) → result_hint...
+
+        marker 由 ``<<...>>`` 包裹是有意为之：自然中文里几乎不会出现，
+        可显著降低 LLM 看到历史回放后伪造同样格式作为 "幻觉执行摘要" 的概率。
+        旧 marker `[执行摘要]` / `[子Agent工作总结]` 仍被读取端识别（向后兼容）。
 
         调用方将返回值存入消息的 ``tool_summary`` 元数据字段（不要拼入 content）。
         空字符串表示无工具调用。
@@ -4944,7 +7400,7 @@ class Agent:
                     continue
                 if name in self._DELEGATION_TOOLS:
                     has_delegation = True
-                tc_input = tc.get("input", {})
+                tc_input = tc.get("input", tc.get("arguments", {}))
                 param_hint = ""
                 if isinstance(tc_input, dict):
                     items = list(tc_input.items())[:6]
@@ -4964,6 +7420,9 @@ class Agent:
                     if tr.get("tool_use_id") == tc.get("id", ""):
                         raw = str(tr.get("result_content", tr.get("result_preview", "")))
                         is_error = tr.get("is_error", False)
+                        if self._is_internal_tool_control_message(raw):
+                            result_hint = ""
+                            break
                         max_len = 800 if name in self._DELEGATION_TOOLS else per_tool_budget
                         if len(raw) > max_len:
                             result_hint = raw[:max_len].replace("\n", " ") + "..."
@@ -4996,14 +7455,53 @@ class Agent:
             if ws_section:
                 parts.append(ws_section)
 
-        parts.append("\n\n[执行摘要]\n" + "\n".join(lines))
+        # NOTE: marker literal ``<<TOOL_TRACE>>`` 必须与
+        # ``response_handler.INTERNAL_TRACE_MARKERS`` 中的字面量完全一致。
+        # 新增 / 重命名 marker 时三处必须同步：
+        #   1) 这里的生成端（``build_tool_trace_summary`` / ``_build_work_summary_section``）
+        #   2) ``response_handler.INTERNAL_TRACE_MARKERS`` 常量
+        #   3) ``agent.py`` 系统提示中告知 LLM 不要模仿的 marker 列表
+        parts.append("\n\n<<TOOL_TRACE>>\n" + "\n".join(lines))
 
         return "".join(parts)
 
-    def _build_work_summary_section(self) -> str:
-        """Build [子Agent工作总结] section from sub_agent_records.
+    @staticmethod
+    def _is_internal_tool_control_message(text: str) -> bool:
+        """Runtime control hints are for the current loop only, not history replay."""
+        stripped = text.strip()
+        if stripped.startswith("[系统提示]") or stripped.startswith("[context_note:"):
+            return True
+        if stripped.startswith("[系统缓存:") or stripped.startswith("[系统缓存]"):
+            return True
+        if stripped.startswith("[系统] 工具 ") and (
+            "已达上限" in stripped
+            or "已从本轮可用工具中临时移除" in stripped
+            or "请整合操作或继续下一步" in stripped
+        ):
+            return True
+        return False
 
-        Placed BEFORE [执行摘要] so that high-level task summaries appear
+    @classmethod
+    def _sanitize_replayed_tool_summary(cls, summary: str) -> str:
+        """Remove internal runtime controls from stored summaries before LLM replay."""
+        kept: list[str] = []
+        for line in str(summary or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                kept.append(line)
+                continue
+            result_part = stripped.split(" → ", 1)[1] if " → " in stripped else stripped
+            if cls._is_internal_tool_control_message(result_part):
+                if " → " in line:
+                    kept.append(line.split(" → ", 1)[0])
+                continue
+            kept.append(line)
+        return "\n".join(kept).strip()
+
+    def _build_work_summary_section(self) -> str:
+        """Build <<DELEGATION_TRACE>> section from sub_agent_records.
+
+        Placed BEFORE <<TOOL_TRACE>> so that high-level task summaries appear
         before low-level tool call details, improving readability and
         ContextManager summarization quality.
         """
@@ -5016,7 +7514,7 @@ class Agent:
         summaries = [r.get("work_summary", "") for r in records if r.get("work_summary")]
         if not summaries:
             return ""
-        lines = ["\n\n[子Agent工作总结]"]
+        lines = ["\n\n<<DELEGATION_TRACE>>"]
         for i, ws in enumerate(summaries, 1):
             lines.append(f"{i}. {ws}")
         return "\n".join(lines)
@@ -5145,7 +7643,6 @@ class Agent:
                 prompt=prompt,
                 system="你是一个任务执行分析专家。请简洁地分析任务执行情况，找出耗时原因和改进建议。",
                 max_tokens=512,
-                usage_scene="task_retrospect",
             )
 
             result = strip_thinking_tags(response.content).strip() if response.content else ""
@@ -5466,7 +7963,6 @@ class Agent:
                         system=system_prompt,
                         tools=[],
                         messages=working_messages,
-                        usage_scene="_background_cancel_farewell",
                     ),
                     timeout=5.0,
                 )
@@ -5475,7 +7971,7 @@ class Agent:
                         farewell_text = block.text.strip()
                         break
                 logger.info(f"[StopTask][BgFarewell] LLM farewell 完成: {farewell_text[:100]}")
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 logger.warning("[StopTask][BgFarewell] LLM farewell 超时 (5s)")
             except Exception as e:
                 logger.warning(f"[StopTask][BgFarewell] LLM farewell 失败: {e}")
@@ -5540,7 +8036,6 @@ class Agent:
                     tools=[],
                     max_tokens=self.brain.max_tokens,
                     endpoint_override=endpoint_override,
-                    usage_scene="_chat_lightweight",
                 )
 
                 content = getattr(response, "content", None)
@@ -5591,8 +8086,9 @@ class Agent:
         progress_callback: Any = None,
         session: Any = None,
         endpoint_override: str | None = None,
+        endpoint_policy: str = "prefer",
         intent_result: Any = None,
-        usage_scene: str = "unknown",
+        mode: str = "agent",
     ) -> str:
         """
         使用指定的消息上下文进行对话（委托给 ReasoningEngine）
@@ -5606,7 +8102,7 @@ class Agent:
             task_monitor: 任务监控器
             session_type: 会话类型 ("cli" 或 "im")
             thinking_mode: 思考模式覆盖 ('auto'/'on'/'off'/None)
-            thinking_depth: 思考深度 ('low'/'medium'/'high'/None)
+            thinking_depth: 思考深度 ('low'/'medium'/'high'/'max'/None)
             progress_callback: 进度回调 async fn(str) -> None，IM 实时思维链
             endpoint_override: 端点覆盖
             intent_result: IntentResult from IntentAnalyzer (drives ForceToolCall policy)
@@ -5619,45 +8115,77 @@ class Agent:
         if not task_description:
             task_description = (getattr(self, "_current_task_query", "") or "").strip()
 
+        conversation_id = getattr(self, "_current_conversation_id", None) or getattr(
+            self, "_current_session_id", None
+        )
+        _endpoint_override_for_engine = endpoint_override
+        if endpoint_override:
+            self._apply_endpoint_override_for_turn(
+                endpoint_override=endpoint_override,
+                endpoint_policy=endpoint_policy,
+                session=session or self._current_session,
+                conversation_id=conversation_id,
+                session_id=getattr(self, "_current_session_id", None),
+                reason=f"chat endpoint override: {endpoint_override}",
+            )
+            _endpoint_override_for_engine = None
+        else:
+            self._apply_endpoint_override_for_turn(
+                endpoint_override=None,
+                endpoint_policy="prefer",
+                session=session or self._current_session,
+                conversation_id=conversation_id,
+                session_id=getattr(self, "_current_session_id", None),
+                reason="chat endpoint auto",
+            )
+
         if use_session_prompt:
             system_prompt = await self._build_system_prompt_compiled(
                 task_description=task_description,
                 session_type=session_type,
                 session=session or self._current_session,
+                mode=mode,
+                conversation_id=conversation_id,
             )
         else:
             system_prompt = self._context.system
 
-        # 注入 TaskDefinition（会议室 _org_context 跳过，见 chat_with_session_stream 注释）
-        if not getattr(self, "_org_context", None):
-            task_def = (getattr(self, "_current_task_definition", "") or "").strip()
-            if task_def:
-                system_prompt += f"\n\n## Developer: TaskDefinition\n{task_def}\n"
+        # 注入 TaskDefinition
+        task_def = (getattr(self, "_current_task_definition", "") or "").strip()
+        if task_def:
+            system_prompt += f"\n\n## Developer: TaskDefinition\n{task_def}\n"
 
         base_system_prompt = system_prompt
-        conversation_id = getattr(self, "_current_conversation_id", None) or getattr(
-            self, "_current_session_id", None
-        )
         _agent_profile_id = "default"
         if session and hasattr(session, "context"):
             _agent_profile_id = getattr(session.context, "agent_profile_id", "default") or "default"
 
         # === Intent-driven ForceToolCall policy ===
-        force_tool_retries = None
-        if intent_result:
-            from .intent_analyzer import IntentType as _IT
+        force_tool_retries, tool_evidence_required = _resolve_force_tool_policy(intent_result)
+        if _looks_like_explicit_no_tool_request(task_description):
+            force_tool_retries, tool_evidence_required = 0, False
 
-            if intent_result.intent in (_IT.CHAT, _IT.QUERY):
-                force_tool_retries = 0
-            elif intent_result.force_tool:
-                pass  # None = use default from settings
-            else:
-                force_tool_retries = max(0, getattr(settings, "force_tool_call_max_retries", 2) - 1)
+        # === PR-M1: Intent-driven 工具裁剪。 ===
+        # chat 意图下只挂 5 个核心工具（详见 reasoning_engine._filter_tools_by_intent）。
+        # 这一步在传入 reasoning engine 之前做，避免 system prompt 注入大段无用工具
+        # schema，token 浪费 + LLM 分心同时治本。
+        _engine_tools = self._effective_tools
+        try:
+            from .reasoning_engine import _filter_tools_by_intent
+
+            _engine_tools = _filter_tools_by_intent(
+                _engine_tools,
+                intent_name=getattr(getattr(intent_result, "intent", None), "value", None),
+                intent_tool_hints=list(getattr(intent_result, "tool_hints", []) or []),
+                requires_tools=bool(getattr(intent_result, "requires_tools", False)),
+            )
+        except Exception as _exc:
+            logger.debug(f"[ToolFilter/Intent] skipped: {_exc}")
 
         # === 委托给 ReasoningEngine ===
         return await self.reasoning_engine.run(
             messages,
-            tools=self._effective_tools,
+            tools=_engine_tools,
             system_prompt=system_prompt,
             base_system_prompt=base_system_prompt,
             task_description=task_description,
@@ -5668,10 +8196,11 @@ class Agent:
             thinking_depth=thinking_depth,
             progress_callback=progress_callback,
             agent_profile_id=_agent_profile_id,
-            endpoint_override=endpoint_override,
+            endpoint_override=_endpoint_override_for_engine,
             force_tool_retries=force_tool_retries,
+            tool_evidence_required=tool_evidence_required,
             is_sub_agent=getattr(self, "_is_sub_agent_call", False),
-            usage_scene=usage_scene,
+            mode=mode,
         )
 
     # ==================== 取消状态代理属性 ====================
@@ -5777,6 +8306,515 @@ class Agent:
         实时取消由 cancel_event 机制在 reason_stream/run 内部处理。
         """
         return bool(session_id and session_id in self._pending_cancels)
+
+    def _append_preempt_marker(
+        self,
+        *,
+        session: Any,
+        policy: str,
+        prev_task_id: str,
+        reason: str,
+        partial_text: str = "",
+        partial_thinking: str = "",
+        partial_truncated: bool = False,
+    ) -> None:
+        """Append a "task was interrupted" marker to session history.
+
+        v1.27.14 (plan: v1.28, S1.8). Bypasses :meth:`Session.add_message`
+        de-dup so multiple rapid preempts each leave a visible record.
+        Frontend can render these specially via ``marker_type``.
+
+        v1.27.15 (S2 P0-3) — extended to also persist the partial
+        assistant text the user already saw before the cancel.  When
+        ``partial_text`` is non-empty we write a SECOND marker right
+        after the bare "[interrupted]" placeholder, with
+        ``marker_type="aborted_partial"`` and the actual partial
+        content.  This avoids the previous behaviour where mid-answer
+        cancel made the timeline look like the model never said
+        anything at all.
+
+        Silently no-ops if ``session`` does not expose ``append_marker``
+        (CLI / unit-test stubs); the lifecycle reset has already been
+        recorded via logger + telemetry counters.
+        """
+        if session is None:
+            return
+        appender = getattr(session, "append_marker", None)
+        if appender is None:
+            return
+        try:
+            # 1) Preempt placeholder — always written so the timeline
+            # has a "this turn was cut short" anchor that the front-end
+            # can render specially (e.g. amber separator).
+            appender(
+                "assistant",
+                "[上一条任务被新请求中断]",
+                marker_type="preempted",
+                policy=policy,
+                preempted_task_id=prev_task_id,
+                reason=reason,
+                has_partial=bool(partial_text or partial_thinking),
+                partial_truncated=partial_truncated,
+            )
+            # 2) Partial assistant content — only when there *is* partial
+            # to show.  We persist text + thinking as separate markers
+            # so the front-end can collapse thinking the same way it
+            # does for finished turns.  Without this, the user used to
+            # see "task was interrupted" placeholder with zero context
+            # for what they had already started reading.
+            if partial_text:
+                appender(
+                    "assistant",
+                    partial_text,
+                    marker_type="aborted_partial",
+                    partial_channel="text",
+                    policy=policy,
+                    preempted_task_id=prev_task_id,
+                    reason=reason,
+                    truncated=partial_truncated,
+                )
+            if partial_thinking:
+                appender(
+                    "assistant",
+                    partial_thinking,
+                    marker_type="aborted_partial",
+                    partial_channel="thinking",
+                    policy=policy,
+                    preempted_task_id=prev_task_id,
+                    reason=reason,
+                    truncated=partial_truncated,
+                )
+        except Exception:
+            logger.debug(
+                "[Preempt] append_marker failed (prev_task=%s, policy=%s)",
+                prev_task_id[:8] if prev_task_id else "?",
+                policy,
+                exc_info=True,
+            )
+
+    async def _preempt_or_queue_prev_task(
+        self,
+        *,
+        session_id: str,
+        session: Any = None,
+        conversation_id: str | None = None,
+    ) -> str:
+        """Resolve prev_task lifecycle before starting a new run on the same session.
+
+        v1.27.14 (plan: conversation concurrency v1.28, S1.3 + S1.4).
+
+        Replaces the legacy ad-hoc "clear_skip + drain_user_inserts" block
+        that silently shared a single ``TaskState`` between two concurrent
+        requests on the same conversation — the root cause behind
+        ``completed -> reasoning`` crashes (issue #572) and "thinking
+        bleeding across turns" complaints.
+
+        Key resolution (FIX 1 vs v1.27.14 first cut):
+        ``reasoning_engine.reason_stream`` / ``run`` register the
+        :class:`TaskState` under ``conversation_id`` (after
+        ``Agent._resolve_conversation_id``).  ``session_id`` is the raw
+        chat/channel identifier, which may differ — especially for IM /
+        org-mode where the resolver maps a ``chat_id`` to a synthetic
+        conversation key.  Looking up by ``session_id`` alone misses the
+        live task in that case, leaving the new request to silently share
+        state with the old one.  We now query ``conversation_id`` first,
+        falling back to ``session_id`` for direct-CLI / sub-agent paths
+        where the caller did not supply a ``conversation_id``.
+
+        Resolution policy comes from
+        :func:`synapse.api.routes.double_texting.resolve_policy`
+        (channel-aware, with INTERRUPT down-graded to QUEUE while
+        ``settings.double_texting_allow_interrupt`` is off; pre-S4 default).
+
+        Returns one of:
+
+        * ``"proceed"`` — old task already settled / was inactive; the
+          caller should fall through to the normal ``begin_task()`` flow.
+        * ``"queued_then_proceed"`` — old task settled within the timeout
+          (or was abandoned on timeout); the caller may proceed.
+        * ``"preempted"`` — old task was actively cancelled and waited on
+          (or marked abandoned on timeout); the caller may proceed.
+
+        REJECT is **not** handled here: the HTTP/IM entry layer already
+        rejects via :class:`ConversationLifecycleManager` busy-lock 409s
+        before reaching Agent; if a REJECT-policy request still makes it
+        here it is treated as "proceed" (lifecycle already permitted the
+        run, presumably because the previous lock was finished).
+        """
+        # Lazy import to avoid circular: agent.py -> api.routes.* would
+        # otherwise pull the FastAPI router stack into Agent import time.
+        from ..api.routes.double_texting import DoubleTextingPolicy, resolve_policy
+        from ..config import settings
+        from .conversation_metrics import (
+            inc_abandon,
+            inc_preempt,
+            inc_queue,
+            inc_settled_timeout,
+        )
+
+        if not self.agent_state:
+            return "proceed"
+
+        # FIX 1: reason_stream / run register TaskState under conversation_id;
+        # query that first.  Fall back to session_id (legacy CLI / sub-agent
+        # paths) and then to current_task (best-effort cross-key search).
+        _prev_task = None
+        _reset_key: str = ""
+        if conversation_id:
+            _prev_task = self.agent_state.get_task_for_session(conversation_id)
+            if _prev_task:
+                _reset_key = conversation_id
+        if not _prev_task and session_id and session_id != conversation_id:
+            _prev_task = self.agent_state.get_task_for_session(session_id)
+            if _prev_task:
+                _reset_key = session_id
+        if not _prev_task:
+            _prev_task = self.agent_state.current_task
+            if _prev_task:
+                _reset_key = _prev_task.session_id or _prev_task.task_id
+        if not _prev_task:
+            return "proceed"
+
+        # 旧 task 已死（cancelled 或非活动状态）→ 清理 + proceed，与老逻辑一致
+        if _prev_task.cancelled or not _prev_task.is_active:
+            logger.info(
+                "[Session:%s] Resetting stale task (cancelled=%s, status=%s, "
+                "reset_key=%r)",
+                session_id,
+                _prev_task.cancelled,
+                _prev_task.status.value,
+                _reset_key,
+            )
+            self.agent_state.reset_task(session_id=_reset_key)
+            # Discard any pending_cancel that targeted the now-gone task to
+            # avoid mis-firing on the next task created here.
+            if session_id:
+                self._pending_cancels.pop(session_id, None)
+            return "proceed"
+
+        # 旧 task 仍在跑：按 policy 处理
+        channel = getattr(session, "channel", None) if session is not None else None
+        policy = resolve_policy(channel=channel)
+        timeout_s = max(0.5, settings.preempt_settle_timeout_ms / 1000.0)
+
+        if policy is DoubleTextingPolicy.REJECT:
+            # HTTP/IM 入口应已 409；走到这里意味着 lifecycle 允许进入但
+            # agent_state 里却还有活 task。安全处理：reset_task 让新流自己
+            # begin_task。打 warning 让运维注意。
+            logger.warning(
+                "[Session:%s] REJECT policy reached agent layer with active "
+                "task %s; HTTP layer should have blocked. Resetting to "
+                "recover.",
+                session_id,
+                _prev_task.task_id[:8],
+            )
+            _prev_task.abandoned = True
+            self.agent_state.reset_task(session_id=_reset_key)
+            if session_id:
+                self._pending_cancels.pop(session_id, None)
+            return "proceed"
+
+        # v1.28 S4: INTERRUPT 降级判定。
+        #
+        # 走到 INTERRUPT 意味着用户/客户端期望"立即抢占"，老 task 应被
+        # cancel。但若老 task 此刻正在执行 "block" 类工具（write_file /
+        # run_shell / browser_click / mcp_call …），中途 cancel 会留下
+        # 半成品副作用：半写文件、subprocess 持锁、远端 RPC 半执行。
+        # 此时降级为 QUEUE——让老 task 把当前工具跑完，再开始新的请求。
+        # 未知工具默认 block，触发同样降级。
+        #
+        # 不影响 REJECT（HTTP 层已 409 不进 agent）/ STEER（HTTP 层
+        # short-circuit）/ QUEUE（本来就要等）。
+        if policy is DoubleTextingPolicy.INTERRUPT:
+            in_flight = _prev_task.get_in_flight_tools()
+            if in_flight:
+                from .tool_interrupt_behavior import (
+                    has_any_block_in_flight,
+                    is_unknown_tool,
+                    parse_mcp_sub_tool,
+                    resolve_in_flight_behavior,
+                )
+
+                # v1.28.2 FOLLOW-UP-S4-B: pass mcp_client so encoded
+                # ``mcp:server:sub_tool`` entries can resolve via MCP
+                # annotations rather than treating every MCP call as block.
+                mcp_client = getattr(self, "mcp_client", None)
+                if has_any_block_in_flight(in_flight, mcp_client=mcp_client):
+                    # Use the mcp-aware resolver for partition + reason
+                    # too — keeps logging accurate.
+                    block_tools: list[str] = []
+                    for n in in_flight:
+                        if (
+                            resolve_in_flight_behavior(n, mcp_client=mcp_client)
+                            == "block"
+                        ):
+                            block_tools.append(n)
+                    # Distinguish "我们标了 block 的工具" vs "未知工具默认
+                    # block"——后者表明 _INTERRUPT_BEHAVIOR_MAP 漏标了，
+                    # 运维需要在监控里看到这个比例。
+                    # MCP sub-tool encoding counts as "unknown" only when
+                    # the annotations themselves are missing — the
+                    # encoded prefix is intentional, not a registry drift.
+                    def _is_drift(n: str) -> bool:
+                        if parse_mcp_sub_tool(n) is not None:
+                            return False
+                        return is_unknown_tool(n)
+
+                    only_unknown = all(_is_drift(n) for n in block_tools)
+                    downgrade_reason = (
+                        "unknown_tool" if only_unknown else "block_in_flight"
+                    )
+                    logger.info(
+                        "[Session:%s] Downgrading INTERRUPT -> QUEUE on task "
+                        "%s: %d block-class tool(s) in flight "
+                        "(reason=%s, sample=%s)",
+                        session_id,
+                        _prev_task.task_id[:8],
+                        len(block_tools),
+                        downgrade_reason,
+                        ",".join(block_tools[:5])
+                        + ("…" if len(block_tools) > 5 else ""),
+                    )
+                    try:
+                        from .conversation_metrics import inc_interrupt_downgrade
+
+                        inc_interrupt_downgrade(
+                            channel=channel, reason=downgrade_reason
+                        )
+                    except Exception:
+                        pass
+                    # Fall through to QUEUE branch below by mutating policy.
+                    policy = DoubleTextingPolicy.QUEUE
+
+        if policy is DoubleTextingPolicy.QUEUE:
+            inc_queue(channel=channel)
+            # v1.28.2 FOLLOW-UP-S4-A: 第一次 timeout 后如果仍有 block 工具
+            # 在跑，再延长一次等待（不直接 cancel）。覆盖大多数 long-write
+            # 场景，避免 write_file/run_shell 超过 preempt_settle_timeout_ms
+            # 仍被中断造成数据损坏。设 extension_ms=0 即关闭该机制。
+            extension_ms = getattr(
+                settings, "preempt_block_tool_extension_ms", 0
+            )
+            extension_s = max(0.0, extension_ms / 1000.0)
+            timed_out = False
+            extended_once = False
+            try:
+                # NOTE: do NOT wrap this in ``asyncio.shield`` — when the
+                # outer coroutine is cancelled while the shield is in
+                # effect, the *inner* wait_for() keeps running with no
+                # awaiter, producing zombie "Task was destroyed but it
+                # is pending" warnings and a leaked asyncio task that
+                # only completes once the prev task naturally settles.
+                # We don't need shield here: ``inc_abandon`` below is
+                # sync, and CancelledError is only injected at await
+                # points — so the except-handler can always run to
+                # completion before re-raising.
+                await asyncio.wait_for(
+                    _prev_task.wait_until_settled(), timeout=timeout_s
+                )
+                logger.info(
+                    "[Session:%s] QUEUE: old task %s settled; proceeding",
+                    session_id,
+                    _prev_task.task_id[:8],
+                )
+            except asyncio.CancelledError:
+                # Outer cancel.  Don't write a marker (the new turn is
+                # being abandoned, not the old one), but DO record the
+                # event in telemetry so we can see queue-cancel rates.
+                try:
+                    inc_abandon(policy=policy.value, channel=channel)
+                except Exception:
+                    pass
+                raise
+            except TimeoutError:
+                # First timeout — check if a block-class tool is still in
+                # flight.  If yes (and extension is configured), give the
+                # old task one more grace window before forcibly cancelling.
+                in_flight_after_timeout = _prev_task.get_in_flight_tools()
+                if (
+                    extension_s > 0
+                    and in_flight_after_timeout
+                ):
+                    from .tool_interrupt_behavior import (
+                        has_any_block_in_flight,
+                        is_unknown_tool,
+                        parse_mcp_sub_tool,
+                    )
+
+                    mcp_client_for_ext = getattr(self, "mcp_client", None)
+                    if has_any_block_in_flight(
+                        in_flight_after_timeout,
+                        mcp_client=mcp_client_for_ext,
+                    ):
+                        only_unknown = all(
+                            parse_mcp_sub_tool(n) is None
+                            and is_unknown_tool(n)
+                            for n in in_flight_after_timeout
+                        )
+                        ext_reason = (
+                            "unknown_tool" if only_unknown else "block_in_flight"
+                        )
+                        logger.info(
+                            "[Session:%s] QUEUE wait timed out after %dms but "
+                            "block tool(s) still in flight (sample=%s, "
+                            "reason=%s); extending +%dms before cancel",
+                            session_id,
+                            settings.preempt_settle_timeout_ms,
+                            ",".join(in_flight_after_timeout[:3])
+                            + (
+                                "…"
+                                if len(in_flight_after_timeout) > 3
+                                else ""
+                            ),
+                            ext_reason,
+                            extension_ms,
+                        )
+                        try:
+                            from .conversation_metrics import inc_queue_extended
+
+                            inc_queue_extended(
+                                channel=channel, reason=ext_reason
+                            )
+                        except Exception:
+                            pass
+                        extended_once = True
+                        try:
+                            await asyncio.wait_for(
+                                _prev_task.wait_until_settled(),
+                                timeout=extension_s,
+                            )
+                            logger.info(
+                                "[Session:%s] QUEUE: old task %s settled "
+                                "during extension window; proceeding",
+                                session_id,
+                                _prev_task.task_id[:8],
+                            )
+                        except asyncio.CancelledError:
+                            try:
+                                inc_abandon(policy=policy.value, channel=channel)
+                            except Exception:
+                                pass
+                            raise
+                        except TimeoutError:
+                            timed_out = True
+                if not extended_once:
+                    timed_out = True
+
+            if timed_out:
+                total_waited_ms = (
+                    settings.preempt_settle_timeout_ms
+                    + (extension_ms if extended_once else 0)
+                )
+                logger.warning(
+                    "[Session:%s] QUEUE wait timed out after %dms "
+                    "(extended=%s); cancelling+abandoning old task %s "
+                    "and proceeding",
+                    session_id,
+                    total_waited_ms,
+                    extended_once,
+                    _prev_task.task_id[:8],
+                )
+                inc_settled_timeout(policy=policy.value, channel=channel)
+                inc_abandon(policy=policy.value, channel=channel)
+                # FIX 4: 不光标 abandoned (reason_stream 头部检查)，还要
+                # 调 cancel() 让 cancel_event 触发——长 running tool 的
+                # handler 监听的是 cancel_event，不是 abandoned 标志。
+                # 不调 cancel 的话 QUEUE 超时后老工具（shell / browser）
+                # 会继续跑直到自己返回，跟新 task 的工具产生 cwd / fs
+                # 副作用 race。
+                _prev_task.cancel(
+                    f"QUEUE timeout after {total_waited_ms}ms"
+                )
+                _prev_task.abandoned = True
+                # S1.8 + P0-3: when abandoning, also surface whatever
+                # partial answer the user already saw — otherwise the
+                # timeline looks like the model never said anything,
+                # even if 800 chars had already streamed.
+                self._append_preempt_marker(
+                    session=session,
+                    policy=policy.value,
+                    prev_task_id=_prev_task.task_id,
+                    reason="queue_timeout_abandoned",
+                    partial_text=_prev_task.partial_text,
+                    partial_thinking=_prev_task.partial_thinking,
+                    partial_truncated=_prev_task.partial_truncated,
+                )
+            self.agent_state.reset_task(session_id=_reset_key)
+            if session_id:
+                self._pending_cancels.pop(session_id, None)
+            return "queued_then_proceed"
+
+        # INTERRUPT / STEER：cancel 旧 task，等 settled，超时则 abandon
+        inc_preempt(policy=policy.value, channel=channel)
+        logger.info(
+            "[Session:%s] Preempting active task %s (status=%s, policy=%s)",
+            session_id,
+            _prev_task.task_id[:8],
+            _prev_task.status.value,
+            policy.value,
+        )
+        _prev_task.cancel(f"被新请求抢占 (policy={policy.value})")
+        # S1.8 + P0-3: surface both the bare interrupt marker AND the
+        # partial assistant text/thinking that already streamed.  The
+        # user's UI now reads as "<half-finished answer>\n[interrupted]"
+        # instead of just "[interrupted]" with no context.
+        #
+        # P2-9: even if an upstream cancel arrives between cancel() and
+        # marker, we want the marker recorded so the user doesn't lose
+        # their partial answer.  ``_append_preempt_marker`` is sync, so
+        # wrapping the *next* await in shield ensures we got here.
+        self._append_preempt_marker(
+            session=session,
+            policy=policy.value,
+            prev_task_id=_prev_task.task_id,
+            reason="preempted_by_new_message",
+            partial_text=_prev_task.partial_text,
+            partial_thinking=_prev_task.partial_thinking,
+            partial_truncated=_prev_task.partial_truncated,
+        )
+        # S1.3: preempt 已显式 cancel 老 task，pending_cancel 失效，避免新
+        # task 被几秒前的过期 cancel 误杀。
+        if session_id:
+            popped = self._pending_cancels.pop(session_id, None)
+            if popped:
+                logger.debug(
+                    "[Preempt] Discarded pending_cancel for session=%s "
+                    "(preempt supersedes; reason=%r)",
+                    session_id,
+                    popped,
+                )
+        try:
+            # NOTE: do NOT wrap this in ``asyncio.shield`` — the inner
+            # wait_for would become a zombie task with no awaiter when
+            # the outer is cancelled.  The except-handler below is sync
+            # except for the final ``raise``, so cleanup still runs to
+            # completion before propagation.
+            await asyncio.wait_for(
+                _prev_task.wait_until_settled(), timeout=timeout_s
+            )
+        except asyncio.CancelledError:
+            # Outer cancel mid-wait — still flip abandoned so the old
+            # coroutine knows to bail out at its next iteration check.
+            _prev_task.abandoned = True
+            try:
+                inc_abandon(policy=policy.value, channel=channel)
+            except Exception:
+                pass
+            raise
+        except TimeoutError:
+            logger.warning(
+                "[Session:%s] Old task %s did not settle within %dms; "
+                "marking abandoned. Old coroutine will exit on its next "
+                "iteration check.",
+                session_id,
+                _prev_task.task_id[:8],
+                settings.preempt_settle_timeout_ms,
+            )
+            inc_settled_timeout(policy=policy.value, channel=channel)
+            inc_abandon(policy=policy.value, channel=channel)
+            _prev_task.abandoned = True
+        self.agent_state.reset_task(session_id=_reset_key)
+        return "preempted"
 
     def _consume_pending_cancel(self, session_id: str | None = None) -> str | None:
         """消费并返回挂起的取消原因，如果没有则返回 None。"""
@@ -5981,7 +9019,6 @@ class Agent:
                     system=_build_effective_system_prompt_cli(),
                     tools=self._effective_tools,
                     messages=messages,
-                    usage_scene="deprecated_cli_chat_with_tools",
                 )
             except UserCancelledError:
                 logger.info("[StopTask] LLM call interrupted by user cancel in _chat_with_tools")
@@ -6075,6 +9112,36 @@ class Agent:
 
             messages.append({"role": "user", "content": tool_results})
 
+            # C12 §14.5: same unattended-deferral bubble-up as in execute_task.
+            # Even on the simpler chat-with-tools loop the unattended decision
+            # path may have triggered (e.g. spawn_agent path, headless API call).
+            _deferred = [
+                tr
+                for tr in tool_results
+                if isinstance(tr, dict) and tr.get("_deferred_approval_id")
+            ]
+            if _deferred:
+                from .policy_v2.exceptions import DeferredApprovalRequired
+
+                _ids = [tr["_deferred_approval_id"] for tr in _deferred]
+                logger.info(
+                    "[chat_loop] %d tool(s) deferred for owner approval; "
+                    "halting loop. pending_ids=%s",
+                    len(_deferred),
+                    _ids,
+                )
+                raise DeferredApprovalRequired(
+                    message=(
+                        f"{len(_deferred)} tool call(s) require owner approval; "
+                        f"task suspended. pending_approvals={_ids}"
+                    ),
+                    pending_id=_ids[0],
+                    unattended_strategy=_deferred[0].get(
+                        "_deferred_approval_strategy", ""
+                    ),
+                    meta={"all_pending_ids": _ids},
+                )
+
             # === 统一处理 skip 反思 + 用户插入消息 ===
             if self.agent_state and self.agent_state.current_task:
                 await self.agent_state.current_task.process_post_tool_signals(messages)
@@ -6088,14 +9155,13 @@ class Agent:
         _, _final = parse_intent_tag(_final)
         return _final or "操作完成"
 
-    async def execute_task_from_message(self, message: str, usage_scene: str) -> TaskResult:
+    async def execute_task_from_message(self, message: str) -> TaskResult:
         """从消息创建并执行任务"""
         task = Task(
             id=str(uuid.uuid4())[:8],
             description=message,
             session_id=getattr(self, "_current_session_id", None),  # 关联当前会话
             priority=1,
-            usage_scene=usage_scene
         )
         return await self.execute_task(task)
 
@@ -6113,39 +9179,6 @@ class Agent:
             stacklevel=2,
         )
         logger.info(f"Executing tool: {tool_name} with {tool_input}")
-
-        # ============================================
-        # Todo 强制检查（仅 Agent 模式；plan/ask 模式跳过）
-        # ============================================
-        _effective_mode = getattr(self.tool_executor, "_current_mode", "agent")
-        if _effective_mode not in ("plan", "ask"):
-            _todo_exempt = (
-                "create_todo",
-                "create_plan_file",
-                "exit_plan_mode",
-                "get_todo_status",
-                "ask_user",
-            )
-            if tool_name not in _todo_exempt:
-                from ..tools.handlers.plan import has_active_todo, is_todo_required
-
-                session_id = getattr(self, "_current_session_id", None)
-                if session_id and is_todo_required(session_id) and not has_active_todo(session_id):
-                    return (
-                        "⚠️ **这是一个多步骤任务，建议先创建 Todo！**\n\n"
-                        "请先调用 `create_todo` 工具创建任务计划，然后再执行具体操作。\n\n"
-                        "示例：\n"
-                        "```\n"
-                        "create_todo(\n"
-                        "  task_summary='写脚本获取时间并显示',\n"
-                        "  steps=[\n"
-                        "    {id: 'step1', description: '创建Python脚本', tool: 'write_file'},\n"
-                        "    {id: 'step2', description: '执行脚本', tool: 'run_shell'},\n"
-                        "    {id: 'step3', description: '读取结果', tool: 'read_file'}\n"
-                        "  ]\n"
-                        ")\n"
-                        "```"
-                    )
 
         # 导入日志缓存
         from ..logging import get_session_log_buffer
@@ -6214,6 +9247,30 @@ class Agent:
 
         Returns:
             TaskResult
+
+        Note (C7→C14 PolicyContext wiring)
+        ----------------------------------
+        ``execute_task`` 本身**不**安装 PolicyContext ContextVar — 调用方负责。
+        当前 SoT 注入点（按入口分类）：
+
+        - ``synapse run`` (main.py)：C14 起通过
+          ``classify_entry("cli", force_unattended=True)`` 拿到分类结果后
+          ``build_policy_context(is_unattended=True, unattended_strategy=…)`` +
+          ``set_current_context``；``run`` 命令的 finally 配对 reset。
+        - ``scheduler.executor._execute_task``：C12 起显式
+          ``PolicyContext(is_unattended=True, unattended_strategy=…)`` +
+          ``set_current_context`` / ``reset_current_context``（try/finally 对称）。
+        - ``mcp_server._execute_tool`` (synapse_chat)：C14 起同上，
+          ``classify_entry("mcp", force_unattended=True)``。
+        - ``evolution.self_check._attempt_fix``：尚未走 classifier（已知 follow-up
+          gap）；行为上由于 self-fix 多数走非 CONFIRM 路径所以暂无可见症状。
+
+        若调用方未安装 ctx，下游 ``check_permission`` 走
+        ``policy_v2.adapter._build_fallback_context``：workspace=cwd /
+        role=AGENT / confirmation_mode=get_config_v2().mode /
+        ``is_unattended=False`` — 前三项与交互会话一致，但 ``is_unattended=False``
+        会让任何 CONFIRM 类工具按 "等用户回应" 挂起。因此 headless 入口
+        必须由调用方按需覆盖（见上面 4 个 SoT 入口）。
         """
         import time
 
@@ -6239,13 +9296,9 @@ class Agent:
 
         # 使用已构建的系统提示词 (包含技能清单)
         # 技能清单已在初始化时注入到 _context.system 中
-        # 研发会议室通过 _org_context 短路：system 已是 build_room_skill_prompt 产物，不再追加通用 Task Execution Strategy
-        if getattr(self, "_org_context", None):
-            system_prompt = self._context.system
-        else:
-            system_prompt = (
-                self._context.system
-                + """
+        system_prompt = (
+            self._context.system
+            + """
 
 ## Task Execution Strategy
 
@@ -6257,7 +9310,7 @@ class Agent:
 4. **If no skill matches**: Use `skill-creator` skill to create one, then `load_skill` to load it
 
 永不放弃，直到任务完成！"""
-            )
+        )
 
         # === Plan 持久化：保存不含 Plan 的基础提示词，循环内动态追加 ===
         _base_system_prompt_task = system_prompt
@@ -6275,52 +9328,14 @@ class Agent:
 
         # === 关键：保存原始任务描述，用于模型切换时重置上下文 ===
         original_task_message = {"role": "user", "content": task.description}
-
-        # 节点内复用对话历史（仅限研发会议室 _org_context=True 场景）：
-        # 同一节点的多次 LLM 调用（host_retry / 重派 / 续跑）累积 messages，节点切换由
-        # 调用方在 _step_node_init 显式 clear。其它路径保持原行为，避免影响普通 Agent。
-        _reuse_meeting_history = bool(getattr(self, "_org_context", False))
-        if _reuse_meeting_history:
-            prior = list(getattr(self._context, "messages", []) or [])
-            messages = prior + [original_task_message.copy()]
-        else:
-            messages = [original_task_message.copy()]
-
-        # === TaskState 注册：会议室路径原本不走 reasoning_engine.run，缺少 begin_task；
-        # 这里补一次，让 _run_one 内的 record_skill_execution / tools_executed 写入生效。===
-        if self.agent_state is not None:
-            try:
-                self.agent_state.begin_task(
-                    session_id=task.session_id or "",
-                    task_id=task.id,
-                )
-            except Exception as _bt_exc:  # pragma: no cover
-                logger.debug("agent_state.begin_task in execute_task failed: %s", _bt_exc)
+        messages = [original_task_message.copy()]
 
         max_tool_iterations = settings.max_iterations  # Ralph Wiggum 模式：永不放弃
         iteration = 0
         final_response = ""
+        has_executed_tools = False
         current_model = self.brain.model
         conversation_id = task.session_id or f"task:{task.id}"
-
-        # preferred_endpoint 通过 brain.switch_model() 持久化到 LLMClient._endpoint_override，
-        # 后续所有 chat 调用自动走指定端点，无需在每次调用时传参。
-        if self._preferred_endpoint:
-            ok, msg = self.brain.switch_model(
-                endpoint_name=self._preferred_endpoint,
-                hours=0.05,
-                reason=f"task preferred_endpoint: {self._preferred_endpoint}",
-                conversation_id=conversation_id,
-            )
-            if ok:
-                logger.info(
-                    f"[EndpointOverride] Task {task.id}: switched to {self._preferred_endpoint}"
-                )
-            else:
-                logger.warning(
-                    f"[EndpointOverride] Task {task.id}: failed to switch to "
-                    f"{self._preferred_endpoint}: {msg}, using default"
-                )
 
         def _resolve_endpoint_name(model_or_endpoint: str) -> str | None:
             """将 'endpoint_name' 或 'model' 解析为 endpoint_name（任务循环专用，最小兼容）。"""
@@ -6358,18 +9373,27 @@ class Agent:
             else asyncio.Event()
         )
 
+        def _fail_task(error: str) -> TaskResult:
+            """Finish task execution with a stable TaskResult failure contract."""
+            duration = time.time() - start_time
+            task.mark_failed(error)
+            task_monitor.complete(success=False, response="", error=error)
+            return TaskResult(
+                success=False,
+                error=error,
+                iterations=iteration,
+                duration_seconds=duration,
+            )
+
         try:
             while iteration < max_tool_iterations:
                 # C8: 每轮迭代开始时检查任务是否被取消
                 if self._task_cancelled:
                     logger.info(f"[StopTask] Task cancelled in execute_task: {self._cancel_reason}")
-                    return "✅ 任务已停止。"
+                    return _fail_task("✅ 任务已停止。")
 
                 iteration += 1
                 logger.info(f"Task iteration {iteration}")
-
-                if self.agent_state and self.agent_state.current_task:
-                    self.agent_state.current_task.iteration = iteration
 
                 # 任务监控：开始迭代
                 task_monitor.begin_iteration(iteration, current_model)
@@ -6384,7 +9408,7 @@ class Agent:
                             f"[Task:{task.id}] Exceeded max model switches "
                             f"({MAX_TASK_MODEL_SWITCHES}), aborting task"
                         )
-                        return (
+                        return _fail_task(
                             "❌ 任务执行失败，已尝试多个模型仍无法恢复。\n"
                             "💡 你可以直接重新发送来重试。"
                         )
@@ -6394,7 +9418,7 @@ class Agent:
                         logger.warning(
                             "[ModelSwitch] No fallback model available for sub-agent timeout"
                         )
-                        return "任务失败：所有模型端点均不可用，请检查网络连接。"
+                        return _fail_task("任务失败：所有模型端点均不可用，请检查网络连接。")
                     task_monitor.switch_model(
                         new_model,
                         f"任务执行超过 {task_monitor.timeout_seconds} 秒，重试 {task_monitor.retry_count} 次后切换",
@@ -6414,7 +9438,7 @@ class Agent:
                                 f"[ModelSwitch] switch_model failed: {msg}. "
                                 f"Aborting task (no healthy endpoint)."
                             )
-                            return (
+                            return _fail_task(
                                 f"❌ 任务失败：模型切换失败（{msg}），无法继续执行。\n"
                                 "💡 建议：请检查网络连接，或在设置中心确认至少有一个模型配置正确。"
                             )
@@ -6428,12 +9452,7 @@ class Agent:
                         f"[ModelSwitch] Task {task.id}: Switching to {new_model}, resetting context. "
                         f"Discarding {len(messages) - 1} tool-related messages"
                     )
-                    if _reuse_meeting_history:
-                        # 会议室：保留跨轮对话历史，仅丢弃当轮工具调用
-                        prior_reset = list(getattr(self._context, "messages", []) or [])
-                        messages = prior_reset + [original_task_message.copy()]
-                    else:
-                        messages = [original_task_message.copy()]
+                    messages = [original_task_message.copy()]
 
                     # 添加模型切换说明 + tool-state revalidation barrier
                     messages.append(
@@ -6458,13 +9477,6 @@ class Agent:
                         )
 
                     # 调用 Brain（可被 cancel_event 中断）
-                    if getattr(self, "_org_context", False):
-                        try:
-                            from synapse.rd_meeting.agent_activity import mark_llm_call_start
-
-                            mark_llm_call_start(self)
-                        except Exception as _mark_exc:
-                            logger.debug("mark_llm_call_start failed: %s", _mark_exc)
                     response = await self._cancellable_llm_call(
                         _cancel_event,
                         max_tokens=self.brain.max_tokens,
@@ -6472,35 +9484,19 @@ class Agent:
                         tools=self._effective_tools,
                         messages=messages,
                         conversation_id=conversation_id,
-                        usage_scene=task.usage_scene
                     )
 
                     # 成功调用，重置重试计数
                     task_monitor.reset_retry_count()
 
-                    if getattr(self, "_org_context", False):
-                        _usage = getattr(response, "usage", None)
-                        if _usage is not None:
-                            try:
-                                from synapse.rd_meeting.agent_activity import try_record_llm_usage_from_agent
-
-                                try_record_llm_usage_from_agent(
-                                    self,
-                                    input_tokens=int(getattr(_usage, "input_tokens", 0) or 0),
-                                    output_tokens=int(getattr(_usage, "output_tokens", 0) or 0),
-                                    usage_scene=str(task.usage_scene or ""),
-                                    model=str(current_model or ""),
-                                )
-                            except Exception as _usage_exc:
-                                logger.debug("meeting llm usage record failed: %s", _usage_exc)
-
                 except UserCancelledError:
                     logger.info(
                         f"[StopTask] LLM call interrupted by user cancel in execute_task {task.id}"
                     )
-                    return await self._handle_cancel_farewell(
+                    _cancel_message = await self._handle_cancel_farewell(
                         messages, _build_effective_system_prompt_task(), current_model
                     )
+                    return _fail_task(_cancel_message)
 
                 except Exception as e:
                     logger.error(f"[LLM] Brain call failed in task {task.id}: {e}")
@@ -6512,7 +9508,7 @@ class Agent:
                             f"[Task:{task.id}] Global retry limit reached "
                             f"({_total_llm_retries}/{MAX_TOTAL_LLM_RETRIES}), aborting"
                         )
-                        return (
+                        return _fail_task(
                             f"❌ 任务执行失败，已重试 {MAX_TOTAL_LLM_RETRIES} 次仍无法恢复。\n"
                             f"错误: {str(e)[:200]}\n"
                             "💡 你可以直接重新发送来重试。"
@@ -6538,7 +9534,7 @@ class Agent:
                                     llm_client.reset_all_cooldowns(include_structural=True)
                                 continue
                         logger.error(f"[Task:{task.id}] Structural error, aborting: {str(e)[:200]}")
-                        return (
+                        return _fail_task(
                             f"❌ API 请求格式错误，无法恢复。\n"
                             f"错误: {str(e)[:200]}\n"
                             "💡 你可以直接重新发送来重试。"
@@ -6555,9 +9551,10 @@ class Agent:
                         try:
                             await self._cancellable_await(asyncio.sleep(2), _cancel_event)
                         except UserCancelledError:
-                            return await self._handle_cancel_farewell(
+                            _cancel_message = await self._handle_cancel_farewell(
                                 messages, _build_effective_system_prompt_task(), current_model
                             )
+                            return _fail_task(_cancel_message)
                         continue
                     else:
                         _task_switch_count += 1
@@ -6566,7 +9563,7 @@ class Agent:
                                 f"[Task:{task.id}] Exceeded max model switches "
                                 f"({MAX_TASK_MODEL_SWITCHES}), aborting task"
                             )
-                            return (
+                            return _fail_task(
                                 f"❌ 任务执行失败，已尝试多个模型仍无法恢复。\n"
                                 f"错误: {str(e)[:200]}\n"
                                 "💡 你可以直接重新发送来重试。"
@@ -6577,7 +9574,7 @@ class Agent:
                             logger.warning(
                                 "[ModelSwitch] No fallback model available for sub-agent error"
                             )
-                            return "任务失败：所有模型端点均不可用，请检查网络连接。"
+                            return _fail_task("任务失败：所有模型端点均不可用，请检查网络连接。")
                         task_monitor.switch_model(
                             new_model,
                             f"LLM 调用失败，重试 {task_monitor.retry_count} 次后切换: {e}",
@@ -6598,7 +9595,7 @@ class Agent:
                                 )
                                 # switch_model 失败（目标在冷静期），不重置 retry_count
                                 # 直接 break，避免无限重试
-                                return (
+                                return _fail_task(
                                     f"❌ 任务失败：模型切换失败（{msg}），无法继续执行。\n"
                                     "💡 建议：请检查网络连接，或在设置中心确认至少有一个模型配置正确。"
                                 )
@@ -6612,11 +9609,7 @@ class Agent:
                         logger.warning(
                             f"[ModelSwitch] Task {task.id}: Switching to {new_model} due to errors, resetting context"
                         )
-                        if _reuse_meeting_history:
-                            prior_reset = list(getattr(self._context, "messages", []) or [])
-                            messages = prior_reset + [original_task_message.copy()]
-                        else:
-                            messages = [original_task_message.copy()]
+                        messages = [original_task_message.copy()]
                         messages.append(
                             {
                                 "role": "user",
@@ -6656,22 +9649,40 @@ class Agent:
                 # 任务监控：结束迭代
                 task_monitor.end_iteration(text_content if text_content else "")
 
+                cleaned_text = ""
+                candidate_is_progress_only = False
                 # 如果有文本响应，保存（过滤 thinking 标签和工具调用模拟文本）
                 if text_content:
                     cleaned_text = clean_llm_response(text_content)
-                    # 只有在没有工具调用时才保存文本作为最终响应
-                    # 如果有工具调用，这个文本可能是 LLM 的思考过程
-                    if not tool_calls and cleaned_text:
+                    candidate_is_progress_only = (
+                        not has_executed_tools
+                        and not tool_calls
+                        and _looks_like_progress_only_task_text(cleaned_text)
+                    )
+                    # 只有无工具调用的可见文本才作为候选最终响应；短进度句不保存，
+                    # 避免最终兜底前把“我来执行...”误当成结果。
+                    if (
+                        not tool_calls
+                        and cleaned_text
+                        and not candidate_is_progress_only
+                        and _prefer_task_final_response(cleaned_text, final_response)
+                    ):
                         final_response = cleaned_text
 
                 # 如果没有工具调用，检查是否需要强制要求调用工具
                 if not tool_calls:
                     no_tool_call_count += 1
 
-                    # 如果还有追问次数，强制要求调用工具
-                    if no_tool_call_count <= max_no_tool_retries:
+                    # 如果模型只给了短进度句，给一次温和机会继续；一旦已有可见结果，
+                    # 直接收束，避免后续短元总结覆盖完整正文。
+                    should_nudge_for_result = (
+                        candidate_is_progress_only
+                        and no_tool_call_count <= min(max_no_tool_retries, 1)
+                    )
+                    if should_nudge_for_result:
                         logger.warning(
-                            f"[ForceToolCall] Task LLM returned text without tool calls (attempt {no_tool_call_count}/{max_no_tool_retries})"
+                            f"[ForceToolCall] Task LLM returned progress text without tool calls "
+                            f"(attempt {no_tool_call_count}/{max_no_tool_retries})"
                         )
 
                         # 将 LLM 的响应加入历史
@@ -6687,7 +9698,10 @@ class Agent:
                         messages.append(
                             {
                                 "role": "user",
-                                "content": "[系统] 若确实需要工具，请调用相应工具；若不需要工具（纯对话/问答），请直接回答，不要复述系统规则。",
+                                "content": (
+                                    "[系统] 请继续完成任务，并在完成时把用户需要看到的最终结果完整写在回复正文中。"
+                                    "如确实需要工具，请调用合适工具；如不需要工具，请直接给出最终结果。"
+                                ),
                             }
                         )
                         continue  # 继续循环，让 LLM 调用工具
@@ -6754,11 +9768,43 @@ class Agent:
                     allow_interrupt_checks=False,
                     capture_delivery_receipts=False,
                 )
+                if executed_names:
+                    has_executed_tools = True
 
                 messages.append({"role": "user", "content": tool_results})
 
-                if executed_names and self.agent_state and self.agent_state.current_task:
-                    self.agent_state.current_task.record_tool_execution(executed_names)
+                # C12 §14.5: bubble up unattended deferrals.
+                # ``_deferred_approval_id`` is set by ``ToolExecutor._defer_unattended_confirm``
+                # whenever a CONFIRM decision in unattended context was rerouted
+                # to PendingApprovalsStore. Halt the Ralph loop now so scheduler /
+                # spawn_agent caller can mark the task as AWAITING_APPROVAL —
+                # otherwise the LLM would burn iterations re-trying the deferred tool.
+                _deferred = [
+                    tr
+                    for tr in tool_results
+                    if isinstance(tr, dict) and tr.get("_deferred_approval_id")
+                ]
+                if _deferred:
+                    from .policy_v2.exceptions import DeferredApprovalRequired
+
+                    _ids = [tr["_deferred_approval_id"] for tr in _deferred]
+                    logger.info(
+                        "[execute_task] %d tool(s) deferred for owner approval; "
+                        "halting Ralph loop. pending_ids=%s",
+                        len(_deferred),
+                        _ids,
+                    )
+                    raise DeferredApprovalRequired(
+                        message=(
+                            f"{len(_deferred)} tool call(s) require owner approval; "
+                            f"task suspended. pending_approvals={_ids}"
+                        ),
+                        pending_id=_ids[0],
+                        unattended_strategy=_deferred[0].get(
+                            "_deferred_approval_strategy", ""
+                        ),
+                        meta={"all_pending_ids": _ids, "task_id": task.id},
+                    )
 
                 # === 统一处理 skip 反思 + 用户插入消息 ===
                 if self.agent_state and self.agent_state.current_task:
@@ -6790,7 +9836,6 @@ class Agent:
                                 system=_build_effective_system_prompt_task(),
                                 messages=messages,
                                 conversation_id=conversation_id,
-                                usage_scene=task.usage_scene
                             ),
                             _cancel_event,
                         )
@@ -6826,23 +9871,12 @@ class Agent:
 
         task.mark_completed(final_response)
 
-        # 会议室节点内复用：把本轮 user + assistant 追加回 _context.messages，
-        # 使同一节点的后续 LLM 调用（自动重跑 / 续跑 / 重派）能看到此前的产出。
-        # 节点切换时由 _step_node_init 显式清空（见 pipeline.STEP_NODE_FINISH 处理）。
-        if _reuse_meeting_history:
-            try:
-                ctx_msgs = getattr(self._context, "messages", None)
-                if isinstance(ctx_msgs, list):
-                    ctx_msgs.append(original_task_message.copy())
-                    if final_response:
-                        ctx_msgs.append({"role": "assistant", "content": final_response})
-            except Exception as _msg_exc:  # pragma: no cover
-                logger.debug("append meeting messages failed: %s", _msg_exc)
-
         duration = time.time() - start_time
 
         # === 桌面通知（仅本地通道：cli/desktop；IM 通道已有自己的通知机制）===
-        if settings.desktop_notify_enabled:
+        if settings.desktop_notify_enabled and not getattr(
+            self, "_suppress_desktop_task_notification", False
+        ):
             _session = getattr(self, "_current_session", None)
             _channel = getattr(_session, "channel", "cli") if _session else "cli"
             if _channel in ("cli", "desktop"):
@@ -6856,18 +9890,6 @@ class Agent:
                         sound=settings.desktop_notify_sound,
                     )
                 )
-
-        try:
-            from synapse.rd_meeting.agent_activity import try_record_output_from_agent
-
-            try_record_output_from_agent(
-                self,
-                output_kind="llm_response",
-                title="智能体反馈",
-                summary=str(final_response or ""),
-            )
-        except Exception as _out_exc:  # pragma: no cover
-            logger.debug("meeting activity output record: %s", _out_exc)
 
         return TaskResult(
             success=True,
@@ -6914,7 +9936,7 @@ class Agent:
 
         # 检查 Brain
         try:
-            response = await self.brain.think("你好，这是一个测试。请回复'OK'。", usage_scene="self_check_brain")
+            response = await self.brain.think("你好，这是一个测试。请回复'OK'。")
             results["checks"]["brain"] = {
                 "status": "ok"
                 if "OK" in response.content or "ok" in response.content.lower()
@@ -7029,8 +10051,12 @@ class Agent:
         logger.info("Shutting down agent...")
 
         # 插件系统清理：dispatch on_shutdown → unload → 清全局 map
+        # 只有"主" Agent（_owns_plugin_manager=True）才负责真正的 unload；
+        # share_from 路径下 sub-agent 共用主 Agent 的 PluginManager，
+        # 在 sub-agent shutdown 里执行 unload 会卸掉主 Agent 还在用的插件。
         pm = getattr(self, "_plugin_manager", None)
-        if pm is not None:
+        owns_pm = getattr(self, "_owns_plugin_manager", True)
+        if pm is not None and owns_pm:
             try:
                 await pm.hook_registry.dispatch("on_shutdown", agent=self)
             except Exception as e:
@@ -7053,6 +10079,12 @@ class Agent:
                 set_prompt_hook_registry(None)
             except Exception:
                 pass
+        elif pm is not None and not owns_pm:
+            logger.debug(
+                "[share_from] sub-agent '%s' shutdown: skipping plugin unload "
+                "(plugins owned by parent agent).",
+                self.name,
+            )
 
         # F9: 清理技能相关资源
         self._cleanup_skill_resources()
@@ -7094,6 +10126,11 @@ class Agent:
         except Exception as e:
             logger.debug(f"[TodoStore] Shutdown flush failed: {e}")
 
+        # 如果当前 Agent 是进程主 Agent，则清理引用，防止后续 sub-agent
+        # 拿到已经 shutdown 的 parent。
+        if get_primary_agent() is self:
+            set_primary_agent(None)
+
         self._running = False
         logger.info("Agent shutdown complete")
 
@@ -7112,3 +10149,4 @@ class Agent:
     def get_memory_stats(self) -> dict:
         """获取记忆统计"""
         return self.memory_manager.get_stats()
+

@@ -63,6 +63,7 @@ _CLASS_MODULE_MAP: dict[str, str] = {
     "VolcEngineRegistry": ".volcengine",
     "ZhipuChinaRegistry": ".zhipu",
     "ZhipuInternationalRegistry": ".zhipu",
+    "XfyunRegistry": ".xfyun",
 }
 
 
@@ -95,12 +96,12 @@ def _get_custom_providers_path() -> Path:
 
 
 def load_custom_providers() -> list[dict]:
-    """从工作区加载自定义服务商列表"""
+    """从工作区加载自定义服务商列表 (atomic-aware: falls back to .bak)."""
+    from synapse.utils.atomic_io import read_json_safe
+
     path = _get_custom_providers_path()
-    if not path.exists():
-        return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = read_json_safe(path)
         return data if isinstance(data, list) else []
     except Exception as e:
         _logger.warning(f"Failed to load custom providers from {path}: {e}")
@@ -108,13 +109,11 @@ def load_custom_providers() -> list[dict]:
 
 
 def save_custom_providers(entries: list[dict]) -> None:
-    """保存自定义服务商列表到工作区"""
+    """保存自定义服务商列表到工作区 (atomic write + .bak backup)."""
+    from synapse.utils.atomic_io import safe_json_write
+
     path = _get_custom_providers_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(entries, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    safe_json_write(path, entries)
     _logger.info(f"Saved {len(entries)} custom providers to {path}")
 
 
@@ -229,3 +228,4 @@ __all__ = [
     "save_custom_providers",
     "reload_registries",
 ]
+

@@ -22,6 +22,7 @@ from ..converters.tools import (
 )
 from ..model_registry import get_model_capabilities, get_thinking_budget
 from ..sse import parse_sse_stream
+from ..thinking import is_minimax_endpoint, minimax_thinking_depth
 from ..types import (
     AuthenticationError,
     EndpointConfig,
@@ -36,7 +37,12 @@ from ..types import (
     Usage,
 )
 from .base import LLMProvider
-from .proxy_utils import build_httpx_timeout, get_httpx_transport, get_proxy_config
+from .proxy_utils import (
+    build_httpx_timeout,
+    get_httpx_transport,
+    get_proxy_config,
+    should_bypass_proxy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +73,16 @@ class AnthropicProvider(LLMProvider):
         return f"{b}/messages" if b.endswith("/v1") else f"{b}/v1/messages"
 
     def _is_local_endpoint(self) -> bool:
-        """检查是否为本地端点"""
+        """检查是否为本地/局域网端点
+
+        覆盖 loopback + RFC 1918 私有地址 + link-local，与 proxy_utils._is_private_host 对齐。
+        """
+        from .proxy_utils import should_bypass_proxy
+
         url = self.base_url.lower()
-        return any(
-            host in url
-            for host in (
-                "localhost",
-                "127.0.0.1",
-                "0.0.0.0",
-                "[::1]",
-            )
-        )
+        if any(host in url for host in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")):
+            return True
+        return should_bypass_proxy(self.base_url)
 
     def _get_validated_api_key(self) -> str:
         """获取并验证 API Key，空 key 时提前抛出有意义的错误而非让 API 返回模糊 401。"""
@@ -151,7 +156,7 @@ class AnthropicProvider(LLMProvider):
                 "event_hooks": {"request": [_ensure_auth_on_redirect]},
             }
 
-            if proxy and not is_local:
+            if proxy and not should_bypass_proxy(self.base_url):
                 client_kwargs["proxy"] = proxy
                 logger.debug(f"[Anthropic] Using proxy: {proxy}")
 
@@ -183,11 +188,23 @@ class AnthropicProvider(LLMProvider):
             if response.status_code >= 400:
                 body = (response.text or "")[:500]
                 if response.status_code == 401:
-                    raise AuthenticationError(f"Authentication failed: {body}", status_code=401)
+                    raise AuthenticationError(
+                        f"Authentication failed: {body}",
+                        status_code=401,
+                        raw_body=body,
+                    )
                 if response.status_code == 429:
-                    raise RateLimitError(f"Rate limit exceeded: {body}", status_code=429)
+                    retry_after = response.headers.get("retry-after")
+                    raw_body = f"{body}\nretry-after: {retry_after}" if retry_after else body
+                    raise RateLimitError(
+                        f"Rate limit exceeded: {body}",
+                        status_code=429,
+                        raw_body=raw_body,
+                    )
                 raise LLMError(
-                    f"API error ({response.status_code}): {body}", status_code=response.status_code
+                    f"API error ({response.status_code}): {body}",
+                    status_code=response.status_code,
+                    raw_body=body,
                 )
 
             data = response.json()
@@ -232,13 +249,24 @@ class AnthropicProvider(LLMProvider):
                 error_text = error_body.decode(errors="replace")[:500]
                 if response.status_code == 401:
                     raise AuthenticationError(
-                        f"Authentication failed: {error_text}", status_code=401
+                        f"Authentication failed: {error_text}",
+                        status_code=401,
+                        raw_body=error_text,
                     )
                 if response.status_code == 429:
-                    raise RateLimitError(f"Rate limit exceeded: {error_text}", status_code=429)
+                    retry_after = response.headers.get("retry-after")
+                    raw_body = (
+                        f"{error_text}\nretry-after: {retry_after}" if retry_after else error_text
+                    )
+                    raise RateLimitError(
+                        f"Rate limit exceeded: {error_text}",
+                        status_code=429,
+                        raw_body=raw_body,
+                    )
                 raise LLMError(
                     f"API error ({response.status_code}): {error_text}",
                     status_code=response.status_code,
+                    raw_body=error_text,
                 )
 
             # 使用符合 SSE 规范的解析器
@@ -264,6 +292,8 @@ class AnthropicProvider(LLMProvider):
         key = (self.api_key or "").strip()
         return {
             "Content-Type": "application/json",
+            # 避免打包环境缺少可用 zstd 解码器导致响应解析前失败。
+            "Accept-Encoding": "gzip, deflate",
             "x-api-key": key,
             # 部分 Anthropic 兼容网关仅识别 Bearer，保留 x-api-key 以兼容官方 Anthropic。
             "Authorization": f"Bearer {key}",
@@ -344,14 +374,26 @@ class AnthropicProvider(LLMProvider):
             budget = get_thinking_budget(self.config.model, request.thinking_depth)
             if budget <= 0:
                 budget = 8192
+            is_mm = is_minimax_endpoint(self.config.provider, self.base_url, self.config.model)
             body["thinking"] = {
-                "type": "enabled",
+                "type": "adaptive" if is_mm else "enabled",
                 "budget_tokens": budget,
             }
             body.pop("temperature", None)
             current_max = body.get("max_tokens", 4096)
             if current_max < budget + 1024:
                 body["max_tokens"] = budget + 4096
+
+        # MiniMax accepts only low/medium/high for the top-level thinking_depth
+        # field on BOTH its OpenAI- and Anthropic-compatible endpoints. Synapse's
+        # UI exposes "max" / "xhigh"; clamp at the provider boundary regardless of
+        # whether the value arrived via request.thinking_depth or extra_params.
+        if is_minimax_endpoint(self.config.provider, self.base_url, self.config.model):
+            depth = minimax_thinking_depth(request.thinking_depth or body.get("thinking_depth"))
+            if depth:
+                body["thinking_depth"] = depth
+            else:
+                body.pop("thinking_depth", None)
 
         return body
 

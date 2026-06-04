@@ -17,6 +17,8 @@ from pathlib import Path
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
+from synapse.utils.redaction import redact_text
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -65,7 +67,7 @@ def _read_log_tail(log_path: Path, tail_bytes: int) -> dict:
             if start > 0:
                 f.seek(start)
             raw = f.read()
-        content = raw.decode("utf-8", errors="replace")
+        content = redact_text(raw.decode("utf-8", errors="replace"))
         return {"path": path_str, "content": content, "truncated": truncated}
     except Exception as e:
         logger.error("Failed to read log %s: %s", log_path, e)
@@ -102,12 +104,37 @@ def _rotate_frontend_log(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_tail_bytes(
+    tail_bytes: int,
+    tail: int | None,
+    *,
+    upper: int = 400_000,
+) -> int:
+    """统一解析 tail/tail_bytes 参数。
+
+    - 优先使用 tail_bytes（旧契约，已被现网调用）
+    - 兼容 tail 别名（小白用户/CLI 测试常用），同样按字节数解释
+    - 任何越界值（负数 / 超 upper）裁剪到 [0, upper]，避免 422 风暴
+    """
+    raw = tail_bytes if tail is None else tail
+    try:
+        n = int(raw)
+    except Exception:
+        n = 60_000
+    if n < 0:
+        n = 0
+    if n > upper:
+        n = upper
+    return n
+
+
 @router.get("/api/logs/service")
 async def service_log(
     tail_bytes: int = Query(default=60000, ge=0, le=400000, description="读取尾部字节数"),
+    tail: int | None = Query(default=None, description="tail_bytes 的别名，兼容 CLI/小白用法"),
 ):
     """读取后端服务日志文件尾部内容。"""
-    return _read_log_tail(_log_file_path(), tail_bytes)
+    return _read_log_tail(_log_file_path(), _resolve_tail_bytes(tail_bytes, tail))
 
 
 class FrontendLogPayload(BaseModel):
@@ -141,7 +168,7 @@ async def receive_frontend_log(request: Request):
             _rotate_frontend_log(log_path)
             with open(log_path, "a", encoding="utf-8") as f:
                 for line in lines:
-                    f.write(str(line) + "\n")
+                    f.write(redact_text(line) + "\n")
     except Exception as e:
         logger.error("Failed to write frontend log: %s", e)
         return {"ok": False, "error": str(e)}
@@ -152,19 +179,22 @@ async def receive_frontend_log(request: Request):
 @router.get("/api/logs/frontend")
 async def frontend_log(
     tail_bytes: int = Query(default=60000, ge=0, le=400000, description="读取尾部字节数"),
+    tail: int | None = Query(default=None, description="tail_bytes 的别名"),
 ):
     """读取前端日志文件尾部内容。"""
-    return _read_log_tail(_frontend_log_path(), tail_bytes)
+    return _read_log_tail(_frontend_log_path(), _resolve_tail_bytes(tail_bytes, tail))
 
 
 @router.get("/api/logs/combined")
 async def combined_log(
     tail_bytes: int = Query(default=60000, ge=0, le=200000, description="每部分读取的尾部字节数"),
+    tail: int | None = Query(default=None, description="tail_bytes 的别名"),
 ):
     """
     合并返回后端服务日志 + 前端日志的尾部内容，供前端 exportLogs() 一次性获取。
     """
+    n = _resolve_tail_bytes(tail_bytes, tail, upper=200_000)
     return {
-        "backend": _read_log_tail(_log_file_path(), tail_bytes),
-        "frontend": _read_log_tail(_frontend_log_path(), tail_bytes),
+        "backend": _read_log_tail(_log_file_path(), n),
+        "frontend": _read_log_tail(_frontend_log_path(), n),
     }

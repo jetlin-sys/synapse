@@ -1,4 +1,32 @@
-"""Plugin-side helper for relay override settings."""
+"""Plugin-side helper for the standard relay override settings.
+
+Every vendor plugin (happyhorse-video, tongyi-image, avatar-studio,
+seedance-video, ...) reads a per-plugin settings dict that ends up
+looking like::
+
+    {
+      "api_key":  "...",
+      "base_url": "https://dashscope.aliyuncs.com",
+      "relay_endpoint": "yunwu-video",          # optional
+      "relay_fallback_policy": "official",      # optional
+    }
+
+This helper takes that dict and, when ``relay_endpoint`` is set,
+overlays the resolved :class:`RelayReference`'s ``base_url`` /
+``api_key`` on it. The fallback semantics match
+``relay_fallback_policy``:
+
+    - ``"official"`` (default): warn-and-keep on missing/unhealthy
+      relay so the user is never blocked by a typo or a temporarily
+      disabled relay.
+    - ``"strict"``: raise :class:`SettingsRelayResolutionError` so the
+      plugin can surface it via its own ``VendorError`` translation
+      (each plugin's exception type is different — we cannot raise
+      it from here without coupling).
+
+Returning a dict instead of mutating in place keeps callers explicit
+about which fields the helper may have touched.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +39,16 @@ logger = logging.getLogger(__name__)
 
 
 class SettingsRelayResolutionError(Exception):
+    """Raised when ``relay_fallback_policy == "strict"`` and the relay
+    cannot be resolved. Plugins catch this and re-raise as their own
+    vendor-specific exception type so the UI error surface stays
+    consistent within each plugin.
+
+    The ``user_message`` attribute already includes the relay name
+    and the list of relays the user might have meant, so plugins can
+    surface it verbatim.
+    """
+
     def __init__(self, message: str, *, user_message: str | None = None):
         super().__init__(message)
         self.user_message = user_message or message
@@ -23,6 +61,31 @@ def apply_relay_override(
     required_capability: str = "",
     plugin_name: str = "plugin",
 ) -> dict[str, Any]:
+    """Return a *new* dict with relay overrides applied (if any).
+
+    The input ``settings`` is never mutated. The returned dict is a
+    shallow copy with the standard relay fields removed
+    (``relay_endpoint`` / ``relay_fallback_policy``) and replaced by:
+
+      - ``base_url`` overridden with the relay's URL
+      - ``api_key`` overridden with the relay's key (only when the
+        relay actually has one; empty relay keys mean "use the per-
+        plugin key" — some relays serve public endpoints)
+      - ``_relay_reference``: the resolved RelayReference, stashed
+        for plugins that want to call ``ref.supports_model(...)``
+        before submission
+
+    Failure modes (governed by ``relay_fallback_policy``):
+
+      - ``"strict"``: SettingsRelayResolutionError
+      - anything else (default ``"official"``): warn and fall back
+        to the per-plugin values
+
+    Importing this helper is intentionally lazy in plugin code: if the
+    synapse package is not on the plugin's sys.path (e.g. bundled
+    plugin distributions) the plugin should ``except ImportError`` and
+    skip the relay step entirely. We never crash from that path here.
+    """
     if not isinstance(settings, dict):
         raise TypeError("settings must be a dict")
 
@@ -57,6 +120,9 @@ def apply_relay_override(
         )
         return out
     except Exception as exc:  # noqa: BLE001
+        # Anything else (network during a sync, import problem, ...)
+        # is non-fatal — we never want plugin Settings updates to die
+        # on a transient relay registry issue.
         logger.warning(
             "%s: relay resolution failed for %r: %s; falling back",
             plugin_name,

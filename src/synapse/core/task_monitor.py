@@ -195,8 +195,13 @@ class TaskMonitor:
         # 每次进入新迭代视为有进展（至少系统仍在推进循环）
         self._touch_progress()
 
-        # 检查是否“无进展超时”（避免长任务被硬切）
-        if self.progress_idle_seconds > self.timeout_seconds and not self._timeout_triggered:
+        # 检查是否“无进展超时”（避免长任务被硬切）。
+        # timeout_seconds <= 0 表示禁用该机制；否则默认 0 会在每轮迭代被误判超时。
+        if (
+            self.timeout_seconds > 0
+            and self.progress_idle_seconds > self.timeout_seconds
+            and not self._timeout_triggered
+        ):
             self._handle_timeout()
 
         # 可选硬超时兜底（默认关闭）
@@ -247,10 +252,11 @@ class TaskMonitor:
         self,
         tool_name: str,
         tool_input: dict,
-        result: str,
+        result: str | float | int = "",
+        legacy_success: bool | None = None,
         *,
-        success: bool,
-        duration_ms: int,
+        success: bool | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         """记录一次工具调用（并行安全）
 
@@ -258,16 +264,24 @@ class TaskMonitor:
         - begin_tool_call/end_tool_call 依赖“同一时间仅一个工具调用”的隐含前提
         - 当一个模型在同一轮返回多个 tool_use（并行工具调用）时，Agent 可能并发执行工具
         - 此方法允许调用方自行测量耗时并直接写入当前 iteration，避免共享状态竞争
+        - 兼容旧调用 record_tool_call(name, input, elapsed_seconds, success)
         """
         if not self._current_iteration:
             return
         self._touch_progress()
+        if duration_ms is None and isinstance(result, (int, float)):
+            duration_ms = int(result * 1000)
+            result = ""
+        if success is None:
+            success = True if legacy_success is None else bool(legacy_success)
+        if duration_ms is None:
+            duration_ms = 0
         record = ToolCallRecord(
             name=tool_name,
             input_summary=str(tool_input),
-            output_summary=result if result else "",
+            output_summary=str(result) if result else "",
             duration_ms=int(duration_ms),
-            success=success,
+            success=bool(success),
         )
         self._current_iteration.tool_calls.append(record)
 
@@ -368,6 +382,8 @@ class TaskMonitor:
     @property
     def should_retry_timeout(self) -> bool:
         """是否应该重试超时（而不是切换模型）"""
+        if self.timeout_seconds <= 0:
+            return False
         return self._timeout_retry_count < self.retry_before_switch
 
     @property
@@ -382,6 +398,9 @@ class TaskMonitor:
         使用独立的超时重试计数器（不受 LLM 成功调用影响）。
         只有在超时重试次数用尽后才会真正切换模型。
         """
+        if self.timeout_seconds <= 0:
+            return
+
         self._phase = TaskPhase.TIMEOUT
 
         # 增加超时重试计数（独立于 LLM 错误重试）
@@ -404,9 +423,12 @@ class TaskMonitor:
             self._timeout_triggered = True
             self.metrics.retry_count = self._timeout_retry_count
             if not self.fallback_model:
-                logger.error(
-                    "[TaskMonitor] Timeout retries exhausted but no fallback_model configured; "
-                    "cannot switch model."
+                # 单端点部署的正常路径：没有备选模型可切换，由上层（reasoning_engine /
+                # agent）决定是直接失败还是继续在当前端点上重试。这里只是登记一下，
+                # 不打 ERROR，避免日志误报。
+                logger.info(
+                    "[TaskMonitor] Timeout retries exhausted; no fallback model configured "
+                    "(single-endpoint deployment). Letting caller decide next step."
                 )
             else:
                 self.switch_model(
@@ -451,10 +473,13 @@ class TaskMonitor:
         是否应该切换模型
 
         只有在以下条件都满足时才切换：
-        1. 已超时
-        2. 超时重试次数已用尽
-        3. 尚未触发切换
+        1. 无进展超时机制已启用
+        2. 已超时
+        3. 超时重试次数已用尽
+        4. 尚未触发切换
         """
+        if self.timeout_seconds <= 0:
+            return False
         if self._timeout_triggered:
             return False
         if self.progress_idle_seconds <= self.timeout_seconds:
@@ -750,3 +775,4 @@ def get_retrospect_storage() -> RetrospectStorage:
     if _retrospect_storage is None:
         _retrospect_storage = RetrospectStorage()
     return _retrospect_storage
+

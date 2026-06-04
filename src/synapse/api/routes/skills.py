@@ -2,6 +2,19 @@
 Skills route: GET /api/skills, POST /api/skills/config, GET /api/skills/marketplace
 
 技能列表与配置管理。
+
+本模块只负责 HTTP 适配 + 自身的列表缓存；所有会影响技能可见性 / 内容的操作
+（install / uninstall / reload / content-update / allowlist-change）在完成磁盘
+副作用后统一调用 ``Agent.propagate_skill_change``，由其负责：
+  - 清空 parser/loader 缓存
+  - 重扫技能目录
+  - 重新应用 allowlist
+  - 重建 SkillCatalog 与 ``_skill_catalog_text``
+  - 同步 handler 映射
+  - 通知 AgentInstancePool 回收旧实例
+  - 广播 ``SkillEvent``（HTTP 缓存失效 + WebSocket 广播通过事件回调完成）
+
+API 层不再自行做半套刷新，避免多路径导致状态不一致。
 """
 
 from __future__ import annotations
@@ -10,71 +23,12 @@ import asyncio
 import json
 import logging
 import re
-import shutil
-import tempfile
-import uuid
-from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
-
-# 前端与约定：研发流程类技能的工具名前缀（参见 WORKSPACE SKILL.md tool_name）
-DEV_TOOL_TOOL_PREFIX = "whalecloud_dev_tool_"
-
-_DEV_TOOL_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-
-
-def sanitize_dev_tool_slug(raw: str) -> str | None:
-    """Validate user slug for whalecloud-dev-tool-{slug} folder names."""
-    s = (raw or "").strip().lower()
-    if len(s) < 2 or len(s) > 48:
-        return None
-    if _DEV_TOOL_SLUG_RE.fullmatch(s) is None:
-        return None
-    return s
-
-
-def _merge_external_allowlist_add(skill_id: str) -> None:
-    """If data/skills.json uses an explicit external_allowlist list, append skill_id."""
-    try:
-        from synapse.config import settings
-
-        base = settings.project_root
-    except Exception:
-        base = Path.cwd()
-    cfg_path = base / "data" / "skills.json"
-    if not cfg_path.exists():
-        return
-    try:
-        raw = cfg_path.read_text(encoding="utf-8")
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception:
-        return
-    al = data.get("external_allowlist", None)
-    if not isinstance(al, list):
-        return
-    ids = {str(x).strip() for x in al if str(x).strip()}
-    if skill_id in ids:
-        return
-    data["external_allowlist"] = list(al) + [skill_id]
-    data["updated_at"] = datetime.now(UTC).isoformat()
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def _notify_skills_changed(action: str = "reload") -> None:
-    """Fire-and-forget WS broadcast for skill state changes."""
-    try:
-        from synapse.api.routes.websocket import broadcast_event
-
-        asyncio.ensure_future(broadcast_event("skills:changed", {"action": action}))
-    except Exception:
-        pass
 
 
 router = APIRouter()
@@ -84,101 +38,114 @@ SKILLS_SH_API = "https://skills.sh/api/search"
 
 _skills_cache: dict | None = None
 """Module-level cache for GET /api/skills response.
-Populated on first request, invalidated by install/uninstall/reload/edit."""
+Populated on first request, invalidated via the cross-layer on-change callback
+registered at the bottom of this module."""
+
+_organize_cache: dict | None = None
+_organize_cache_hash: str | None = None
 
 
 def _invalidate_skills_cache() -> None:
     """Clear the cached skill list so the next GET /api/skills re-scans disk."""
-    global _skills_cache
+    global _skills_cache, _organize_cache, _organize_cache_hash
     _skills_cache = None
+    _organize_cache = None
+    _organize_cache_hash = None
 
 
-def _read_external_allowlist() -> tuple[Path, set[str] | None]:
-    """Read external_allowlist from data/skills.json.
+def _resolve_agent(request: Request):
+    """返回真实 Agent 实例（解包可能的 thin wrapper / _local_agent）。"""
+    from synapse.core.agent import Agent
 
-    Returns (base_path, allowlist). allowlist is None when the file doesn't
-    exist or has no external_allowlist key (meaning "all external skills enabled").
-    """
-    import json
+    agent = getattr(request.app.state, "agent", None)
+    if isinstance(agent, Agent):
+        return agent
+    return getattr(agent, "_local_agent", None)
+
+
+def _extract_json_object(text: str) -> dict:
+    """Extract a JSON object from plain or fenced LLM output."""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("empty response")
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S | re.I)
+    if fenced:
+        raw = fenced.group(1)
+    elif not raw.startswith("{"):
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("no JSON object found")
+        raw = raw[start : end + 1]
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("JSON root must be an object")
+    return data
+
+
+def _get_external_skills_from_cache() -> list[dict] | None:
+    """从 _skills_cache 中提取外部技能列表（不触发磁盘扫描）。"""
+    if _skills_cache is None:
+        return None
+    skills = _skills_cache.get("skills")
+    if not skills:
+        return None
+    return [s for s in skills if not s.get("system", False)]
+
+
+async def _load_external_skills_for_organize() -> tuple[list, set[str] | None]:
+    """Load all external skills from disk and return effective allowlist."""
+    from synapse.skills.allowlist_io import read_allowlist
+    from synapse.skills.categories import CategoryRegistry
+    from synapse.skills.category_store import CategoryStore
+    from synapse.skills.loader import SkillLoader
 
     try:
         from synapse.config import settings
 
-        base_path = settings.project_root
+        base_path = Path(settings.project_root)
     except Exception:
         base_path = Path.cwd()
 
-    external_allowlist: set[str] | None = None
+    cat_registry = CategoryRegistry()
+    cat_registry.set_store(CategoryStore())
+    loader = SkillLoader(category_registry=cat_registry)
+    await asyncio.to_thread(loader.load_all, base_path)
+    _, external_allowlist = read_allowlist()
     try:
-        cfg_path = base_path / "data" / "skills.json"
-        if cfg_path.exists():
-            raw = cfg_path.read_text(encoding="utf-8")
-            cfg = json.loads(raw) if raw.strip() else {}
-            al = cfg.get("external_allowlist", None)
-            if isinstance(al, list):
-                external_allowlist = {str(x).strip() for x in al if str(x).strip()}
+        effective_allowlist = loader.compute_effective_allowlist(external_allowlist)
     except Exception:
-        pass
-    return base_path, external_allowlist
+        effective_allowlist = external_allowlist
+    external_skills = [s for s in loader.registry.list_all() if not getattr(s, "system", False)]
+    return external_skills, effective_allowlist
 
 
-def _apply_allowlist_and_rebuild_catalog(request: Request) -> int:
-    """Re-read skills.json allowlist, prune agent's loader & registry, rebuild catalog.
-
-    Call this after any operation that changes loaded skills or the allowlist.
-    Returns the number of pruned external skills.
-    """
-    from synapse.core.agent import Agent
-
-    agent = getattr(request.app.state, "agent", None)
-    actual_agent = agent
-    if not isinstance(agent, Agent):
-        actual_agent = getattr(agent, "_local_agent", None)
-    if actual_agent is None:
-        return 0
-
-    _, external_allowlist = _read_external_allowlist()
-
-    loader = getattr(actual_agent, "skill_loader", None)
-    removed = 0
-    if loader:
-        from synapse.skills.preset_utils import collect_preset_referenced_skills
-
-        effective = loader.compute_effective_allowlist(external_allowlist)
-        agent_skills = collect_preset_referenced_skills()
-        removed = loader.prune_external_by_allowlist(
-            effective, agent_referenced_skills=agent_skills
-        )
-
-    catalog = getattr(actual_agent, "skill_catalog", None)
-    if catalog:
-        catalog.invalidate_cache()
-        new_text = catalog.generate_catalog()
-        if hasattr(actual_agent, "_skill_catalog_text"):
-            actual_agent._skill_catalog_text = new_text
-
-    # 同步系统技能的 tool_name → handler 映射到 handler_registry
-    if hasattr(actual_agent, "_update_skill_tools"):
-        actual_agent._update_skill_tools()
-
-    # 通知所有 Agent 池技能已变更，使池中旧 Agent 在下次使用时重建
-    _notify_pools_skills_changed(request)
-
-    return removed
+async def _propagate(request: Request, action: str, *, rescan: bool = True) -> None:
+    """在工作线程中调用 Agent 的统一刷新入口，避免阻塞事件循环。"""
+    agent = _resolve_agent(request)
+    if agent is None or not hasattr(agent, "propagate_skill_change"):
+        return
+    try:
+        await asyncio.to_thread(agent.propagate_skill_change, action, rescan=rescan)
+    except Exception as e:
+        logger.warning("propagate_skill_change(%s) failed: %s", action, e)
 
 
-def _notify_pools_skills_changed(request: Request) -> None:
-    """通知所有 Agent 实例池全局技能已变更。"""
-    for pool_attr in ("agent_pool", "orchestrator"):
-        obj = getattr(request.app.state, pool_attr, None)
-        if obj is None:
+def _skill_load_issues(loader, *, limit: int = 20) -> list[dict[str, str]]:
+    """Return concise non-fatal skill load diagnostics from the active loader."""
+    raw = getattr(loader, "last_load_issues", []) or []
+    if not isinstance(raw, list | tuple):
+        return []
+    issues: list[dict[str, str]] = []
+    for item in raw[:limit]:
+        if not isinstance(item, dict):
             continue
-        pool = getattr(obj, "_pool", obj)
-        if hasattr(pool, "notify_skills_changed"):
-            try:
-                pool.notify_skills_changed()
-            except Exception as e:
-                logger.warning(f"Failed to notify pool ({pool_attr}): {e}")
+        skill_id = str(item.get("skill_id") or "").strip()
+        error = str(item.get("error") or "").strip()
+        path = str(item.get("path") or "").strip()
+        if skill_id and error:
+            issues.append({"skill_id": skill_id, "error": error, "path": path})
+    return issues
 
 
 async def _auto_translate_new_skills(request: Request, install_url: str) -> None:
@@ -186,13 +153,8 @@ async def _auto_translate_new_skills(request: Request, install_url: str) -> None
 
     翻译失败不影响安装结果，仅记录日志。
     """
-    from synapse.core.agent import Agent
-
     try:
-        agent = getattr(request.app.state, "agent", None)
-        actual_agent = agent
-        if not isinstance(agent, Agent):
-            actual_agent = getattr(agent, "_local_agent", None)
+        actual_agent = _resolve_agent(request)
         if actual_agent is None:
             return
 
@@ -229,41 +191,40 @@ async def list_skills(request: Request):
     ``enabled`` status derived from ``data/skills.json`` allowlist.
 
     Uses a module-level cache to avoid re-scanning disk on every request.
-    The cache is invalidated by install/uninstall/reload/edit operations.
+    The cache is invalidated by install/uninstall/reload/edit operations via
+    the cross-layer on-change callback.
     """
     global _skills_cache
     if _skills_cache is not None:
         return _skills_cache
 
-    base_path, external_allowlist = _read_external_allowlist()
+    from synapse.skills.allowlist_io import read_allowlist
 
-    # load_all() does synchronous file I/O — run in a thread to avoid blocking
-    # the event loop.
+    skills_json_path, external_allowlist = read_allowlist()
+    # 用于生成 relative_path 的 base 仍需项目根目录
+    try:
+        from synapse.config import settings
+
+        base_path = Path(settings.project_root)
+    except Exception:
+        base_path = skills_json_path.parent.parent
+
     try:
         from synapse.skills.loader import SkillLoader
 
         loader = SkillLoader()
-        await asyncio.to_thread(loader.load_all, base_path=base_path)
+        await asyncio.to_thread(loader.load_all, base_path)
         all_skills = loader.registry.list_all()
         effective_allowlist = loader.compute_effective_allowlist(external_allowlist)
     except Exception:
-        from synapse.core.agent import Agent
-
-        agent = getattr(request.app.state, "agent", None)
-        actual_agent = agent
-        if not isinstance(agent, Agent):
-            actual_agent = getattr(agent, "_local_agent", None)
+        actual_agent = _resolve_agent(request)
         if actual_agent is None:
             return {"skills": []}
         registry = getattr(actual_agent, "skill_registry", None)
         if registry is None:
             return {"skills": []}
         all_skills = registry.list_all()
-        loader2 = getattr(actual_agent, "skill_loader", None)
-        if loader2 is not None:
-            effective_allowlist = loader2.compute_effective_allowlist(external_allowlist)
-        else:
-            effective_allowlist = external_allowlist
+        effective_allowlist = external_allowlist
 
     skills = []
     for skill in all_skills:
@@ -283,10 +244,19 @@ async def list_skills(request: Request):
             except (ValueError, TypeError):
                 relative_path = sid
 
-        tool_nm = getattr(skill, "tool_name", None) or ""
-        out_category = skill.category
-        if tool_nm.startswith(DEV_TOOL_TOOL_PREFIX):
-            out_category = "研发工具"
+        runtime_state = {}
+        try:
+            from synapse.skills.runtime_registry import read_skill_runtime_registry
+
+            runtime_state = (
+                read_skill_runtime_registry()
+                .get("skills", {})
+                .get(str(sid), {})
+            )
+            if not isinstance(runtime_state, dict):
+                runtime_state = {}
+        except Exception:
+            runtime_state = {}
 
         skills.append(
             {
@@ -297,17 +267,25 @@ async def list_skills(request: Request):
                 "visibility": getattr(skill, "visibility", "public"),
                 "permission_profile": getattr(skill, "permission_profile", ""),
                 "name": skill.name,
-                "label": getattr(skill, "label", None),
                 "description": skill.description,
                 "name_i18n": skill.name_i18n or None,
                 "description_i18n": skill.description_i18n or None,
                 "system": is_system,
                 "enabled": is_enabled,
-                "category": out_category,
+                "category": skill.category,
                 "tool_name": skill.tool_name,
                 "config": config,
                 "path": relative_path,
                 "source_url": getattr(skill, "source_url", None),
+                "runtime_state": {
+                    "installed": bool(runtime_state.get("installed", True)),
+                    "enabled": is_enabled,
+                    "loaded": bool(runtime_state.get("loaded", True)),
+                    "deps_hash": runtime_state.get("deps_hash", ""),
+                    "pending_update_revision": runtime_state.get("pending_update_revision"),
+                    "reload_required": bool(runtime_state.get("reload_required", False)),
+                    "update_policy": runtime_state.get("update_policy", "disk-only"),
+                },
             }
         )
 
@@ -329,6 +307,388 @@ async def list_skills(request: Request):
     return result
 
 
+_ORGANIZE_BATCH_SIZE = 50
+
+
+def _compact(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _compute_skill_list_hash(ids: set[str]) -> str:
+    import hashlib
+    return hashlib.sha256(",".join(sorted(ids)).encode()).hexdigest()[:16]
+
+
+@router.post("/api/skills/organize")
+async def organize_skills(request: Request):
+    """Generate a structured preview for AI skill categorization.
+
+    优化策略：
+    1. 增量整理 — 跳过已绑定分类的技能，只让 LLM 处理未分类技能
+    2. 两阶段并行 — 阶段1生成分类，阶段2分批并行归类，大幅降低总耗时
+    3. 结果缓存 — 相同技能列表直接返回上次结果
+    4. 优先从 _skills_cache 读取（避免磁盘扫描），回退到全量加载
+    """
+    global _organize_cache, _organize_cache_hash
+
+    from synapse.skills.categories import is_valid_category_name
+    from synapse.skills.category_store import CategoryStore
+
+    agent = _resolve_agent(request)
+    if agent is None or not hasattr(agent, "brain"):
+        raise HTTPException(status_code=503, detail="Agent 尚未就绪，无法执行 AI 整理")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    force = body.get("force", False)
+
+    # ── 获取技能列表 ──
+    cached_skills = _get_external_skills_from_cache()
+    if cached_skills is not None:
+        skill_items = [
+            {
+                "id": s["skill_id"],
+                "name": s.get("name", s["skill_id"]),
+                "desc": s.get("description") or "",
+                "cat": s.get("category") or "",
+            }
+            for s in cached_skills
+        ]
+        known_ids = {s["skill_id"] for s in cached_skills}
+    else:
+        try:
+            external_skills, _ = await _load_external_skills_for_organize()
+        except Exception as e:
+            logger.warning("Failed to load skills for AI organize: %s", e)
+            raise HTTPException(
+                status_code=500, detail="技能列表读取失败，无法生成整理请求"
+            ) from e
+        skill_items = [
+            {
+                "id": s.skill_id,
+                "name": s.name,
+                "desc": s.description or "",
+                "cat": s.category or "",
+            }
+            for s in external_skills
+        ]
+        known_ids = {s.skill_id for s in external_skills}
+
+    total_count = len(skill_items)
+
+    # ── P2: 结果缓存 — 技能列表未变时直接返回 ──
+    current_hash = _compute_skill_list_hash(known_ids)
+    if not force and _organize_cache is not None and _organize_cache_hash == current_hash:
+        logger.info("[organize] cache hit (hash=%s), returning cached result", current_hash)
+        return _organize_cache
+
+    # ── P1: 增量整理 — 只处理未分类技能 ──
+    store = CategoryStore()
+    store.reload()
+    existing_bindings = store.get_bindings()
+    existing_categories = store.list_categories()
+    existing_cat_names = {c["name"] for c in existing_categories}
+
+    unclassified = [s for s in skill_items if s["id"] not in existing_bindings]
+    pre_bound = {
+        sid: cat for sid, cat in existing_bindings.items()
+        if sid in known_ids and cat in existing_cat_names
+    }
+
+    if not unclassified:
+        result = {
+            "categories": existing_categories,
+            "bindings": pre_bound,
+            "summary": {
+                "total": total_count,
+                "included": total_count,
+                "truncated": 0,
+                "category_count": len(existing_categories),
+                "binding_count": len(pre_bound),
+                "unassigned_count": 0,
+                "by_category": {
+                    c["name"]: sum(1 for v in pre_bound.values() if v == c["name"])
+                    for c in existing_categories
+                },
+            },
+        }
+        _organize_cache = result
+        _organize_cache_hash = current_hash
+        return result
+
+    # ── 阶段1: 生成分类（只传 id+name，prompt 更小、输出更少） ──
+    names_lines: list[str] = []
+    for item in sorted(unclassified, key=lambda s: (s["name"], s["id"])):
+        names_lines.append(f"- {item['id']}|{item['name']}")
+
+    existing_hint = ""
+    if existing_cat_names:
+        existing_hint = (
+            f"\n已有分类供参考（可复用）: {', '.join(sorted(existing_cat_names))}\n"
+        )
+
+    phase1_prompt = "\n".join([
+        f"共{len(unclassified)}个待分类技能:",
+        *names_lines,
+        existing_hint,
+        "生成4-12个中文分类（可复用已有分类），返回严格JSON。",
+        '{"categories":[{"name":"X","description":"Y"}]}',
+    ])
+
+    try:
+        phase1_resp = await agent.brain.think_lightweight(
+            phase1_prompt,
+            system="技能分类助手。只返回JSON对象，无其他文本。",
+            max_tokens=800,
+        )
+        phase1_data = _extract_json_object(phase1_resp.content)
+    except Exception as e:
+        logger.warning("AI organize phase1 (category generation) failed: %s", e)
+        raise HTTPException(
+            status_code=502, detail="AI 整理生成失败（阶段1），请检查模型端点后重试"
+        ) from e
+
+    raw_categories = phase1_data.get("categories") or []
+    if not isinstance(raw_categories, list):
+        raise HTTPException(status_code=502, detail="AI 整理结果格式无效（阶段1）")
+
+    categories: list[dict] = []
+    category_names: set[str] = set()
+    for item in raw_categories[:20]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not is_valid_category_name(name) or name in category_names:
+            continue
+        description = _compact(str(item.get("description") or ""), 120)
+        categories.append({"name": name, "description": description})
+        category_names.add(name)
+
+    for ec in existing_categories:
+        if ec["name"] not in category_names:
+            categories.append(ec)
+            category_names.add(ec["name"])
+
+    if not categories:
+        raise HTTPException(status_code=502, detail="AI 整理没有生成有效分类")
+
+    # ── 阶段2: 分批并行归类 ──
+    cat_list_str = ", ".join(sorted(category_names))
+    batches = [
+        unclassified[i : i + _ORGANIZE_BATCH_SIZE]
+        for i in range(0, len(unclassified), _ORGANIZE_BATCH_SIZE)
+    ]
+
+    async def _classify_batch(batch: list[dict]) -> dict[str, str]:
+        lines = "\n".join(
+            f"- {s['id']}|{s['name']}|{_compact(s['desc'], 30)}" for s in batch
+        )
+        prompt = "\n".join([
+            f"可选分类: {cat_list_str}",
+            f"技能({len(batch)}个):",
+            lines,
+            "",
+            "为每个技能选择最合适的分类，返回严格JSON。",
+            "bindings的key必须是上方id，value必须是上方可选分类之一，不要凭空创造。",
+            '{"bindings":{"skill_id":"category_name"}}',
+        ])
+        resp = await agent.brain.think_lightweight(
+            prompt,
+            system="技能分类助手。只返回JSON对象，无其他文本。",
+            max_tokens=1500,
+        )
+        data = _extract_json_object(resp.content)
+        return data.get("bindings") or {}
+
+    try:
+        batch_results = await asyncio.gather(
+            *[_classify_batch(b) for b in batches],
+            return_exceptions=True,
+        )
+    except Exception as e:
+        logger.warning("AI organize phase2 (batch classify) failed: %s", e)
+        raise HTTPException(
+            status_code=502, detail="AI 整理生成失败（阶段2），请检查模型端点后重试"
+        ) from e
+
+    new_bindings: dict[str, str] = {}
+    for i, result in enumerate(batch_results):
+        if isinstance(result, Exception):
+            logger.warning("AI organize batch %d/%d failed: %s", i + 1, len(batches), result)
+            continue
+        if not isinstance(result, dict):
+            continue
+        for sid_raw, cat_raw in result.items():
+            sid = str(sid_raw).strip()
+            cat = str(cat_raw).strip()
+            if sid in known_ids and cat in category_names:
+                new_bindings[sid] = cat
+
+    all_bindings = {**pre_bound, **new_bindings}
+
+    if not all_bindings:
+        raise HTTPException(status_code=502, detail="AI 整理没有生成有效技能归类")
+
+    by_category: dict[str, int] = {cat["name"]: 0 for cat in categories}
+    for cat in all_bindings.values():
+        by_category[cat] = by_category.get(cat, 0) + 1
+
+    result = {
+        "categories": categories,
+        "bindings": all_bindings,
+        "summary": {
+            "total": total_count,
+            "included": len(unclassified),
+            "truncated": 0,
+            "category_count": len(categories),
+            "binding_count": len(all_bindings),
+            "unassigned_count": max(0, total_count - len(all_bindings)),
+            "by_category": by_category,
+        },
+    }
+    _organize_cache = result
+    _organize_cache_hash = current_hash
+    return result
+
+
+@router.post("/api/skills/organize/apply")
+async def apply_skill_organization(request: Request):
+    """Apply a reviewed AI skill categorization preview to CategoryStore."""
+    from synapse.skills.categories import is_valid_category_name
+    from synapse.skills.category_store import CategoryStore
+
+    body = await request.json()
+    categories = body.get("categories") or []
+    bindings = body.get("bindings") or {}
+    rename_map_raw = body.get("rename_map") or {}
+    category_order_raw = body.get("category_order") or []
+    if not isinstance(categories, list) or not isinstance(bindings, dict):
+        raise HTTPException(status_code=400, detail="categories 和 bindings 格式无效")
+    if rename_map_raw is not None and not isinstance(rename_map_raw, dict):
+        raise HTTPException(status_code=400, detail="rename_map 格式无效")
+    if category_order_raw is not None and not isinstance(category_order_raw, list):
+        raise HTTPException(status_code=400, detail="category_order 格式无效")
+
+    try:
+        external_skills, _ = await _load_external_skills_for_organize()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="技能列表读取失败，无法应用整理结果") from e
+
+    known_ids = {s.skill_id for s in external_skills}
+    store = CategoryStore()
+    store.reload()
+
+    valid_categories_ordered: list[tuple[str, str]] = []
+    seen_category_names: set[str] = set()
+    valid_categories: dict[str, str] = {}
+    for item in categories:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not is_valid_category_name(name):
+            continue
+        if name in seen_category_names:
+            continue
+        desc = str(item.get("description") or "").strip()
+        valid_categories_ordered.append((name, desc))
+        valid_categories[name] = desc
+        seen_category_names.add(name)
+
+    if not valid_categories:
+        raise HTTPException(status_code=400, detail="没有有效分类可应用")
+
+    rename_map: dict[str, str] = {}
+    for old_raw, new_raw in rename_map_raw.items():
+        old_name = str(old_raw).strip()
+        new_name = str(new_raw).strip()
+        if not old_name or not new_name or old_name == new_name:
+            continue
+        if not is_valid_category_name(new_name):
+            raise HTTPException(status_code=400, detail=f"重命名目标非法: {new_name}")
+        rename_map[old_name] = new_name
+
+    target_seen: set[str] = set()
+    for target in rename_map.values():
+        if target in target_seen:
+            raise HTTPException(status_code=400, detail="rename_map 存在重名目标冲突")
+        target_seen.add(target)
+
+    for start in rename_map:
+        seen: set[str] = set()
+        cur = start
+        while cur in rename_map:
+            if cur in seen:
+                raise HTTPException(status_code=400, detail="rename_map 存在循环映射")
+            seen.add(cur)
+            cur = rename_map[cur]
+
+    rename_order: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def _dfs(node: str) -> None:
+        if node in visited:
+            return
+        if node in visiting:
+            raise HTTPException(status_code=400, detail="rename_map 存在循环映射")
+        visiting.add(node)
+        nxt = rename_map.get(node)
+        if nxt and nxt in rename_map:
+            _dfs(nxt)
+        visiting.remove(node)
+        visited.add(node)
+        rename_order.append(node)
+
+    for name in rename_map:
+        _dfs(name)
+
+    for old_name in rename_order:
+        new_name = rename_map[old_name]
+        if not store.has_category(old_name):
+            continue
+        if store.has_category(new_name):
+            raise HTTPException(status_code=400, detail=f"重命名冲突，目标已存在: {new_name}")
+        ok = store.update_category(old_name, new_name=new_name)
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"分类重命名失败: {old_name} -> {new_name}")
+
+    applied_categories = 0
+    for name, desc in valid_categories_ordered:
+        if store.has_category(name):
+            store.update_category(name, description=desc)
+        else:
+            store.create_category(name, desc)
+        applied_categories += 1
+
+    applied_bindings = 0
+    for sid_raw, cat_raw in bindings.items():
+        sid = str(sid_raw).strip()
+        cat = str(cat_raw).strip()
+        if sid not in known_ids or cat not in valid_categories:
+            continue
+        store.bind_skill(sid, cat)
+        applied_bindings += 1
+
+    if category_order_raw:
+        order = [str(x).strip() for x in category_order_raw if str(x).strip()]
+        if order:
+            store.set_category_order(order)
+
+    _invalidate_skills_cache()
+    await _propagate(request, "skill_organize_apply", rescan=True)
+    _invalidate_skills_cache()
+
+    return {
+        "status": "ok",
+        "categories": applied_categories,
+        "bindings": applied_bindings,
+    }
+
+
 @router.post("/api/skills/config")
 async def update_skill_config(request: Request):
     """Persist skill configuration to data/skill_configs.json."""
@@ -346,20 +706,14 @@ async def update_skill_config(request: Request):
     except Exception:
         config_file = Path.cwd() / "data" / "skill_configs.json"
 
-    existing: dict = {}
-    if config_file.exists():
-        try:
-            raw = config_file.read_text(encoding="utf-8")
-            existing = json.loads(raw) if raw.strip() else {}
-        except Exception:
-            pass
+    from synapse.utils.atomic_io import read_json_safe, safe_json_write
+
+    existing = read_json_safe(config_file) or {}
+    if not isinstance(existing, dict):
+        existing = {}
 
     existing[skill_name] = config_values
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text(
-        json.dumps(existing, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    safe_json_write(config_file, existing)
 
     return {"status": "ok", "skill": skill_name, "config": config_values}
 
@@ -368,29 +722,43 @@ async def update_skill_config(request: Request):
 async def install_skill(request: Request):
     """安装技能（远程模式替代 Tauri synapse_install_skill 命令）。
 
-    POST body: { "url": "github:user/repo/skill" }
-    安装完成后自动重新加载技能并应用 allowlist。
-    """
-    import asyncio
+    POST body: { "url": "github:user/repo/skill", "category": "Browser" (可选) }
 
-    from synapse.core.agent import Agent
+    完成后会：
+      1. 把新安装 skill_id upsert 到 data/skills.json 的 external_allowlist
+         （仅当已存在该字段；文件不存在时保留“未声明=全部启用”语义）
+      2. 通过 ``propagate_skill_change`` 完整刷新运行时缓存与 Agent Pool。
+
+    Args:
+        category: 可选大类名。命中且通过校验时安装到 ``skills/<category>/<id>/``；
+            否则安装到 ``skills/<id>/`` 顶层（向后兼容）。
+    """
+    from synapse.skills.allowlist_io import upsert_skill_ids
 
     body = await request.json()
     url = body.get("url", "").strip()
     if not url:
         return {"error": "url is required"}
+    category_raw = body.get("category")
+    category = (
+        str(category_raw).strip() if isinstance(category_raw, str) and category_raw.strip() else None
+    )
 
     try:
         from synapse.config import settings
 
         workspace_dir = str(settings.project_root)
     except Exception:
-        workspace_dir = str(__import__("pathlib").Path.cwd())
+        workspace_dir = str(Path.cwd())
+
+    from synapse.setup_center.bridge import SkillInstallError
+    from synapse.setup_center.bridge import install_skill as _install_skill
 
     try:
-        from synapse.setup_center.bridge import install_skill as _install_skill
-
-        await asyncio.to_thread(_install_skill, workspace_dir, url)
+        await asyncio.to_thread(_install_skill, workspace_dir, url, category=category)
+    except SkillInstallError as e:
+        logger.error("Skill install failed (%s): %s", e.code, e.message, exc_info=True)
+        return {"error": e.message, "error_code": e.code}
     except FileNotFoundError as e:
         missing = getattr(e, "filename", None) or "外部命令"
         logger.error("Skill install missing dependency: %s", e, exc_info=True)
@@ -404,15 +772,35 @@ async def install_skill(request: Request):
         logger.error("Skill install failed: %s", e, exc_info=True)
         return {"error": str(e)}
 
-    # 验证安装的技能是否能被 SkillLoader 正确解析
+    # 识别本次新增的 skill 目录（最近修改的 SKILL.md 所在目录）。
+    # 升级为 rglob 扫描以兼容分类目录化后的嵌套布局
+    # （skills/<category>/<skill_id>/SKILL.md，最多 4 层即可覆盖
+    #  <category>/<sub>/<skill> + SKILL.md 的最深路径）。
     install_warning = None
+    new_skill_id: str | None = None
     try:
         from synapse.setup_center.bridge import _resolve_skills_dir
 
         skills_dir = _resolve_skills_dir(workspace_dir)
-        # 找到刚安装的技能目录（最新修改的含 SKILL.md 的子目录）
+        candidate_dirs: list[Path] = []
+        try:
+            for skill_md in skills_dir.rglob("SKILL.md"):
+                parent = skill_md.parent
+                # 跳过位于隐藏 / 内部目录里的 SKILL.md（如克隆遗留 .git）
+                rel_parts = parent.relative_to(skills_dir).parts
+                if any(p.startswith(".") or p.startswith("_") for p in rel_parts):
+                    continue
+                # 限制深度：分类最多嵌套 3 层 + skill 目录 = 4 段
+                if len(rel_parts) > 4:
+                    continue
+                candidate_dirs.append(parent)
+        except Exception:
+            # rglob 异常时回退到原顶层扫描，避免完全失败
+            candidate_dirs = [
+                d for d in skills_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()
+            ]
         candidates = sorted(
-            (d for d in skills_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()),
+            candidate_dirs,
             key=lambda d: d.stat().st_mtime,
             reverse=True,
         )
@@ -422,6 +810,7 @@ async def install_skill(request: Request):
             parser = SkillParser()
             try:
                 parser.parse_directory(candidates[0])
+                new_skill_id = candidates[0].name
             except Exception as parse_err:
                 import shutil
 
@@ -442,30 +831,53 @@ async def install_skill(request: Request):
         install_warning = str(ve)
         logger.warning("Post-install validation skipped: %s", ve)
 
-    # 安装成功后：重新加载技能到 agent 运行时，并应用 allowlist
+    # 若 skills.json 已有 external_allowlist，自动把新装 skill upsert 进去，
+    # 避免被随后的 prune 立即裁掉。不存在 allowlist 字段时跳过（全部启用语义）。
+    if new_skill_id:
+        try:
+            upsert_skill_ids({new_skill_id})
+        except Exception as e:
+            logger.warning("Failed to upsert %s into skills.json: %s", new_skill_id, e)
+
+    # 若指定了分类，写入分类归属（由 CategoryStore 落盘到 categories[].skills）
+    if new_skill_id and category:
+        try:
+            agent = _resolve_agent(request)
+            if agent is not None:
+                cat_registry = getattr(agent, "skill_category_registry", None)
+                store = getattr(cat_registry, "store", None) if cat_registry else None
+                if store is not None:
+                    if store.has_category(category):
+                        store.bind_skill(new_skill_id, category)
+                    else:
+                        logger.warning(
+                            "Skip binding newly installed skill %s to unknown category %s",
+                            new_skill_id,
+                            category,
+                        )
+        except Exception as e:
+            logger.warning("Failed to bind %s to category %s: %s", new_skill_id, category, e)
+
+    # 统一刷新入口 —— 重扫磁盘 + 重新应用 allowlist + 重建 catalog + 通知 Pool
+    await _propagate(request, "install")
+
+    # 自动翻译（可选，不阻塞成功返回）—— 后台执行，避免拖慢安装路径
     try:
-        agent = getattr(request.app.state, "agent", None)
-        actual_agent = agent
-        if not isinstance(agent, Agent):
-            actual_agent = getattr(agent, "_local_agent", None)
+        async def _bg_translate(req=request, src_url=url):
+            try:
+                await _auto_translate_new_skills(req, src_url)
+            except Exception as bg_err:  # pragma: no cover - 仅日志
+                logger.debug("Background auto-translate skipped: %s", bg_err)
 
-        if actual_agent is not None:
-            loader = getattr(actual_agent, "skill_loader", None)
-            if loader:
-                base_path, _ = _read_external_allowlist()
-                loader.load_all(base_path)
-            _apply_allowlist_and_rebuild_catalog(request)
-
-            # 自动翻译：为新安装的技能生成 i18n (agents/openai.yaml)
-            await _auto_translate_new_skills(request, url)
+        asyncio.create_task(_bg_translate())
     except Exception as e:
-        logger.warning(f"Post-install reload failed (skill was installed): {e}")
+        logger.debug("Auto-translate scheduling skipped: %s", e)
 
-    _invalidate_skills_cache()
-    _notify_skills_changed("install")
     result: dict = {"status": "ok", "url": url}
     if install_warning:
         result["warning"] = install_warning
+    if new_skill_id:
+        result["skill_id"] = new_skill_id
     return result
 
 
@@ -474,26 +886,20 @@ async def uninstall_skill(request: Request):
     """卸载技能。
 
     POST body: { "skill_id": "skill-directory-name" }
-    卸载后自动重新加载技能并刷新 allowlist。
     """
-    from synapse.core.agent import Agent
+    from synapse.skills.allowlist_io import remove_skill_ids
 
     body = await request.json()
     skill_id = (body.get("skill_id") or "").strip()
     if not skill_id:
         return {"error": "skill_id is required"}
 
-    from synapse.utils.whaleclouddevtool import is_whalecloud_base_scripts_skill_id
-
-    if is_whalecloud_base_scripts_skill_id(skill_id):
-        return {"error": "研发工具共享脚本技能为系统强制依赖，不可卸载"}
-
     try:
         from synapse.config import settings
 
         workspace_dir = str(settings.project_root)
     except Exception:
-        workspace_dir = str(__import__("pathlib").Path.cwd())
+        workspace_dir = str(Path.cwd())
 
     try:
         from synapse.setup_center.bridge import uninstall_skill as _uninstall_skill
@@ -503,24 +909,42 @@ async def uninstall_skill(request: Request):
         logger.error("Skill uninstall failed: %s", e, exc_info=True)
         return {"error": str(e)}
 
+    # 从 allowlist 中移除（文件不存在或无该字段时静默跳过）
     try:
-        agent = getattr(request.app.state, "agent", None)
-        actual_agent = agent
-        if not isinstance(agent, Agent):
-            actual_agent = getattr(agent, "_local_agent", None)
-        if actual_agent is not None:
-            loader = getattr(actual_agent, "skill_loader", None)
-            if loader:
-                loader.unload_skill(skill_id)
-                base_path, _ = _read_external_allowlist()
-                loader.load_all(base_path)
-            _apply_allowlist_and_rebuild_catalog(request)
+        remove_skill_ids({skill_id})
     except Exception as e:
-        logger.warning(f"Post-uninstall reload failed: {e}")
+        logger.warning("Failed to remove %s from skills.json: %s", skill_id, e)
 
-    _invalidate_skills_cache()
-    _notify_skills_changed("uninstall")
+    await _propagate(request, "uninstall")
+
     return {"status": "ok", "skill_id": skill_id}
+
+
+@router.get("/api/skills/conflicts")
+async def list_skill_conflicts(request: Request):
+    """Return skill registration conflicts logged by SkillRegistry.
+
+    Each entry has ``skill_id`` / ``name`` / ``action`` (``rejected`` |
+    ``overridden``) plus the winner and shadowed source metadata. The frontend
+    Skill panel uses this to warn users that two sources tried to register
+    the same skill and which one is being used.
+    """
+    actual_agent = _resolve_agent(request)
+    registry = getattr(actual_agent, "skill_registry", None) if actual_agent else None
+    if registry is None or not hasattr(registry, "get_conflicts"):
+        return {"conflicts": []}
+    return {"conflicts": registry.get_conflicts()}
+
+
+@router.post("/api/skills/conflicts/clear")
+async def clear_skill_conflicts(request: Request):
+    """Reset the in-memory conflict log (audit only — does not change registrations)."""
+    actual_agent = _resolve_agent(request)
+    registry = getattr(actual_agent, "skill_registry", None) if actual_agent else None
+    if registry is None or not hasattr(registry, "clear_conflicts"):
+        return {"ok": False, "error": "skill_registry unavailable"}
+    registry.clear_conflicts()
+    return {"ok": True}
 
 
 @router.post("/api/skills/reload")
@@ -529,9 +953,15 @@ async def reload_skills(request: Request):
 
     POST body: { "skill_name": "optional-name" }
     如果 skill_name 为空或未提供，则重新扫描并加载所有技能。
-    全量重载后会重新读取 data/skills.json 的 allowlist 并裁剪禁用技能。
     """
-    from synapse.core.agent import Agent
+    agent = _resolve_agent(request)
+    if agent is None:
+        return {"error": "Agent not initialized"}
+
+    loader = getattr(agent, "skill_loader", None)
+    registry = getattr(agent, "skill_registry", None)
+    if not loader or not registry:
+        return {"error": "Skill loader/registry not available"}
 
     body = (
         await request.json()
@@ -540,43 +970,35 @@ async def reload_skills(request: Request):
     )
     skill_name = (body.get("skill_name") or "").strip()
 
-    agent = getattr(request.app.state, "agent", None)
-    actual_agent = agent
-    if not isinstance(agent, Agent):
-        actual_agent = getattr(agent, "_local_agent", None)
-
-    if actual_agent is None:
-        return {"error": "Agent not initialized"}
-
-    loader = getattr(actual_agent, "skill_loader", None)
-    registry = getattr(actual_agent, "skill_registry", None)
-    if not loader or not registry:
-        return {"error": "Skill loader/registry not available"}
-
     try:
-        _invalidate_skills_cache()
         if skill_name:
-            reloaded = loader.reload_skill(skill_name)
-            if reloaded:
-                _apply_allowlist_and_rebuild_catalog(request)
-                _notify_skills_changed("reload")
-                return {"status": "ok", "reloaded": [skill_name]}
-            else:
+            reloaded = await asyncio.to_thread(loader.reload_skill, skill_name)
+            if not reloaded:
                 return {"error": f"Skill '{skill_name}' not found or reload failed"}
-        else:
-            base_path, _ = _read_external_allowlist()
-            loaded_count = loader.load_all(base_path)
+            await _propagate(request, "reload", rescan=False)
+            return {"status": "ok", "reloaded": [skill_name]}
 
-            pruned = _apply_allowlist_and_rebuild_catalog(request)
-            total = len(registry.list_all())
-            _notify_skills_changed("reload")
-            return {
-                "status": "ok",
-                "reloaded": "all",
-                "loaded": loaded_count,
-                "pruned": pruned,
-                "total": total,
-            }
+        await _propagate(request, "reload", rescan=True)
+        total = len(registry.list_all())
+        issues = _skill_load_issues(loader)
+        result = {
+            "status": "ok",
+            "reloaded": "all",
+            "total": total,
+        }
+        if issues:
+            result.update(
+                {
+                    "partial": True,
+                    "skipped_count": len(issues),
+                    "skipped_skills": issues,
+                    "warning": (
+                        f"已刷新可用技能，但有 {len(issues)} 个技能未加载。"
+                        "其他技能可正常使用。"
+                    ),
+                }
+            )
+        return result
     except Exception as e:
         logger.error(f"Skill reload failed: {e}")
         return {"error": str(e)}
@@ -591,13 +1013,14 @@ async def get_skill_content(skill_name: str, request: Request):
     """
     from synapse.skills.loader import SkillLoader
 
-    base_path, _ = _read_external_allowlist()
+    try:
+        from synapse.config import settings
 
-    # 优先从 agent 运行时的 loader 中查找（已加载的技能）
-    from synapse.core.agent import Agent
+        base_path = Path(settings.project_root)
+    except Exception:
+        base_path = Path.cwd()
 
-    agent = getattr(request.app.state, "agent", None)
-    actual_agent = agent if isinstance(agent, Agent) else getattr(agent, "_local_agent", None)
+    actual_agent = _resolve_agent(request)
 
     skill = None
     if actual_agent:
@@ -606,7 +1029,6 @@ async def get_skill_content(skill_name: str, request: Request):
             skill = loader.get_skill(skill_name)
 
     if not skill:
-        # Fallback: 用临时 loader 扫描
         try:
             tmp_loader = SkillLoader()
             tmp_loader.load_all(base_path=base_path)
@@ -640,14 +1062,7 @@ async def update_skill_content(skill_name: str, request: Request):
     """更新技能的 SKILL.md 内容并热重载。
 
     PUT body: { "content": "完整的 SKILL.md 内容" }
-
-    流程:
-    1. 校验新内容能被正确解析（frontmatter + body）
-    2. 写入磁盘
-    3. 热重载该技能
-    4. 返回更新后的元数据
     """
-    from synapse.core.agent import Agent
     from synapse.skills.parser import skill_parser
 
     try:
@@ -658,9 +1073,7 @@ async def update_skill_content(skill_name: str, request: Request):
     if not new_content.strip():
         return {"error": "content is required"}
 
-    # 查找技能
-    agent = getattr(request.app.state, "agent", None)
-    actual_agent = agent if isinstance(agent, Agent) else getattr(agent, "_local_agent", None)
+    actual_agent = _resolve_agent(request)
 
     skill = None
     loader = None
@@ -675,317 +1088,32 @@ async def update_skill_content(skill_name: str, request: Request):
     if skill.metadata.system:
         return {"error": "Cannot edit system (built-in) skills"}
 
-    # 1. 校验新内容格式
     try:
         parsed = skill_parser.parse_content(new_content, skill.path)
     except Exception as e:
         return {"error": f"Invalid SKILL.md format: {e}"}
 
-    # 2. 写入磁盘
     try:
         skill.path.write_text(new_content, encoding="utf-8")
     except Exception as e:
         return {"error": f"Failed to write SKILL.md: {e}"}
 
-    # 3. 热重载
     reloaded = False
     if loader:
         try:
-            result = loader.reload_skill(skill_name)
+            result = await asyncio.to_thread(loader.reload_skill, skill_name)
             if result:
-                _apply_allowlist_and_rebuild_catalog(request)
+                await _propagate(request, "content_update", rescan=False)
                 reloaded = True
         except Exception as e:
             logger.warning(f"Skill reload after edit failed: {e}")
 
-    _invalidate_skills_cache()
-    _notify_skills_changed("content_update")
     return {
         "status": "ok",
         "reloaded": reloaded,
         "name": parsed.metadata.name,
         "description": parsed.metadata.description,
     }
-
-
-def _skill_registry_from_request(request: Request):
-    from synapse.core.agent import Agent
-
-    agent = getattr(request.app.state, "agent", None)
-    actual = agent if isinstance(agent, Agent) else getattr(agent, "_local_agent", None)
-    if actual is None:
-        return None
-    return getattr(actual, "skill_registry", None)
-
-
-def _resolve_profile_for_dev_tool_test(agent_profile_id: str | None):
-    """默认使用「小鲸」（preset id=default）；可由请求覆盖 agent_profile_id。"""
-    from synapse.agents.presets import SYSTEM_PRESETS
-    from synapse.agents.profile import get_profile_store
-
-    pid = (agent_profile_id or "").strip() or "default"
-    store = get_profile_store()
-    loaded = store.get(pid)
-    if loaded:
-        return loaded
-    for sp in SYSTEM_PRESETS:
-        if sp.id == pid:
-            return sp
-    for sp in SYSTEM_PRESETS:
-        if sp.id == "default":
-            return sp
-    return SYSTEM_PRESETS[0]
-
-
-@router.post("/api/skills/dev-tools/test")
-async def dev_tools_test_skill(request: Request):
-    """在临时目录中用指定 Agent（默认小鲸）对单个研发流程技能做一次快速验证。"""
-    pool = getattr(request.app.state, "agent_pool", None)
-    if pool is None:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "agent_pool_unavailable", "message": "Agent pool not initialized"},
-        )
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "invalid_json"})
-
-    skill_id = (body.get("skill_id") or "").strip()
-    message = (body.get("message") or "").strip()
-    agent_profile_raw = body.get("agent_profile_id")
-    agent_profile_id = agent_profile_raw if isinstance(agent_profile_raw, str) else None
-
-    timeout_raw = body.get("timeout_seconds")
-    try:
-        timeout_s = float(timeout_raw) if timeout_raw is not None else 180.0
-    except (TypeError, ValueError):
-        timeout_s = 180.0
-    timeout_s = max(30.0, min(timeout_s, 600.0))
-
-    if not skill_id:
-        return JSONResponse(status_code=400, content={"error": "skill_id_required"})
-
-    reg = _skill_registry_from_request(request)
-    if reg is None:
-        return JSONResponse(status_code=503, content={"error": "skill_registry_unavailable"})
-
-    entry = reg.get(skill_id)
-    if entry is None:
-        return JSONResponse(status_code=404, content={"error": "skill_not_found", "skill_id": skill_id})
-
-    tn = (entry.tool_name or "").strip()
-    if not tn.startswith(DEV_TOOL_TOOL_PREFIX):
-        return JSONResponse(
-            status_code=400,
-            content={"error": "not_dev_tool_skill", "tool_name": tn},
-        )
-
-    base_prof = _resolve_profile_for_dev_tool_test(agent_profile_id)
-    prof_id = f"__dev_tool_test_{uuid.uuid4().hex[:16]}"
-    session_id = f"devtool_test_{uuid.uuid4().hex}"
-
-    from synapse.agents.profile import SkillsMode
-
-    test_profile = replace(
-        base_prof,
-        id=prof_id,
-        skills=[skill_id],
-        skills_mode=SkillsMode.INCLUSIVE,
-        ephemeral=True,
-    )
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="synapse_dev_tool_test_"))
-    try:
-        agent = await pool.get_or_create(session_id, test_profile)
-        agent.default_cwd = str(temp_dir)
-        if getattr(agent, "shell_tool", None):
-            agent.shell_tool.default_cwd = str(temp_dir)
-        agent._current_session_id = session_id
-
-        default_msg = (
-            "请在当前工作目录下完成一次最小验证：确认本研发流程技能可用，"
-            "可按需调用 list_skills / get_skill_info，并简要说明验证步骤与结果。"
-        )
-        user_msg = message or default_msg
-
-        result = await asyncio.wait_for(
-            agent.execute_task_from_message(user_msg, usage_scene="dev_tools_test"),
-            timeout=timeout_s,
-        )
-        out_data = result.data
-        if isinstance(out_data, str):
-            output_text = out_data
-        else:
-            output_text = str(out_data) if out_data is not None else ""
-
-        return {
-            "success": result.success,
-            "output": output_text if result.success else None,
-            "error": result.error if not result.success else None,
-            "duration_seconds": result.duration_seconds,
-        }
-    except TimeoutError:
-        return JSONResponse(
-            status_code=504,
-            content={
-                "error": "timeout",
-                "message": f"验证超时（{timeout_s:.0f}s）",
-            },
-        )
-    except Exception as e:
-        logger.exception("dev-tools test failed")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-    finally:
-        try:
-            pool.invalidate_profile(prof_id)
-        except Exception:
-            logger.warning("invalidate_profile after dev-tools test failed", exc_info=True)
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-
-@router.post("/api/skills/dev-tools/create")
-async def create_dev_tool_skill(request: Request):
-    """在 ``skills/whalecloud-dev-tool-{slug}/`` 下创建 SKILL.md（及可选 .synapse-i18n.json）。"""
-    import yaml as pyyaml
-
-    from synapse.skills.parser import SkillParser
-
-    body = await request.json()
-    slug_in = body.get("slug") or body.get("skill_slug") or ""
-    slug = sanitize_dev_tool_slug(str(slug_in))
-    if not slug:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": "invalid_slug",
-                "message": "slug 须为 2–48 字符，仅小写字母、数字与连字符（如 my-flow）",
-            },
-        )
-
-    name_zh = str(body.get("name_zh") or "").strip()
-    name_en = str(body.get("name_en") or "").strip()
-    desc_zh = str(body.get("description_zh") or "").strip()
-    desc_en = str(body.get("description_en") or "").strip()
-
-    try:
-        from synapse.config import settings
-
-        workspace_root = Path(settings.project_root)
-    except Exception:
-        workspace_root = Path.cwd()
-
-    dir_name = f"whalecloud-dev-tool-{slug}"
-    skill_id = dir_name
-    tool_name = f"{DEV_TOOL_TOOL_PREFIX}{slug.replace('-', '_')}"
-
-    skills_root = workspace_root / "skills"
-    skill_folder = skills_root / dir_name
-    skill_md = skill_folder / "SKILL.md"
-
-    if skill_folder.exists():
-        return JSONResponse(
-            status_code=409,
-            content={"error": "exists", "message": f"技能目录已存在: {dir_name}"},
-        )
-
-    primary_desc = (desc_en or desc_zh or "R&D workflow skill (Synapse).").strip()
-    primary_desc = primary_desc.replace("\n", " ").strip()[:1024]
-    display_title = (name_en or name_zh or dir_name).strip()
-    when_use = (
-        (desc_en or desc_zh or "When this R&D workflow applies.")
-        .strip()
-        .replace("\n", " ")[:800]
-    )
-
-    fm = {
-        "name": dir_name,
-        "description": primary_desc,
-        "tool-name": tool_name,
-        "license": "MIT",
-        "category": "Dev Tools",
-        "when-to-use": when_use,
-        "keywords": ["whalecloud-dev-tool"],
-    }
-    fm_txt = pyyaml.safe_dump(fm, allow_unicode=True, sort_keys=False, default_flow_style=False).rstrip()
-
-    intro_body = ""
-    if desc_zh:
-        intro_body += f"\n\n## 说明（中文）\n\n{desc_zh}\n"
-    if desc_en:
-        intro_body += f"\n\n## Overview (English)\n\n{desc_en}\n"
-
-    md = f"---\n{fm_txt}\n---\n\n# {display_title}\n\n在编辑区完善指令、脚本与 references；可使用「测试验证」检查。\n{intro_body}"
-
-    parser = SkillParser()
-    try:
-        parsed = parser.parse_content(md, skill_md)
-        errs = parser.validate(parsed)
-        hard = [e for e in (errs or []) if e.startswith("ERROR:")]
-        if hard:
-            return JSONResponse(status_code=400, content={"error": "validation", "details": hard})
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-    i18n_sidecar: dict[str, dict[str, str]] = {}
-    if name_zh or desc_zh:
-        i18n_sidecar["zh"] = {
-            "name": name_zh or dir_name,
-            "description": desc_zh or primary_desc,
-        }
-    if name_en or desc_en:
-        i18n_sidecar["en"] = {
-            "name": name_en or dir_name,
-            "description": desc_en or primary_desc,
-        }
-
-    def _write_files() -> None:
-        from synapse.skills.i18n import LEGACY_I18N_FILENAME
-
-        skill_folder.mkdir(parents=True, exist_ok=True)
-        skill_md.write_text(md, encoding="utf-8")
-        if i18n_sidecar:
-            (skill_folder / LEGACY_I18N_FILENAME).write_text(
-                json.dumps(i18n_sidecar, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-
-    try:
-        await asyncio.to_thread(_write_files)
-    except Exception as e:
-        logger.exception("dev-tools create write failed")
-        await asyncio.to_thread(shutil.rmtree, str(skill_folder), ignore_errors=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-    _merge_external_allowlist_add(skill_id)
-
-    try:
-        from synapse.core.agent import Agent
-
-        agent = getattr(request.app.state, "agent", None)
-        actual_agent = agent
-        if not isinstance(agent, Agent):
-            actual_agent = getattr(agent, "_local_agent", None)
-        if actual_agent is not None:
-            loader = getattr(actual_agent, "skill_loader", None)
-            if loader:
-                base_path, _ = _read_external_allowlist()
-                loader.load_all(base_path)
-            _apply_allowlist_and_rebuild_catalog(request)
-    except Exception as e:
-        logger.warning("Post dev-tools create reload failed: %s", e)
-
-    _invalidate_skills_cache()
-    _notify_skills_changed("dev-tools-create")
-    try:
-        rel = skill_md.relative_to(workspace_root)
-    except ValueError:
-        rel = skill_md
-    return {"status": "ok", "skill_id": skill_id, "path": str(rel).replace("\\", "/")}
 
 
 @router.get("/api/skills/marketplace")
@@ -1003,7 +1131,6 @@ async def search_marketplace(q: str = "agent"):
             "trust_env": False,
         }
 
-        # 复用项目的代理和 IPv4 设置（get_proxy_config 含可达性验证）
         proxy = get_proxy_config()
         if proxy:
             client_kwargs["proxy"] = proxy
@@ -1021,11 +1148,33 @@ async def search_marketplace(q: str = "agent"):
         return {"skills": [], "count": 0, "error": str(e)}
 
 
-# Register API-layer side effects (cache invalidation + WS broadcast) so that
-# skill changes made by the *tools* layer also propagate to the frontend.
+# ──────────────────────────────────────────────────────────────────────
+# Cross-layer event subscribers
+#
+# ``Agent.propagate_skill_change`` 是所有刷新路径的起点，
+# 其最后一步会调用 ``notify_skills_changed(action)``；此处注册两个副作用：
+#   1. 清空 GET /api/skills 的模块缓存，使前端下次 GET 时拿到最新列表
+#   2. 通过 WebSocket 广播 ``skills:changed`` 事件，前端可实时刷新 UI
+#
+# AgentInstancePool 的版本号提升已在 ``propagate_skill_change`` 内部完成，
+# 此处**不再**重复通知池，避免版本号被同一次变更递增两次。
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _broadcast_ws_event(action: str) -> None:
+    """WebSocket 广播（fire-and-forget）。"""
+    try:
+        from synapse.api.routes.websocket import broadcast_event
+
+        asyncio.ensure_future(broadcast_event("skills:changed", {"action": action}))
+    except Exception:
+        pass
+
+
 def _on_skills_changed_api(action: str) -> None:
+    """由 ``skills.events.notify_skills_changed`` 触发的 API 层副作用。"""
     _invalidate_skills_cache()
-    _notify_skills_changed(action)
+    _broadcast_ws_event(action)
 
 
 try:
@@ -1034,3 +1183,4 @@ try:
     register_on_change(_on_skills_changed_api)
 except Exception:
     pass
+

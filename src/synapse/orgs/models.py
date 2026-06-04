@@ -124,6 +124,36 @@ def _new_id(prefix: str = "") -> str:
     return f"{prefix}{short}" if prefix else short
 
 
+def infer_agent_profile_id_for_node(data: dict) -> str:
+    """Infer a stable built-in AgentProfile id for legacy org nodes/templates."""
+    node_id = str(data.get("id") or "").lower()
+    title = str(data.get("role_title") or "").lower()
+    dept = str(data.get("department") or "").lower()
+    haystack = f"{node_id} {title} {dept}"
+
+    if any(k in haystack for k in ("architect", "架构", "cto", "技术总监")):
+        return "architect"
+    if any(k in haystack for k in ("devops", "运维", "部署", "ci/cd")):
+        return "devops-engineer"
+    if any(k in haystack for k in ("dev", "engineer", "工程师", "开发", "全栈", "前端", "后端", "qa", "测试")):
+        return "code-assistant"
+    if any(k in haystack for k in ("pm", "project", "项目", "产品", "cpo")):
+        return "project-manager"
+    if any(k in haystack for k in ("marketing", "market", "cmo", "seo", "社媒", "市场", "营销")):
+        return "marketing-planner"
+    if any(k in haystack for k in ("content", "writer", "文案", "内容", "运营", "编辑")):
+        return "content-creator"
+    if any(k in haystack for k in ("hr", "人力")):
+        return "hr-assistant"
+    if any(k in haystack for k in ("legal", "法务", "合规")):
+        return "legal-advisor"
+    if any(k in haystack for k in ("data", "分析", "数据")):
+        return "data-analyst"
+    if any(k in haystack for k in ("support", "客服", "客户")):
+        return "customer-support"
+    return "default"
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -145,6 +175,7 @@ class OrgNode:
     skills: list[str] = field(default_factory=list)
     skills_mode: str = "all"
     preferred_endpoint: str | None = None
+    endpoint_policy: str = "prefer"
     max_concurrent_tasks: int = 1
     timeout_s: int = 0
     can_delegate: bool = True
@@ -158,10 +189,33 @@ class OrgNode:
     ephemeral: bool = False
     avatar: str | None = None
     external_tools: list[str] = field(default_factory=list)
+    # 节点是否拥有"基础文件工具"（write_file / read_file / edit_file /
+    # list_directory）。默认 True，让没有显式勾选 filesystem 类目的角色（CPO、
+    # 文案、运营等）也能在需要时把交付物落盘成附件，而不是只回一段长文。
+    # 注意：刻意排除 run_shell / delete_file / grep / glob —— 那些归 filesystem
+    # 类目自管，需要的话用户再去勾 external_tools=["filesystem"]。文件路径会被
+    # agent.file_tool.base_path = <org_workspace> 隔离在组织 workspace 内，沿用
+    # 现有沙盒，不引入新的逃逸面。
+    enable_file_tools: bool = True
+    # 工作台节点来源：当节点由"工作台模板"创建时填入，结构为
+    # {"plugin_id": str, "template_id": str, "version": str}。
+    # 该字段仅用于 UI 识别与提示词点睛，不参与运行时工具放行决策
+    # （工具放行仍由 external_tools 决定）。约束：工作台节点必须是叶子节点，
+    # 详见 OrgManager.update / OrgRuntime._create_node_agent。
+    plugin_origin: dict | None = None
     frozen_by: str | None = None
     frozen_reason: str | None = None
     frozen_at: str | None = None
     status: NodeStatus = NodeStatus.IDLE
+    # Per-node runtime overrides. Default empty dict means "no override —
+    # use the org-level / global defaults". Recognised keys:
+    #   - max_iterations: int — caps ReAct loops for this node
+    #   - max_task_seconds: int — wall-clock timeout per delegated task
+    #   - allowed_tools: list[str] — intersect with the node's tool grant
+    #   - denied_tools: list[str] — subtract from the effective tool set
+    # All keys are opt-in; unknown keys are ignored. Other organizations
+    # leaving the dict empty get exactly the legacy behaviour.
+    runtime_overrides: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -180,6 +234,7 @@ class OrgNode:
             "skills": list(self.skills) if self.skills else [],
             "skills_mode": self.skills_mode,
             "preferred_endpoint": self.preferred_endpoint,
+            "endpoint_policy": self.endpoint_policy,
             "max_concurrent_tasks": self.max_concurrent_tasks,
             "timeout_s": self.timeout_s,
             "can_delegate": self.can_delegate,
@@ -193,20 +248,29 @@ class OrgNode:
             "ephemeral": self.ephemeral,
             "avatar": self.avatar,
             "external_tools": list(self.external_tools) if self.external_tools else [],
+            "enable_file_tools": self.enable_file_tools,
+            "plugin_origin": dict(self.plugin_origin) if self.plugin_origin else None,
             "frozen_by": self.frozen_by,
             "frozen_reason": self.frozen_reason,
             "frozen_at": self.frozen_at,
             "status": self.status.value,
+            "runtime_overrides": (
+                dict(self.runtime_overrides) if self.runtime_overrides else {}
+            ),
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> OrgNode:
         d = dict(d)
+        if not d.get("agent_profile_id"):
+            d["agent_profile_id"] = infer_agent_profile_id_for_node(d)
         if "status" in d and isinstance(d["status"], str):
             try:
                 d["status"] = NodeStatus(d["status"])
             except ValueError:
                 d["status"] = NodeStatus.IDLE
+        if d.get("endpoint_policy") not in {"prefer", "require"}:
+            d["endpoint_policy"] = "prefer"
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
@@ -383,6 +447,9 @@ class Organization:
     # Core business mission — drives proactive operations
     core_business: str = ""
 
+    # Canvas layout
+    layout_locked: bool = False
+
     # Token budget (reserved, not enforced initially)
     token_budget: int | None = None  # TODO: not yet enforced
     token_budget_period: str | None = None  # TODO: not yet enforced
@@ -394,10 +461,32 @@ class Organization:
     workspace_dir: str = ""
 
     # Watchdog
+    # 默认开启：自动发现节点长时间无进展；用户仍可在组织设置中关闭。
     watchdog_enabled: bool = True
     watchdog_interval_s: int = 30
     watchdog_stuck_threshold_s: int = 1800
     watchdog_silence_threshold_s: int = 1800
+
+    # 交付兜底：当用户原始 prompt 明显需要附件交付，但本任务内 LLM 一个文件
+    # 都没产出且最终答复是 ≥200 字的长文时，OrgRuntime 会把该长文自动落盘为
+    # ``<workspace>/deliverables/*.md``（走唯一登记入口 _register_file_output），
+    # 并给非 root 节点合成一条 TASK_DELIVERED 给上级。默认 True；从组织设置
+    # 页可关。该开关只影响"兜底"，关掉不影响 LLM 自己显式调 write_file /
+    # org_submit_deliverable 的行为。
+    auto_persist_final_answer: bool = True
+
+    # Per-org runtime overrides. Default empty dict — other orgs keep
+    # the global defaults. Recognised keys (all opt-in, unknown keys
+    # ignored):
+    #   - max_iterations: int — cap on ReAct loops at the org level
+    #     (a node-level override takes priority when present)
+    #   - command_timeout_secs: int — max wall-clock for a single
+    #     user-facing command before the watchdog declares it stuck
+    #   - command_stuck_warn_secs: int — emit org:command_stuck_warning
+    #     after this many seconds of no progress
+    #   - inflight_window_secs: float — duplicate-tool-call coalescing
+    #     window for the executor
+    runtime_overrides: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.tags = normalize_tags(self.tags)
@@ -445,6 +534,7 @@ class Organization:
             "total_tokens_used": self.total_tokens_used,
             "user_persona": self.user_persona.to_dict(),
             "core_business": self.core_business,
+            "layout_locked": self.layout_locked,
             "token_budget": self.token_budget,
             "token_budget_period": self.token_budget_period,
             "operation_mode": self.operation_mode,
@@ -453,6 +543,10 @@ class Organization:
             "watchdog_interval_s": self.watchdog_interval_s,
             "watchdog_stuck_threshold_s": self.watchdog_stuck_threshold_s,
             "watchdog_silence_threshold_s": self.watchdog_silence_threshold_s,
+            "auto_persist_final_answer": self.auto_persist_final_answer,
+            "runtime_overrides": (
+                dict(self.runtime_overrides) if self.runtime_overrides else {}
+            ),
         }
 
     @classmethod
@@ -508,6 +602,94 @@ class Organization:
                 if parts and all(p in haystack for p in parts):
                     return n
         return None
+
+    # ------------------------------------------------------------------
+    # Strict reference resolution
+    # ------------------------------------------------------------------
+    #
+    # ``get_node`` above is intentionally lenient — it is the backbone of
+    # search-style callers (org_find_colleague, UI reference rendering,
+    # historical log reconstruction) where "resolve whatever the user might
+    # have typed" is the correct behaviour.
+    #
+    # For *write-effect* tool parameters (``to_node`` on delegate /
+    # send_message / reply_message etc.) the same leniency is actively
+    # harmful: if role_titles share a prefix — e.g. "产品总监" vs "产品经理"
+    # — the substring branches ``title in query`` / ``query in title`` on
+    # L496 can silently resolve the caller's own title to itself or to the
+    # wrong sibling, which then triggers the self-delegation guard and
+    # spins the ReAct loop until Supervisor terminates it.
+    #
+    # ``resolve_reference`` is the strict counterpart: it returns a 3-tuple
+    #
+    #   (exact_match_or_none, candidates, status)
+    #
+    # where *status* is one of:
+    #
+    #   "exact_id"         – matched by node id (literal or normalized)
+    #   "exact_title"      – exactly one node has this role_title (strict)
+    #   "ambiguous_title"  – ≥ 2 nodes share this role_title
+    #   "fuzzy"            – no exact match; legacy lenient matching found
+    #                        one-or-more candidates (caller decides what
+    #                        to do — delegate handler rejects; search
+    #                        handler may accept the first candidate)
+    #   "not_found"        – nothing matched at all
+    #
+    # Callers that need the old "any hit wins" behaviour should keep using
+    # ``get_node``. Callers that need the strict contract (delegate,
+    # send_message, reply_message) should consume ``resolve_reference``
+    # directly and surface the candidate list in their error messages.
+    def resolve_reference(
+        self, query: str
+    ) -> tuple[OrgNode | None, list[OrgNode], str]:
+        if not query:
+            return None, [], "not_found"
+
+        for n in self.nodes:
+            if n.id == query:
+                return n, [], "exact_id"
+
+        q_lower = query.lower().replace(" ", "").replace("-", "")
+        if q_lower:
+            for n in self.nodes:
+                if n.id.lower().replace("-", "") == q_lower:
+                    return n, [], "exact_id"
+
+        q_title = query.strip()
+        if q_title:
+            # Case-sensitive exact title wins first; if that also yields
+            # multiple hits we still have to report ambiguity (e.g. two
+            # nodes literally named "产品经理" across departments).
+            exact_title_hits = [
+                n for n in self.nodes if (n.role_title or "").strip() == q_title
+            ]
+            if len(exact_title_hits) == 1:
+                return exact_title_hits[0], [], "exact_title"
+            if len(exact_title_hits) >= 2:
+                return None, exact_title_hits, "ambiguous_title"
+
+            # Case-insensitive exact title is still considered an exact
+            # match (safe — not a substring collision) so that legitimate
+            # shorthands like "cto" → role_title "CTO" keep working without
+            # being downgraded to fuzzy. Still gate on strict equality after
+            # normalizing case + whitespace only (no substring).
+            q_norm = q_title.lower().replace(" ", "").replace("　", "")
+            if q_norm:
+                ci_hits = [
+                    n for n in self.nodes
+                    if (n.role_title or "").strip().lower()
+                    .replace(" ", "").replace("　", "") == q_norm
+                ]
+                if len(ci_hits) == 1:
+                    return ci_hits[0], [], "exact_title"
+                if len(ci_hits) >= 2:
+                    return None, ci_hits, "ambiguous_title"
+
+        fuzzy_hit = self.get_node(query)
+        if fuzzy_hit is not None:
+            return None, [fuzzy_hit], "fuzzy"
+
+        return None, [], "not_found"
 
     def get_root_nodes(self) -> list[OrgNode]:
         return [n for n in self.nodes if n.level == 0]
@@ -833,3 +1015,4 @@ class OrgProject:
         proj = cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
         proj.tasks = [ProjectTask.from_dict(t) for t in raw_tasks]
         return proj
+

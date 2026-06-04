@@ -5,13 +5,15 @@ LLM Provider 基类
 """
 
 import asyncio
+import hashlib
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import AsyncIterator
 
-from ..types import EndpointConfig, LLMRequest, LLMResponse
+from ..types import EndpointConfig, LLMRequest, LLMResponse, normalize_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,7 @@ class RPMRateLimiter:
     当请求速率超过限制时，自动等待直到窗口内有空余配额。
     """
 
-    __slots__ = ("_rpm", "_window", "_timestamps", "_lock", "_lock_loop_id")
+    __slots__ = ("_rpm", "_window", "_timestamps", "_lock", "_lock_loop_id", "_blocked_until")
 
     def __init__(self, rpm: int):
         self._rpm = rpm
@@ -31,6 +33,26 @@ class RPMRateLimiter:
         self._timestamps: deque[float] = deque()
         self._lock: asyncio.Lock | None = None
         self._lock_loop_id: int | None = None
+        self._blocked_until: float = 0.0
+
+    def configure(self, rpm: int) -> None:
+        """更新 RPM 配置，保留已有窗口状态以避免 reload 瞬间绕过限流。"""
+        self._rpm = max(0, int(rpm or 0))
+
+    def penalize(self, seconds: float, endpoint_name: str = "") -> None:
+        """记录上游 429 后的短暂退避。
+
+        这不是常规限流额度，只在服务商已经明确返回 rate limit 后生效，
+        用来阻止多 Agent/多 LLMClient 实例继续立刻打同一个上游端点。
+        """
+        if seconds <= 0:
+            return
+        seconds = min(max(seconds, 1.0), 300.0)
+        until = time.monotonic() + seconds
+        if until > self._blocked_until:
+            self._blocked_until = until
+            tag = f" endpoint={endpoint_name}" if endpoint_name else ""
+            logger.warning(f"[RPM]{tag} upstream rate limit backoff {seconds:.1f}s")
 
     def _get_lock(self) -> asyncio.Lock:
         """获取或创建 asyncio.Lock（绑定到当前事件循环）。"""
@@ -45,27 +67,35 @@ class RPMRateLimiter:
 
     async def acquire(self, endpoint_name: str = "") -> None:
         """获取一个请求配额，必要时等待。"""
-        if self._rpm <= 0:
-            return
-
         lock = self._get_lock()
         while True:
             async with lock:
                 now = time.monotonic()
-                while self._timestamps and self._timestamps[0] <= now - self._window:
-                    self._timestamps.popleft()
-
-                if len(self._timestamps) < self._rpm:
-                    self._timestamps.append(now)
+                if self._blocked_until > now:
+                    wait_time = self._blocked_until - now
+                elif self._rpm <= 0:
                     return
+                else:
+                    wait_time = 0
 
-                oldest = self._timestamps[0]
-                wait_time = oldest + self._window - now
+                if wait_time <= 0:
+                    while self._timestamps and self._timestamps[0] <= now - self._window:
+                        self._timestamps.popleft()
+
+                    if len(self._timestamps) < self._rpm:
+                        self._timestamps.append(now)
+                        return
+
+                    oldest = self._timestamps[0]
+                    wait_time = oldest + self._window - now
 
             tag = f" endpoint={endpoint_name}" if endpoint_name else ""
-            logger.info(
-                f"[RPM]{tag} rate limit reached ({self._rpm} rpm), waiting {wait_time:.1f}s"
-            )
+            if self._blocked_until > time.monotonic():
+                logger.info(f"[RPM]{tag} upstream backoff active, waiting {wait_time:.1f}s")
+            else:
+                logger.info(
+                    f"[RPM]{tag} rate limit reached ({self._rpm} rpm), waiting {wait_time:.1f}s"
+                )
             await asyncio.sleep(max(wait_time, 0.1))
 
 
@@ -91,6 +121,8 @@ COOLDOWN_SECONDS = COOLDOWN_DEFAULT
 class LLMProvider(ABC):
     """LLM Provider 基类"""
 
+    _shared_rate_limiters: dict[str, RPMRateLimiter] = {}
+
     def __init__(self, config: EndpointConfig):
         self.config = config
         self._healthy = True
@@ -100,7 +132,34 @@ class LLMProvider(ABC):
         self._consecutive_cooldowns: int = 0  # 连续进入冷静期次数（无成功请求间隔）
         self._is_extended_cooldown: bool = False  # 是否处于升级冷静期
         _rpm = config.rpm_limit if isinstance(config.rpm_limit, int) else 0
-        self._rate_limiter: RPMRateLimiter | None = RPMRateLimiter(_rpm) if _rpm > 0 else None
+        self._rate_limiter: RPMRateLimiter = self._get_shared_rate_limiter(_rpm)
+
+    def _get_shared_rate_limiter(self, rpm: int) -> RPMRateLimiter:
+        """按真实上游身份共享限速器，避免多 Agent/多客户端实例绕过 RPM。"""
+        key = self._rate_limit_key()
+        limiter = self._shared_rate_limiters.get(key)
+        if limiter is None:
+            limiter = RPMRateLimiter(max(0, int(rpm or 0)))
+            self._shared_rate_limiters[key] = limiter
+        else:
+            limiter.configure(max(0, int(rpm or 0)))
+        return limiter
+
+    def _rate_limit_key(self) -> str:
+        api_key = self.config.get_api_key() or ""
+        key_fingerprint = (
+            hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16] if api_key else ""
+        )
+        base_url = normalize_base_url(self.config.base_url or "")
+        return "|".join(
+            [
+                self.config.api_type or "",
+                base_url,
+                self.config.model or "",
+                self.config.api_key_env or "",
+                key_fingerprint,
+            ]
+        )
 
     @property
     def name(self) -> str:
@@ -128,10 +187,12 @@ class LLMProvider(ABC):
             self._error_category = ""
             if self._is_extended_cooldown:
                 self._is_extended_cooldown = False
-                # 渐进退避冷静期结束后重置连续计数，给端点重新证明自己的机会
-                self._consecutive_cooldowns = 0
+                # 不重置 _consecutive_cooldowns：只有 record_success() 才重置。
+                # 这样持续失败的端点在冷却到期后如果再次失败，会直接进入
+                # 上一次的退避阶级（而非从 0 重新开始），避免 5s→10s→reset 循环。
                 logger.info(
-                    f"[LLM] endpoint={self.name} progressive cooldown expired, reset to healthy"
+                    f"[LLM] endpoint={self.name} progressive cooldown expired, "
+                    f"reset to healthy (consecutive_cooldowns={self._consecutive_cooldowns} preserved)"
                 )
 
         return self._healthy
@@ -175,14 +236,14 @@ class LLMProvider(ABC):
                 - "structural": 结构性/格式错误 (10s)
                 - "transient": 超时/连接错误 (5s)
                 - "": 默认 (30s)
-            is_local: 是否为本地端点（Ollama 等），本地端点 transient
-                错误不参与渐进升级（超时是资源不足，非远程故障）
+            is_local: 是否为本地端点（Ollama 等），影响 transient 错误的退避策略
 
         渐进式冷静期退避：
             连续非结构性错误进入冷静期（中间没有成功请求），冷静期从
-            COOLDOWN_ESCALATION_STEPS 按次数递增，上限 5 分钟。
+            COOLDOWN_ESCALATION_STEPS 按次数递增，上限 60 秒。
             - 结构性错误不计入连续次数（重试不会改变结果）
-            - 本地端点 transient 错误不触发渐进升级（超时是正常行为）
+            - 本地端点 Timeout 不触发渐进升级（超时是推理资源不足）
+            - 本地端点 ConnectError 正常参与渐进升级（服务未启动，持续重试无意义）
         """
         was_already_unhealthy = not self._healthy
         self._healthy = False
@@ -192,9 +253,10 @@ class LLMProvider(ABC):
         # 累计连续冷静期次数
         # - 只在从健康 → 不健康时递增（同一轮重试中多次 mark_unhealthy 不重复计数）
         # - 结构性错误不累计：每次重试结果相同
-        # - 本地端点 transient 错误不累计：超时是资源不足，惩罚无意义
+        # - 本地端点 Timeout 不累计：超时是推理资源不足，惩罚无意义
+        #   但 ConnectError（服务未启动）应参与渐进退避，否则 5s 冷却循环浪费资源
         skip_escalation = self._error_category == "structural" or (
-            is_local and self._error_category == "transient"
+            is_local and self._error_category == "transient" and self._is_timeout_error(error)
         )
         if not skip_escalation and not was_already_unhealthy:
             self._consecutive_cooldowns += 1
@@ -219,8 +281,9 @@ class LLMProvider(ABC):
         elif self._error_category == "structural":
             cooldown = COOLDOWN_STRUCTURAL
         elif self._error_category == "transient":
-            if is_local:
-                # 本地端点超时固定短冷静期，不升级
+            _local_timeout = is_local and self._is_timeout_error(error)
+            if _local_timeout:
+                # 本地端点超时固定短冷静期，不升级（服务在跑但慢）
                 cooldown = COOLDOWN_TRANSIENT
             elif self._consecutive_cooldowns >= 2:
                 # 远程端点连续失败 → 渐进退避
@@ -286,8 +349,31 @@ class LLMProvider(ABC):
 
     async def acquire_rate_limit(self):
         """获取 RPM 限流配额，必要时等待。无限流配置时立即返回。"""
-        if self._rate_limiter:
-            await self._rate_limiter.acquire(endpoint_name=self.name)
+        await self._rate_limiter.acquire(endpoint_name=self.name)
+
+    def report_upstream_rate_limit(self, error: str) -> None:
+        """上游明确返回 429 后，给同一上游身份设置短暂共享退避。"""
+        retry_after = self._parse_retry_after_seconds(error)
+        self._rate_limiter.penalize(retry_after or 60.0, endpoint_name=self.name)
+
+    @staticmethod
+    def _parse_retry_after_seconds(error: str) -> float | None:
+        """从常见 429 文本中提取 retry-after/reset 秒数，缺失时由调用方兜底。"""
+        err = error or ""
+        patterns = [
+            r"retry-after[\"'\s:=]+(\d+(?:\.\d+)?)",
+            r"retry_after[\"'\s:=]+(\d+(?:\.\d+)?)",
+            r"retry in\s+(\d+(?:\.\d+)?)\s*s",
+            r"try again in\s+(\d+(?:\.\d+)?)\s*s",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, err, flags=re.IGNORECASE)
+            if match:
+                try:
+                    return float(match.group(1))
+                except ValueError:
+                    return None
+        return None
 
     def reset_cooldown(self):
         """重置冷静期，允许端点立即被重新尝试
@@ -322,11 +408,20 @@ class LLMProvider(ABC):
             self._cooldown_until = new_until
 
     @staticmethod
+    def _is_timeout_error(error: str) -> bool:
+        """判断是否为超时错误（区别于连接拒绝等其他 transient 错误）"""
+        err = error.lower()
+        return any(kw in err for kw in ["timeout", "timed out"])
+
+    @staticmethod
     def _classify_error(error: str) -> str:
         """根据错误信息自动分类。
 
-        分类优先级: quota > auth > structural > transient > unknown
+        分类优先级: content_safety > quota > auth > rate_limit(→transient) > structural > transient > unknown
+        content_safety 必须最优先检测，否则 "data_inspection_failed" 中的
+        "(400)" 或其他子串会被错误分到 STRUCTURAL，导致换端点重试浪费配额。
         quota 必须在 auth 之前检测，因为 403 配额耗尽也包含 "403" 关键字。
+        rate_limit 必须在 structural 之前检测，因为某些提供商 429 响应体含 "invalid_request"。
 
         返回 ``FailoverReason`` 枚举成员 (StrEnum, 与字符串互兼容)。
         """
@@ -337,15 +432,42 @@ class LLMProvider(ABC):
         if any(
             kw in err_lower
             for kw in [
+                "data_inspection",
+                "datainspectionfailed",
+                "inappropriate content",
+                "content_filter",
+            ]
+        ):
+            return FailoverReason.CONTENT_SAFETY
+
+        if any(
+            kw in err_lower
+            for kw in [
                 "allocationquota",
                 "freetieronly",
+                "insufficientquota",
                 "insufficient_quota",
+                "insufficient balance",
+                "balance insufficient",
+                "account balance",
                 "quota_exceeded",
+                "quota exceeded",
+                "payment required",
                 "billing",
                 "free tier",
                 "free_tier",
                 "quota",
+                "tokens.total",
+                "business.total",
                 "exceeded your current",
+                "api error (402)",
+                "http 402",
+                "(402)",
+                "余额不足",
+                "额度不足",
+                "额度已用尽",
+                "账户余额",
+                "请充值",
             ]
         ):
             return FailoverReason.QUOTA
@@ -354,6 +476,9 @@ class LLMProvider(ABC):
             kw in err_lower
             for kw in [
                 "auth",
+                "appidnoautherror",
+                "noauth",
+                "unauthorized",
                 "401",
                 "403",
                 "api_key",
@@ -363,12 +488,28 @@ class LLMProvider(ABC):
         ):
             return FailoverReason.AUTH
 
+        # 限速类（必须在 structural 之前，某些提供商 429 响应体含 "invalid_request"）#324
+        if any(
+            kw in err_lower
+            for kw in [
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+                "rate reaches maximum",
+                "request rate",
+                "(429)",
+            ]
+        ):
+            return FailoverReason.TRANSIENT
+
+        # 结构性/格式类
         # 注意: 用 "(400)" 而非 "400"，避免匹配 HTML 中的 CSS 类名等内容
         if any(
             kw in err_lower
             for kw in [
                 "invalid_request",
                 "invalid_parameter",
+                "invalid function response",
                 "messages with role",
                 "must be a response",
                 "does not support",
@@ -378,6 +519,11 @@ class LLMProvider(ABC):
                 "payload too large",
                 "request entity too large",
                 "larger than allowed",
+                "exceed_context_size",
+                "exceeds the available context",
+                "maximum context length",
+                "prompt is too long",
+                "too many tokens",
             ]
         ):
             return FailoverReason.STRUCTURAL
@@ -447,7 +593,16 @@ class LLMProvider(ABC):
                 messages=[Message(role="user", content="Hi")],
                 max_tokens=10,
             )
-            await self.chat(request)
+            response = await self.chat(request)
+            if response.usage.output_tokens > 0 and not response.content:
+                error = (
+                    "Endpoint returned output tokens but no visible content. "
+                    "The API proxy may be stripping model output."
+                )
+                if dry_run:
+                    raise RuntimeError(error)
+                self.mark_unhealthy(error, category="structural")
+                return False
             if not dry_run:
                 self.mark_healthy()
             return True

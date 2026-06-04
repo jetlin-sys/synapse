@@ -54,13 +54,6 @@ AGENT_TOOLS = [
                     "type": "string",
                     "description": "委派原因（可选，用于日志和追踪）",
                 },
-                "plan_item_id": {
-                    "type": "string",
-                    "description": (
-                        "研发会议室：对应 submit_meeting_work_plan.items[].id（可选但推荐），"
-                        "便于日志关联"
-                    ),
-                },
                 "model": {
                     "type": "string",
                     "enum": ["fast", "default", "capable"],
@@ -230,10 +223,6 @@ AGENT_TOOLS = [
                                 "type": "string",
                                 "description": "委派原因（可选）",
                             },
-                            "plan_item_id": {
-                                "type": "string",
-                                "description": "研发会议室：对应 submit_meeting_work_plan.items[].id（可选）",
-                            },
                             "context": {
                                 "type": "string",
                                 "description": "为该子Agent提供的额外背景上下文（可选，与顶层context合并）",
@@ -316,6 +305,10 @@ AGENT_TOOLS = [
             "- 创建的 Agent 默认是临时的（ephemeral），任务结束后自动销毁\n"
             "- 不会污染系统 Agent 列表\n"
             "- 设置 persistent=true 可永久保存（仅在用户明确要求时使用）\n\n"
+            "**记忆与身份**：\n"
+            "- 默认共享身份与记忆，适合一次性或通用任务\n"
+            "- 当用户要长期保存某个专业 Agent，或该 Agent 需要形成独立偏好/经验时，可设置 memory_isolation=\"isolated\"（旧名 memory_mode 同义，已废弃）\n"
+            "- memory_inherit_global=true 表示独立记忆也能参考全局记忆，通常保持默认即可\n\n"
             "**限制**：\n"
             "- 每个会话最多创建 5 个动态 Agent\n"
             "- 动态 Agent 不能再创建新 Agent\n"
@@ -344,6 +337,25 @@ AGENT_TOOLS = [
                 "persistent": {
                     "type": "boolean",
                     "description": "是否永久保存此 Agent（默认 false = 临时，任务结束后自动清理）",
+                },
+                "identity_mode": {
+                    "type": "string",
+                    "enum": ["shared", "custom"],
+                    "description": "身份模式：shared 共享全局身份；custom 使用独立身份（默认 shared）",
+                },
+                "memory_isolation": {
+                    "type": "string",
+                    "enum": ["shared", "isolated"],
+                    "description": "记忆隔离：shared 共享全局记忆；isolated 使用独立记忆（默认 shared）。Phase 2b.2 新名，推荐使用。",
+                },
+                "memory_mode": {
+                    "type": "string",
+                    "enum": ["shared", "isolated"],
+                    "description": "memory_isolation 的旧名，已废弃但仍兼容；优先使用 memory_isolation。",
+                },
+                "memory_inherit_global": {
+                    "type": "boolean",
+                    "description": "独立记忆是否同时参考全局记忆（默认 true）",
                 },
                 "force": {
                     "type": "boolean",

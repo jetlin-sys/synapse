@@ -13,6 +13,14 @@ from .catalog import (
     SkillCatalog,
     generate_skill_catalog,
 )
+from .categories import (
+    RESERVED_NAMESPACE_DIRS,
+    CategoryEntry,
+    CategoryRegistry,
+    is_valid_category_name,
+    read_description_md,
+)
+from .category_store import CategoryStore
 from .events import (
     notify_skills_changed,
     register_on_change,
@@ -58,6 +66,13 @@ __all__ = [
     # Catalog
     "SkillCatalog",
     "generate_skill_catalog",
+    # Categories
+    "CategoryRegistry",
+    "CategoryEntry",
+    "CategoryStore",
+    "RESERVED_NAMESPACE_DIRS",
+    "is_valid_category_name",
+    "read_description_md",
     # Events
     "register_on_change",
     "notify_skills_changed",
@@ -73,3 +88,4 @@ __all__ = [
     "SkillWatcher",
     "clear_all_skill_caches",
 ]
+

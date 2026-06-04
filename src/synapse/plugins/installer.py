@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,9 +24,205 @@ from .manifest import ManifestError, parse_manifest
 
 logger = logging.getLogger(__name__)
 
+_SPEC_NAME_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)")
+
+
+def _normalise_dist_name(name: str) -> str:
+    """Return the normalised distribution name used by ``*.dist-info`` dirs."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _dist_name_from_spec(spec: str) -> str | None:
+    """Extract a best-effort package name from a pip requirement string."""
+    raw = spec.strip()
+    if not raw or raw.startswith(("-", ".")):
+        return None
+    if " @ " in raw:
+        raw = raw.split(" @ ", 1)[0].strip()
+    raw = raw.split(";", 1)[0].strip()
+    raw = raw.split("[", 1)[0].strip()
+    match = _SPEC_NAME_RE.match(raw)
+    if not match:
+        return None
+    return _normalise_dist_name(match.group(1))
+
+
+def _pip_output_excerpt(proc: subprocess.CompletedProcess[str], *, limit: int = 4000) -> str:
+    """Build a compact pip failure excerpt suitable for logs and API errors."""
+    text = (proc.stderr or proc.stdout or "").strip()
+    if not text:
+        return f"pip exited with code {proc.returncode} and produced no output"
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    excerpt = "\n".join(lines[-40:]) if lines else text
+    if len(excerpt) > limit:
+        excerpt = excerpt[-limit:]
+    return excerpt
+
+
+def _pip_subprocess_env(python_executable: str) -> dict[str, str]:
+    """Environment for plugin dependency installs.
+
+    Delegates to the runtime manager env builder so plugin installs share the
+    same Python/Conda/pip/SSL isolation rules as channel and skill installs.
+    """
+    from synapse.runtime_manager import apply_runtime_pip_environment
+
+    return apply_runtime_pip_environment(python_executable=python_executable)
+
+
+def _pip_install_context(
+    *,
+    python_executable: str,
+    deps_dir: Path,
+    specs: list[str],
+    extra_args: list[str],
+) -> str:
+    """Human-readable context for diagnosing packaged plugin installs."""
+    return (
+        f"python={python_executable!r}; target={str(deps_dir)!r}; "
+        f"specs={specs!r}; extra_args={extra_args!r}"
+    )
+
 
 class PluginInstallError(Exception):
     """Installation could not complete."""
+
+
+# --- Windows-friendly file-system helpers -----------------------------------
+
+_RMTREE_ATTEMPTS = 5
+_RMTREE_BASE_DELAY = 0.2  # seconds; doubled each retry (max ~3.2 s total wait)
+
+
+def _on_rm_error(func: Any, path: str, exc_info: Any) -> None:
+    """``shutil.rmtree`` ``onerror`` hook: clear read-only bit then retry once."""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+    except OSError:
+        # Re-raise so the outer retry loop in _robust_rmtree can take over.
+        raise
+
+
+def _robust_rmtree(path: Path, *, attempts: int = _RMTREE_ATTEMPTS) -> bool:
+    """Remove a directory tree with Windows-friendly retries.
+
+    Windows often refuses to delete a path immediately after a process closed
+    its handles (the kernel finalises the unlink lazily, especially across
+    SQLite WAL/SHM files). Exponential-backoff retries, plus a ``chmod`` to
+    clear the read-only bit, fix the vast majority of "[WinError 32] file in
+    use" failures during plugin uninstall / hot-reload.
+
+    Returns ``True`` on success; ``False`` if all retries fail. Never raises.
+    """
+    if not path.exists():
+        return True
+    last_err: OSError | None = None
+    for i in range(attempts):
+        try:
+            shutil.rmtree(path, onerror=_on_rm_error)
+        except OSError as e:
+            last_err = e
+        if not path.exists():
+            return True
+        time.sleep(_RMTREE_BASE_DELAY * (2**i))
+    if last_err is not None:
+        logger.warning(
+            "Could not remove %s after %d attempts: %s", path, attempts, last_err
+        )
+    return False
+
+
+def _robust_rename(src: Path, dst: Path, *, attempts: int = _RMTREE_ATTEMPTS) -> bool:
+    """Rename a path with Windows-friendly retries. Never raises; returns success."""
+    last_err: OSError | None = None
+    for i in range(attempts):
+        try:
+            src.rename(dst)
+            return True
+        except OSError as e:
+            last_err = e
+            time.sleep(_RMTREE_BASE_DELAY * (2**i))
+    if last_err is not None:
+        logger.warning(
+            "Could not rename %s -> %s after %d attempts: %s",
+            src,
+            dst,
+            attempts,
+            last_err,
+        )
+    return False
+
+
+def _list_locked_files(plugin_dir: Path, *, max_items: int = 10) -> list[str]:
+    """Probe each surviving file under ``plugin_dir`` to find likely locks.
+
+    Used after ``_robust_rmtree`` fails so the user/diagnostics can see
+    which files are actually held (DB vs log vs .pyc), narrowing the root
+    cause without naming the holding process. Pure read-only probe — does
+    NOT modify the filesystem.
+
+    Heuristic: ``os.replace(f, f)`` (rename-to-self) is the correct probe
+    for "can rmtree delete this?" on Windows. Renaming requires the
+    ``DELETE`` access right and ``FILE_SHARE_DELETE`` from any other open
+    handle — exactly the same combination ``os.unlink`` (and therefore
+    ``shutil.rmtree``) needs. SQLite/aiosqlite, Python's ``RotatingFileHandler``,
+    and most "open exclusively for write" handles deny ``FILE_SHARE_DELETE``,
+    so they show up here even though they happily allow ``open(f, "ab")``.
+
+    NOTE: an earlier version probed with ``open(f, "ab")``. That only checks
+    ``FILE_SHARE_WRITE`` and silently missed the most common offender
+    (a still-open SQLite connection from a leaked test/process), making the
+    user-facing 207/409 error a generic "目录无法清理" with no filenames.
+    """
+    locked: list[str] = []
+    try:
+        for f in plugin_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                # Rename-to-self: identity op on success, raises OSError if
+                # any other handle on the file denies DELETE share — i.e.
+                # exactly the rmtree blocker we want to surface.
+                os.replace(f, f)
+            except OSError:
+                try:
+                    rel = f.relative_to(plugin_dir).as_posix()
+                except ValueError:
+                    rel = str(f)
+                locked.append(rel)
+                if len(locked) >= max_items:
+                    break
+    except OSError as e:
+        logger.debug("Could not walk %s for lock probe: %s", plugin_dir, e)
+    return locked
+
+
+def _force_remove_db_files(plugin_dir: Path) -> bool:
+    """Last-resort: delete any SQLite files so a reinstall is not blocked.
+
+    Returns ``True`` if at least one file was removed.
+    """
+    cleaned = False
+    try:
+        for f in plugin_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            name = f.name.lower()
+            if (
+                name.endswith(".db")
+                or name.endswith(".sqlite")
+                or name.endswith(".sqlite3")
+                or ".db-" in name  # *.db-shm, *.db-wal, *.db-journal
+            ):
+                try:
+                    f.unlink()
+                    cleaned = True
+                except OSError as e:
+                    logger.debug("Could not remove %s: %s", f, e)
+    except OSError as e:
+        logger.debug("Could not walk %s: %s", plugin_dir, e)
+    return cleaned
 
 
 class InstallProgress:
@@ -157,32 +356,93 @@ def _download_to_file(url: str, dest: Path) -> None:
         raise PluginInstallError(f"Download failed: {e}") from e
 
 
-def install_pip_deps(plugin_dir: Path, manifest_requires: dict) -> bool:
+def _parse_pip_specs(manifest_requires: dict) -> list[str]:
+    """Normalise ``manifest.requires.pip`` into a list of pip-installable specs.
+
+    Returns an empty list when the field is absent or not a string/list, so
+    callers can short-circuit without doing the type-checking themselves.
+    """
     if not manifest_requires:
-        return True
+        return []
     raw = manifest_requires.get("pip")
     if raw is None:
-        return True
+        return []
     if isinstance(raw, str):
-        specs = [raw] if raw.strip() else []
-    elif isinstance(raw, list):
-        specs = [str(x).strip() for x in raw if str(x).strip()]
-    else:
-        logger.warning("requires.pip must be a string or list of strings")
-        return False
+        return [raw] if raw.strip() else []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    logger.warning("requires.pip must be a string or list of strings")
+    return []
+
+
+def _resolve_pip_runner() -> tuple[str, list[str]]:
+    """Pick the Python executable + base pip args for installing plugin deps.
+
+    Returns ``(python_path, extra_install_args)``. ``extra_install_args``
+    carries the configured PyPI mirror so e.g. China users don't time out
+    against the default pypi.org.
+
+    In a PyInstaller-frozen build ``sys.executable`` points at
+    ``synapse-server.exe`` which intercepts Click args and refuses
+    ``-m pip``. We must instead use ``runtime_env.get_python_executable()``
+    which resolves to the real ``_internal/python.exe`` (or the workspace /
+    user venv when one was bootstrapped). For source / pip-installed
+    deployments ``sys.executable`` is already a real Python so we keep it.
+    """
+    try:
+        from ..runtime_env import IS_FROZEN, get_python_executable, resolve_pip_index
+    except Exception:
+        return sys.executable, []
+    py = sys.executable
+    if IS_FROZEN:
+        resolved = get_python_executable()
+        if resolved:
+            py = resolved
+    extra: list[str] = []
+    try:
+        index = resolve_pip_index()
+        if index.get("url"):
+            extra.extend(["-i", index["url"]])
+            if index.get("trusted_host"):
+                extra.extend(["--trusted-host", index["trusted_host"]])
+    except Exception:
+        pass
+    return py, extra
+
+
+def install_pip_deps(plugin_dir: Path, manifest_requires: dict) -> bool:
+    """Install the plugin's ``requires.pip`` packages into ``<plugin_dir>/deps``.
+
+    The deps directory is appended to ``sys.path`` by ``PluginManager._load_python_plugin``
+    when the plugin loads, so packages installed here are private to this
+    plugin and don't leak into the host or other plugins.
+
+    Returns ``False`` on any pip failure / timeout — callers decide whether to
+    propagate that as an install error or merely log it.
+    """
+    specs = _parse_pip_specs(manifest_requires)
     if not specs:
         return True
 
     deps_dir = plugin_dir / "deps"
     deps_dir.mkdir(parents=True, exist_ok=True)
+    py, extra_args = _resolve_pip_runner()
+    context = _pip_install_context(
+        python_executable=py,
+        deps_dir=deps_dir,
+        specs=specs,
+        extra_args=extra_args,
+    )
     cmd = [
-        sys.executable,
+        py,
         "-m",
         "pip",
         "install",
         "--upgrade",
+        "--prefer-binary",
         "--target",
         str(deps_dir),
+        *extra_args,
         *specs,
     ]
     try:
@@ -191,19 +451,66 @@ def install_pip_deps(plugin_dir: Path, manifest_requires: dict) -> bool:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_pip_subprocess_env(py),
             timeout=600,
         )
-    except subprocess.TimeoutExpired:
-        logger.error("pip install timed out for %s", plugin_dir)
-        return False
-    if proc.returncode != 0:
+    except subprocess.TimeoutExpired as exc:
         logger.error(
-            "pip install failed for %s: %s",
+            "pip install timed out for %s after %ss (%s)",
             plugin_dir,
-            (proc.stderr or proc.stdout or "").strip(),
+            exc.timeout,
+            context,
         )
         return False
+    except OSError as exc:
+        logger.error("pip install failed to start for %s: %s (%s)", plugin_dir, exc, context)
+        return False
+    if proc.returncode != 0:
+        excerpt = _pip_output_excerpt(proc)
+        logger.error("pip install failed for %s (%s): %s", plugin_dir, context, excerpt)
+        return False
     return True
+
+
+def deps_appear_installed(plugin_dir: Path, manifest_requires: dict) -> bool:
+    """Best-effort check whether ``requires.pip`` packages already live in ``deps/``.
+
+    We match declared requirement names against ``*.dist-info`` directories
+    written by pip's ``--target`` mode. This remains intentionally best effort:
+    pip still owns full version resolution, but a stale unrelated dist-info
+    file should not make the host believe plugin dependencies are present.
+    """
+    if not _parse_pip_specs(manifest_requires):
+        return True
+    deps_dir = plugin_dir / "deps"
+    if not deps_dir.is_dir():
+        return False
+    expected = {
+        name for spec in _parse_pip_specs(manifest_requires)
+        if (name := _dist_name_from_spec(spec))
+    }
+    if not expected:
+        return True
+    found: set[str] = set()
+    try:
+        for child in deps_dir.iterdir():
+            if not child.is_dir() or not child.name.endswith(".dist-info"):
+                continue
+            dist_name = child.name[: -len(".dist-info")]
+            # ``pip --target`` writes e.g. ``synapse_plugin_sdk-0.7.0.dist-info``.
+            # Strip the version suffix by scanning from the right for the first
+            # segment that starts with a digit.
+            parts = dist_name.split("-")
+            for idx, part in enumerate(parts):
+                if part[:1].isdigit():
+                    dist_name = "-".join(parts[:idx]) or dist_name
+                    break
+            found.add(_normalise_dist_name(dist_name))
+    except OSError:
+        return False
+    return expected.issubset(found)
 
 
 def _finalize_install(plugin_dir: Path, *, remove_on_failure: bool = True) -> str:
@@ -216,7 +523,12 @@ def _finalize_install(plugin_dir: Path, *, remove_on_failure: bool = True) -> st
     if not install_pip_deps(plugin_dir, manifest.requires):
         if remove_on_failure:
             shutil.rmtree(plugin_dir, ignore_errors=True)
-        raise PluginInstallError(f"Plugin {manifest.id!r} installed but pip dependencies failed")
+        raise PluginInstallError(
+            f"Plugin {manifest.id!r} installed but pip dependencies failed. "
+            "Synapse does not migrate plugin dependency directories in place; "
+            "the isolated plugin directory was removed and reinstall/rebuild is required. "
+            "See synapse.plugins.installer logs for the pip error excerpt."
+        )
     return manifest.id
 
 
@@ -454,7 +766,19 @@ def install_from_url(
     return result
 
 
-def install_from_path(source: Path, plugins_dir: Path) -> str:
+def install_from_path(
+    source: Path,
+    plugins_dir: Path,
+    *,
+    dev_mode: bool = False,
+) -> str:
+    """Install a plugin from a local directory.
+
+    When ``dev_mode`` is ``True`` we **symlink** instead of copying so source
+    edits are immediately visible after a hot-reload — ideal for plugin
+    developers. If the OS refuses the symlink (Windows without dev-mode /
+    admin), we fall back transparently to a regular copy and emit a warning.
+    """
     source = source.resolve()
     plugins_dir = plugins_dir.resolve()
     if not source.is_dir():
@@ -476,25 +800,41 @@ def install_from_path(source: Path, plugins_dir: Path) -> str:
             same = False
         if same:
             return _finalize_install(dest, remove_on_failure=False)
-        backup = dest.with_suffix(".bak")
-        try:
-            if backup.exists():
-                shutil.rmtree(backup)
-            dest.rename(backup)
-        except OSError as e:
-            raise PluginInstallError(
-                f"Cannot upgrade: failed to backup existing plugin: {e}"
-            ) from e
-
-    try:
-        shutil.copytree(source, dest)
-    except OSError as e:
-        if backup is not None:
+        # If dest is already a symlink pointing at source, just refresh.
+        if dest.is_symlink():
             try:
-                backup.rename(dest)
+                if Path(os.readlink(dest)).resolve() == source:
+                    return _finalize_install(dest, remove_on_failure=False)
             except OSError:
                 pass
-        raise PluginInstallError(f"Could not copy plugin: {e}") from e
+        backup = dest.with_suffix(".bak")
+        if backup.exists():
+            _robust_rmtree(backup)
+        if not _robust_rename(dest, backup):
+            raise PluginInstallError(
+                f"Cannot upgrade: failed to backup existing plugin at {dest}"
+            )
+
+    linked = False
+    if dev_mode:
+        try:
+            os.symlink(source, dest, target_is_directory=True)
+            linked = True
+            logger.info("Plugin '%s' linked from %s (dev mode)", manifest.id, source)
+        except (OSError, NotImplementedError) as e:
+            logger.warning(
+                "Plugin '%s' dev-mode symlink failed (%s); falling back to copy",
+                manifest.id,
+                e,
+            )
+
+    if not linked:
+        try:
+            shutil.copytree(source, dest)
+        except OSError as e:
+            if backup is not None:
+                _robust_rename(backup, dest)
+            raise PluginInstallError(f"Could not copy plugin: {e}") from e
 
     try:
         result = _finalize_install(dest)
@@ -502,15 +842,125 @@ def install_from_path(source: Path, plugins_dir: Path) -> str:
         if backup is not None and backup.exists():
             try:
                 if dest.exists():
-                    shutil.rmtree(dest)
-                backup.rename(dest)
+                    if dest.is_symlink():
+                        dest.unlink()
+                    else:
+                        _robust_rmtree(dest)
+                _robust_rename(backup, dest)
             except OSError:
                 pass
         raise
 
     if backup is not None and backup.exists():
-        shutil.rmtree(backup, ignore_errors=True)
+        _robust_rmtree(backup)
     return result
+
+
+def uninstall(
+    plugin_id: str,
+    plugins_dir: Path,
+    *,
+    purge_data: bool = False,
+    data_root: Path | None = None,
+) -> dict[str, Any]:
+    """Remove a plugin from disk and optionally purge its persistent data.
+
+    Returns a structured result dict (no exceptions for "expected" failures —
+    the API layer turns these into HTTP responses with proper error codes):
+
+    .. code-block:: python
+
+        {
+            "removed": bool,        # plugin code dir is gone
+            "partial": bool,        # code dir survived but *.db* files cleaned
+            "purged_data": bool,    # data_root/<plugin_id> also removed
+            "warnings": [str, ...], # human-readable hints (UI surfaces these)
+        }
+
+    A symlinked plugin (dev mode) is unlinked, never recursively deleted.
+    """
+    plugins_dir = plugins_dir.resolve()
+    out: dict[str, Any] = {
+        "removed": False,
+        "partial": False,
+        "purged_data": False,
+        "warnings": [],
+    }
+
+    if not plugins_dir.is_dir():
+        out["warnings"].append(f"plugins dir not found: {plugins_dir}")
+        return out
+
+    target: Path | None = None
+    for child in plugins_dir.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            manifest = parse_manifest(child)
+        except ManifestError:
+            continue
+        if manifest.id == plugin_id:
+            target = child
+            break
+
+    if target is None:
+        out["warnings"].append(f"plugin '{plugin_id}' not installed")
+        return out
+
+    # Symlink fast-path: just unlink, never delete the linked source tree.
+    if target.is_symlink():
+        try:
+            target.unlink()
+            out["removed"] = True
+        except OSError as e:
+            out["warnings"].append(f"failed to unlink {target}: {e}")
+    else:
+        if _robust_rmtree(target):
+            out["removed"] = True
+        else:
+            # Probe which files survived — actionable info for the user
+            # ("the DB is held" vs "a .pyc is held" points to very different
+            # root causes; in practice it's almost always the SQLite WAL or a
+            # log file that the plugin failed to close in on_unload).
+            locked = _list_locked_files(target)
+            if locked:
+                preview = ", ".join(locked[:5])
+                more = f" (+{len(locked) - 5} 更多)" if len(locked) > 5 else ""
+                out["warnings"].append(
+                    f"以下文件仍被占用: {preview}{more}"
+                )
+            # Graceful degradation: clear DB files so the next install isn't
+            # blocked by a still-locked SQLite file inside the leftover dir.
+            if _force_remove_db_files(target):
+                out["partial"] = True
+                out["warnings"].append(
+                    f"目录 {target} 无法完全删除（可能仍被占用），"
+                    "已清理其中的 *.db / *.db-shm / *.db-wal 文件"
+                )
+            else:
+                out["warnings"].append(f"目录 {target} 完全无法清理")
+
+    if purge_data and data_root is not None:
+        data_root_resolved = data_root.resolve()
+        data_dir = (data_root_resolved / plugin_id).resolve()
+        try:
+            data_dir.relative_to(data_root_resolved)
+        except ValueError:
+            out["warnings"].append(
+                "data path traversal check failed; skipping purge_data"
+            )
+        else:
+            if data_dir.exists():
+                if _robust_rmtree(data_dir):
+                    out["purged_data"] = True
+                else:
+                    out["warnings"].append(
+                        f"plugin_data {data_dir} 无法完全删除"
+                    )
+            else:
+                out["purged_data"] = True  # nothing to purge → success
+
+    return out
 
 
 def install_bundle(source: str, plugins_dir: Path) -> str:
@@ -579,25 +1029,3 @@ def install_bundle(source: str, plugins_dir: Path) -> str:
             pass
 
     return _finalize_install(dest)
-
-
-def uninstall(plugin_id: str, plugins_dir: Path) -> bool:
-    plugins_dir = plugins_dir.resolve()
-    if not plugins_dir.is_dir():
-        return False
-
-    for child in plugins_dir.iterdir():
-        if not child.is_dir():
-            continue
-        try:
-            manifest = parse_manifest(child)
-        except ManifestError:
-            continue
-        if manifest.id == plugin_id:
-            try:
-                shutil.rmtree(child)
-            except OSError as e:
-                logger.error("Could not remove %s: %s", child, e)
-                return False
-            return True
-    return False

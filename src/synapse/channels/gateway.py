@@ -14,22 +14,30 @@ import asyncio
 import base64
 import collections
 import contextlib
+import hashlib
 import logging
 import os
 import random
-import sys
+import re
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ..sessions import Session, SessionManager
+from ..utils.errors import format_user_friendly_error as format_user_friendly_error  # re-export
 from .base import ChannelAdapter
 from .group_response import GroupResponseMode, SmartModeThrottle
-from .types import MediaStatus, OutgoingMessage, UnifiedMessage
+from .types import MediaStatus, MessageContent, OutgoingMessage, UnifiedMessage
+
+if TYPE_CHECKING:
+    from ..core.brain import Brain
+    from ..llm.stt_client import STTClient
+    from .dm_pairing import DMPairingManager
+    from .media_parser import MediaParseResult
 
 
 def _notify_im_event(event: str, data: dict | None = None) -> None:
@@ -37,19 +45,78 @@ def _notify_im_event(event: str, data: dict | None = None) -> None:
     try:
         from synapse.api.routes.websocket import broadcast_event
 
-        asyncio.ensure_future(broadcast_event(event, data))
+        loop = asyncio.get_running_loop()
+        loop.create_task(broadcast_event(event, data))
+    except RuntimeError:
+        logger.debug("[Gateway] skip IM websocket broadcast outside event loop: %s", event)
     except Exception:
         pass
 
 
-from ..utils.errors import format_user_friendly_error as format_user_friendly_error  # re-export
+_INTERNAL_OBJECT_TOKENS_RE = None
 
-if TYPE_CHECKING:
-    from ..core.brain import Brain
-    from ..llm.stt_client import STTClient
-    from .media_parser import MediaParseResult
+
+def _format_user_error(exc: BaseException | str) -> str:
+    """PR-E1: 把任何异常/字符串转成对外可见的中文提示。
+
+    根因：旧实现 ``f"[处理出错: {str(e)[:200]}]"`` 直接把 Python 内部对象
+    的 repr 暴露给用户。当 ``e.args[0]`` 是 ``slice(None, 200, None)``
+    或 ``<TypedDict at 0x...>`` 这类对象时，IM 用户看到的是诡异的
+    ``[处理出错: slice(None, 200, None)]``（参见 2026-05-09 P1-3）。
+
+    本函数：
+    - 优先从 exc.args[0] 取真实的字符串理由
+    - 过滤掉 slice(...) / <... object at 0x...> / typing repr 等内部 token
+    - 兜底用 ``utils.errors.format_user_friendly_error`` 转中文
+    - 始终把完整 traceback 在 logger.error(exc_info=True) 处保留
+    """
+    import re
+
+    global _INTERNAL_OBJECT_TOKENS_RE
+    if _INTERNAL_OBJECT_TOKENS_RE is None:
+        _INTERNAL_OBJECT_TOKENS_RE = re.compile(
+            r"(slice\([^)]*\)|<[^>]*?at\s+0x[0-9a-fA-F]+>|<class\s+'[^']+'>"
+            r"|<function\s+[^>]+>|<built-in[^>]+>|<bound method[^>]+>"
+            r"|<module[^>]+>|typing\.[A-Za-z_]+\[[^\]]*\])"
+        )
+
+    if isinstance(exc, BaseException):
+        candidate = ""
+        try:
+            args = list(exc.args or [])
+            for a in args:
+                if isinstance(a, str) and a.strip():
+                    candidate = a.strip()
+                    break
+        except Exception:
+            pass
+        if not candidate:
+            candidate = str(exc).strip()
+        if not candidate:
+            candidate = type(exc).__name__
+    else:
+        candidate = str(exc).strip() if exc else ""
+
+    # Strip internal repr tokens
+    cleaned = _INTERNAL_OBJECT_TOKENS_RE.sub("", candidate).strip()
+    if not cleaned:
+        cleaned = "服务暂时无法响应，请稍后再试"
+
+    # Truncate very long stacks-as-strings
+    if len(cleaned) > 240:
+        cleaned = cleaned[:240].rstrip() + "…"
+
+    try:
+        return format_user_friendly_error(cleaned)
+    except Exception:
+        return f"[处理出错: {cleaned}]"
+
 
 logger = logging.getLogger(__name__)
+
+# Fix-12: in-app channels — gateway 不需要为它们注册 IM adapter，
+# 主线靠 SSE / CLI 直接交付，所以此处遇到这些 channel 时跳过 ERROR 日志。
+_NOOP_CHANNELS: frozenset[str] = frozenset({"desktop", "api", "cli", "sse", "in-app"})
 
 # Agent 处理函数类型
 AgentHandler = Callable[[Session, str], Awaitable[str]]
@@ -484,19 +551,20 @@ class ThinkingCommandHandler:
 
     支持的命令:
     - /thinking [on|off|auto]: 切换思考模式
-    - /thinking_depth [low|medium|high]: 设置思考深度
+    - /thinking_depth [low|medium|high|max]: 设置思考深度
     - /chain [on|off]: 开关思维链进度推送（默认关闭）
     """
 
     THINKING_COMMANDS = {"/thinking", "/thinking_depth", "/chain"}
 
     VALID_MODES = {"on", "off", "auto"}
-    VALID_DEPTHS = {"low", "medium", "high"}
+    VALID_DEPTHS = {"low", "medium", "high", "max", "xhigh"}
 
     DEPTH_LABELS = {
         "low": "低（快速响应）",
         "medium": "中（平衡）",
         "high": "高（深度推理）",
+        "max": "最大（最高推理强度）",
     }
 
     def __init__(self, session_manager: "SessionManager"):
@@ -560,8 +628,10 @@ class ThinkingCommandHandler:
             depth = text_lower.split(None, 1)[1].strip()
             if depth not in self.VALID_DEPTHS:
                 return (
-                    f"❌ 无效的思考深度: `{depth}`\n可选: `low`（低）| `medium`（中）| `high`（高）"
+                    f"❌ 无效的思考深度: `{depth}`\n可选: `low`（低）| `medium`（中）| `high`（高）| `max`（最大）"
                 )
+            if depth == "xhigh":
+                depth = "max"
             session.set_metadata("thinking_depth", depth)
             return f"✅ 思考深度已设置为: **{self.DEPTH_LABELS[depth]}**"
 
@@ -612,7 +682,7 @@ class ThinkingCommandHandler:
             "`/thinking on` — 强制开启深度思考",
             "`/thinking off` — 关闭深度思考",
             "`/thinking auto` — 自动决定（默认）",
-            "`/thinking_depth low|medium|high` — 设置思考深度",
+            "`/thinking_depth low|medium|high|max` — 设置思考深度",
         ]
         return "\n".join(lines)
 
@@ -628,7 +698,7 @@ class ThinkingCommandHandler:
         for key, label in self.DEPTH_LABELS.items():
             marker = " ⬅️" if key == (current_depth or "medium") else ""
             lines.append(f"• `{key}` — {label}{marker}")
-        lines.append("\n用法: `/thinking_depth low|medium|high`")
+        lines.append("\n用法: `/thinking_depth low|medium|high|max`")
         return "\n".join(lines)
 
 
@@ -843,24 +913,17 @@ class MessageGateway:
     - 将回复发送回通道
     """
 
-    # 支持 .en 专用模型的 Whisper 尺寸（large 无 .en 变体）
-    _EN_MODEL_SIZES = {"tiny", "base", "small", "medium"}
-
     def __init__(
         self,
         session_manager: SessionManager,
         agent_handler: AgentHandler | None = None,
-        whisper_model: str = "base",
-        whisper_language: str = "zh",
         stt_client: "STTClient | None" = None,
     ):
         """
         Args:
             session_manager: 会话管理器
             agent_handler: Agent 处理函数 (session, message) -> response
-            whisper_model: Whisper 模型大小 (tiny, base, small, medium, large)，默认 base
-            whisper_language: 语音识别语言 (zh/en/auto/其他语言代码)
-            stt_client: 在线 STT 客户端（可选，用于替代本地 Whisper）
+            stt_client: 在线 STT 客户端（可选）
         """
         self.session_manager = session_manager
         self.agent_handler = agent_handler
@@ -894,22 +957,8 @@ class MessageGateway:
         self._pre_process_hooks: list[Callable[[UnifiedMessage], Awaitable[UnifiedMessage]]] = []
         self._post_process_hooks: list[Callable[[UnifiedMessage, str], Awaitable[str]]] = []
 
-        self._plugin_hooks = None  # set by start_im_channels() in main.py
-
-        # Whisper 语音识别模型（延迟加载或启动时预加载）
-        self._whisper_language = whisper_language.lower().strip()
-        # 英语且模型尺寸有 .en 变体时，自动切换到更小更快的 .en 模型
-        if self._whisper_language == "en" and whisper_model in self._EN_MODEL_SIZES:
-            self._whisper_model_name = f"{whisper_model}.en"
-            logger.info(
-                f"Whisper language=en → auto-selected English-only model: "
-                f"{self._whisper_model_name}"
-            )
-        else:
-            self._whisper_model_name = whisper_model
-        self._whisper = None
-        self._whisper_loaded = False
-        self._whisper_unavailable = False  # ImportError → 本进程内不再重试
+        # 插件 hook 注册表（由 main.py 在构造 gateway 之后注入）
+        self._plugin_hooks = None
 
         # ==================== 消息中断机制 ====================
         # 会话级中断队列 {session_key: asyncio.PriorityQueue[InterruptMessage]}
@@ -942,6 +991,21 @@ class MessageGateway:
         # 外部注入的 shutdown_event（由 main.py 调用 set_shutdown_event 设置）
         self._shutdown_event: asyncio.Event | None = None
 
+        # 外部注入的 AgentOrchestrator 引用（由 main.py 调用 set_orchestrator 设置）
+        # 用途：
+        #   1. /切换 /状态 /重置 等多Agent命令的可用性判断
+        #   2. 流式/非流式分支决策（有编排时禁用 wait_for 墙钟超时，
+        #      改由 Orchestrator 自带的 idle/hard timeout 监控活跃度）
+        #   3. 流式 IM 路径在有编排时改走 handle_message，保证多 Bot/profile 路由生效
+        self._orchestrator_ref: Any = None
+
+        # 外部注入的 channel-deps 安装错误快照（由 main.py 调用 set_channel_install_errors）
+        # 形如 ``{"lark-oapi": "镜像源 ... 在 600s 内未完成下载", ...}``。
+        # 仅作为 fallback：当适配器 start() 抛 ImportError 但 reason 里只有
+        # "缺少依赖: pip install xxx" 这种笼统提示时，用 pip 包名反查更具体
+        # 的错误尾巴，附加到 _failed_adapter_reasons 里供 IM 行 tooltip 渲染。
+        self._channel_install_errors: dict[str, str] = {}
+
         # ==================== 进度事件流（Plan/Deliver 等）====================
         # 目标：把“执行过程进度展示”下沉到网关侧，避免模型/工具刷屏。
         self._progress_buffers: dict[str, list[str]] = {}  # session_key -> [lines]
@@ -952,14 +1016,14 @@ class MessageGateway:
         ] = {}  # session_key -> accumulated progress lines (for card PATCH)
 
         # ==================== DM Pairing 配对授权 ====================
-        self._dm_pairing: "DMPairingManager | None" = None
+        self._dm_pairing: DMPairingManager | None = None
 
         # ==================== 群聊响应策略 ====================
         self._smart_throttle = SmartModeThrottle()
 
         # ==================== 群聊上下文缓冲区 ====================
         # 缓存被过滤的群聊消息（未 @ 时），供后续 @ 消息注入上下文
-        # key: "channel:chat_id", value: deque of context entries
+        # key: "bot_instance_id:chat_id", value: deque of context entries
         self._group_context_buffer: dict[str, collections.deque] = {}
         self._GROUP_CONTEXT_MAX_ITEMS = 20
         self._GROUP_CONTEXT_TTL = 600  # 10 分钟
@@ -1040,10 +1104,14 @@ class MessageGateway:
 
         async def _run_background():
             try:
+                from ..config import settings
                 from ..scheduler.executor import TaskExecutor
                 from ..scheduler.task import ScheduledTask, TaskType, TriggerType
 
-                executor = TaskExecutor(gateway=self, timeout_seconds=1200)
+                executor = TaskExecutor(
+                    gateway=self,
+                    timeout_seconds=settings.scheduler_task_timeout,
+                )
 
                 task = ScheduledTask(
                     id=bg_id,
@@ -1165,7 +1233,8 @@ class MessageGateway:
                 settings.multi_agent_enabled = False
                 runtime_state.save()
                 return (
-                    f"❌ 多Agent模式开启失败（Orchestrator 初始化出错: {e}）\n已回滚到单Agent模式。"
+                    f"❌ 多Agent模式开启失败（Orchestrator 初始化出错: {e}）\n"
+                    "已回滚到单Agent模式。"
                 )
             return "✅ 已切换到 **多Agent模式 (Beta)**\n新消息将通过多Agent系统处理。"
 
@@ -1212,11 +1281,12 @@ class MessageGateway:
             chat_id=message.chat_id,
             user_id=message.user_id,
             thread_id=message.thread_id,
+            bot_instance_id=self._get_message_bot_instance_id(message),
         )
         if not session:
             return "❌ 无法获取会话"
 
-        self._apply_bot_agent_profile(session, message.channel)
+        self._apply_bot_agent_profile(session, self._get_message_bot_instance_id(message))
 
         t = user_text.strip().lower()
 
@@ -1290,7 +1360,6 @@ class MessageGateway:
 
     def _format_system_help(self) -> str:
         """格式化全局 /help 输出（所有模式可用）——基于统一命令注册表"""
-        from ..config import settings
         from .slash_commands import format_help
 
         lines = [
@@ -1310,6 +1379,17 @@ class MessageGateway:
                 "  `/切换` / `/switch` — 列出或切换 Agent",
                 "  `/状态` / `/status` — 查看当前 Agent 信息",
                 "  `/重置` / `/agent_reset` — 重置为默认 Agent",
+                "",
+                "**组织（Org）指挥台:**",
+                "  `/org list` / `/组织 列表` — 列出可用组织",
+                "  `/org bind <组织名>` / `/组织 绑定 <组织名>` — 绑定当前会话",
+                "  `/org status` / `/组织 状态` — 查看当前绑定",
+                "  `/org unbind` / `/组织 解绑` — 解除绑定",
+                "  `@组织 <任务>` / `@org <task>` — 向已绑定组织下达指令",
+                "  `/org <组织名> <任务>` / `/组织 <组织名> <任务>` — 直接下达（不需先绑定）",
+                "  `/org running` / `/组织 在跑` — 查看正在跑的命令进度",
+                "  `/org cancel` / `/组织 取消` — 立即取消正在跑的命令",
+                "  `/org last` / `/组织 上次` — 重新看上一条命令的结果",
                 "",
             ]
         )
@@ -1369,25 +1449,164 @@ class MessageGateway:
         return f"✅ 已重置为 **{reset_target}**"
 
     def _get_bot_default_agent(self, channel: str) -> str:
-        """Return the agent_profile_id configured on the adapter for *channel*."""
+        """Return the agent_profile_id configured for a bot namespace."""
         adapter = self._adapters.get(channel)
+        if adapter is None:
+            adapter = next(
+                (
+                    candidate
+                    for candidate in self._adapters.values()
+                    if getattr(candidate, "bot_instance_id", "") == channel
+                ),
+                None,
+            )
         if adapter and hasattr(adapter, "agent_profile_id"):
             return adapter.agent_profile_id
         return "default"
 
-    def _apply_bot_agent_profile(self, session: Session, channel: str) -> None:
+    def _apply_bot_agent_profile(self, session: Session, bot_instance_id: str) -> None:
         """For multi-bot setups, apply the adapter's bound agent_profile_id
         to a newly-created session so the orchestrator routes to the correct agent.
-        Only runs once per session (guard: ``_bot_default_agent`` metadata).
         """
-        if session.get_metadata("_bot_default_agent") is not None:
+        expected_namespace = bot_instance_id or session.channel
+        if (session.bot_instance_id or session.channel) != expected_namespace:
+            logger.warning(
+                "[IM] Refusing to reuse session across bot namespaces: "
+                f"session={session.session_key}, expected={expected_namespace}"
+            )
             return
-        bot_agent = self._get_bot_default_agent(channel)
+
+        session.set_metadata("bot_instance_id", expected_namespace)
+        bot_agent = self._get_bot_default_agent(expected_namespace)
+        previous_default = session.get_metadata("_bot_default_agent")
+        if previous_default == bot_agent:
+            return
         session.set_metadata("_bot_default_agent", bot_agent)
-        if bot_agent != "default" and not session.context.agent_switch_history:
+
+        has_manual_switch = any(
+            item.get("source") != "bot_default"
+            for item in (session.context.agent_switch_history or [])
+            if isinstance(item, dict)
+        )
+        if not has_manual_switch:
+            previous_profile = session.context.agent_profile_id
             session.context.agent_profile_id = bot_agent
+            if previous_profile != bot_agent:
+                session.context.agent_switch_history.append(
+                    {
+                        "from": previous_profile,
+                        "to": bot_agent,
+                        "source": "bot_default",
+                        "bot_instance_id": expected_namespace,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
             self.session_manager.mark_dirty()
             logger.info(f"[IM] Applied bot default agent: {bot_agent} for {session.session_key}")
+
+    def _desktop_mirror_id_for_im(self, session: Session) -> str:
+        """Return a stable desktop conversation id for an IM chat."""
+        raw_key = (
+            f"{session.bot_instance_id or session.channel}:"
+            f"{session.chat_id}:{session.user_id}:{session.thread_id or ''}"
+        )
+        digest = hashlib.sha1(raw_key.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        platform = re.sub(r"[^A-Za-z0-9_-]+", "_", session.channel.split(":", 1)[0])[:20]
+        return f"im_{platform}_{digest}"
+
+    def _format_im_mirror_label(self, session: Session) -> str:
+        platform = (session.channel or "im").split(":", 1)[0]
+        platform_label = {
+            "feishu": "飞书",
+            "lark": "飞书",
+            "wechat": "微信",
+            "wework": "企微",
+            "wework_ws": "企微",
+            "telegram": "Telegram",
+            "dingtalk": "钉钉",
+            "qqbot": "QQ",
+            "onebot": "OneBot",
+            "onebot_reverse": "OneBot",
+            "whatsapp": "WhatsApp",
+        }.get(platform.lower(), platform)
+        chat_label = session.chat_name or session.display_name or session.chat_id or "会话"
+        chat_type = "群聊" if session.chat_type == "group" else "私聊"
+        return f"{platform_label} · {chat_type} · {chat_label}"
+
+    def _mirror_im_message_to_desktop(
+        self,
+        session: Session,
+        *,
+        role: str,
+        content: str,
+        source_message_id: str | None = None,
+        chain_summary: list | None = None,
+        tool_summary: str | None = None,
+    ) -> None:
+        """Mirror IM turns into the normal desktop chat list.
+
+        This only improves visibility and continuity. The IM adapter still owns
+        inbound/outbound delivery, and the Agent execution path is unchanged.
+        """
+        if not content or not content.strip():
+            return
+        if session.channel in _NOOP_CHANNELS:
+            return
+
+        mirror_id = self._desktop_mirror_id_for_im(session)
+        label = self._format_im_mirror_label(session)
+        mirror = self.session_manager.get_session(
+            channel="desktop",
+            chat_id=mirror_id,
+            user_id="desktop_user",
+            create_if_missing=True,
+            chat_type="private",
+            display_name=label,
+            chat_name=label,
+        )
+        mirror.context.agent_profile_id = session.context.agent_profile_id
+        mirror.set_metadata("source_channel", session.channel)
+        mirror.set_metadata("source_bot_instance_id", session.bot_instance_id or session.channel)
+        mirror.set_metadata("source_chat_id", session.chat_id)
+        mirror.set_metadata("source_user_id", session.user_id)
+        mirror.set_metadata("source_session_key", session.session_key)
+
+        if role == "user":
+            mirrored_content = f"[来自{label}]\n{content}"
+        elif role == "assistant":
+            mirrored_content = f"[回复到{label}]\n{content}"
+        else:
+            mirrored_content = content
+
+        meta: dict = {
+            "source": "im_mirror",
+            "source_channel": session.channel,
+            "source_bot_instance_id": session.bot_instance_id or session.channel,
+            "source_session_key": session.session_key,
+        }
+        if source_message_id:
+            meta["source_message_id"] = source_message_id
+        if chain_summary:
+            meta["chain_summary"] = chain_summary
+        if tool_summary:
+            meta["tool_summary"] = tool_summary
+
+        added = mirror.add_message(role=role, content=mirrored_content, **meta)
+        if not added:
+            return
+        self.session_manager.mark_dirty()
+        _notify_im_event(
+            "chat:message_update",
+            {
+                "conversation_id": mirror_id,
+                "title": label,
+                "last_message_preview": mirrored_content[:100],
+                "timestamp": _time.time(),
+                "source": "im_mirror",
+                "source_channel": session.channel,
+                "source_session_id": session.session_key,
+            },
+        )
 
     # ==================== 自然语言意图检测 ====================
 
@@ -1443,6 +1662,15 @@ class MessageGateway:
                 except ValueError:
                     pass
         adapter = self._adapters.get(channel)
+        if adapter is None:
+            adapter = next(
+                (
+                    candidate
+                    for candidate in self._adapters.values()
+                    if getattr(candidate, "bot_instance_id", "") == channel
+                ),
+                None,
+            )
         per_bot = getattr(adapter, "_group_response_mode", None)
         if per_bot:
             try:
@@ -1460,6 +1688,15 @@ class MessageGateway:
     def _get_group_allowlist(self, channel: str) -> set[str]:
         """获取群聊白名单（Per-Bot 配置 > 全局配置）"""
         adapter = self._adapters.get(channel)
+        if adapter is None:
+            adapter = next(
+                (
+                    candidate
+                    for candidate in self._adapters.values()
+                    if getattr(candidate, "bot_instance_id", "") == channel
+                ),
+                None,
+            )
         per_bot = getattr(adapter, "_group_allowlist", None)
         if per_bot:
             return set(per_bot) if not isinstance(per_bot, set) else per_bot
@@ -1480,10 +1717,10 @@ class MessageGateway:
     ) -> None:
         """将被过滤的群聊消息缓存到上下文缓冲区。
 
-        key 为 ``channel:chat_id``（群聊级），每条记录包含时间戳、用户、文本。
+        key 为 ``bot_instance_id:chat_id``（群聊级），每条记录包含时间戳、用户、文本。
         超出 TTL 或最大条数的旧条目自动淘汰。
         """
-        buf_key = f"{message.channel}:{message.chat_id}"
+        buf_key = f"{self._get_message_bot_instance_id(message)}:{message.chat_id}"
         buf = self._group_context_buffer.get(buf_key)
         if buf is None:
             buf = collections.deque(maxlen=self._GROUP_CONTEXT_MAX_ITEMS)
@@ -1513,10 +1750,11 @@ class MessageGateway:
         channel: str,
         chat_id: str,
         *,
+        bot_instance_id: str | None = None,
         max_items: int = 10,
     ) -> list[dict]:
         """获取群聊上下文缓冲区中的近期消息（已过期的自动淘汰）。"""
-        buf_key = f"{channel}:{chat_id}"
+        buf_key = f"{bot_instance_id or channel}:{chat_id}"
         buf = self._group_context_buffer.get(buf_key)
         if not buf:
             return []
@@ -1591,13 +1829,59 @@ class MessageGateway:
         except Exception as e:
             logger.warning(f"[Gateway] Failed to load group policy: {e}")
 
+    def _get_owner_user_ids(self, channel: str) -> set[str] | None:
+        """C8 §9.2 + R5-22：返回某 IM 渠道的 owner user_id 集合。
+
+        语义：
+        - ``None`` → 该渠道没配 owner allowlist；保持单用户假设（``is_owner=True``），
+          向后兼容现有部署
+        - ``set()`` 空集 → 显式声明"该渠道无人是 owner"；CONTROL_PLANE 工具全员
+          被拒（适合"机器人对外公测但不暴露管理面"场景）
+        - 非空 set → 仅集合内 user_id 视为 owner；其余 IM 用户 CONTROL_PLANE 被拒
+        """
+        adapter = self._adapters.get(channel)
+        per_bot = getattr(adapter, "_owner_user_ids", None)
+        if per_bot is not None:
+            return set(per_bot) if not isinstance(per_bot, set) else per_bot
+        return None
+
+    def _apply_persisted_owner_allowlist(self) -> None:
+        """Load persisted IM owner allowlist from JSON and apply to adapters.
+
+        Storage：``data/sessions/im_owner_allowlist.json`` =
+        ``{"telegram": {"owners": ["123", "456"]}, ...}``。
+        独立于 ``group_policy.json``，因为 owner 是 user-level ACL（CONTROL_PLANE
+        工具的最后一道闸），group_policy 是 chat-level（哪些群可以接消息）；
+        两者 §9.3 是 AND 关系，但配置面分离。
+        """
+        import json
+        from pathlib import Path
+
+        policy_path = Path("data/sessions/im_owner_allowlist.json")
+        if not policy_path.exists():
+            return
+        try:
+            data = json.loads(policy_path.read_text(encoding="utf-8"))
+            applied = 0
+            for channel, cfg in data.items():
+                adapter = self._adapters.get(channel)
+                if adapter is None:
+                    continue
+                owners = cfg.get("owners")
+                if isinstance(owners, list):
+                    adapter._owner_user_ids = {str(uid) for uid in owners}
+                    applied += 1
+            if applied:
+                logger.info(
+                    f"[Gateway] Applied persisted owner allowlist for {applied} channel(s)"
+                )
+        except Exception as e:
+            logger.warning(f"[Gateway] Failed to load owner allowlist: {e}")
+
     async def start(self) -> None:
         """启动网关"""
         self._running = True
         self._accepting = True
-
-        # 预加载 Whisper 语音识别模型（在后台线程中执行，不阻塞启动）
-        asyncio.create_task(self._preload_whisper_async())
 
         # 启动所有适配器
         started = []
@@ -1610,7 +1894,14 @@ class MessageGateway:
                 logger.info(f"Started adapter: {name}")
             except Exception as e:
                 failed.append(name)
-                failed_reasons[name] = str(e)
+                reason = str(e)
+                # 若 reason 只是 "缺少依赖: pip install xxx" 之类笼统提示，
+                # 用 channel-deps 安装错误快照补充更具体的根因（超时/版本冲突/网络）
+                install_err = self._resolve_install_error_for_adapter(name)
+                if install_err and ("缺少依赖" in reason or "ImportError" in reason
+                                    or "No module" in reason or not reason):
+                    reason = f"{reason}（原因：{install_err}）" if reason else install_err
+                failed_reasons[name] = reason
                 adapter._running = False
                 logger.error(f"Failed to start adapter {name}: {e}")
 
@@ -1619,6 +1910,7 @@ class MessageGateway:
         self._failed_adapter_reasons = failed_reasons
 
         self._apply_persisted_group_policy()
+        self._apply_persisted_owner_allowlist()
 
         _notify_im_event(
             "im:channel_status",
@@ -1744,14 +2036,6 @@ class MessageGateway:
                     )
                     break
 
-    async def _preload_whisper_async(self) -> None:
-        """异步预加载 Whisper 模型"""
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._load_whisper_model)
-        except Exception as e:
-            logger.warning(f"Failed to preload Whisper model: {e}")
-
     def _ensure_ffmpeg(self) -> None:
         """确保 ffmpeg 可用（优先使用系统已有的，否则自动下载静态版本）"""
         import shutil
@@ -1840,73 +2124,6 @@ class MessageGateway:
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _do_extract)
-
-    def _load_whisper_model(self) -> None:
-        """加载 Whisper 模型（在线程池中执行）"""
-        if self._whisper_loaded or self._whisper_unavailable:
-            return
-
-        # 模块可能在服务运行期间安装，路径尚未注入 sys.path。
-        # 在导入前尝试刷新一次（idempotent，不会重复添加已有路径）。
-        # 必须在 _ensure_ffmpeg 之前执行，因为 static_ffmpeg 也在 whisper 模块中。
-        if "whisper" not in sys.modules:
-            try:
-                from synapse.runtime_env import inject_module_paths_runtime
-
-                inject_module_paths_runtime()
-            except Exception:
-                pass
-
-        # 确保 ffmpeg 可用（Whisper 依赖 ffmpeg 解码音频）
-        self._ensure_ffmpeg()
-
-        try:
-            import hashlib
-            import os
-
-            import whisper
-            from whisper import _MODELS
-
-            model_name = self._whisper_model_name
-
-            # 获取模型缓存路径
-            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "whisper")
-            model_file = os.path.join(cache_dir, f"{model_name}.pt")
-
-            # 检查本地模型 hash（仅提醒，不阻塞）
-            if os.path.exists(model_file) and os.path.getsize(model_file) > 1000000:
-                model_url = _MODELS.get(model_name, "")
-                if model_url:
-                    url_parts = model_url.split("/")
-                    expected_hash = url_parts[-2] if len(url_parts) >= 2 else ""
-
-                    if expected_hash and len(expected_hash) > 5:
-                        sha256 = hashlib.sha256()
-                        with open(model_file, "rb") as f:
-                            for chunk in iter(lambda: f.read(65536), b""):
-                                sha256.update(chunk)
-                        local_hash = sha256.hexdigest()
-
-                        if not local_hash.startswith(expected_hash):
-                            logger.info(
-                                f"Whisper model '{model_name}' may have updates available. "
-                                f"Delete {model_file} to re-download if needed."
-                            )
-
-            # 正常加载
-            logger.info(f"Loading Whisper model '{model_name}'...")
-            self._whisper = whisper.load_model(model_name)
-            self._whisper_loaded = True
-            logger.info(f"Whisper model '{model_name}' loaded successfully")
-
-        except ImportError:
-            from synapse.tools._import_helper import import_or_hint
-
-            hint = import_or_hint("whisper")
-            logger.warning(f"Whisper 不可用（本进程内不再重试）: {hint}")
-            self._whisper_unavailable = True
-        except Exception as e:
-            logger.error(f"Failed to load Whisper model: {e}", exc_info=True)
 
     async def drain(self, timeout: float = 30.0) -> None:
         """
@@ -2082,6 +2299,43 @@ class MessageGateway:
         self._restart_cmd_handler._shutdown_event = event
         logger.debug("RestartCommandHandler shutdown_event set")
 
+    def set_orchestrator(self, orchestrator: Any) -> None:
+        """注入 AgentOrchestrator 引用（由 main.py 在 Orchestrator/Gateway 都就绪后调用）。
+
+        必须双向注入（这里 + ``orchestrator.set_gateway(gateway)``），否则：
+        - IM 输入 ``/状态`` ``/切换`` 等命令会被告知"系统正在初始化"
+        - 流式 IM 路径会绕过 Orchestrator，多 Bot 的 ``agent_profile_id`` 路由失效
+        """
+        self._orchestrator_ref = orchestrator
+        logger.info(
+            "[Gateway] AgentOrchestrator reference set "
+            "(stream-routing and /switch /status /reset commands now enabled)"
+        )
+
+    def set_channel_install_errors(self, errors: dict[str, str]) -> None:
+        """注入 channel-deps 自动安装的逐包错误快照（由 main.py 在依赖巡检后调用）。
+
+        让适配器启动失败时，IM 行 tooltip 能从"缺少依赖: pip install lark-oapi"
+        升级到"缺少依赖: pip install lark-oapi（原因：镜像源 ... 在 600s 内
+        未完成下载）"。
+        """
+        self._channel_install_errors = dict(errors or {})
+
+    def _resolve_install_error_for_adapter(self, adapter_name: str) -> str | None:
+        """根据适配器名查 channel-deps 安装错误快照里对应 pip 包的错误尾巴。"""
+        if not self._channel_install_errors:
+            return None
+        try:
+            from synapse.channels.deps import CHANNEL_DEPS
+        except Exception:
+            return None
+        channel_type = str(adapter_name).split(":", 1)[0]
+        for _, pip_name in CHANNEL_DEPS.get(channel_type, []):
+            err = self._channel_install_errors.get(pip_name)
+            if err:
+                return f"{pip_name}: {err[-200:]}"
+        return None
+
     # ==================== 适配器管理 ====================
 
     async def register_adapter(self, adapter: ChannelAdapter) -> None:
@@ -2139,6 +2393,23 @@ class MessageGateway:
         """列出所有适配器"""
         return list(self._adapters.keys())
 
+    def _get_message_bot_instance_id(self, message: UnifiedMessage) -> str:
+        """Resolve the stable bot namespace for a message."""
+        explicit = (getattr(message, "bot_instance_id", "") or "").strip()
+        if explicit:
+            return explicit
+        adapter = self._adapters.get(message.channel)
+        if adapter is not None:
+            resolved = (getattr(adapter, "bot_instance_id", "") or "").strip()
+            if resolved:
+                return resolved
+        return message.channel
+
+    def _ensure_message_bot_instance_id(self, message: UnifiedMessage) -> str:
+        bot_instance_id = self._get_message_bot_instance_id(message)
+        message.bot_instance_id = bot_instance_id
+        return bot_instance_id
+
     # ==================== 消息处理 ====================
 
     async def _on_message(self, message: UnifiedMessage) -> None:
@@ -2155,6 +2426,8 @@ class MessageGateway:
                 f"[Shutdown] Message rejected (drain mode): {message.channel}/{message.user_id}"
             )
             return
+
+        self._ensure_message_bot_instance_id(message)
 
         if self._plugin_hooks:
             try:
@@ -2181,6 +2454,42 @@ class MessageGateway:
             return
         # ==================== /终极重启指令拦截 ====================
 
+        # ==================== 组织控制 fast-path ====================
+        # /org cancel  /org running  /org last —— 这三条**不能**进消息队列：
+        # 当一条 `/org <name> <task>` 已经在 _try_handle_org_command 的等待循环
+        # 里阻塞时，session 的处理 task 还在运行，新消息默认会被加入中断队列、
+        # 直到旧任务结束才被处理。但这三条本来就是用来 "对正在运行的命令进行
+        # 干预 / 查询" 的，必须立刻执行——因此在这里直通处理后 return，绕过
+        # _message_queue 与 per-session 串行机制。
+        _org_ctrl = self._is_org_control_command(_raw_text)
+        if _org_ctrl is not None:
+            try:
+                handled = await self._handle_org_control_command(message, _org_ctrl)
+            except Exception as exc:
+                logger.warning("[IM] org control command failed: %s", exc, exc_info=True)
+                handled = False
+                await self._send_response(message, f"指令执行失败：{_format_user_error(exc)}")
+            if handled:
+                return
+
+        # 裸文本中止 fast-path：用户发"中止 / 结束任务 / 停了"等短句时，
+        # 只要当前 session 上确实有一条组织命令在跑，立即走 command_service.cancel
+        # 而不是排在消息队列后面。命中后绕过 _message_queue + per-session 串行。
+        if self._is_bare_org_cancel(_raw_text):
+            try:
+                bare_handled = await self._handle_bare_org_cancel(message)
+            except Exception as exc:
+                logger.warning(
+                    "[IM] bare-text org cancel failed: %s", exc, exc_info=True,
+                )
+                bare_handled = False
+                await self._send_response(
+                    message, f"中止失败：{_format_user_error(exc)}",
+                )
+            if bare_handled:
+                return
+        # ==================== /组织控制 fast-path ====================
+
         # ==================== 中断快路径（无锁检测） ====================
         # 在获取 interrupt_lock 之前做低成本文本检测，减少锁竞争
         if self._processing_sessions.get(session_key, False) and self._is_abort_text(_raw_text):
@@ -2195,7 +2504,7 @@ class MessageGateway:
                 # 群聊响应模式过滤（防止未 @ 的群消息通过中断路径注入上下文）
                 if message.chat_type == "group" and not message.is_direct_message:
                     _irq_mode = self._get_group_response_mode(
-                        message.channel, message.chat_id, message.user_id
+                        self._get_message_bot_instance_id(message), message.chat_id, message.user_id
                     )
                     if _irq_mode == GroupResponseMode.MENTION_ONLY and not message.is_mentioned:
                         _is_stop_or_skip = (
@@ -2216,7 +2525,19 @@ class MessageGateway:
                 _agent_ref = (
                     getattr(self.agent_handler, "_agent_ref", None) if self.agent_handler else None
                 )
-                _resolved_sid = self._resolve_task_session_id(session_key, _agent_ref)
+                _active_session = self.session_manager.get_session(
+                    channel=message.channel,
+                    chat_id=message.chat_id,
+                    user_id=message.user_id,
+                    thread_id=message.thread_id,
+                    bot_instance_id=self._get_message_bot_instance_id(message),
+                    create_if_missing=False,
+                )
+                _resolved_sid = self._resolve_task_session_id(
+                    session_key,
+                    _agent_ref,
+                    preferred_session_id=getattr(_active_session, "id", None),
+                )
                 _session_matches = _resolved_sid is not None
 
                 logger.debug(
@@ -2266,6 +2587,7 @@ class MessageGateway:
                             chat_id=message.chat_id,
                             user_id=message.user_id,
                             thread_id=message.thread_id,
+                            bot_instance_id=self._get_message_bot_instance_id(message),
                         )
                         if _ins_session:
                             _ins_session.add_message(
@@ -2492,19 +2814,26 @@ class MessageGateway:
 
     def _get_session_key(self, message: UnifiedMessage) -> str:
         """获取会话标识（话题消息会追加 thread_id 实现话题级隔离）"""
-        key = f"{message.channel}:{message.chat_id}:{message.user_id}"
-        if message.thread_id:
-            key += f":{message.thread_id}"
-        return key
+        return self.session_manager.build_session_key(
+            message.channel,
+            message.chat_id,
+            message.user_id,
+            message.thread_id,
+            bot_instance_id=self._get_message_bot_instance_id(message),
+        )
 
     @staticmethod
-    def _resolve_task_session_id(session_key: str, agent_ref: object) -> str | None:
+    def _resolve_task_session_id(
+        session_key: str,
+        agent_ref: object,
+        preferred_session_id: str | None = None,
+    ) -> str | None:
         """
         根据 gateway session_key 找到 AgentState._tasks 中匹配的 task session_id。
 
         session_key 格式:
-          三段式: "telegram:1241684312:tg_1241684312"  (channel:chat_id:user_id)
-          四段式: "telegram:1241684312:tg_1241684312:thread_abc"  (channel:chat_id:user_id:thread_id)
+          旧格式: "telegram:1241684312:tg_1241684312"  (channel:chat_id:user_id)
+          新格式: "feishu:writer:chat:user"  (bot_instance_id:chat_id:user_id)
 
         task key 格式为 _resolve_conversation_id 的返回值（即传入的 session_id）:
           IM 路径: session.id 格式 "telegram_1241684312_20260219031213_xxx"（下划线分隔）
@@ -2515,32 +2844,43 @@ class MessageGateway:
         agent_state = getattr(agent_ref, "agent_state", None)
         if not agent_state:
             return None
-        parts = session_key.split(":")
-        channel = parts[0] if parts else ""
-        chat_id = parts[1] if len(parts) >= 2 else ""
-        thread_id = parts[3] if len(parts) >= 4 else ""
-        if not channel or not chat_id:
-            return None
-
         tasks = getattr(agent_state, "_tasks", {})
 
         if session_key in tasks:
             return session_key
+        if preferred_session_id:
+            preferred_task = tasks.get(preferred_session_id)
+            if preferred_task is not None:
+                return preferred_session_id
 
-        prefix_underscore = f"{channel}_"
-        chat_id_seg_underscore = f"_{chat_id}_"
-        prefix_colon = f"{channel}:"
-        chat_id_seg_colon = f":{chat_id}:"
+        parts = session_key.split(":")
+        if len(parts) < 3:
+            return None
+
+        candidates: list[tuple[str, str, str]] = []
+        # No thread_id: namespace may itself contain ":".
+        candidates.append((":".join(parts[:-2]), parts[-2], ""))
+        # With thread_id: support both legacy and bot-instance namespaces.
+        if len(parts) >= 4:
+            candidates.append((":".join(parts[:-3]), parts[-3], parts[-1]))
+
+        def _namespace_prefixes(namespace: str) -> tuple[str, ...]:
+            platform = namespace.split(":", 1)[0]
+            return tuple(
+                value
+                for value in (namespace, platform)
+                if value
+            )
 
         def _match_key(key: str) -> bool:
-            base_matched = (
-                key.startswith(prefix_underscore) and chat_id_seg_underscore in key
-            ) or (key.startswith(prefix_colon) and chat_id_seg_colon in key)
-            if not base_matched:
-                return False
-            if thread_id:
-                return thread_id in key
-            return True
+            for namespace, chat_id, thread_id in candidates:
+                for prefix in _namespace_prefixes(namespace):
+                    base_matched = (
+                        key.startswith(f"{prefix}_") and f"_{chat_id}_" in key
+                    ) or (key.startswith(f"{prefix}:") and f":{chat_id}:" in key)
+                    if base_matched and (not thread_id or thread_id in key):
+                        return True
+            return False
 
         for key in tasks:
             task = tasks[key]
@@ -2649,7 +2989,7 @@ class MessageGateway:
                     task = asyncio.create_task(self._session_dispatch(message))
                     self._session_tasks[session_key] = task
 
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
@@ -2664,15 +3004,742 @@ class MessageGateway:
             except Exception as e:
                 logger.error(f"Error handling message: {e}", exc_info=True)
 
+    def _parse_org_command(self, text: str, session: Session | None = None) -> tuple[str, str] | None:
+        stripped = (text or "").strip()
+        if not stripped:
+            return None
+        lowered = stripped.lower()
+        for prefix in ("/org ", "/组织 "):
+            if lowered.startswith(prefix):
+                rest = stripped[len(prefix):].strip()
+                if not rest:
+                    return None
+                if rest.lower().startswith("bind ") or rest.lower().startswith("绑定 "):
+                    return None
+                parts = rest.split(maxsplit=1)
+                if len(parts) < 2:
+                    return None
+                return parts[0], parts[1].strip()
+        for prefix in ("@组织 ", "@org "):
+            if lowered.startswith(prefix):
+                org_id = session.get_metadata("bound_org_id") if session else ""
+                task = stripped[len(prefix):].strip()
+                if org_id and task:
+                    return str(org_id), task
+        return None
+
+    def _get_org_manager(self):
+        """从 OrgCommandService 链路上取出 OrgManager 单例。
+
+        IM 端按名字/ID 解析组织时用。拿不到（服务未就绪）时返回 None。
+        """
+        try:
+            from synapse.orgs.command_service import get_command_service
+
+            svc = get_command_service()
+            if svc is None:
+                return None
+            runtime = getattr(svc, "_runtime", None)
+            return getattr(runtime, "_manager", None) if runtime else None
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # 组织命令在 IM 会话上的"当前/历史"追踪
+    # ------------------------------------------------------------------
+    # 给 /org cancel /org running /org last 三条 fast-path 命令使用：
+    # - current_org_command: 正在跑的命令信息（提交后写入，结束/取消后清空）
+    # - last_org_command: 上一条已结束的命令（用 /org last 可重新拉到）
+    # 两个字段都存在 session.metadata 里，跨重启亦可恢复（受 session 持久化）。
+
+    @staticmethod
+    def _record_current_org_command(
+        session: Session,
+        *,
+        org_id: str,
+        org_name: str,
+        command_id: str,
+        task_preview: str,
+    ) -> None:
+        import time as _time
+
+        session.set_metadata(
+            "current_org_command",
+            {
+                "org_id": org_id,
+                "org_name": org_name,
+                "command_id": command_id,
+                "task_preview": (task_preview or "")[:200],
+                "started_at": _time.time(),
+            },
+        )
+
+    @staticmethod
+    def _finish_current_org_command(
+        session: Session,
+        *,
+        result_text: str,
+    ) -> None:
+        """把 current_org_command 迁移到 last_org_command 槽位（成功或失败结尾都调一次）。"""
+        import time as _time
+
+        cur = session.get_metadata("current_org_command") or None
+        if isinstance(cur, dict):
+            session.set_metadata(
+                "last_org_command",
+                {
+                    **cur,
+                    "result_text": (result_text or "")[:4000],
+                    "finished_at": _time.time(),
+                },
+            )
+        session.set_metadata("current_org_command", None)
+
+    def _format_current_org_command(self, session: Session) -> str:
+        """`/org running` 的回复体生成。会主动调一次命令服务拿最新 phase / busy。"""
+        cur = session.get_metadata("current_org_command") or None
+        if not isinstance(cur, dict) or not cur.get("command_id"):
+            return (
+                "当前没有正在跑的组织命令。\n"
+                "用 `/org bind <组织名>` 绑定后，再 `@组织 <任务>` 派发。"
+            )
+        org_id = str(cur.get("org_id") or "")
+        command_id = str(cur.get("command_id") or "")
+        org_name = str(cur.get("org_name") or "")
+        preview = str(cur.get("task_preview") or "")
+        try:
+            from synapse.orgs.command_service import get_command_service
+
+            svc = get_command_service()
+            status_obj = svc.get_status(org_id, command_id) if svc else None
+        except Exception:
+            status_obj = None
+
+        head = f"「{org_name}」(ID: {org_id})" if org_name else org_id
+        lines = [
+            f"📍 当前正在跑：{head}",
+            f"  • 命令 ID：`{command_id}`",
+            f"  • 任务：{preview}",
+        ]
+        if isinstance(status_obj, dict):
+            phase = status_obj.get("phase") or status_obj.get("status") or "unknown"
+            lines.append(f"  • 阶段：{phase}")
+            elapsed = status_obj.get("elapsed_s")
+            if isinstance(elapsed, (int, float)):
+                lines.append(f"  • 已运行：{elapsed:.0f} 秒")
+            busy = status_obj.get("busy_nodes") or []
+            if isinstance(busy, list) and busy:
+                shown = ", ".join(str(n) for n in busy[:5])
+                more = f" 等 {len(busy)} 个" if len(busy) > 5 else ""
+                lines.append(f"  • 忙碌节点：{shown}{more}")
+            blockers = status_obj.get("blockers") or []
+            if isinstance(blockers, list) and blockers:
+                lines.append(f"  • 阻塞数：{len(blockers)}")
+            warn = status_obj.get("warning")
+            if warn:
+                lines.append(f"  • ⚠️ {warn}")
+        lines.append("\n如要叫停，发送 `/org cancel`。")
+        return "\n".join(lines)
+
+    def _format_last_org_command(self, session: Session) -> str:
+        """`/org last` 的回复体生成。"""
+        last = session.get_metadata("last_org_command") or None
+        if not isinstance(last, dict):
+            return "本会话还没有任何已完成的组织命令记录。"
+        org_name = str(last.get("org_name") or "")
+        org_id = str(last.get("org_id") or "")
+        preview = str(last.get("task_preview") or "")
+        result = str(last.get("result_text") or "")
+        head = f"「{org_name}」(ID: {org_id})" if org_name else org_id
+        lines = [f"📜 上次组织命令：{head}", f"  • 任务：{preview}", "", "结果："]
+        lines.append(result if result else "(无结果)")
+        return "\n".join(lines)
+
+    async def _handle_org_control_command(
+        self,
+        message: UnifiedMessage,
+        normalized: str,
+    ) -> bool:
+        """fast-path 处理 /org cancel /org running /org last 三条命令。
+
+        返回 True 表示命令已处理（调用方应立即 return，不要继续走消息队列）。
+        这条 fast-path 不依赖 session.lock / processing_sessions，因此即使
+        当前会话已有一条组织命令在 `await queue.get()` 阻塞，新指令仍能立刻
+        响应——这正是修这三条命令要解决的核心痛点。
+        """
+        session = self.session_manager.get_session(
+            channel=message.channel,
+            chat_id=message.chat_id,
+            user_id=message.user_id,
+            thread_id=message.thread_id,
+            bot_instance_id=self._get_message_bot_instance_id(message),
+            create_if_missing=False,
+        )
+        if session is None:
+            await self._send_response(message, "当前会话不存在或已过期，请先发送一条普通消息建立会话。")
+            return True
+
+        if normalized in ("/org cancel", "/组织 取消"):
+            cur = session.get_metadata("current_org_command") or None
+            if not isinstance(cur, dict) or not cur.get("command_id"):
+                await self._send_response(message, "当前没有正在跑的组织命令可以取消。")
+                return True
+            org_id = str(cur.get("org_id") or "")
+            command_id = str(cur.get("command_id") or "")
+            try:
+                from synapse.orgs.command_service import get_command_service
+
+                svc = get_command_service()
+                if svc is None:
+                    await self._send_response(message, "组织命令服务尚未初始化，请稍后再试。")
+                    return True
+                result = await svc.cancel(org_id, command_id)
+            except Exception as exc:
+                logger.warning("[IM] /org cancel failed: %s", exc, exc_info=True)
+                await self._send_response(message, f"取消失败：{_format_user_error(exc)}")
+                return True
+            if not result:
+                await self._send_response(message, "未找到该组织命令（可能已被清理）。")
+                return True
+            if result.get("already_done"):
+                await self._send_response(message, "命令已经结束，无需取消。")
+                return True
+            await self._send_response(
+                message,
+                f"✅ 已发起取消，命令 ID：`{command_id}`。\n"
+                "组织会在执行完当前最小步骤后停止；最终结果（含「cancelled_by_user」）"
+                "将通过此前那条派发回执的等待循环发回。",
+            )
+            return True
+
+        if normalized in ("/org running", "/组织 在跑"):
+            await self._send_response(message, self._format_current_org_command(session))
+            return True
+
+        if normalized in ("/org last", "/组织 上次"):
+            await self._send_response(message, self._format_last_org_command(session))
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_org_control_command(text: str) -> str | None:
+        """识别 fast-path 控制指令；命中返回归一化后的小写字符串，否则 None。"""
+        if not text:
+            return None
+        t = text.strip().lower()
+        if t in (
+            "/org cancel",
+            "/org running",
+            "/org last",
+            "/组织 取消",
+            "/组织 在跑",
+            "/组织 上次",
+        ):
+            return t
+        return None
+
+    # 裸文本中止短语 — 用户在 IM 里直接发"中止 / 结束任务 / 停了"等，
+    # 不带 /org 前缀，但意图就是停掉当前正在跑的组织命令。原先这些会进
+    # session 串行队列，等当前长任务结束才被处理 — 体感就是"我中止了
+    # 半天没反应"。AIGC 编排优化 P1-B：当 session 有 active org command
+    # 时，直接走 command_service.cancel 的 fast-path，绕过队列。
+    # 故意只接受**短**且**意图明确**的裸文本，避免在长正文里误命中。
+    _BARE_ORG_CANCEL_PHRASES: frozenset[str] = frozenset({
+        "中止", "中止任务",
+        "停止", "停止任务", "停了", "停了停了",
+        "结束任务", "结束",
+        "取消", "取消任务",
+        "终止", "终止任务",
+        "别做了", "不做了",
+        "/中止", "/结束", "/停止", "/取消", "/终止",
+    })
+
+    @classmethod
+    def _is_bare_org_cancel(cls, text: str) -> bool:
+        """是否为裸文本"中止当前组织任务"意图。
+
+        仅匹配整条消息就是中止短语本身（无标点、无附加内容），避免在
+        长文本里误吃用户原话。带 ASCII/CJK 标点的版本也接受，例如
+        "中止！" / "中止。" → 视作匹配。
+        """
+        if not text:
+            return False
+        t = text.strip()
+        # 剥掉首尾常见的中英文标点，再做一次比对
+        _PUNCT = "！!。.,，、；;:：?？～~ \t"
+        stripped = t.strip(_PUNCT)
+        if stripped in cls._BARE_ORG_CANCEL_PHRASES:
+            return True
+        return t.lower() in cls._BARE_ORG_CANCEL_PHRASES
+
+    async def _handle_bare_org_cancel(self, message: UnifiedMessage) -> bool:
+        """处理裸文本"中止/结束任务/停了"等意图。
+
+        与 ``_handle_org_control_command`` 的 ``/org cancel`` 分支共用底层
+        ``command_service.cancel``，但语义上"裸文本"只有在 session 当前确实
+        有 ``current_org_command`` 时才接管：
+        - 有 → 立即触发取消，回执"已对组织发起取消"。返回 True 表示已处理。
+        - 没有 → 不接管，返回 False；让消息按正常路径走，agent 自己的
+          STOP_COMMANDS 识别会兜底处理（避免对话里偶尔说"算了"被误吞）。
+        """
+        session = self.session_manager.get_session(
+            channel=message.channel,
+            chat_id=message.chat_id,
+            user_id=message.user_id,
+            thread_id=message.thread_id,
+            bot_instance_id=self._get_message_bot_instance_id(message),
+            create_if_missing=False,
+        )
+        if session is None:
+            return False
+        cur = session.get_metadata("current_org_command") or None
+        if not isinstance(cur, dict) or not cur.get("command_id"):
+            return False
+        org_id = str(cur.get("org_id") or "")
+        command_id = str(cur.get("command_id") or "")
+        if not org_id or not command_id:
+            return False
+        try:
+            from synapse.orgs.command_service import get_command_service
+
+            svc = get_command_service()
+            if svc is None:
+                await self._send_response(
+                    message, "检测到中止意图，但组织命令服务尚未就绪，请稍后再试。",
+                )
+                return True
+            result = await svc.cancel(org_id, command_id)
+        except Exception as exc:
+            logger.warning(
+                "[IM] bare-text org cancel failed: %s", exc, exc_info=True,
+            )
+            await self._send_response(message, f"中止失败：{_format_user_error(exc)}")
+            return True
+        if not result:
+            await self._send_response(
+                message, "检测到中止意图，但当前组织命令已经被清理。",
+            )
+            return True
+        if result.get("already_done"):
+            await self._send_response(
+                message, "命令已经结束，无需中止。",
+            )
+            return True
+        await self._send_response(
+            message,
+            f"✅ 检测到中止意图，已对组织发起取消（命令 ID `{command_id}`）。\n"
+            "组织会在执行完当前最小步骤后停止；结果会通过此前的等待循环发回。",
+        )
+        return True
+
+    def _resolve_org_query(self, query: str) -> tuple[str | None, str | None]:
+        """把用户在 IM 里输入的"组织名或 ID"解析成真实 org_id。
+
+        返回 ``(org_id, error_message)``：
+        - 解析成功：``(org_id, None)``。
+        - 失败/歧义：``(None, 用户可见的中文提示)``，调用方直接把提示回给用户。
+        """
+        q = (query or "").strip()
+        if not q:
+            return None, "用法：/org bind <组织名 或 组织ID>"
+        mgr = self._get_org_manager()
+        if mgr is None:
+            return None, "组织管理器尚未就绪，请稍后再试。"
+        org_id, candidates = mgr.resolve_id_by_name_or_id(q)
+        if org_id:
+            return org_id, None
+        if candidates:
+            lines = [f"找到 {len(candidates)} 个名为「{q}」的组织，请用更精确的名字或直接用 ID 指定："]
+            for c in candidates[:10]:
+                created = (c.get("created_at") or "")[:10]
+                lines.append(f"  • {c.get('name', '')}  ID: {c.get('id', '')}  创建于 {created}")
+            if len(candidates) > 10:
+                lines.append(f"  …还有 {len(candidates) - 10} 个未显示")
+            return None, "\n".join(lines)
+        return None, f"未找到组织「{q}」。请用 `/org list` 或在桌面端查看可用组织名。"
+
+    @staticmethod
+    def _format_org_command_status_card(
+        *,
+        org_display: str,
+        command_id: str,
+        progress_lines: list[str],
+        done: bool = False,
+    ) -> str:
+        lines = [
+            f"已向组织 {org_display} 下发指令，命令 ID：`{command_id}`",
+            "• 查看进度：`/org running`",
+            "• 立即取消：`/org cancel`",
+            "• 重看上次结果：`/org last`",
+            "（期间您发的其他普通消息会排队等待至命令结束）",
+            "",
+            "组织进度：",
+        ]
+        if progress_lines:
+            for line in progress_lines[-12:]:
+                lines.append(f"• {line}")
+        else:
+            lines.append("• 等待组织开始处理")
+        if done:
+            lines.append("")
+            lines.append("✅ 命令已完成")
+        return "\n".join(lines)
+
+    async def _send_org_status_card(
+        self,
+        message: UnifiedMessage,
+        content: str,
+    ) -> str | None:
+        """发送可更新的组织状态卡片；失败时退回普通发送。"""
+        adapter = self._adapters.get(message.channel)
+        if not adapter:
+            await self._send_response(message, content)
+            return None
+        outgoing_meta = dict(message.metadata) if message.metadata else {}
+        if message.channel_user_id:
+            outgoing_meta["channel_user_id"] = message.channel_user_id
+        outgoing = OutgoingMessage.text(
+            chat_id=message.chat_id,
+            text=content,
+            reply_to=message.channel_message_id,
+            thread_id=message.thread_id,
+            parse_mode="markdown",
+            metadata=outgoing_meta,
+        )
+        try:
+            msg_id = await adapter.send_message(outgoing)
+            if not self._is_im_send_delivered(msg_id):
+                return None
+            return str(msg_id or "") or None
+        except Exception:
+            logger.debug("[IM] org status card send failed; falling back", exc_info=True)
+            await self._send_response(message, content)
+            return None
+
+    async def _patch_org_status_card(
+        self,
+        message: UnifiedMessage,
+        card_id: str | None,
+        content: str,
+        *,
+        done: bool = False,
+    ) -> bool:
+        """尽量就地更新组织状态卡片。
+
+        - 飞书 / Lark：走 CardKit / PatchMessage（``_patch_card_content``），无新消息。
+        - 其它带 ``edit_message`` 能力的通道（Telegram 等）：调 ``edit_message``，
+          这样在 Telegram 等聊天里也能像飞书一样**只更新同一条消息**，
+          而不是每条进度都新发一条灰色消息。
+        - DingTalk 的 ``_patch_card_content`` 需要 ``_CardState``，gateway 这里
+          没法构造；DingTalk 退化为重新发普通消息（与之前一致）。
+        """
+        if not card_id:
+            return False
+        adapter = self._adapters.get(message.channel)
+        if not adapter:
+            return False
+
+        base_channel = (message.channel or "").split(":")[0].split("_")[0]
+
+        # 飞书 / Lark 走原有 CardKit 路径，UI 一致性最好。
+        if base_channel in {"feishu", "lark"} and hasattr(adapter, "_patch_card_content"):
+            sk = None
+            if hasattr(adapter, "_make_session_key"):
+                try:
+                    sk = adapter._make_session_key(message.chat_id, message.thread_id)
+                except Exception:
+                    sk = None
+            try:
+                return bool(await adapter._patch_card_content(card_id, content, sk, final=done))
+            except TypeError:
+                try:
+                    return bool(await adapter._patch_card_content(card_id, content, sk))
+                except Exception:
+                    return False
+            except Exception:
+                return False
+
+        # 其它支持原生编辑消息的通道（Telegram 等）。
+        if getattr(adapter, "has_capability", None) and adapter.has_capability("edit_message"):
+            try:
+                ok = await adapter.edit_message(
+                    message.chat_id,
+                    card_id,
+                    content,
+                    parse_mode="markdown",
+                )
+                return bool(ok)
+            except TypeError:
+                try:
+                    return bool(await adapter.edit_message(message.chat_id, card_id, content))
+                except Exception:
+                    return False
+            except Exception:
+                return False
+
+        return False
+
+    @staticmethod
+    def _append_attachment_media_lines(final_text: str, attachments: list[dict]) -> str:
+        media_lines: list[str] = []
+        seen: set[str] = set()
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            file_path = str(att.get("file_path") or att.get("path") or "").strip()
+            if not file_path:
+                continue
+            key = file_path.lower().replace("\\", "/")
+            if key in seen:
+                continue
+            seen.add(key)
+            media_lines.append(f"MEDIA: {file_path}")
+        if not media_lines:
+            return final_text
+        return (final_text or "文件已生成。").rstrip() + "\n\n" + "\n".join(media_lines)
+
+    async def _try_handle_org_command(
+        self,
+        message: UnifiedMessage,
+        session: Session,
+        user_text: str,
+    ) -> bool:
+        text = (user_text or "").strip()
+        lowered = text.lower()
+        if lowered.startswith(("/org bind ", "/组织 绑定 ")):
+            parts = text.split(maxsplit=2)
+            if len(parts) < 3:
+                await self._send_response(message, "用法：/org bind <组织名 或 组织ID>")
+                return True
+            query = parts[2].strip()
+            org_id, err = self._resolve_org_query(query)
+            if err:
+                await self._send_response(message, err)
+                return True
+            mgr = self._get_org_manager()
+            display_name = ""
+            if mgr is not None:
+                try:
+                    org_obj = mgr.get(org_id) if org_id else None
+                    display_name = org_obj.name if org_obj else ""
+                except Exception:
+                    display_name = ""
+            session.set_metadata("bound_org_id", org_id)
+            self.session_manager.mark_dirty()
+            label = f"「{display_name}」(ID: {org_id})" if display_name else org_id
+            await self._send_response(message, f"已绑定组织：{label}")
+            return True
+        if lowered in ("/org unbind", "/组织 解绑"):
+            session.set_metadata("bound_org_id", "")
+            self.session_manager.mark_dirty()
+            await self._send_response(message, "已取消当前 IM 会话的组织绑定。")
+            return True
+        if lowered in ("/org status", "/组织 状态"):
+            bound = session.get_metadata("bound_org_id") or ""
+            if not bound:
+                await self._send_response(message, "当前未绑定组织。用 `/org bind <组织名>` 绑定。")
+                return True
+            mgr = self._get_org_manager()
+            display_name = ""
+            if mgr is not None:
+                try:
+                    org_obj = mgr.get(bound)
+                    display_name = org_obj.name if org_obj else ""
+                except Exception:
+                    display_name = ""
+            if display_name:
+                await self._send_response(message, f"当前绑定组织：「{display_name}」(ID: {bound})")
+            else:
+                await self._send_response(message, f"当前绑定组织：{bound}（注意：该组织可能已被删除或归档）")
+            return True
+        if lowered in ("/org list", "/组织 列表"):
+            mgr = self._get_org_manager()
+            if mgr is None:
+                await self._send_response(message, "组织管理器尚未就绪，请稍后再试。")
+                return True
+            try:
+                orgs = mgr.list_orgs(include_archived=False)
+            except Exception as exc:
+                await self._send_response(message, f"列出组织失败：{exc}")
+                return True
+            if not orgs:
+                await self._send_response(message, "当前没有任何已创建的组织。")
+                return True
+            lines = [f"当前共 {len(orgs)} 个组织："]
+            for o in orgs[:20]:
+                lines.append(
+                    f"  • {o.get('name', '')}  [{o.get('status', '')}]  ID: {o.get('id', '')}"
+                )
+            if len(orgs) > 20:
+                lines.append(f"  …还有 {len(orgs) - 20} 个未显示")
+            lines.append("\n下达指令：`/org bind <组织名>` 后用 `@组织 <任务>`")
+            await self._send_response(message, "\n".join(lines))
+            return True
+
+        parsed = self._parse_org_command(text, session)
+        if parsed is None:
+            return False
+        org_query, task = parsed
+
+        # 将已下载的文本文件内容拼接到 task，使组织根节点能看到文件内容。
+        # _preprocess_media 已在 _handle_message 中提前执行（媒体已下载到本地）。
+        file_supplement = self._extract_text_file_content(message)
+        if file_supplement:
+            task = task + file_supplement
+
+        # 把用户输入的"组织名或 ID"解析为真实 ID。@组织/@org 简短形式时
+        # ``_parse_org_command`` 已经返回 session 里 bound 好的真实 id，再走一遍解析
+        # 仍然安全（id 精确匹配自身）。
+        org_id, err = self._resolve_org_query(org_query)
+        if err:
+            await self._send_response(message, err)
+            return True
+
+        try:
+            from synapse.orgs.command_service import (
+                OrgCommandRequest,
+                OrgCommandSource,
+                OrgCommandSurface,
+                default_scope_for_surface,
+                get_command_service,
+            )
+
+            svc = get_command_service()
+            if svc is None:
+                await self._send_response(message, "组织命令服务尚未初始化，请稍后再试。")
+                return True
+
+            chat_type = message.chat_type or "private"
+            started = svc.submit(
+                OrgCommandRequest(
+                    org_id=org_id,
+                    content=task,
+                    source=OrgCommandSource(
+                        channel=message.channel,
+                        chat_id=message.chat_id,
+                        user_id=message.user_id,
+                        thread_id=message.thread_id,
+                        display_name=(message.metadata or {}).get("sender_name", ""),
+                    ),
+                    origin_surface=OrgCommandSurface.IM,
+                    output_scope=default_scope_for_surface(OrgCommandSurface.IM, chat_type=chat_type),
+                )
+            )
+            command_id = started["command_id"]
+            queue = svc.subscribe_summary(
+                command_id,
+                surface="im",
+                target=f"{message.channel}:{message.chat_id}:{message.user_id}",
+            )
+            mgr = self._get_org_manager()
+            org_name = ""
+            if mgr is not None:
+                try:
+                    org_obj = mgr.get(org_id)
+                    org_name = org_obj.name if org_obj else ""
+                except Exception:
+                    org_name = ""
+            self._record_current_org_command(
+                session,
+                org_id=org_id,
+                org_name=org_name,
+                command_id=command_id,
+                task_preview=task,
+            )
+            self.session_manager.mark_dirty()
+            try:
+                progress_lines: list[str] = []
+                progress_seen: set[str] = set()
+                org_display = f"「{org_name}」" if org_name else org_id
+                status_card_id: str | None = None
+                if chat_type != "group":
+                    status_card_id = await self._send_org_status_card(
+                        message,
+                        self._format_org_command_status_card(
+                            org_display=org_display,
+                            command_id=command_id,
+                            progress_lines=progress_lines,
+                        ),
+                    )
+                final_text = ""
+                while True:
+                    item = await queue.get()
+                    if item.get("type") == "org_progress":
+                        summary = str(item.get("summary") or "").strip()
+                        if summary and chat_type != "group":
+                            if summary in progress_seen:
+                                continue
+                            progress_seen.add(summary)
+                            progress_lines.append(summary)
+                            status_text = self._format_org_command_status_card(
+                                org_display=org_display,
+                                command_id=command_id,
+                                progress_lines=progress_lines,
+                            )
+                            patched = await self._patch_org_status_card(
+                                message,
+                                status_card_id,
+                                status_text,
+                            )
+                            if not patched and not status_card_id:
+                                await self._send_response(message, f"组织进度：{summary}")
+                        continue
+                    if item.get("type") == "org_command_done":
+                        result = item.get("result")
+                        error = item.get("error")
+                        attachments: list[dict] = []
+                        if isinstance(result, dict):
+                            final_text = str(result.get("result") or result.get("error") or result)
+                            raw_attachments = result.get("file_attachments") or []
+                            if isinstance(raw_attachments, list):
+                                attachments = [a for a in raw_attachments if isinstance(a, dict)]
+                        else:
+                            final_text = str(error or result or "组织命令已完成")
+                        if attachments:
+                            final_text = self._append_attachment_media_lines(final_text, attachments)
+                        session.add_message("user", text, message_id=message.id)
+                        session.add_message("assistant", final_text)
+                        self._finish_current_org_command(session, result_text=final_text)
+                        self.session_manager.mark_dirty()
+                        if chat_type != "group":
+                            await self._patch_org_status_card(
+                                message,
+                                status_card_id,
+                                self._format_org_command_status_card(
+                                    org_display=org_display,
+                                    command_id=command_id,
+                                    progress_lines=progress_lines,
+                                    done=True,
+                                ),
+                                done=True,
+                            )
+                        await self._send_response(message, final_text)
+                        return True
+            finally:
+                svc.unsubscribe_summary(command_id, queue)
+                # 防御：如果 finally 走到这里时 current_org_command 还没被清，
+                # 强制把它转入 last_org_command 槽位，避免后续 /org running 误指。
+                cur_now = session.get_metadata("current_org_command") or None
+                if isinstance(cur_now, dict) and cur_now.get("command_id") == command_id:
+                    self._finish_current_org_command(session, result_text="(无最终回复)")
+                    self.session_manager.mark_dirty()
+        except Exception as exc:
+            logger.warning("[IM] org command failed: %s", exc, exc_info=True)
+            await self._send_response(message, f"组织命令提交失败：{_format_user_error(exc)}")
+            return True
+
     async def _handle_message(self, message: UnifiedMessage) -> None:
         """
         处理单条消息
         """
+        bot_namespace = self._get_message_bot_instance_id(message)
         session_key = self._get_session_key(message)
         user_text = message.plain_text.strip() if message.plain_text else ""
 
         logger.info(
-            f"[IM] <<< 收到消息: channel={message.channel}, user={message.user_id}, "
+            f"[IM] <<< 收到消息: channel={message.channel}, bot={bot_namespace}, "
+            f"user={message.user_id}, "
             f'text="{user_text[:100]}"'
         )
 
@@ -2682,7 +3749,7 @@ class MessageGateway:
             # ==================== 群聊响应过滤 ====================
             if message.chat_type == "group" and not message.is_direct_message:
                 mode = self._get_group_response_mode(
-                    message.channel, message.chat_id, message.user_id
+                    bot_namespace, message.chat_id, message.user_id
                 )
 
                 if mode == GroupResponseMode.DISABLED:
@@ -2694,7 +3761,7 @@ class MessageGateway:
 
                     gp_config = GroupPolicyConfig(
                         policy=GroupPolicyType.ALLOWLIST,
-                        allowlist=self._get_group_allowlist(message.channel),
+                        allowlist=self._get_group_allowlist(bot_namespace),
                     )
                     gp_result = check_group_policy(message.chat_id, gp_config)
                     if not gp_result.allowed:
@@ -2754,6 +3821,7 @@ class MessageGateway:
                     chat_id=message.chat_id,
                     user_id=message.user_id,
                     thread_id=message.thread_id,
+                    bot_instance_id=bot_namespace,
                 )
                 response_text = await self._thinking_cmd_handler.handle_command(
                     session_key,
@@ -2822,6 +3890,7 @@ class MessageGateway:
                         chat_id=message.chat_id,
                         user_id=message.user_id,
                         thread_id=message.thread_id,
+                        bot_instance_id=self._get_message_bot_instance_id(message),
                     )
                     resp = await self._handle_agent_switch(_switch_session, f"/切换 {arg}")
                 else:
@@ -2839,6 +3908,7 @@ class MessageGateway:
                     chat_id=message.chat_id,
                     user_id=message.user_id,
                     thread_id=message.thread_id,
+                    bot_instance_id=self._get_message_bot_instance_id(message),
                 )
                 if _reset_session:
                     _old_count = len(_reset_session.context.messages)
@@ -2879,28 +3949,14 @@ class MessageGateway:
             # ==================== 正常消息处理流程 ====================
 
             # 0. Bot 开关检查（必须在 typing 之前，避免禁用会话触发 typing）
-            if not self.bot_config.is_enabled(message.channel, message.chat_id, message.user_id):
+            if not self.bot_config.is_enabled(bot_namespace, message.chat_id, message.user_id):
                 logger.debug(
-                    f"[Gateway] Bot disabled for {message.channel}:{message.chat_id}:{message.user_id}, skipping"
+                    f"[Gateway] Bot disabled for {bot_namespace}:{message.chat_id}:{message.user_id}, skipping"
                 )
                 return
 
-            # 1. 启动持续 typing 状态（覆盖预处理 + Agent 全流程）
-            typing_task = asyncio.create_task(self._keep_typing(message))
-
-            # 2. 预处理钩子
-            for hook in self._pre_process_hooks:
-                try:
-                    message = await hook(message)
-                except Exception as hook_err:
-                    logger.warning(
-                        f"[Gateway] Pre-process hook {hook.__qualname__} failed: {hook_err}"
-                    )
-
-            # 3. 媒体预处理（下载图片、语音转文字）
-            await self._preprocess_media(message)
-
-            # 4. 获取或创建会话
+            # 1. 先获取或创建会话。组织指挥台命令会在启动 typing 之前处理，
+            # 避免飞书/Telegram 先创建“思考中...”卡片，短命令回复后又被补发或撤回。
             _msg_sender_name = (message.metadata or {}).get("sender_name", "")
             _msg_chat_name = (message.metadata or {}).get("chat_name", "")
             session = self.session_manager.get_session(
@@ -2908,6 +3964,7 @@ class MessageGateway:
                 chat_id=message.chat_id,
                 user_id=message.user_id,
                 thread_id=message.thread_id,
+                bot_instance_id=bot_namespace,
                 chat_type=message.chat_type or "private",
                 display_name=_msg_sender_name,
                 chat_name=_msg_chat_name,
@@ -2921,8 +3978,55 @@ class MessageGateway:
             if _msg_chat_name and session.chat_name != _msg_chat_name:
                 session.chat_name = _msg_chat_name
 
+            # 4.0.2 C14 / R4-7: IM/Webhook 通道没有同步 confirm UI 通道（无法
+            # 在 IM 客户端弹模态框）。把 session 标记为 is_unattended → 让
+            # PolicyEngineV2 step 11 通过 unattended_strategy（默认 ask_owner）
+            # 把 CONFIRM-class 工具 defer 给 owner 的 setup-center / 收件箱，
+            # 而不是悬挂在等不到响应的 SSE confirm 上。
+            #
+            # 用 classifier 的 idempotent helper：已经 unattended 的 session
+            # 不会被改回 False；明确设置过 unattended_strategy 的 session 也
+            # 不会被默认策略覆盖。
+            from ..core.policy_v2 import (
+                apply_classification_to_session,
+                classify_entry,
+            )
+
+            apply_classification_to_session(
+                session,
+                classify_entry(message.channel),
+            )
+
+            # 1.5 媒体预处理（下载文件/图片/语音 + 语音 STT）。
+            # 必须在 org 命令路由之前执行，否则组织命令路径无法读取文件内容。
+            # 对纯文本消息是 no-op（无媒体时直接跳过）；内部有幂等保护，
+            # 后续正常路径即使再次调用也安全。
+            if message.content.has_media:
+                await self._preprocess_media(message)
+
+            org_handled = await self._try_handle_org_command(message, session, user_text)
+            if org_handled:
+                return
+
+            # 2. 启动持续 typing 状态（覆盖预处理 + Agent 全流程）。
+            # 只有会进入普通 Agent 的消息才需要这个提示；/org list、/org bind、
+            # /org <组织名> 的解析错误等都会在上面直接返回。
+            typing_task = asyncio.create_task(self._keep_typing(message))
+
+            # 3. 预处理钩子
+            for hook in self._pre_process_hooks:
+                try:
+                    message = await hook(message)
+                except Exception as hook_err:
+                    logger.warning(
+                        f"[Gateway] Pre-process hook {hook.__qualname__} failed: {hook_err}"
+                    )
+
+            # 4. 媒体预处理（幂等：已下载的文件不会重复下载）
+            await self._preprocess_media(message)
+
             # 4.1 多Bot绑定：将 adapter 配置的 agent_profile_id 写入新 session
-            self._apply_bot_agent_profile(session, message.channel)
+            self._apply_bot_agent_profile(session, bot_namespace)
 
             # 4.2 注入 IM 环境上下文（平台、聊天类型、机器人身份、能力列表）
             adapter = self._adapters.get(message.channel)
@@ -2933,10 +4037,22 @@ class MessageGateway:
                     "chat_id": message.chat_id,
                     "thread_id": message.thread_id,
                     "bot_id": getattr(adapter, "_bot_open_id", None),
+                    "bot_instance_id": bot_namespace,
                     "capabilities": getattr(adapter, "_capabilities", []),
                 }
                 session.set_metadata("_im_environment", im_env)
                 session.set_metadata("chat_type", message.chat_type)
+
+            # 4.2.1 C8 §9.2：判定本次消息发送者是否为本渠道 owner，写入 session.metadata。
+            # adapter.build_policy_context 会读这个字段供 OwnerOnly 检查使用
+            # （CONTROL_PLANE 工具仅 owner 可调）。
+            #
+            # 三态语义见 ``_get_owner_user_ids`` docstring；这里把"未配 allowlist"
+            # 翻译成 ``True`` 以维持单用户私聊默认体验，把"配了 allowlist 但用户不在"
+            # 翻译成 ``False`` 以真正卡死非 owner 调控制面工具的能力。
+            owner_ids = self._get_owner_user_ids(message.channel)
+            is_owner = True if owner_ids is None else (str(message.user_id) in owner_ids)
+            session.set_metadata("is_owner", is_owner)
 
             # 4.5 推送未送达的自检报告（每天第一条消息时触发，最多一次）
             await self._maybe_deliver_pending_selfcheck_report(message)
@@ -3001,6 +4117,7 @@ class MessageGateway:
                     _ctx_items = self._get_group_context(
                         message.channel,
                         message.chat_id,
+                        bot_instance_id=bot_namespace,
                         max_items=10,
                     )
                     if _ctx_items:
@@ -3011,7 +4128,7 @@ class MessageGateway:
                             f"for {session_key}"
                         )
                         # 注入后清空缓冲区，避免重复注入
-                        _buf_key = f"{message.channel}:{message.chat_id}"
+                        _buf_key = f"{bot_namespace}:{message.chat_id}"
                         self._group_context_buffer.pop(_buf_key, None)
                 except Exception as _ctx_err:
                     logger.debug(f"[IM] Group context injection failed (non-critical): {_ctx_err}")
@@ -3022,12 +4139,20 @@ class MessageGateway:
                 content=message.plain_text,
                 message_id=message.id,
                 channel_message_id=message.channel_message_id,
+                bot_instance_id=bot_namespace,
+            )
+            self._mirror_im_message_to_desktop(
+                session,
+                role="user",
+                content=message.plain_text,
+                source_message_id=message.channel_message_id or message.id,
             )
             self.session_manager.mark_dirty()  # 触发保存
             _notify_im_event(
                 "im:new_message",
                 {
                     "channel": message.channel,
+                    "bot_instance_id": bot_namespace,
                     "role": "user",
                     "session_id": session.session_key,
                     "chat_type": session.chat_type,
@@ -3073,18 +4198,25 @@ class MessageGateway:
                         logger.debug(f"[Gateway] Tool trace summary ({len(_tool_summary)} chars)")
             except Exception:
                 pass
-            _msg_meta: dict = {}
+            _msg_meta: dict = {"bot_instance_id": bot_namespace}
             if _chain_summary:
                 _msg_meta["chain_summary"] = _chain_summary
             if _tool_summary:
                 _msg_meta["tool_summary"] = _tool_summary
             session.add_message(role="assistant", content=response_text, **_msg_meta)
-            self.session_manager.mark_dirty()
-            self.session_manager.flush()
+            self._mirror_im_message_to_desktop(
+                session,
+                role="assistant",
+                content=response_text,
+                chain_summary=_chain_summary,
+                tool_summary=_tool_summary,
+            )
+            self.session_manager.persist()
             _notify_im_event(
                 "im:new_message",
                 {
                     "channel": message.channel,
+                    "bot_instance_id": bot_namespace,
                     "role": "assistant",
                     "session_id": session.session_key,
                     "chat_type": session.chat_type,
@@ -3153,7 +4285,7 @@ class MessageGateway:
                     if _last.get("role") == "user":
                         session.add_message(
                             role="assistant",
-                            content=f"[处理出错: {str(e)[:200]}]",
+                            content=_format_user_error(e),
                         )
                         self.session_manager.mark_dirty()
             except Exception:
@@ -3290,15 +4422,17 @@ class MessageGateway:
                         logger.info(f"Voice downloaded: {voice.local_path}")
 
                 if voice.local_path and not voice.transcription:
-                    transcription = await asyncio.wait_for(
-                        self._transcribe_voice_local(voice.local_path), timeout=120
-                    )
+                    transcription = None
+                    if self.stt_client and self.stt_client.is_available:
+                        transcription = await asyncio.wait_for(
+                            self.stt_client.transcribe(voice.local_path), timeout=120
+                        )
                     if transcription:
                         voice.transcription = transcription
                         logger.info(f"Voice transcribed: {transcription}")
                     else:
-                        voice.transcription = "[语音识别失败]"
-            except (asyncio.TimeoutError, TimeoutError):
+                        voice.transcription = "[语音识别失败，请配置在线 STT 端点]"
+            except TimeoutError:
                 logger.error(f"Voice processing timed out: {voice.filename}")
                 voice.transcription = "[语音处理超时]"
             except Exception as e:
@@ -3397,64 +4531,83 @@ class MessageGateway:
                 logger.warning(f"[Interrupt] _build_pending_files failed for {fil.local_path}: {e}")
         return files_data
 
-    async def _transcribe_voice_local(self, audio_path: str) -> str | None:
+    # Known text-file extensions for inline content injection.
+    # Shared by _extract_text_file_content and _call_agent.
+    _TEXT_FILE_EXTENSIONS = frozenset((
+        ".md", ".txt", ".csv", ".json", ".jsonl", ".xml",
+        ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log",
+        ".py", ".js", ".ts", ".jsx", ".tsx",
+        ".html", ".htm", ".css", ".sql",
+        ".sh", ".bat", ".ps1",
+        ".java", ".c", ".cpp", ".h", ".hpp",
+        ".go", ".rs", ".rb", ".php", ".lua", ".r",
+        ".swift", ".kt", ".scala",
+        ".conf", ".env", ".gitignore", ".dockerfile", ".makefile",
+    ))
+
+    _TEXT_FILE_SIZE_LIMIT = 512 * 1024  # 512 KB
+
+    @staticmethod
+    def _extract_text_file_content(message: "UnifiedMessage") -> str:
+        """Extract readable text content from downloaded file attachments.
+
+        Returns a string with file contents (for known text extensions)
+        or path/failure notices for other file types.  Returns "" when
+        the message carries no file attachments or none could be read.
+
+        This is the single source of truth for text-file inlining —
+        used by both the normal agent path and the org-command path.
         """
-        使用本地 Whisper 进行语音转文字
+        parts: list[str] = []
+        for fil in getattr(message.content, "files", []) or []:
+            if not fil.local_path or not Path(fil.local_path).exists():
+                continue
+            try:
+                mime = fil.mime_type or ""
+                suffix = Path(fil.local_path).suffix.lower()
+                _fname = fil.filename or Path(fil.local_path).name
 
-        使用预加载的模型，避免每次都重新加载
-        """
-        import asyncio
+                if suffix in MessageGateway._TEXT_FILE_EXTENSIONS or mime.startswith("text/"):
+                    _fpath = Path(fil.local_path)
+                    if _fpath.stat().st_size <= MessageGateway._TEXT_FILE_SIZE_LIMIT:
+                        _content = _fpath.read_text(encoding="utf-8", errors="replace")
+                        parts.append(
+                            f"\n\n--- 文件: {_fname} ---\n{_content}\n--- 文件结束 ---"
+                        )
+                        logger.info(
+                            f"Text file injected: {fil.local_path} ({len(_content)} chars)"
+                        )
+                    else:
+                        parts.append(
+                            f"\n[附件: {_fname} ({mime or suffix}), "
+                            f"文件过大无法内联，本地路径: {fil.local_path}]"
+                        )
+                        logger.info(
+                            f"Text file too large for inline, path provided: {fil.local_path}"
+                        )
+                elif suffix == ".pdf" or "pdf" in mime:
+                    parts.append(
+                        f"\n[附件: {_fname} (PDF), 本地路径: {fil.local_path}]"
+                    )
+                else:
+                    parts.append(
+                        f"\n[附件: {_fname} ({mime or suffix}), 本地路径: {fil.local_path}]"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to extract file content: {e}")
 
-        try:
-            # 检查文件是否存在
-            if not Path(audio_path).exists():
-                logger.error(f"Audio file not found: {audio_path}")
-                return None
+        failed_files = [
+            fil for fil in (getattr(message.content, "files", []) or [])
+            if fil.status == MediaStatus.FAILED
+        ]
+        if failed_files:
+            reasons = "; ".join(fil.description or "未知原因" for fil in failed_files)
+            parts.append(
+                f"\n[用户发送了{len(failed_files)}个文件，但下载失败: {reasons}]"
+            )
+            logger.warning(f"File download failed, notifying agent: {reasons}")
 
-            # 确保模型已加载
-            if not self._whisper_loaded and not self._whisper_unavailable:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._load_whisper_model)
-
-            if self._whisper is None:
-                if not self._whisper_unavailable:
-                    logger.error("Whisper model not available")
-                return None
-
-            # 在线程池中运行转写（避免阻塞事件循环）
-            whisper_lang = self._whisper_language
-
-            def transcribe():
-                from synapse.channels.media.audio_utils import (
-                    ensure_whisper_compatible,
-                    load_wav_as_numpy,
-                )
-
-                compatible_path = ensure_whisper_compatible(audio_path)
-
-                kwargs = {}
-                if whisper_lang and whisper_lang != "auto":
-                    kwargs["language"] = whisper_lang
-
-                # 对已转换的 WAV 尝试直接 numpy 加载，绕过 ffmpeg 依赖
-                if compatible_path.endswith(".wav"):
-                    audio_array = load_wav_as_numpy(compatible_path)
-                    if audio_array is not None:
-                        result = self._whisper.transcribe(audio_array, **kwargs)
-                        return result["text"].strip()
-
-                result = self._whisper.transcribe(compatible_path, **kwargs)
-                return result["text"].strip()
-
-            # 异步执行
-            loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(None, transcribe)
-
-            return text if text else None
-
-        except Exception as e:
-            logger.error(f"Voice transcription failed: {e}", exc_info=True)
-            return None
+        return "".join(parts)
 
     async def _send_typing(self, message: UnifiedMessage) -> None:
         """发送正在输入状态"""
@@ -3530,7 +4683,7 @@ class MessageGateway:
             input_text = message.plain_text
             _has_voice = bool(message.content.voices)
 
-            # 处理语音文件 - 双路策略：保留原始音频 + Whisper 转写
+            # 处理语音文件 - 双路策略：保留原始音频 + STT 转写
             audio_data_list = []
             for voice in message.content.voices:
                 # 双路保留：始终存储原始音频路径到 pending_audio
@@ -3699,7 +4852,15 @@ class MessageGateway:
                     input_text = "[用户发送了视频]"
                 logger.info(f"Processing multimodal message with {len(videos_data)} videos")
 
-            # 处理文件 - PDF 等文档的多模态输入
+            # 处理文件 — 文本内联 + PDF/二进制多模态
+            # 文本文件内联使用共享 helper（与 org 命令路径一致）
+            file_text_supplement = self._extract_text_file_content(message)
+            if file_text_supplement:
+                input_text += file_text_supplement
+
+            # PDF 文件构建 pending_files（供 Agent DocumentBlock 多模态）。
+            # 文本文件已由 _extract_text_file_content 内联到 input_text，
+            # 不需要重复进入 pending_files。
             files_data = []
             for fil in message.content.files:
                 if fil.local_path and Path(fil.local_path).exists():
@@ -3708,9 +4869,9 @@ class MessageGateway:
                         suffix = Path(fil.local_path).suffix.lower()
                         _fname = fil.filename or Path(fil.local_path).name
                         if suffix == ".pdf" or "pdf" in mime:
-                            file_data = base64.b64encode(Path(fil.local_path).read_bytes()).decode(
-                                "utf-8"
-                            )
+                            file_data = base64.b64encode(
+                                Path(fil.local_path).read_bytes()
+                            ).decode("utf-8")
                             files_data.append(
                                 {
                                     "type": "document",
@@ -3724,89 +4885,8 @@ class MessageGateway:
                                 }
                             )
                             logger.info(f"PDF file encoded: {fil.local_path}")
-                        elif suffix in (
-                            ".md",
-                            ".txt",
-                            ".csv",
-                            ".json",
-                            ".jsonl",
-                            ".xml",
-                            ".yaml",
-                            ".yml",
-                            ".toml",
-                            ".ini",
-                            ".cfg",
-                            ".log",
-                            ".py",
-                            ".js",
-                            ".ts",
-                            ".jsx",
-                            ".tsx",
-                            ".html",
-                            ".htm",
-                            ".css",
-                            ".sql",
-                            ".sh",
-                            ".bat",
-                            ".ps1",
-                            ".java",
-                            ".c",
-                            ".cpp",
-                            ".h",
-                            ".hpp",
-                            ".go",
-                            ".rs",
-                            ".rb",
-                            ".php",
-                            ".lua",
-                            ".r",
-                            ".swift",
-                            ".kt",
-                            ".scala",
-                            ".conf",
-                            ".env",
-                            ".gitignore",
-                            ".dockerfile",
-                            ".makefile",
-                        ) or mime.startswith("text/"):
-                            _TEXT_FILE_SIZE_LIMIT = 512 * 1024  # 512KB
-                            _fpath = Path(fil.local_path)
-                            if _fpath.stat().st_size <= _TEXT_FILE_SIZE_LIMIT:
-                                _content = _fpath.read_text(
-                                    encoding="utf-8",
-                                    errors="replace",
-                                )
-                                input_text += (
-                                    f"\n\n--- 文件: {_fname} ---\n{_content}\n--- 文件结束 ---"
-                                )
-                                logger.info(
-                                    f"Text file injected: {fil.local_path} ({len(_content)} chars)"
-                                )
-                            else:
-                                input_text += (
-                                    f"\n[附件: {_fname} ({mime or suffix}), "
-                                    f"文件过大无法内联，本地路径: {fil.local_path}]"
-                                )
-                                logger.info(
-                                    f"Text file too large for inline, "
-                                    f"path provided: {fil.local_path}"
-                                )
-                        else:
-                            input_text += (
-                                f"\n[附件: {_fname} ({mime or suffix}), 本地路径: {fil.local_path}]"
-                            )
                     except Exception as e:
-                        logger.error(f"Failed to process file: {e}")
-
-            # 检查文件下载失败
-            failed_files = [
-                fil for fil in message.content.files if fil.status == MediaStatus.FAILED
-            ]
-            if failed_files:
-                reasons = "; ".join(fil.description or "未知原因" for fil in failed_files)
-                notice = f"[用户发送了{len(failed_files)}个文件，但下载失败: {reasons}]"
-                input_text = f"{input_text}\n\n{notice}" if input_text.strip() else notice
-                logger.warning(f"File download failed, notifying agent: {reasons}")
+                        logger.error(f"Failed to process file for pending_files: {e}")
 
             if files_data:
                 session.set_metadata("pending_files", files_data)
@@ -3823,7 +4903,6 @@ class MessageGateway:
             # === 流式 / 非流式分支 ===
             adapter = self._adapters.get(message.channel)
             is_group = message.chat_type == "group"
-            from ..config import settings as _cfg
 
             use_streaming = (
                 allow_streaming
@@ -3849,21 +4928,27 @@ class MessageGateway:
                 # 不再套 wait_for 墙钟超时，避免活跃任务被误杀
                 response = await self.agent_handler(session, input_text)
             else:
-                _AGENT_TIMEOUT = float(os.environ.get("AGENT_HANDLER_TIMEOUT", "1200"))
-                try:
-                    response = await asyncio.wait_for(
-                        self.agent_handler(session, input_text),
-                        timeout=_AGENT_TIMEOUT,
-                    )
-                except (asyncio.TimeoutError, TimeoutError):
-                    logger.error(f"[Gateway] Agent handler timed out after {_AGENT_TIMEOUT}s")
-                    response = f"⚠️ 处理超时（{int(_AGENT_TIMEOUT)}秒），请稍后重试或简化您的问题。"
+                _agent_timeout = self._get_agent_handler_timeout()
+                if _agent_timeout is None:
+                    response = await self.agent_handler(session, input_text)
+                else:
+                    try:
+                        response = await asyncio.wait_for(
+                            self.agent_handler(session, input_text),
+                            timeout=_agent_timeout,
+                        )
+                    except TimeoutError:
+                        logger.error(
+                            "[Gateway] Agent handler timed out after %ss",
+                            _agent_timeout,
+                        )
+                        response = self._format_agent_timeout_message(_agent_timeout)
 
             return (response, streamed_ok)
 
         except Exception as e:
             logger.error(f"Agent error: {e}", exc_info=True)
-            return (format_user_friendly_error(str(e)), False)
+            return (_format_user_error(e), False)
         finally:
             session.set_metadata("pending_images", None)
             session.set_metadata("pending_videos", None)
@@ -3898,8 +4983,6 @@ class MessageGateway:
         if hasattr(adapter, "_streaming_buffers") and hasattr(adapter, "_make_session_key"):
             _sk = adapter._make_session_key(message.chat_id, message.thread_id)
             adapter._streaming_buffers.setdefault(_sk, "")
-
-        _STREAM_TIMEOUT = float(os.environ.get("AGENT_HANDLER_TIMEOUT", "1200"))
 
         async def _consume_stream():
             nonlocal reply_text, _thinking_buf
@@ -3952,12 +5035,12 @@ class MessageGateway:
                         else:
                             await self.emit_progress_event(session, content)
                 elif etype == "tool_call_start":
-                    tool_name = event.get("name", "unknown")
+                    tool_name = event.get("tool") or event.get("name", "unknown")
                     if chain_push:
                         await self.emit_progress_event(session, f"🔧 正在调用工具: {tool_name}")
                 elif etype == "tool_call_end":
-                    tool_name = event.get("name", "unknown")
-                    tool_ok = event.get("success", True)
+                    tool_name = event.get("tool") or event.get("name", "unknown")
+                    tool_ok = not bool(event.get("is_error", False))
                     if chain_push:
                         status = "✅" if tool_ok else "❌"
                         await self.emit_progress_event(
@@ -3976,15 +5059,19 @@ class MessageGateway:
                     pass
 
         try:
-            await asyncio.wait_for(_consume_stream(), timeout=_STREAM_TIMEOUT)
-        except (asyncio.TimeoutError, TimeoutError):
-            logger.error(f"[IM] Streaming agent timed out after {_STREAM_TIMEOUT}s")
+            _stream_timeout = self._get_agent_handler_timeout()
+            if _stream_timeout is None:
+                await _consume_stream()
+            else:
+                await asyncio.wait_for(_consume_stream(), timeout=_stream_timeout)
+        except TimeoutError:
+            logger.error("[IM] Streaming agent timed out after %ss", _stream_timeout)
             if not reply_text:
-                reply_text = f"⚠️ 处理超时（{int(_STREAM_TIMEOUT)}秒），请稍后重试或简化您的问题。"
+                reply_text = self._format_agent_timeout_message(_stream_timeout)
         except Exception as e:
             logger.error(f"[IM] Streaming agent error: {e}", exc_info=True)
             if not reply_text:
-                reply_text = format_user_friendly_error(str(e))
+                reply_text = _format_user_error(e)
 
         if not reply_text or not reply_text.strip():
             return (reply_text, False)
@@ -4027,10 +5114,47 @@ class MessageGateway:
     }
     _DEFAULT_MAX_LENGTH = 4000
 
+    @staticmethod
+    def _get_agent_handler_timeout() -> float | None:
+        """Return an explicitly configured IM wall-clock timeout, if any.
+
+        Long IM tasks are user-driven conversations. By default, they should keep
+        running until completion or an explicit user stop/skip instead of being
+        killed by a hidden 20-minute wall-clock limit.
+        """
+        raw = os.environ.get("AGENT_HANDLER_TIMEOUT", "").strip()
+        if not raw:
+            return None
+        try:
+            timeout = float(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid AGENT_HANDLER_TIMEOUT=%r; IM agent wall-clock timeout disabled",
+                raw,
+            )
+            return None
+        if timeout <= 0:
+            return None
+        return timeout
+
+    @staticmethod
+    def _format_agent_timeout_message(timeout_seconds: float) -> str:
+        if timeout_seconds >= 60 and timeout_seconds % 60 == 0:
+            timeout_display = f"{int(timeout_seconds // 60)}分钟"
+        elif timeout_seconds >= 1:
+            timeout_display = f"{int(timeout_seconds)}秒"
+        else:
+            timeout_display = f"{timeout_seconds:g}秒"
+        return (
+            f"⚠️ 当前任务超过配置的处理时长上限（{timeout_display}），已停止本轮处理。"
+            "可以回复“继续”让我接着做；如这是预期的长任务，可调高或关闭 AGENT_HANDLER_TIMEOUT。"
+        )
+
     # 分片间发送间隔（秒），避免触发平台限流
     _SPLIT_SEND_INTERVAL: dict[str, float] = {
         "telegram": 0.5,
         "wechat": 2.5,
+        "feishu": 0.4,
     }
     _DEFAULT_SPLIT_INTERVAL = 0.15
 
@@ -4040,6 +5164,7 @@ class MessageGateway:
         "wechat": 12.0,
         "qqbot": 10.0,
         "onebot": 10.0,
+        "feishu": 3.0,
     }
 
     @staticmethod
@@ -4076,7 +5201,7 @@ class MessageGateway:
             chunks.append(current.rstrip())
         return chunks
 
-    async def _send_response(self, original: UnifiedMessage, response: str) -> None:
+    async def _send_response(self, original: UnifiedMessage, response: str) -> bool:
         """
         发送响应（带重试、按渠道分割长消息、分片间限流保护）
 
@@ -4103,8 +5228,17 @@ class MessageGateway:
 
         adapter = self._adapters.get(original.channel)
         if not adapter:
-            logger.error(f"No adapter for channel: {original.channel}")
-            return
+            # Fix-12: ``desktop`` / ``api`` / ``cli`` 等 in-app channel 没有 IM
+            # adapter，主线靠 SSE 直接推到前端 / CLI；此处重复 ERROR 日志容易
+            # 让 dashboard 误以为 IM 故障。降级为 DEBUG，仅未知 channel 才 ERROR。
+            if (original.channel or "").lower() in _NOOP_CHANNELS:
+                logger.debug(
+                    "[Gateway] No adapter for in-app channel '%s' — relying on SSE/CLI delivery",
+                    original.channel,
+                )
+            else:
+                logger.error(f"No adapter for channel: {original.channel}")
+            return False
 
         # 解析文本中的媒体引用
         media_result = parse_media_from_text(response)
@@ -4159,13 +5293,20 @@ class MessageGateway:
             from .retry import async_with_retry
 
             try:
-                await async_with_retry(
+                send_result = await async_with_retry(
                     adapter.send_message,
                     outgoing,
                     max_retries=2,
                     base_delay=1.0,
                     operation_name=f"send_response[{i + 1}/{len(messages)}]",
                 )
+                if not self._is_im_send_delivered(send_result):
+                    logger.warning(
+                        f"Response part {i + 1}/{len(messages)} was not immediately delivered "
+                        f"(channel={original.channel}, chat_id={original.chat_id})"
+                    )
+                    failed_at = i
+                    break
             except Exception as e:
                 logger.error(
                     f"Failed to send response part {i + 1}/{len(messages)} after retries: {e}"
@@ -4175,7 +5316,7 @@ class MessageGateway:
 
         if failed_at < 0:
             await self._send_extracted_media(adapter, original, media_result, outgoing_meta)
-            return
+            return True
 
         # 分片发送失败 → 仅将失败及后续分片以纯文本重发，避免已送达的部分重复
         remaining = messages[failed_at:]
@@ -4195,7 +5336,9 @@ class MessageGateway:
                 metadata=outgoing_meta,
             )
             try:
-                await adapter.send_message(plain_out)
+                plain_result = await adapter.send_message(plain_out)
+                if not self._is_im_send_delivered(plain_result):
+                    raise RuntimeError("adapter did not confirm immediate delivery")
             except Exception as e2:
                 logger.error(f"Plain-text fallback also failed for part {failed_at + j + 1}: {e2}")
                 _sent_count = failed_at + j
@@ -4212,9 +5355,10 @@ class MessageGateway:
                         thread_id=original.thread_id,
                         metadata=outgoing_meta,
                     )
-                return
+                return False
 
         await self._send_extracted_media(adapter, original, media_result, outgoing_meta)
+        return True
 
     async def _send_extracted_media(
         self,
@@ -4418,6 +5562,67 @@ class MessageGateway:
 
     # ==================== 主动发送 ====================
 
+    @staticmethod
+    def _is_im_send_delivered(result: object) -> bool:
+        """Return True only when an adapter reports an immediate delivery.
+
+        QQ official group bots return an empty string when a proactive message is
+        queued for the next user interaction. That queue is useful, but it is not
+        an immediate notification and should not make scheduler delivery look
+        successful.
+        """
+        if isinstance(result, str):
+            return bool(result)
+        return result is not None
+
+    async def send_text_reliably(
+        self,
+        channel: str,
+        chat_id: str,
+        text: str,
+        record_to_session: bool = True,
+        user_id: str = "system",
+        thread_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> bool:
+        """Send final text through the same chunking/retry path as normal replies."""
+        if not isinstance(text, str):
+            logger.warning(
+                "[Gateway] Refusing to send non-text reliable payload to IM channel "
+                "%s/%s: %s",
+                channel,
+                chat_id,
+                type(text).__name__,
+            )
+            return False
+
+        message = UnifiedMessage.create(
+            channel=channel,
+            channel_message_id="",
+            user_id=user_id,
+            channel_user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            content=MessageContent.text_only(text),
+            metadata=dict(metadata or {}),
+        )
+        delivered = await self._send_response(message, text)
+
+        if delivered and record_to_session and self.session_manager:
+            try:
+                self.session_manager.add_message(
+                    channel=channel,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    role="system",
+                    content=text,
+                    source="gateway.send_text_reliably",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to record reliable message to session: {e}")
+
+        return delivered
+
     async def send(
         self,
         channel: str,
@@ -4440,9 +5645,26 @@ class MessageGateway:
         Returns:
             消息 ID 或 None
         """
+        if not isinstance(text, str):
+            logger.warning(
+                "[Gateway] Refusing to send non-text payload to IM channel "
+                "%s/%s: %s",
+                channel,
+                chat_id,
+                type(text).__name__,
+            )
+            return None
+
         adapter = self._adapters.get(channel)
         if not adapter:
-            logger.error(f"No adapter for channel: {channel}")
+            if (channel or "").lower() in _NOOP_CHANNELS:
+                logger.debug(
+                    "[Gateway] send() target '%s' is an in-app channel without IM adapter — "
+                    "no-op (frontend listens via SSE)",
+                    channel,
+                )
+            else:
+                logger.error(f"No adapter for channel: {channel}")
             return None
 
         try:
@@ -4483,6 +5705,14 @@ class MessageGateway:
         """
         发送消息到会话
         """
+        if not isinstance(text, str):
+            logger.warning(
+                "[Gateway] Refusing to send non-text payload to session %s: %s",
+                getattr(session, "id", "<unknown>"),
+                type(text).__name__,
+            )
+            return None
+
         # 话题感知：session 关联了话题且调用者未显式指定 reply_to 时，
         # 自动使用 thread_id 使消息留在话题内（飞书等平台需要 reply 才能定位到话题）
         if session.thread_id and "reply_to" not in kwargs:
@@ -4512,7 +5742,9 @@ class MessageGateway:
         tool_name: str,
         reason: str,
         risk_level: str = "HIGH",
-    ) -> None:
+        *,
+        confirm_id: str = "",
+    ) -> bool:
         """Send a security confirmation request to the IM channel.
 
         Uses platform-native interactive elements when available
@@ -4520,30 +5752,42 @@ class MessageGateway:
         """
         adapter = self._adapters.get(session.channel)
         if adapter is None:
-            return
+            return False
 
         text = (
             f"⚠️ **安全确认**\n\n"
             f"工具: `{tool_name}`\n"
             f"风险等级: **{risk_level}**\n"
+            f"确认码: `{confirm_id[-4:] if confirm_id else '----'}`\n"
             f"原因: {reason}\n\n"
-            f"请回复: **允许** / **拒绝**"
+            f"请回复 **允许 {confirm_id[-4:] if confirm_id else '----'}** / "
+            f"**会话允许 {confirm_id[-4:] if confirm_id else '----'}** / "
+            f"**始终允许 {confirm_id[-4:] if confirm_id else '----'}** / "
+            f"**拒绝 {confirm_id[-4:] if confirm_id else '----'}** / "
+            f"**沙箱 {confirm_id[-4:] if confirm_id else '----'}**"
         )
 
         if hasattr(adapter, "build_simple_card") and hasattr(adapter, "send_card"):
             card = adapter.build_simple_card(
                 title=f"⚠️ 安全确认 — {risk_level}",
-                content=(f"**工具**: {tool_name}\n**原因**: {reason}"),
+                content=(
+                    f"**工具**: {tool_name}\n"
+                    f"**确认码**: {confirm_id[-4:] if confirm_id else '----'}\n"
+                    f"**原因**: {reason}"
+                ),
                 buttons=[
-                    {"text": "✅ 允许", "value": "security_allow"},
-                    {"text": "❌ 拒绝", "value": "security_deny"},
+                    {"text": "✅ 允许", "value": {"action": "security_allow", "confirm_id": confirm_id}},
+                    {"text": "❌ 拒绝", "value": {"action": "security_deny", "confirm_id": confirm_id}},
+                    {"text": "本次会话允许", "value": {"action": "security_allow_session", "confirm_id": confirm_id}},
+                    {"text": "始终允许", "value": {"action": "security_allow_always", "confirm_id": confirm_id}},
+                    {"text": "沙箱执行", "value": {"action": "security_sandbox", "confirm_id": confirm_id}},
                 ],
             )
             try:
                 chat_id = session.chat_id
                 reply_to = session.thread_id
                 await adapter.send_card(chat_id, card, reply_to=reply_to)
-                return
+                return True
             except Exception as e:
                 logger.warning(f"[Security] Card send failed, falling back to text: {e}")
 
@@ -4551,6 +5795,7 @@ class MessageGateway:
             await self.send_to_session(session, text, role="system")
         except Exception as e:
             logger.warning(f"[Security] Failed to send confirmation: {e}")
+        return False
 
     async def _handle_im_security_confirm(
         self,
@@ -4561,43 +5806,105 @@ class MessageGateway:
     ) -> None:
         """Handle security_confirm events in IM streaming.
 
-        Send a confirmation card/text to the user, then wait for their reply
-        via the interrupt queue.
+        Send a confirmation card/text to the user. The reasoning_engine
+        generator is the authoritative waiter for ``wait_for_ui_resolution``;
+        this gateway hook only renders the card / waits-for-text and forwards
+        the user's choice back via ``pe.resolve_ui_confirm``.
+
+        **C8 §2.3 fix**：旧实现这里也调 ``prepare_ui_confirm`` + ``wait_for_ui_resolution`` +
+        ``cleanup_ui_confirm``，与 reasoning_engine 的 wait 形成"序列竞争"——
+        async generator 的 ``yield`` 暂停后，gateway 处理事件时把 resolution
+        "提前消费 + 清理"了，等 ``__anext__`` 恢复 reasoning_engine 时，
+        ev/decisions 都已被 pop，reasoning_engine 的 ``wait_for_ui_resolution``
+        永远拿不到决策，回退默认 deny → IM 用户点了卡片但 agent 仍以 deny 行动。
+        现在 gateway 只**渲染**卡片，``wait_for_ui_resolution`` 留给 reasoning_engine
+        在 yield 之后自行 await，gateway 当前调用立即返回让 ``__anext__`` 接力。
         """
         tool_name = event.get("tool", "")
         reason = event.get("reason", "")
         risk = event.get("risk_level", "HIGH")
-        confirm_id = event.get("id", "")
+        confirm_id = (event.get("id") or "") or ""
+        timeout = float(session.get_metadata("security_timeout") or 120)
+        # C8b-5: 之前用 v1 ``pe._is_trust_mode()`` 做 IM 渠道 trust-mode 自动
+        # 拒绝。v2 ``read_permission_mode_label() == "yolo"`` 是 SoT 等价读，
+        # v1 ``_is_trust_mode`` method 在 C8b-6 删除前仍存在但仅供内部 v1
+        # ``assert_tool_allowed`` 使用——外部 caller 全部切到 v2 helper。
+        from ..core.policy_v2 import read_permission_mode_label
 
-        await self.send_security_confirm(session, tool_name, reason, risk_level=risk)
+        is_trust_mode = read_permission_mode_label() == "yolo"
+        if is_trust_mode:
+            if confirm_id:
+                from ..core.policy_v2 import apply_resolution
 
-        # Wait for user reply via interrupt queue (set by adapter callbacks or
-        # plain-text keyword matching in _handle_message)
+                apply_resolution(confirm_id, "deny")
+            logger.info(
+                "[Security] Trust-mode IM confirmation resolved without prompting: "
+                "tool=%s confirm_id=%s",
+                tool_name,
+                confirm_id,
+            )
+            return
+
+        try:
+            sent_interactive = await self.send_security_confirm(
+                session,
+                tool_name,
+                reason,
+                risk_level=risk,
+                confirm_id=confirm_id,
+            )
+        except Exception:
+            # 渲染卡片失败：让 reasoning_engine 的 wait 走默认 deny（不在这里
+            # 主动 resolve，避免与 reasoning_engine 的 cleanup 形成另一条 race）。
+            raise
+
+        if sent_interactive and confirm_id:
+            # 卡片已渲染。IM 适配器会在用户点卡时调 resolve_ui_confirm，
+            # 唤醒 reasoning_engine 当前的 wait。我们直接 return，让上层
+            # ``__anext__`` 立即接力，由 reasoning_engine 拥有 wait 与 cleanup。
+            return
+
+        # ---------- text fallback：交互式发送失败时退回纯文本提示 + 等待回复 ----------
+        # 此分支同样不调 prepare/cleanup —— reasoning_engine 已经 prepare，
+        # 我们只负责拿到用户文字、parse 出 decision、调 resolve_ui_confirm。
         try:
             reply_msg = await asyncio.wait_for(
                 self._wait_for_interrupt(session.session_key),
-                timeout=float(session.get_metadata("security_timeout") or 120),
+                timeout=timeout,
             )
             text = reply_msg.message.text.strip().lower() if reply_msg else ""
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
+            text = ""
+
+        code = confirm_id[-4:].lower() if confirm_id else ""
+        original_user = getattr(message, "user_id", "") or ""
+        reply_user = getattr(getattr(reply_msg, "message", None), "user_id", "") if "reply_msg" in locals() else ""
+        if original_user and reply_user and reply_user != original_user:
+            logger.warning("[Security] Ignored IM confirmation from a different user")
+            text = ""
+        if code and code not in text:
             text = ""
 
         decision = "deny"
-        if text in ("允许", "allow", "yes", "y", "allow_once"):
+        tokens = text.split()
+        action = tokens[0] if tokens else ""
+        if action in ("允许", "allow", "yes", "y", "allow_once"):
             decision = "allow_once"
-        elif text in ("始终允许", "allow_always", "always"):
+        elif action in ("始终允许", "allow_always", "always"):
             decision = "allow_always"
-        elif text in ("会话允许", "allow_session", "session"):
+        elif action in ("会话允许", "allow_session", "session"):
             decision = "allow_session"
-        elif text in ("沙箱", "sandbox"):
+        # 兼容两种字形：交互卡片按钮文案是"沙箱执行"，历史上也出现过"沙盒"。
+        elif action in ("沙箱", "沙箱执行", "沙盒", "沙盒执行", "sandbox"):
             decision = "sandbox"
 
-        try:
-            from ..core.policy import get_policy_engine
+        if confirm_id:
+            try:
+                from ..core.policy_v2 import apply_resolution
 
-            get_policy_engine().resolve_ui_confirm(confirm_id, decision)
-        except Exception as exc:
-            logger.warning(f"[Security] IM confirm resolve failed: {exc}")
+                apply_resolution(confirm_id, decision)
+            except Exception as exc:
+                logger.warning(f"[Security] IM confirm resolve failed: {exc}")
 
     async def _wait_for_interrupt(self, session_key: str) -> "InterruptMessage | None":
         """Block until an interrupt message arrives for the session."""
@@ -4824,6 +6131,13 @@ class MessageGateway:
         Returns:
             {channel: sent_count}
         """
+        if not isinstance(text, str):
+            logger.warning(
+                "[Gateway] Refusing to broadcast non-text payload: %s",
+                type(text).__name__,
+            )
+            return {}
+
         results = {}
 
         # 获取目标会话

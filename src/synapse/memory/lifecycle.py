@@ -3,7 +3,7 @@
 
 统一归纳 + 衰减 + 去重逻辑:
 - 处理未归纳的原文 → 生成 Episode → 提取语义记忆
-- O(n log n) 聚类去重 (替代 O(n²))
+- 基于内容相似度的本地去重（按类型分组，减少全库比较）
 - 衰减计算与归档
 - 刷新 MEMORY.md / USER.md
 - 晋升 PERSONA_TRAIT
@@ -12,12 +12,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .extractor import MemoryExtractor
+from .json_utils import coerce_text, extract_json_array, loads_llm_json
+from .retention import apply_retention
 from .storage import _is_db_locked
 
 if TYPE_CHECKING:
@@ -139,26 +142,126 @@ class LifecycleManager:
     # Daily Consolidation (凌晨任务编排)
     # ==================================================================
 
-    async def consolidate_daily(self) -> dict:
+    async def consolidate_daily(
+        self,
+        *,
+        checkpoint: dict | None = None,
+        checkpoint_callback: Callable[[dict], None] | None = None,
+        time_budget_seconds: int | None = None,
+        review_max_batches: int | None = None,
+    ) -> dict:
         """
         凌晨归纳主流程, 返回统计报告
         """
-        report: dict = {"started_at": datetime.now().isoformat()}
+        started_at = time.monotonic()
+        checkpoint = checkpoint or {}
+        phase = checkpoint.get("phase") if isinstance(checkpoint, dict) else None
+        report: dict = {
+            "started_at": datetime.now().isoformat(),
+            "resumed_from_checkpoint": bool(checkpoint),
+        }
 
-        extracted = await self.process_unextracted_turns()
-        report["unextracted_processed"] = extracted
+        def has_budget(reserve_seconds: int = 30) -> bool:
+            try:
+                from ..core.token_tracking import token_budget_exceeded
 
-        deduped = await self.deduplicate_batch()
-        report["duplicates_removed"] = deduped
+                if token_budget_exceeded():
+                    return False
+            except Exception:
+                pass
+            if not time_budget_seconds:
+                return True
+            return (time.monotonic() - started_at) < max(1, time_budget_seconds - reserve_seconds)
 
-        decayed = self.compute_decay()
-        report["memories_decayed"] = decayed
+        def save_checkpoint(next_phase: str, extra: dict | None = None) -> None:
+            if not checkpoint_callback:
+                return
+            state = {
+                "phase": next_phase,
+                "partial_report": dict(report),
+            }
+            if extra:
+                state.update(extra)
+            checkpoint_callback(state)
 
-        cleaned_att = self.cleanup_stale_attachments()
-        report["stale_attachments_cleaned"] = cleaned_att
+        if phase not in ("llm_review", "post_review"):
+            extracted_result = await self.process_unextracted_turns(
+                deadline_monotonic=(started_at + time_budget_seconds)
+                if time_budget_seconds
+                else None,
+            )
+            if isinstance(extracted_result, dict):
+                extracted = int(extracted_result.get("processed", 0) or 0)
+                report["unextracted_processed"] = extracted
+                if extracted_result.get("partial"):
+                    report["partial"] = True
+                    report["reason"] = extracted_result.get(
+                        "reason",
+                        "本轮时间预算即将用完，已保存对话提取进度，下次继续。",
+                    )
+                    report["finished_at"] = datetime.now().isoformat()
+                    save_checkpoint("turns")
+                    logger.info(f"[Lifecycle] Daily consolidation paused safely: {report}")
+                    return report
+            else:
+                extracted = extracted_result
+            report["unextracted_processed"] = extracted
 
-        review_result = await self.review_memories_with_llm()
-        report["llm_review"] = review_result
+            deduped = await self.deduplicate_batch()
+            report["duplicates_removed"] = deduped
+            if not has_budget():
+                report["partial"] = True
+                report["reason"] = "本轮已完成对话提取和去重，剩余步骤下次继续。"
+                report["finished_at"] = datetime.now().isoformat()
+                save_checkpoint("turns")
+                return report
+
+            decayed = self.compute_decay()
+            report["memories_decayed"] = decayed
+
+            cleaned_att = self.cleanup_stale_attachments()
+            report["stale_attachments_cleaned"] = cleaned_att
+            if not has_budget():
+                report["partial"] = True
+                report["reason"] = "本轮已完成基础清理，剩余记忆审查下次继续。"
+                report["finished_at"] = datetime.now().isoformat()
+                save_checkpoint("llm_review")
+                return report
+
+            save_checkpoint("llm_review")
+        else:
+            report.update(checkpoint.get("partial_report") or {})
+            report["resumed_from_checkpoint"] = True
+
+        if phase == "post_review":
+            review_result = checkpoint.get("llm_review") or {}
+            report["llm_review"] = review_result
+        else:
+            review_checkpoint = checkpoint.get("llm_review") if isinstance(checkpoint, dict) else None
+            review_result = await self.review_memories_with_llm(
+                checkpoint=review_checkpoint if isinstance(review_checkpoint, dict) else None,
+                checkpoint_callback=lambda state: save_checkpoint("llm_review", {"llm_review": state}),
+                max_batches=review_max_batches,
+                deadline_monotonic=(started_at + time_budget_seconds) if time_budget_seconds else None,
+            )
+            report["llm_review"] = review_result
+
+        if isinstance(review_result, dict) and review_result.get("partial"):
+            report["partial"] = True
+            report["reason"] = review_result.get(
+                "reason",
+                "本轮时间预算已用完，已保存进度，下次会继续整理剩余记忆。",
+            )
+            report["finished_at"] = datetime.now().isoformat()
+            logger.info(f"[Lifecycle] Daily consolidation paused safely: {report}")
+            return report
+
+        if not has_budget():
+            report["partial"] = True
+            report["reason"] = "本轮已完成记忆审查，剩余收尾步骤下次继续。"
+            save_checkpoint("post_review", {"llm_review": review_result})
+            report["finished_at"] = datetime.now().isoformat()
+            return report
 
         synthesized = await self.synthesize_experiences()
         report["experience_synthesized"] = synthesized
@@ -169,27 +272,67 @@ class LifecycleManager:
 
         self._sync_vector_store()
 
+        report["partial"] = False
         report["finished_at"] = datetime.now().isoformat()
         logger.info(f"[Lifecycle] Daily consolidation complete: {report}")
         return report
 
     def _sync_vector_store(self) -> None:
-        """Rebuild vector store index from current SQLite data."""
+        """Rebuild vector store index from current SQLite data.
+
+        双向同步：
+        - 删 stale：SQLite 已不存在的 id 从向量库剔除
+        - 补 missing：SQLite 有但向量库无的 id 重新嵌入（避免 Chroma 启动期
+          竞态导致的"写入失败 + 后续无补全"洞口，参考 vector_store.py 300s 冷却）
+        """
         try:
             if not hasattr(self.store, "search") or not self.store.search:
                 return
             all_mems = self.store.load_all_memories()
             mem_ids = {m.id for m in all_mems}
             search = self.store.search
+
+            existing_ids: set[str] | None = None
+            if hasattr(search, "_collection"):
+                try:
+                    existing_ids = set(search._collection.get()["ids"])
+                except Exception:
+                    existing_ids = None
+
             if hasattr(search, "delete_not_in"):
                 search.delete_not_in(mem_ids)
                 logger.info(f"[Lifecycle] Vector store synced ({len(mem_ids)} memories)")
-            elif hasattr(search, "_collection"):
-                existing = set(search._collection.get()["ids"])
-                stale = existing - mem_ids
+            elif existing_ids is not None:
+                stale = existing_ids - mem_ids
                 if stale:
                     search._collection.delete(ids=list(stale))
                     logger.info(f"[Lifecycle] Removed {len(stale)} stale vectors")
+
+            if existing_ids is not None and hasattr(search, "add"):
+                missing = [m for m in all_mems if m.id not in existing_ids]
+                if missing:
+                    added = 0
+                    for mem in missing:
+                        try:
+                            search.add(
+                                mem.id,
+                                mem.content,
+                                {
+                                    "type": mem.type.value,
+                                    "priority": mem.priority.value,
+                                    "importance": mem.importance_score,
+                                    "tags": mem.tags,
+                                },
+                            )
+                            added += 1
+                        except Exception as _e:
+                            logger.debug(
+                                f"[Lifecycle] backfill embed failed for {mem.id}: {_e}"
+                            )
+                    if added:
+                        logger.info(
+                            f"[Lifecycle] Backfilled {added}/{len(missing)} missing vectors"
+                        )
         except Exception as e:
             logger.debug(f"[Lifecycle] Vector store sync skipped: {e}")
 
@@ -197,18 +340,95 @@ class LifecycleManager:
     # Process Unextracted Turns
     # ==================================================================
 
-    async def process_unextracted_turns(self) -> int:
+    async def process_unextracted_turns(
+        self,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> int | dict:
         """处理未归纳的原文 → 生成 Episode → 提取语义记忆"""
         unextracted = self.store.get_unextracted_turns(limit=200)
         if not unextracted:
-            return 0
+            return {"processed": 0, "partial": False} if deadline_monotonic else 0
+
+        # v1.27.15 (S2 P1-6): drop ``preempted`` / ``aborted_partial``
+        # markers before they reach the LLM-driven extractor.  These
+        # placeholders are UI-only signals that a turn was cut short
+        # — extracting "[上一条任务被新请求中断]" as a long-term
+        # memory would actively confuse the agent (it would learn the
+        # user wants tasks to be interrupted!) and waste extraction
+        # tokens.  We immediately ``mark_turns_extracted`` so they're
+        # not picked up on the next pass either.
+        _markers_per_session: dict[str, list[int]] = defaultdict(list)
+        _real_turns: list[dict] = []
+        for _t in unextracted:
+            _meta = _t.get("metadata")
+            _marker_type = (
+                _meta.get("marker_type") if isinstance(_meta, dict) else None
+            )
+            if _marker_type in ("preempted", "aborted_partial"):
+                _markers_per_session[_t["session_id"]].append(_t["turn_index"])
+            else:
+                _real_turns.append(_t)
+        if _markers_per_session:
+            _total_markers = sum(len(v) for v in _markers_per_session.values())
+            logger.debug(
+                "[Lifecycle] skipping %d marker turn(s) across %d session(s)",
+                _total_markers,
+                len(_markers_per_session),
+            )
+            for _sid, _indices in _markers_per_session.items():
+                try:
+                    self.store.mark_turns_extracted(_sid, _indices)
+                except Exception as _exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "[Lifecycle] mark_turns_extracted(markers) failed for %s: %s",
+                        _sid,
+                        _exc,
+                    )
+
+        if not _real_turns:
+            return {"processed": 0, "partial": False} if deadline_monotonic else 0
 
         by_session: dict[str, list[dict]] = defaultdict(list)
-        for turn in unextracted:
+        for turn in _real_turns:
             by_session[turn["session_id"]].append(turn)
 
         total = 0
+
+        def pause_if_needed() -> dict | None:
+            try:
+                from ..core.token_tracking import token_budget_exceeded
+
+                if token_budget_exceeded():
+                    return {
+                        "processed": total,
+                        "partial": True,
+                        "reason": "本轮后台 token 预算已用完，已保存对话提取进度，下次继续。",
+                    }
+            except Exception:
+                pass
+            if deadline_monotonic is None:
+                return None
+            if time.monotonic() >= deadline_monotonic - 30:
+                return {
+                    "processed": total,
+                    "partial": True,
+                    "reason": "本轮时间预算即将用完，已保存对话提取进度，下次继续。",
+                }
+            return None
+
         for session_id, turns in by_session.items():
+            if paused := pause_if_needed():
+                logger.info("[Lifecycle] Pausing unextracted turn processing before session %s", session_id)
+                return paused
+
+            # v4：先从 session_tenants 反查这个 session 属于哪个 (user_id, workspace_id)。
+            # 找不到（例如老 session 在 v4 之前创建、或 session 已被回收）时，
+            # 把抽取产物写入 pending_consolidation 桶 — 而不是历史 legacy 桶，
+            # 也不是当前 ContextVar default。pending_consolidation 对用户不可见，
+            # 后续 promote/dedup 流程可以再决定怎么处理。
+            tenant = self._resolve_tenant_for_session(session_id)
+
             conv_turns = [
                 ConversationTurn(
                     role=t["role"],
@@ -225,37 +445,103 @@ class LifecycleManager:
             episode = await self.extractor.generate_episode(
                 conv_turns, session_id, source="daily_consolidation"
             )
-            if episode:
-                self.store.save_episode(episode)
+            if not episode:
+                logger.warning(
+                    "[Lifecycle] Episode generation returned empty for session %s; "
+                    "leaving turns unextracted for retry",
+                    session_id,
+                )
+                continue
 
-                for turn_obj in conv_turns:
+            self.store.save_episode(episode)
+
+            for turn_data, turn_obj in zip(turns, conv_turns, strict=False):
+                if paused := pause_if_needed():
+                    logger.info(
+                        "[Lifecycle] Pausing unextracted turn processing at %s/%s",
+                        session_id,
+                        turn_data.get("turn_index"),
+                    )
+                    return paused
+                try:
                     items = await self.extractor.extract_from_turn_v2(turn_obj)
                     for item in items:
-                        self._save_extracted_item(item, episode.id)
+                        self._save_extracted_item(item, episode.id, tenant=tenant)
                     total += len(items)
-
-            indices = [t["turn_index"] for t in turns]
-            self.store.mark_turns_extracted(session_id, indices)
+                    self.store.mark_turns_extracted(session_id, [turn_data["turn_index"]])
+                except Exception as e:
+                    logger.warning(
+                        "[Lifecycle] Failed to extract turn %s/%s: %s",
+                        session_id,
+                        turn_data.get("turn_index"),
+                        e,
+                    )
 
         retry_items = self.store.dequeue_extraction(batch_size=20)
         for item in retry_items:
+            if paused := pause_if_needed():
+                logger.info("[Lifecycle] Pausing queued extraction processing at item %s", item.get("id"))
+                return paused
             turn = ConversationTurn(
                 role="user",
                 content=item.get("content", ""),
                 tool_calls=item.get("tool_calls") or [],
                 tool_results=item.get("tool_results") or [],
             )
+            queue_session_id = (item.get("session_id") or "").strip()
+            tenant = self._resolve_tenant_for_session(queue_session_id)
             extracted = await self.extractor.extract_from_turn_v2(turn)
             success = len(extracted) > 0
             for e in extracted:
-                self._save_extracted_item(e)
+                self._save_extracted_item(e, tenant=tenant)
                 total += 1
             self.store.complete_extraction(item["id"], success=success)
 
         logger.info(f"[Lifecycle] Processed {total} memories from unextracted turns")
-        return total
+        return {"processed": total, "partial": False} if deadline_monotonic else total
 
-    def _save_extracted_item(self, item: dict, episode_id: str | None = None) -> None:
+    def _resolve_tenant_for_session(self, session_id: str) -> tuple[str, str] | None:
+        """根据 session_id 查归属租户 (user_id, workspace_id)。
+
+        语义（v4 修正版）：
+        - 表里 **登记过** 的 session：信任其登记的 user_id，包括 ``default``。
+          理由：session_tenants 是写入侧登记，单条 session 只属于一个用户；
+          desktop CLI 通过 ``start_session(session_id)`` 启动时 user_id 就是
+          ``default``，这是合法的单用户桌面身份，不能当成共享桶拒绝。
+        - 表里 **没登记** 的 session：返回 None（调用方落 pending_consolidation）。
+        - ``anonymous / legacy / system`` 是占位身份，仍然拒绝（这些是显式
+          表示"不知道是谁"，不能当成有效归属落写入）。
+        """
+        if not session_id:
+            return None
+        try:
+            tenant = self.store.get_session_tenant(session_id)
+        except Exception as e:
+            logger.debug("[Lifecycle] get_session_tenant(%s) failed: %s", session_id, e)
+            return None
+        if not tenant:
+            return None
+        user_id, workspace_id = tenant
+        if not user_id or user_id in {"anonymous", "legacy", "system", ""}:
+            return None
+        return (user_id, workspace_id or "default")
+
+    def _save_extracted_item(
+        self,
+        item: dict,
+        episode_id: str | None = None,
+        *,
+        tenant: tuple[str, str] | None = None,
+    ) -> None:
+        """保存后台抽取出的语义记忆。
+
+        v4 改动：
+        - 如果 ``tenant`` 是 (user_id, workspace_id)，写入该租户的 ``user`` scope，
+          直接成为该用户的跨会话长期记忆候选；
+        - 否则写入 ``pending_consolidation`` 桶（user_id='pending'），
+          UI 默认不展示，不再混进 legacy_quarantine 反复骚扰用户。
+        - 历史 legacy_quarantine 桶不再被后台合成新增内容，保留给真历史旧数据。
+        """
         type_map = {
             "PREFERENCE": MemoryType.PREFERENCE,
             "FACT": MemoryType.FACT,
@@ -263,12 +549,22 @@ class LifecycleManager:
             "ERROR": MemoryType.ERROR,
             "RULE": MemoryType.RULE,
             "PERSONA_TRAIT": MemoryType.PERSONA_TRAIT,
+            "EXPERIENCE": MemoryType.EXPERIENCE,
         }
         mem_type = type_map.get(item.get("type", "FACT"), MemoryType.FACT)
         importance = item.get("importance", 0.5)
         content = (item.get("content") or "").strip()
         subject = item.get("subject", "")
         predicate = item.get("predicate", "")
+        if tenant:
+            write_scope = "user"
+            write_owner = ""
+            write_user, write_workspace = tenant
+        else:
+            write_scope = "pending_consolidation"
+            write_owner = ""
+            write_user = "pending"
+            write_workspace = "default"
 
         if importance >= 0.85 or mem_type == MemoryType.RULE:
             priority = MemoryPriority.PERMANENT
@@ -279,20 +575,20 @@ class LifecycleManager:
 
         # --- Dedup layer 1: subject+predicate match (always, not only is_update) ---
         if subject and predicate:
-            existing = self.store.find_similar(subject, predicate)
+            existing = self.store.find_similar(
+                subject,
+                predicate,
+                scope=write_scope,
+                scope_owner=write_owner,
+                user_id=write_user,
+                workspace_id=write_workspace,
+            )
             if existing and not existing.superseded_by:
                 updates: dict = {
                     "importance_score": max(existing.importance_score, importance),
                     "confidence": min(1.0, existing.confidence + 0.1),
                 }
-                should_update = (
-                    item.get("is_update")
-                    or importance > existing.importance_score
-                    or (
-                        importance >= existing.importance_score
-                        and len(content) > len(existing.content or "")
-                    )
-                )
+                should_update = bool(content and content != (existing.content or ""))
                 if should_update:
                     updates["content"] = content
                 self.store.update_semantic(existing.id, updates)
@@ -302,7 +598,14 @@ class LifecycleManager:
         # --- Dedup layer 2: content similarity via search backend ---
         if content and len(content) >= 10:
             try:
-                similar = self.store.search_semantic(content, limit=5)
+                similar = self.store.search_semantic(
+                    content,
+                    limit=5,
+                    scope=write_scope,
+                    scope_owner=write_owner,
+                    user_id=write_user,
+                    workspace_id=write_workspace,
+                )
                 for s in similar:
                     if s.superseded_by or s.type != mem_type:
                         continue
@@ -332,10 +635,17 @@ class LifecycleManager:
             source_episode_id=episode_id,
             tags=[item.get("type", "fact").lower()],
         )
-        self.store.save_semantic(mem)
+        apply_retention(mem, item.get("duration"))
+        self.store.save_semantic(
+            mem,
+            scope=write_scope,
+            scope_owner=write_owner,
+            user_id=write_user,
+            workspace_id=write_workspace,
+        )
 
     # ==================================================================
-    # Deduplication (O(n log n))
+    # Deduplication
     # ==================================================================
 
     async def deduplicate_batch(self) -> int:
@@ -431,7 +741,16 @@ class LifecycleManager:
 
     def compute_decay(self) -> int:
         """Apply decay to SHORT_TERM memories, archive low-scoring ones."""
-        memories = self.store.query_semantic(priority="SHORT_TERM", limit=500)
+        memories = self.store.query_semantic(
+            priority=MemoryPriority.SHORT_TERM.value,
+            limit=500,
+        )
+        legacy_memories = self.store.query_semantic(
+            priority="SHORT_TERM",
+            limit=500,
+        )
+        seen = {m.id for m in memories}
+        memories.extend(m for m in legacy_memories if m.id not in seen)
         decayed = 0
 
         for mem in memories:
@@ -456,7 +775,7 @@ class LifecycleManager:
                 )
                 decayed += 1
 
-        expired = self.store.db.cleanup_expired()
+        expired = self.store.cleanup_expired()
         decayed += expired
 
         if decayed > 0:
@@ -555,6 +874,10 @@ class LifecycleManager:
         self,
         progress_callback: Callable[[dict], None] | None = None,
         cancel_event: asyncio.Event | None = None,
+        checkpoint: dict | None = None,
+        checkpoint_callback: Callable[[dict], None] | None = None,
+        max_batches: int | None = None,
+        deadline_monotonic: float | None = None,
     ) -> dict:
         """
         使用 LLM 审查所有记忆，清理垃圾、合并重复、更新过期内容。
@@ -562,35 +885,108 @@ class LifecycleManager:
         Args:
             progress_callback: 每完成一个 batch 后调用，传入当前进度 dict
             cancel_event: 如果 set，则在下一个 batch 前中止
+            checkpoint: 上次未完成审查留下的批次游标
+            checkpoint_callback: 每完成一个 batch 后保存游标
+            max_batches: 本轮最多审查多少批，None 表示不限制
+            deadline_monotonic: 接近该 monotonic 时间时安全暂停
 
         Returns:
             审查报告 {deleted, updated, merged, kept, errors}
         """
-        import json
         import math
-        import re
 
         all_memories = self.store.load_all_memories()
         if not all_memories:
-            return {"deleted": 0, "updated": 0, "merged": 0, "kept": 0}
+            return {"deleted": 0, "updated": 0, "merged": 0, "kept": 0, "partial": False}
 
         if not self.extractor or not self.extractor.brain:
             logger.warning("[Lifecycle] No LLM available for memory review, skipping")
-            return {"deleted": 0, "updated": 0, "merged": 0, "kept": len(all_memories)}
+            return {
+                "deleted": 0,
+                "updated": 0,
+                "merged": 0,
+                "kept": len(all_memories),
+                "partial": False,
+            }
 
         report = {"deleted": 0, "updated": 0, "merged": 0, "kept": 0, "errors": 0}
 
         batch_size = 15
-        total_batches = math.ceil(len(all_memories) / batch_size)
-        consecutive_risky_skips = 0
+        memory_by_id = {m.id: m for m in all_memories}
+
+        if checkpoint and isinstance(checkpoint.get("memory_ids"), list):
+            memory_ids = list(checkpoint["memory_ids"])
+            cursor = int(checkpoint.get("cursor", 0) or 0)
+            saved_report = checkpoint.get("report")
+            if isinstance(saved_report, dict):
+                for key in report:
+                    report[key] = int(saved_report.get(key, report[key]) or 0)
+            consecutive_risky_skips = int(checkpoint.get("consecutive_risky_skips", 0) or 0)
+        else:
+            memory_ids = [m.id for m in all_memories]
+            cursor = 0
+            consecutive_risky_skips = 0
+
+        total_batches = math.ceil(len(memory_ids) / batch_size)
+        cursor = min(max(cursor, 0), total_batches)
         max_consecutive_risky = 3
+        processed_this_run = 0
 
-        for batch_idx, i in enumerate(range(0, len(all_memories), batch_size)):
+        def save_review_checkpoint(partial: bool, reason: str | None = None) -> None:
+            if not checkpoint_callback:
+                return
+            state = {
+                "memory_ids": memory_ids,
+                "cursor": cursor,
+                "batch_size": batch_size,
+                "total_batches": total_batches,
+                "report": dict(report),
+                "consecutive_risky_skips": consecutive_risky_skips,
+                "partial": partial,
+                "done": not partial,
+            }
+            if reason:
+                state["reason"] = reason
+            checkpoint_callback(state)
+
+        def should_pause() -> str | None:
+            try:
+                from ..core.token_tracking import token_budget_exceeded
+
+                if token_budget_exceeded():
+                    return "本轮后台 token 预算已用完，已保存进度，下次继续。"
+            except Exception:
+                pass
             if cancel_event and cancel_event.is_set():
-                logger.info("[Lifecycle] Memory review cancelled by user")
-                break
+                return "记忆审查已收到取消信号，已保存当前进度。"
+            if max_batches is not None and processed_this_run >= max_batches:
+                return "本轮已完成预设批次数，剩余记忆下次继续审查。"
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic - 30:
+                return "本轮时间预算即将用完，已保存进度，下次继续。"
+            return None
 
-            batch = all_memories[i : i + batch_size]
+        for batch_idx in range(cursor, total_batches):
+            pause_reason = should_pause()
+            if pause_reason:
+                logger.info("[Lifecycle] Memory review paused: %s", pause_reason)
+                save_review_checkpoint(partial=True, reason=pause_reason)
+                report.update(
+                    {
+                        "partial": True,
+                        "reason": pause_reason,
+                        "processed_batches": cursor,
+                        "total_batches": total_batches,
+                    }
+                )
+                return report
+
+            i = batch_idx * batch_size
+            batch_ids = memory_ids[i : i + batch_size]
+            batch = [memory_by_id[mid] for mid in batch_ids if mid in memory_by_id]
+            if not batch:
+                cursor = batch_idx + 1
+                save_review_checkpoint(partial=cursor < total_batches)
+                continue
 
             if progress_callback:
                 progress_callback(
@@ -598,7 +994,7 @@ class LifecycleManager:
                         "phase": "llm_calling",
                         "batch": batch_idx,
                         "total_batches": total_batches,
-                        "total_memories": len(all_memories),
+                        "total_memories": len(memory_ids),
                         "processed": i,
                         "report": dict(report),
                     }
@@ -606,7 +1002,8 @@ class LifecycleManager:
 
             memories_text = "\n".join(
                 f"- ID={m.id} | type={m.type.value} | score={m.importance_score:.2f} "
-                f"| cited={m.access_count} | subject={m.subject or ''} | content={m.content}"
+                f"| cited={m.access_count} | subject={coerce_text(m.subject)} "
+                f"| content={coerce_text(m.content)}"
                 for m in batch
             )
 
@@ -616,113 +1013,132 @@ class LifecycleManager:
                 response = await self.extractor.brain.think(
                     prompt,
                     system="你是记忆质量审查专家。只输出 JSON 数组。",
-                    usage_scene="review_memories_with_llm",
+                    enable_thinking=False,
                 )
-                text = (getattr(response, "content", None) or str(response)).strip()
+                text = coerce_text(getattr(response, "content", response)).strip()
 
-                json_match = re.search(r"\[[\s\S]*\]", text)
-                if not json_match:
+                json_text = extract_json_array(text)
+                if not json_text:
                     logger.warning(f"[Lifecycle] LLM review batch {batch_idx}: no JSON output")
                     report["kept"] += len(batch)
-                    continue
-
-                decisions = json.loads(json_match.group())
-                if not isinstance(decisions, list):
-                    report["kept"] += len(batch)
-                    continue
-
-                destructive = 0
-                for d in decisions:
-                    if not isinstance(d, dict):
-                        continue
-                    action = str(d.get("action", "keep")).lower()
-                    if action in ("delete", "merge"):
-                        destructive += 1
-                if destructive > max(3, int(len(batch) * 0.4)):
-                    consecutive_risky_skips += 1
-                    logger.warning(
-                        "[Lifecycle] Skip risky review batch %s: destructive=%s/%s "
-                        "(consecutive=%s/%s)",
-                        batch_idx,
-                        destructive,
-                        len(batch),
-                        consecutive_risky_skips,
-                        max_consecutive_risky,
-                    )
-                    report["kept"] += len(batch)
-                    if consecutive_risky_skips >= max_consecutive_risky:
-                        remaining = len(all_memories) - (i + len(batch))
+                    decisions = None
+                else:
+                    try:
+                        decisions = loads_llm_json(json_text)
+                    except ValueError as parse_error:
                         logger.warning(
-                            "[Lifecycle] Aborting LLM review: %s consecutive risky "
-                            "batches — LLM appears unreliable for this corpus. "
-                            "Keeping remaining %s memories as-is.",
+                            "[Lifecycle] LLM review batch %s json_parse_error: %s "
+                            "(output_chars=%s)",
+                            batch_idx,
+                            parse_error,
+                            len(text),
+                        )
+                        report["errors"] += 1
+                        report["kept"] += len(batch)
+                        decisions = None
+
+                if not isinstance(decisions, list):
+                    if decisions is not None:
+                        report["kept"] += len(batch)
+                    decision_map = {}
+                else:
+                    destructive = 0
+                    for d in decisions:
+                        if not isinstance(d, dict):
+                            continue
+                        action = str(d.get("action", "keep")).lower()
+                        if action in ("delete", "merge"):
+                            destructive += 1
+                    if destructive > max(3, int(len(batch) * 0.4)):
+                        consecutive_risky_skips += 1
+                        logger.warning(
+                            "[Lifecycle] Skip risky review batch %s: destructive=%s/%s "
+                            "(consecutive=%s/%s); continuing with later batches",
+                            batch_idx,
+                            destructive,
+                            len(batch),
+                            consecutive_risky_skips,
                             max_consecutive_risky,
-                            remaining,
                         )
-                        report["kept"] += remaining
-                        break
-                    continue
-                consecutive_risky_skips = 0
-
-                decision_map = {d["id"]: d for d in decisions if isinstance(d, dict) and "id" in d}
-
-                for mem in batch:
-                    dec = decision_map.get(mem.id)
-                    if not dec:
-                        report["kept"] += 1
-                        continue
-
-                    action = dec.get("action", "keep")
-
-                    if action == "delete":
-                        self.store.delete_semantic(mem.id)
-                        report["deleted"] += 1
-                        logger.debug(
-                            f"[Lifecycle] Review DELETE: {mem.content[:50]} "
-                            f"({dec.get('reason', '')})"
-                        )
-
-                    elif action == "update":
-                        updates: dict = {}
-                        if dec.get("new_content"):
-                            updates["content"] = dec["new_content"]
-                        if dec.get("new_importance"):
-                            updates["importance_score"] = float(dec["new_importance"])
-                        if updates:
-                            self.store.update_semantic(mem.id, updates)
-                            report["updated"] += 1
-                        else:
-                            report["kept"] += 1
-
-                    elif action == "merge":
-                        target_id = dec.get("merged_with")
-                        new_content = dec.get("new_content")
-                        if target_id and new_content:
-                            self.store.update_semantic(target_id, {"content": new_content})
-                            self.store.delete_semantic(mem.id)
-                            report["merged"] += 1
-                        else:
-                            report["kept"] += 1
-
+                        report["kept"] += len(batch)
+                        if consecutive_risky_skips >= max_consecutive_risky:
+                            logger.warning(
+                                "[Lifecycle] Memory review remains in safe-skip mode after "
+                                "%s consecutive risky batches; later batches will still be reviewed.",
+                                consecutive_risky_skips,
+                            )
+                        decision_map = None
                     else:
-                        report["kept"] += 1
+                        consecutive_risky_skips = 0
+                        decision_map = {
+                            d["id"]: d for d in decisions if isinstance(d, dict) and "id" in d
+                        }
+                        if not decision_map:
+                            report["kept"] += len(batch)
+                            decision_map = None
+
+                if decision_map:
+                    for mem in batch:
+                        dec = decision_map.get(mem.id)
+                        if not dec:
+                            report["kept"] += 1
+                            continue
+
+                        action = coerce_text(dec.get("action", "keep")).lower()
+
+                        if action == "delete":
+                            self.store.delete_semantic(mem.id)
+                            report["deleted"] += 1
+                            logger.debug(
+                                f"[Lifecycle] Review DELETE: {coerce_text(mem.content)[:50]} "
+                                f"({coerce_text(dec.get('reason', ''))})"
+                            )
+
+                        elif action == "update":
+                            updates: dict = {}
+                            if dec.get("new_content"):
+                                updates["content"] = coerce_text(dec["new_content"])
+                            if dec.get("new_importance"):
+                                updates["importance_score"] = float(dec["new_importance"])
+                            if updates:
+                                self.store.update_semantic(mem.id, updates)
+                                report["updated"] += 1
+                            else:
+                                report["kept"] += 1
+
+                        elif action == "merge":
+                            target_id = dec.get("merged_with")
+                            new_content = dec.get("new_content")
+                            if target_id and new_content:
+                                self.store.update_semantic(target_id, {"content": new_content})
+                                self.store.delete_semantic(mem.id)
+                                report["merged"] += 1
+                            else:
+                                report["kept"] += 1
+
+                        else:
+                            report["kept"] += 1
 
             except Exception as e:
                 logger.error(f"[Lifecycle] LLM review batch {batch_idx} failed: {e}")
                 report["errors"] += 1
                 report["kept"] += len(batch)
 
+            cursor = batch_idx + 1
+            processed_this_run += 1
+
             if progress_callback:
                 progress_callback(
                     {
                         "phase": "batch_done",
-                        "batch": batch_idx + 1,
+                        "batch": cursor,
                         "total_batches": total_batches,
-                        "total_memories": len(all_memories),
-                        "processed": min(i + batch_size, len(all_memories)),
+                        "total_memories": len(memory_ids),
+                        "processed": min(i + batch_size, len(memory_ids)),
                         "report": dict(report),
                     }
                 )
+            save_review_checkpoint(partial=cursor < total_batches)
 
         cancelled = cancel_event.is_set() if cancel_event else False
 
@@ -732,13 +1148,15 @@ class LifecycleManager:
                     "phase": "done",
                     "batch": total_batches,
                     "total_batches": total_batches,
-                    "total_memories": len(all_memories),
-                    "processed": len(all_memories),
+                    "total_memories": len(memory_ids),
+                    "processed": len(memory_ids),
                     "report": dict(report),
                     "done": True,
                     "cancelled": cancelled,
                 }
             )
+
+        save_review_checkpoint(partial=False)
 
         # All batches failed → LLM completely unavailable, re-raise so the
         # scheduler can mark_failed() and trigger its existing notification.
@@ -754,6 +1172,13 @@ class LifecycleManager:
             f"deleted={report['deleted']}, updated={report['updated']}, "
             f"merged={report['merged']}, kept={report['kept']}"
             f"{' (cancelled)' if cancelled else ''}"
+        )
+        report.update(
+            {
+                "partial": False,
+                "processed_batches": total_batches,
+                "total_batches": total_batches,
+            }
         )
         return report
 
@@ -790,108 +1215,198 @@ class LifecycleManager:
 只输出 JSON 数组。如果没有可归纳的经验，输出 []。"""
 
     async def synthesize_experiences(self) -> int:
-        """Synthesize specific experience memories into general principles."""
+        """Synthesize specific experience memories into general principles.
+
+        v4 改动：必须按 (user_id, workspace_id) 分组合成，禁止跨用户取相似。
+        合成产物写回该租户的 ``user`` scope，不再走 legacy_quarantine。
+        没有任何已知租户时直接 return 0，避免把跨用户经验混淆成一条共享记忆。
+        """
         import json
         import re
 
         exp_types = {MemoryType.EXPERIENCE.value, MemoryType.SKILL.value, MemoryType.ERROR.value}
-        all_mems = self.store.load_all_memories()
-        experiences = [m for m in all_mems if m.type.value in exp_types]
-
-        if len(experiences) < 3:
-            return 0
 
         if not self.extractor or not self.extractor.brain:
             return 0
 
-        exp_text = "\n".join(
-            f"- ID={m.id} | type={m.type.value} | cited={m.access_count} | content={m.content}"
-            for m in experiences[:30]
-        )
-
-        prompt = self.EXPERIENCE_SYNTHESIS_PROMPT.format(experience_memories=exp_text)
-
         try:
-            response = await self.extractor.brain.think(
-                prompt,
-                system="你是经验归纳专家。只输出 JSON 数组。",
-                usage_scene="synthesize_experiences",
-            )
-            text = (getattr(response, "content", None) or str(response)).strip()
-            json_match = re.search(r"\[[\s\S]*\]", text)
-            if not json_match:
-                return 0
-
-            syntheses = json.loads(json_match.group())
-            if not isinstance(syntheses, list):
-                return 0
-
-            saved = 0
-            for synth in syntheses:
-                if not isinstance(synth, dict):
-                    continue
-                content = (synth.get("content") or "").strip()
-                source_ids = synth.get("synthesized_from", [])
-                if len(content) < 10 or len(source_ids) < 2:
-                    continue
-
-                # Dedup: skip if a similar experience already exists
-                dup_target: SemanticMemory | None = None
-                try:
-                    similar = self.store.search_semantic(content, limit=3)
-                    for s in similar:
-                        if s.superseded_by:
-                            continue
-                        if _fast_content_dedup(content, s.content or "") == "exact":
-                            dup_target = s
-                            break
-                except Exception:
-                    pass
-
-                if dup_target is not None:
-                    for sid in source_ids:
-                        self.store.update_semantic(sid, {"superseded_by": dup_target.id})
-                    logger.debug(f"[Lifecycle] Synthesis dedup: reused {dup_target.id[:8]}")
-                    continue
-
-                mem = SemanticMemory(
-                    type=MemoryType.EXPERIENCE,
-                    priority=MemoryPriority.LONG_TERM,
-                    content=content,
-                    source="experience_synthesis",
-                    subject=(synth.get("subject") or "").strip(),
-                    predicate=(synth.get("predicate") or "").strip(),
-                    importance_score=min(1.0, max(0.7, float(synth.get("importance", 0.85)))),
-                    confidence=0.8,
-                )
-                self.store.save_semantic(mem)
-                saved += 1
-
-                # Mark source memories as superseded
-                for sid in source_ids:
-                    self.store.update_semantic(sid, {"superseded_by": mem.id})
-
-            if saved:
-                logger.info(
-                    f"[Lifecycle] Synthesized {saved} experience principles from {len(experiences)} memories"
-                )
-            return saved
-
+            tenants = self.store.list_known_tenants()
         except Exception as e:
-            logger.error(f"[Lifecycle] Experience synthesis failed: {e}")
+            logger.warning("[Lifecycle] list_known_tenants failed: %s", e)
             return 0
+        if not tenants:
+            logger.debug("[Lifecycle] No known tenants; skipping cross-user synthesis")
+            return 0
+
+        total_saved = 0
+        for tenant_user_id, tenant_workspace_id in tenants:
+            try:
+                tenant_experiences = self.store.load_all_memories(
+                    scope="user",
+                    scope_owner="",
+                    user_id=tenant_user_id,
+                    workspace_id=tenant_workspace_id,
+                )
+            except Exception as e:
+                logger.debug(
+                    "[Lifecycle] load_all_memories for tenant (%s, %s) failed: %s",
+                    tenant_user_id, tenant_workspace_id, e,
+                )
+                continue
+
+            experiences = [m for m in tenant_experiences if m.type.value in exp_types]
+            if len(experiences) < 3:
+                continue
+
+            exp_text = "\n".join(
+                f"- ID={m.id} | type={m.type.value} | cited={m.access_count} | content={m.content}"
+                for m in experiences[:30]
+            )
+
+            prompt = self.EXPERIENCE_SYNTHESIS_PROMPT.format(experience_memories=exp_text)
+
+            try:
+                response = await self.extractor.brain.think(
+                    prompt,
+                    system="你是经验归纳专家。只输出 JSON 数组。",
+                    enable_thinking=False,
+                )
+                text = (getattr(response, "content", None) or str(response)).strip()
+                json_match = re.search(r"\[[\s\S]*\]", text)
+                if not json_match:
+                    continue
+
+                syntheses = json.loads(json_match.group())
+                if not isinstance(syntheses, list):
+                    continue
+
+                saved = 0
+                for synth in syntheses:
+                    if not isinstance(synth, dict):
+                        continue
+                    content = (synth.get("content") or "").strip()
+                    source_ids = synth.get("synthesized_from", [])
+                    if len(content) < 10 or len(source_ids) < 2:
+                        continue
+
+                    # Dedup: skip if a similar experience already exists in this tenant
+                    dup_target: SemanticMemory | None = None
+                    try:
+                        similar = self.store.search_semantic(
+                            content,
+                            limit=3,
+                            scope="user",
+                            scope_owner="",
+                            user_id=tenant_user_id,
+                            workspace_id=tenant_workspace_id,
+                        )
+                        for s in similar:
+                            if s.superseded_by:
+                                continue
+                            if _fast_content_dedup(content, s.content or "") == "exact":
+                                dup_target = s
+                                break
+                    except Exception:
+                        pass
+
+                    if dup_target is not None:
+                        for sid in source_ids:
+                            self.store.update_semantic(sid, {"superseded_by": dup_target.id})
+                        logger.debug(
+                            "[Lifecycle] Synthesis dedup (tenant=%s/%s): reused %s",
+                            tenant_user_id, tenant_workspace_id, dup_target.id[:8],
+                        )
+                        continue
+
+                    mem = SemanticMemory(
+                        type=MemoryType.EXPERIENCE,
+                        priority=MemoryPriority.LONG_TERM,
+                        content=content,
+                        source="experience_synthesis",
+                        subject=(synth.get("subject") or "").strip(),
+                        predicate=(synth.get("predicate") or "").strip(),
+                        importance_score=min(1.0, max(0.7, float(synth.get("importance", 0.85)))),
+                        confidence=0.8,
+                    )
+                    self.store.save_semantic(
+                        mem,
+                        scope="user",
+                        scope_owner="",
+                        user_id=tenant_user_id,
+                        workspace_id=tenant_workspace_id,
+                    )
+                    saved += 1
+
+                    for sid in source_ids:
+                        self.store.update_semantic(sid, {"superseded_by": mem.id})
+
+                if saved:
+                    logger.info(
+                        "[Lifecycle] Synthesized %d experience principles for tenant (%s, %s) "
+                        "from %d memories",
+                        saved, tenant_user_id, tenant_workspace_id, len(experiences),
+                    )
+                total_saved += saved
+            except Exception as e:
+                logger.warning(
+                    "[Lifecycle] Synthesis failed for tenant (%s, %s): %s",
+                    tenant_user_id, tenant_workspace_id, e,
+                )
+                continue
+
+        if total_saved:
+            logger.info(
+                "[Lifecycle] Total synthesized %d experience principles across %d tenants",
+                total_saved, len(tenants),
+            )
+        return total_saved
 
     # ==================================================================
     # Refresh MEMORY.md (post-review, no keyword filter needed)
     # ==================================================================
 
     def refresh_memory_md(self, identity_dir: Path) -> None:
-        """刷新 MEMORY.md — LLM 审查后直接选取 top-K（无需关键词过滤）"""
-        memories = self.store.query_semantic(min_importance=0.5, limit=100)
+        """刷新 MEMORY.md — LLM 审查后直接选取 top-K（无需关键词过滤）
+
+        PR-B2：
+        - 排除 ``source="profile_fallback"`` 的记忆（那是会话内的非结构化档案
+          补充，不应该写进全局 MEMORY.md，否则跨会话注入会造成身份污染）。
+        - 同一 (type, content_hash) 仅保留一条，避免 manual / session_extraction /
+          daily_consolidation 三份重复同时写入。
+        """
+        # v4：限定 scope='user'，防止 pending_consolidation / legacy_quarantine
+        # 里的未审查内容直接写进 MEMORY.md（之前未过滤 scope 会跨用户污染）。
+        memories = self.store.query_semantic(
+            scope="user", min_importance=0.5, limit=200
+        )
+
+        try:
+            from ..core.feature_flags import is_enabled as _ff_enabled
+
+            ff_filter = _ff_enabled("memory_session_scope_v1")
+        except Exception:
+            ff_filter = True
+
+        if ff_filter:
+            memories = [
+                m for m in memories
+                if str(getattr(m, "source", "") or "") != "profile_fallback"
+            ]
 
         by_type: dict[str, list[SemanticMemory]] = defaultdict(list)
+        seen_hashes: set[tuple[str, str]] = set()
         for mem in memories:
-            by_type[mem.type.value].append(mem)
+            type_value = mem.type.value
+            content_norm = (mem.content or "").strip().lower()
+            if ff_filter and content_norm:
+                import hashlib
+
+                ch = hashlib.sha1(content_norm.encode("utf-8")).hexdigest()[:16]
+                key = (type_value, ch)
+                if key in seen_hashes:
+                    continue
+                seen_hashes.add(key)
+            by_type[type_value].append(mem)
 
         lines: list[str] = ["# 核心记忆\n"]
         type_labels = {

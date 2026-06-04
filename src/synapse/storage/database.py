@@ -1,9 +1,19 @@
 """
 SQLite 数据库封装
+
+.. deprecated::
+    Direct use of :class:`Database` is discouraged for new code. Long-term
+    storage should go through the relevant subsystem store
+    (``MemoryStorage``, ``AssetBus``, ``feedback_store``...) which already
+    pipe their connections through :mod:`synapse.storage.safe_sqlite`.
+    This class itself now uses the same helpers but exists primarily as
+    legacy infrastructure for ``/api/stats/tokens`` style endpoints.
 """
 
+import contextlib
 import json
 import logging
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,28 +27,65 @@ from .models import (
     Message,
     SkillRecord,
 )
+from .safe_sqlite import SQLiteUnavailable, safe_open_async
 
 logger = logging.getLogger(__name__)
 
 
 class Database:
-    """SQLite 数据库"""
+    """SQLite 数据库 (legacy facade — see module docstring)."""
 
     def __init__(self, db_path: Path | None = None):
+        warnings.warn(
+            "synapse.storage.database.Database is legacy; use a subsystem-"
+            "specific store routed through synapse.storage.safe_sqlite instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.db_path = db_path or settings.db_full_path
         self._connection: aiosqlite.Connection | None = None
 
     async def connect(self) -> None:
-        """连接数据库"""
-        # 确保目录存在
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        """连接数据库 (via safe_sqlite helper).
 
-        self._connection = await aiosqlite.connect(self.db_path)
-        self._connection.row_factory = aiosqlite.Row
+        Raises :class:`synapse.storage.safe_sqlite.SQLiteUnavailable`
+        when the database is corrupted / unavailable. Callers should
+        catch the exception and degrade rather than crashing the
+        backend.
+        """
+        try:
+            self._connection = await safe_open_async(
+                self.db_path,
+                want_wal=True,
+                run_quick_check=True,
+                foreign_keys=False,
+                row_factory=aiosqlite.Row,
+            )
+        except SQLiteUnavailable:
+            self._connection = None
+            raise
 
-        await self._init_tables()
+        try:
+            await self._init_tables()
+        except Exception as e:
+            # Schema bootstrap failures shouldn't leave a half-initialised
+            # connection around — close it and re-raise as SQLiteUnavailable
+            # so the caller treats it like any other unavailable backend.
+            await self._close_quiet()
+            logger.error("[Database] schema init failed: %s", e)
+            raise SQLiteUnavailable(
+                "schema_init_failed",
+                path=self.db_path,
+                details=str(e)[:200],
+            ) from e
 
         logger.info(f"Database connected: {self.db_path}")
+
+    async def _close_quiet(self) -> None:
+        if self._connection is not None:
+            with contextlib.suppress(Exception):
+                await self._connection.close()
+            self._connection = None
 
     async def close(self) -> None:
         """关闭数据库连接"""
@@ -46,6 +93,10 @@ class Database:
             await self._connection.close()
             self._connection = None
             logger.info("Database connection closed")
+
+    async def quiesce(self) -> None:
+        """Drop the underlying connection so a quarantine handler can rename files."""
+        await self._close_quiet()
 
     async def _init_tables(self) -> None:
         """初始化数据表"""
@@ -204,6 +255,8 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 session_id TEXT,
+                request_id TEXT DEFAULT '',
+                turn_id TEXT DEFAULT '',
                 endpoint_name TEXT,
                 model TEXT,
                 operation_type TEXT,
@@ -217,65 +270,36 @@ class Database:
                 channel TEXT,
                 user_id TEXT,
                 agent_profile_id TEXT DEFAULT 'default',
-                estimated_cost REAL DEFAULT 0,
-                usage_scene TEXT DEFAULT 'unknown'
+                estimated_cost REAL DEFAULT 0
             );
 
-            CREATE INDEX IF NOT EXISTS idx_token_usage_ts ON token_usage(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
-            CREATE INDEX IF NOT EXISTS idx_token_usage_endpoint ON token_usage(endpoint_name);
-            CREATE INDEX IF NOT EXISTS idx_token_usage_op ON token_usage(operation_type);
-            CREATE INDEX IF NOT EXISTS idx_token_usage_usage_scene ON token_usage(usage_scene);
-
-            -- ========== SOP 轨迹表 ==========
-            CREATE TABLE IF NOT EXISTS sop_trajectories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id TEXT NOT NULL,
-                sop_step_id TEXT NOT NULL,
-                sop_node_id TEXT NOT NULL,
-                sop_node_status TEXT NOT NULL,
-                sop_node_start_time TIMESTAMP NOT NULL,
-                sop_node_end_time TIMESTAMP NOT NULL,
-                sop_node_use_model TEXT NOT NULL,
-                sop_node_use_tokens INTEGER DEFAULT 0,
-                sop_node_output_list TEXT NOT NULL,
-                sop_node_human_in_the_loop INTEGER DEFAULT 0
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_sop_trajectories_order ON sop_trajectories(order_id, sop_step_id, sop_node_id);
-            CREATE INDEX IF NOT EXISTS idx_sop_trajectories_step ON sop_trajectories(sop_step_id);
-            CREATE INDEX IF NOT EXISTS idx_sop_trajectories_node ON sop_trajectories(sop_node_id);
-            CREATE INDEX IF NOT EXISTS idx_sop_trajectories_order_id ON sop_trajectories(order_id);
         """)
         await self._connection.commit()
+        await self._ensure_token_usage_schema()
 
-        # Migration: 为旧数据库添加 estimated_cost 列
-        try:
-            await self._connection.execute(
-                "ALTER TABLE token_usage ADD COLUMN estimated_cost REAL DEFAULT 0"
-            )
-            await self._connection.commit()
-        except Exception:
-            pass  # 列已存在则忽略
-        # Migration: 为旧数据库添加 agent_profile_id 列
-        try:
-            await self._connection.execute(
-                "ALTER TABLE token_usage ADD COLUMN agent_profile_id TEXT DEFAULT 'default'"
-            )
-            await self._connection.commit()
-        except Exception:
-            pass  # 列已存在则忽略
-
-        # Migration: 为旧数据库添加 usage_scene 列
-        try:
-            await self._connection.execute(
-                "ALTER TABLE token_usage ADD COLUMN usage_scene TEXT DEFAULT 'unknown'"
-            )
-            await self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_token_usage_usage_scene ON token_usage(usage_scene)"
-            )
-            await self._connection.commit()
-        except Exception:
-            pass  # 列已存在则忽略
+    async def _ensure_token_usage_schema(self) -> None:
+        """Migrate token_usage before creating indexes that depend on new columns."""
+        cursor = await self._connection.execute("PRAGMA table_info(token_usage)")
+        existing = {str(row["name"]) for row in await cursor.fetchall()}
+        required_columns = {
+            "request_id": "TEXT DEFAULT ''",
+            "turn_id": "TEXT DEFAULT ''",
+            "agent_profile_id": "TEXT DEFAULT 'default'",
+            "estimated_cost": "REAL DEFAULT 0",
+        }
+        for column, ddl in required_columns.items():
+            if column not in existing:
+                await self._connection.execute(
+                    f"ALTER TABLE token_usage ADD COLUMN {column} {ddl}"
+                )
+        await self._connection.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_token_usage_ts ON token_usage(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_request ON token_usage(request_id);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_endpoint ON token_usage(endpoint_name);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_op ON token_usage(operation_type);
+        """)
+        await self._connection.commit()
 
     # ===== 对话相关 =====
 
@@ -608,7 +632,6 @@ class Database:
             "session_id",
             "channel",
             "agent_profile_id",
-            "usage_scene",
         }
         if group_by not in allowed:
             group_by = "endpoint_name"
@@ -694,6 +717,7 @@ class Database:
                    SUM(output_tokens) AS total_output,
                    SUM(input_tokens + output_tokens) AS total_tokens,
                    COUNT(*) AS request_count,
+                   GROUP_CONCAT(DISTINCT request_id) AS request_ids,
                    GROUP_CONCAT(DISTINCT operation_type) AS operation_types,
                    GROUP_CONCAT(DISTINCT endpoint_name) AS endpoints,
                    COALESCE(SUM(estimated_cost), 0) AS total_cost
@@ -709,55 +733,56 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
-    async def get_token_usage_by_scene(
+    async def get_token_usage_records(
         self,
         start_time: str | datetime,
         end_time: str | datetime,
-        limit: int = 50,
+        limit: int = 100,
         offset: int = 0,
+        endpoint_name: str | None = None,
+        operation_type: str | None = None,
     ) -> list[dict]:
-        """按 usage_scene（操作场景）聚合 token 消耗，结构与按会话列表相近。"""
-        sql = """
-            SELECT COALESCE(NULLIF(TRIM(usage_scene), ''), 'unknown') AS usage_scene,
-                   MIN(timestamp) AS first_call,
-                   MAX(timestamp) AS last_call,
-                   SUM(input_tokens) AS total_input,
-                   SUM(output_tokens) AS total_output,
-                   SUM(input_tokens + output_tokens) AS total_tokens,
-                   COUNT(*) AS request_count,
-                   GROUP_CONCAT(DISTINCT operation_type) AS operation_types,
-                   GROUP_CONCAT(DISTINCT endpoint_name) AS endpoints,
-                   COALESCE(SUM(estimated_cost), 0) AS total_cost
+        """Return recent token usage records with attribution details."""
+        where = ["timestamp >= ?", "timestamp <= ?"]
+        params: list[Any] = [
+            start_time if isinstance(start_time, str) else start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            end_time if isinstance(end_time, str) else end_time.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        if endpoint_name:
+            where.append("endpoint_name = ?")
+            params.append(endpoint_name)
+        if operation_type:
+            where.append("operation_type = ?")
+            params.append(operation_type)
+
+        sql = f"""
+            SELECT timestamp,
+                   session_id,
+                   request_id,
+                   turn_id,
+                   endpoint_name,
+                   model,
+                   operation_type,
+                   operation_detail,
+                   input_tokens,
+                   output_tokens,
+                   input_tokens + output_tokens AS total_tokens,
+                   cache_creation_tokens,
+                   cache_read_tokens,
+                   context_tokens,
+                   iteration,
+                   channel,
+                   user_id,
+                   agent_profile_id,
+                   COALESCE(estimated_cost, 0) AS estimated_cost
             FROM token_usage
-            WHERE timestamp >= ? AND timestamp <= ?
-            GROUP BY COALESCE(NULLIF(TRIM(usage_scene), ''), 'unknown')
-            ORDER BY total_tokens DESC
+            WHERE {" AND ".join(where)}
+            ORDER BY timestamp DESC, id DESC
             LIMIT ? OFFSET ?
         """
-        s = start_time if isinstance(start_time, str) else start_time.strftime("%Y-%m-%d %H:%M:%S")
-        e = end_time if isinstance(end_time, str) else end_time.strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            cursor = await self._connection.execute(sql, (s, e, limit, offset))
-            rows = await cursor.fetchall()
-        except Exception:
-            # 兼容极旧库无 usage_scene 列
-            sql_fallback = """
-                SELECT 'unknown' AS usage_scene,
-                       MIN(timestamp) AS first_call,
-                       MAX(timestamp) AS last_call,
-                       SUM(input_tokens) AS total_input,
-                       SUM(output_tokens) AS total_output,
-                       SUM(input_tokens + output_tokens) AS total_tokens,
-                       COUNT(*) AS request_count,
-                       GROUP_CONCAT(DISTINCT operation_type) AS operation_types,
-                       GROUP_CONCAT(DISTINCT endpoint_name) AS endpoints,
-                       COALESCE(SUM(estimated_cost), 0) AS total_cost
-                FROM token_usage
-                WHERE timestamp >= ? AND timestamp <= ?
-                LIMIT ? OFFSET ?
-            """
-            cursor = await self._connection.execute(sql_fallback, (s, e, limit, offset))
-            rows = await cursor.fetchall()
+        params.extend([limit, offset])
+        cursor = await self._connection.execute(sql, params)
+        rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
     async def get_token_usage_total(
@@ -826,211 +851,3 @@ class Database:
             agent_id = d.pop("agent_profile_id", "default")
             result[agent_id] = d
         return result
-
-    @staticmethod
-    def _artifacts_from_sop_output_list(raw: str) -> list[str]:
-        """Parse sop_node_output_list JSON/text into human-readable artifact labels."""
-        text = (raw or "").strip()
-        if not text:
-            return []
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            return [text[:800]] if text else []
-        out: list[str] = []
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, str) and item.strip():
-                    out.append(item.strip())
-                elif isinstance(item, dict):
-                    label = (
-                        item.get("name")
-                        or item.get("title")
-                        or item.get("path")
-                        or item.get("file")
-                    )
-                    if label:
-                        out.append(str(label).strip())
-        elif isinstance(data, dict):
-            label = data.get("name") or data.get("title") or data.get("path")
-            if label:
-                out.append(str(label).strip())
-        return out
-
-    @staticmethod
-    def _merge_unique_preserve_order(items: list[str]) -> list[str]:
-        seen: set[str] = set()
-        merged: list[str] = []
-        for s in items:
-            key = s.strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            merged.append(key)
-        return merged
-
-    async def get_sop_trajectory_metrics_by_order_ids(
-        self, order_ids: list[str]
-    ) -> dict[str, dict[str, int]]:
-        """Per order_id: deal_seconds (wall SOP node span), deal_tokens, human_interventions."""
-        if not self._connection or not order_ids:
-            return {}
-        cleaned = [str(x).strip() for x in order_ids if str(x).strip()]
-        if not cleaned:
-            return {}
-        placeholders = ",".join("?" * len(cleaned))
-        sql = f"""
-            SELECT order_id,
-                   COALESCE(SUM(
-                     CASE
-                       WHEN sop_node_start_time IS NOT NULL
-                            AND sop_node_end_time IS NOT NULL
-                       THEN MAX(
-                         0,
-                         CAST(
-                           (strftime('%s', sop_node_end_time) - strftime('%s', sop_node_start_time))
-                           AS INTEGER
-                         )
-                       )
-                       ELSE 0
-                     END
-                   ), 0) AS deal_seconds,
-                   COALESCE(SUM(sop_node_use_tokens), 0) AS deal_tokens,
-                   COALESCE(SUM(sop_node_human_in_the_loop), 0) AS human_interventions
-            FROM sop_trajectories
-            WHERE order_id IN ({placeholders})
-            GROUP BY order_id
-        """
-        cursor = await self._connection.execute(sql, cleaned)
-        rows = await cursor.fetchall()
-        result: dict[str, dict[str, int]] = {}
-        for row in rows:
-            d = dict(row)
-            oid = str(d.get("order_id") or "").strip()
-            if not oid:
-                continue
-            result[oid] = {
-                "deal_seconds": int(d.get("deal_seconds") or 0),
-                "deal_tokens": int(d.get("deal_tokens") or 0),
-                "human_interventions": int(d.get("human_interventions") or 0),
-            }
-        return result
-
-    async def get_sop_human_in_loop_flags_by_order_ids(self, order_ids: list[str]) -> dict[str, bool]:
-        """Per order_id: True iff the latest sop_trajectories row (max id) has sop_node_human_in_the_loop = 1."""
-        if not self._connection or not order_ids:
-            return {}
-        cleaned = [str(x).strip() for x in order_ids if str(x).strip()]
-        if not cleaned:
-            return {}
-        placeholders = ",".join("?" * len(cleaned))
-        sql = f"""
-            SELECT t.order_id AS order_id,
-                   CASE WHEN COALESCE(t.sop_node_human_in_the_loop, 0) = 1 THEN 1 ELSE 0 END AS has_hitl
-            FROM sop_trajectories t
-            INNER JOIN (
-                SELECT order_id, MAX(id) AS max_id
-                FROM sop_trajectories
-                WHERE order_id IN ({placeholders})
-                GROUP BY order_id
-            ) latest ON t.order_id = latest.order_id AND t.id = latest.max_id
-        """
-        cursor = await self._connection.execute(sql, cleaned)
-        rows = await cursor.fetchall()
-        result: dict[str, bool] = dict.fromkeys(cleaned, False)
-        for row in rows:
-            rd = dict(row)
-            oid = str(rd.get("order_id") or "").strip()
-            if oid and int(rd.get("has_hitl") or 0) == 1:
-                result[oid] = True
-        return result
-
-    async def get_sop_trajectory_artifacts_for_order_ids(self, order_ids: list[str]) -> list[str]:
-        """Collect merged artifact labels from sop_node_output_list for given order_ids."""
-        if not self._connection or not order_ids:
-            return []
-        cleaned = [str(x).strip() for x in order_ids if str(x).strip()]
-        if not cleaned:
-            return []
-        placeholders = ",".join("?" * len(cleaned))
-        sql = f"""
-            SELECT sop_node_output_list
-            FROM sop_trajectories
-            WHERE order_id IN ({placeholders})
-        """
-        cursor = await self._connection.execute(sql, cleaned)
-        rows = await cursor.fetchall()
-        acc: list[str] = []
-        for row in rows:
-            rd = dict(row)
-            raw = str(rd.get("sop_node_output_list") or "")
-            acc.extend(self._artifacts_from_sop_output_list(raw))
-        return self._merge_unique_preserve_order(acc)
-
-    async def get_sop_trajectory_summary_for_order_ids(
-        self, order_ids: list[str]
-    ) -> dict[str, int | list[str]]:
-        """Aggregate process_seconds, human_interventions, artifacts across all given order_ids."""
-        if not self._connection or not order_ids:
-            return {
-                "process_seconds": 0,
-                "human_interventions": 0,
-                "artifacts": [],
-            }
-        cleaned = [str(x).strip() for x in order_ids if str(x).strip()]
-        if not cleaned:
-            return {
-                "process_seconds": 0,
-                "human_interventions": 0,
-                "artifacts": [],
-            }
-        placeholders = ",".join("?" * len(cleaned))
-        sql = f"""
-            SELECT COALESCE(SUM(
-                     CASE
-                       WHEN sop_node_start_time IS NOT NULL
-                            AND sop_node_end_time IS NOT NULL
-                       THEN MAX(
-                         0,
-                         CAST(
-                           (strftime('%s', sop_node_end_time) - strftime('%s', sop_node_start_time))
-                           AS INTEGER
-                         )
-                       )
-                       ELSE 0
-                     END
-                   ), 0) AS process_seconds,
-                   COALESCE(SUM(sop_node_human_in_the_loop), 0) AS human_interventions
-            FROM sop_trajectories
-            WHERE order_id IN ({placeholders})
-        """
-        cursor = await self._connection.execute(sql, cleaned)
-        row = await cursor.fetchone()
-        process_seconds = int(dict(row).get("process_seconds") or 0) if row else 0
-        human_interventions = int(dict(row).get("human_interventions") or 0) if row else 0
-        artifacts = await self.get_sop_trajectory_artifacts_for_order_ids(cleaned)
-        return {
-            "process_seconds": process_seconds,
-            "human_interventions": human_interventions,
-            "artifacts": artifacts,
-        }
-
-    async def get_token_usage_total_tokens_for_scenes(self, usage_scenes: list[str]) -> int:
-        """Sum (input+output) tokens where usage_scene matches any of the given scenes."""
-        if not self._connection or not usage_scenes:
-            return 0
-        cleaned = [str(x).strip() for x in usage_scenes if str(x).strip()]
-        if not cleaned:
-            return 0
-        placeholders = ",".join("?" * len(cleaned))
-        sql = f"""
-            SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS total_tokens
-            FROM token_usage
-            WHERE usage_scene IN ({placeholders})
-        """
-        try:
-            cursor = await self._connection.execute(sql, cleaned)
-            row = await cursor.fetchone()
-            return int(dict(row).get("total_tokens") or 0) if row else 0
-        except Exception:
-            return 0

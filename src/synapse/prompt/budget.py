@@ -10,17 +10,75 @@ Prompt Budget - Token 预算裁剪模块
   - 用户自定义策略（可选）
 - catalogs_budget: 8000 tokens (tools 33% + skills 55% + mcp 10%)
   - 工具定义已通过 API tools 参数传递，system prompt 中的 catalog 仅补充描述
-- user_budget: 300 tokens (user.summary + runtime_facts)
-- memory_budget: 2500 tokens (retriever 输出)
+- user_budget: 1200 tokens (user.summary + runtime_facts)
+- memory_budget: 3500 tokens (retriever 输出)
 
-默认总预算约 ~14000 tokens。
+默认总预算约 ~22000 tokens。
 对于小上下文窗口模型，使用 BudgetConfig.for_context_window(ctx) 自适应缩放。
 """
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .builder import PromptTier
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Fix-4 helper：根据 IntentResult.tool_hints 推算 SkillCatalog 的优先分类
+# ---------------------------------------------------------------------------
+#
+# IntentAnalyzer 给出的 tool_hints 是抽象类别名（如 "File System",
+# "Web Search", "Code Generation"），SkillCatalog 的 category 是技能 SKILL.md
+# 中声明的 `category:` 字段（如 "file-tools", "web", "coding"）。两者命名空
+# 间不一致，需要一个简单的关键词映射。本表是软映射 — 命中即提升优先级，
+# 没命中也不会丢工具（priority_categories=None 时全量展开，行为不变）。
+_TOOL_HINT_TO_SKILL_CATEGORY: dict[str, tuple[str, ...]] = {
+    "file system": ("file-tools", "filesystem", "file"),
+    "web search": ("web", "search", "web-tools"),
+    "code generation": ("coding", "code", "code-tools"),
+    "code review": ("coding", "code", "code-tools"),
+    "browser": ("browser", "web"),
+    "shell": ("shell", "system"),
+    "shell command": ("shell", "system"),
+    "scheduling": ("schedule", "automation"),
+    "memory": ("memory",),
+    "documents": ("doc", "documents", "office"),
+    "data analysis": ("data", "analytics"),
+    "image": ("image", "vision"),
+    "audio": ("audio", "voice"),
+}
+
+
+def intent_to_priority_categories(
+    tool_hints: list[str] | None,
+) -> tuple[str, ...]:
+    """Map ``IntentResult.tool_hints`` → SkillCatalog ``priority_categories``.
+
+    Returns an **empty tuple** when no mapping is available; callers should
+    pass ``priority_categories=None`` (full expansion, legacy behaviour) in
+    that case to avoid over-aggressive pruning.
+
+    The mapping is intentionally lossy and additive — when intent is
+    uncertain, prefer to fall back to the full grouped catalog rather than
+    risk hiding a relevant skill behind the (index) collapse.
+    """
+    if not tool_hints:
+        return ()
+    seen: list[str] = []
+    for hint in tool_hints:
+        key = (hint or "").strip().lower()
+        if not key:
+            continue
+        for cat in _TOOL_HINT_TO_SKILL_CATEGORY.get(key, ()):
+            if cat not in seen:
+                seen.append(cat)
+    return tuple(seen)
 
 # Token 估算常量
 CHARS_PER_TOKEN = 4  # 保守估计，中文约 1.5-2，英文约 4
@@ -35,11 +93,11 @@ class BudgetConfig:
     catalogs_budget: int = (
         8000  # tools(33%) + skills(55%) + mcp(10%) — 工具定义已通过 API tools 参数传递
     )
-    user_budget: int = 300  # user.summary + runtime_facts
-    memory_budget: int = 2500  # retriever 输出（含 MEMORY.md + pinned rules + vector memory）
+    user_budget: int = 1200  # user.summary + runtime_facts
+    memory_budget: int = 3500  # retriever 输出（含 MEMORY.md + pinned rules + vector memory）
 
     # 总预算（作为硬限制）
-    total_budget: int = 18000
+    total_budget: int = 22000
 
     # 裁剪优先级（数字越小越先被裁剪）
     # 高优先级的内容会在预算不足时保留
@@ -55,7 +113,7 @@ class BudgetConfig:
     )
 
     @classmethod
-    def for_context_window(cls, context_window: int) -> "BudgetConfig":
+    def for_context_window(cls, context_window: int) -> BudgetConfig:
         """根据模型上下文窗口大小自适应调整预算。
 
         系统提示词应控制在 context_window 的 40% 以内（剩余留给对话和输出）。
@@ -67,29 +125,29 @@ class BudgetConfig:
         prompt_budget = int(context_window * 0.40)
 
         if context_window > 32000:
-            # sum: 5000+10000+300+2000 = 17300
+            # sum: 5000+10000+800+2500 = 18300
             return cls(
                 identity_budget=5000,
                 catalogs_budget=10000,
-                user_budget=300,
-                memory_budget=2000,
-                total_budget=min(prompt_budget, 18000),
+                user_budget=800,
+                memory_budget=2500,
+                total_budget=min(prompt_budget, 20000),
             )
         elif context_window >= 16000:
-            # sum: 3500+6000+250+1500 = 11250
+            # sum: 3500+6000+600+1800 = 11900
             return cls(
                 identity_budget=3500,
                 catalogs_budget=6000,
-                user_budget=250,
-                memory_budget=1500,
+                user_budget=600,
+                memory_budget=1800,
                 total_budget=min(prompt_budget, 12000),
             )
         elif context_window >= 8000:
-            # sum: 2500+4000+200+1000 = 7700
+            # sum: 2500+4000+350+1000 = 7850
             return cls(
                 identity_budget=2500,
                 catalogs_budget=4000,
-                user_budget=200,
+                user_budget=350,
                 memory_budget=1000,
                 total_budget=min(prompt_budget, 8000),
             )
@@ -97,13 +155,13 @@ class BudgetConfig:
             return cls(
                 identity_budget=600,
                 catalogs_budget=800,
-                user_budget=100,
+                user_budget=150,
                 memory_budget=300,
                 total_budget=min(prompt_budget, 2000),
             )
 
     @classmethod
-    def for_tier(cls, tier: "PromptTier", context_window: int = 0) -> "BudgetConfig":
+    def for_tier(cls, tier: PromptTier, context_window: int = 0) -> BudgetConfig:
         """根据 PromptTier 分配预算（推荐使用，取代 for_context_window）。
 
         PromptTier 由 resolve_tier() 判定，与此方法配合使用：
@@ -112,13 +170,13 @@ class BudgetConfig:
         """
         from .builder import PromptTier
 
-        prompt_budget = int(context_window * 0.40) if context_window > 0 else 18000
+        prompt_budget = int(context_window * 0.40) if context_window > 0 else 22000
 
         if tier == PromptTier.SMALL:
             return cls(
                 identity_budget=600,
                 catalogs_budget=800,
-                user_budget=100,
+                user_budget=150,
                 memory_budget=300,
                 total_budget=min(prompt_budget, 2000),
             )
@@ -126,8 +184,8 @@ class BudgetConfig:
             return cls(
                 identity_budget=3000,
                 catalogs_budget=5000,
-                user_budget=250,
-                memory_budget=1500,
+                user_budget=600,
+                memory_budget=1800,
                 total_budget=min(prompt_budget, 10000),
             )
         else:
@@ -224,6 +282,20 @@ def apply_budget(
         logger.info(
             f"[Budget] {section_name}: {original_tokens} tokens "
             f"slightly over budget {budget_tokens} (+{pct:.0f}%), allowing"
+        )
+        return BudgetResult(
+            content=content,
+            original_tokens=original_tokens,
+            final_tokens=original_tokens,
+            truncated=False,
+        )
+
+    if truncate_strategy == "none":
+        # 显式不截断（用于 skills：与 hermes-agent 的零截断范式对齐，
+        # 避免新装技能因排序靠后被剔除导致 LLM 看不见）
+        logger.info(
+            f"[Budget] {section_name}: {original_tokens} tokens over budget "
+            f"{budget_tokens} but strategy=none, allowing full content"
         )
         return BudgetResult(
             content=content,
@@ -340,9 +412,12 @@ def apply_budget_to_sections(
     }
 
     # 截断策略
+    # NOTE: skills 段使用 "none" — SkillCatalog.get_grouped_compact_catalog
+    # 内部自带三级自适应压缩（完整描述 → 短描述 → 仅名字），
+    # 既保证所有技能名字可见，又控制 token 总量。
     strategy_map = {
         "memory": "start",  # 记忆保留最新
-        "skills": "end",  # 技能截断末尾
+        "skills": "none",  # 技能不截断（紧凑分组本身已小）
         "mcp": "end",  # MCP 截断末尾
         "tools": "end",  # 工具截断末尾
     }
@@ -379,3 +454,4 @@ def apply_budget_to_sections(
         )
 
     return results
+

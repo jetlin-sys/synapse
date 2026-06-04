@@ -5,12 +5,21 @@
 - enable_thinking: 控制深度思考
 - get_session_logs: 获取会话日志
 - get_tool_info: 获取工具信息
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
 """
 
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...core.policy_v2 import ApprovalClass
 from ...skills.exposure import get_skill_source_roots
 
 if TYPE_CHECKING:
@@ -31,6 +40,19 @@ class SystemHandler:
         "set_task_timeout",
         "get_workspace_map",
     ]
+
+    # C7 explicit ApprovalClass
+    TOOL_CLASSES = {
+        "ask_user": ApprovalClass.INTERACTIVE,
+        "enable_thinking": ApprovalClass.EXEC_LOW_RISK,
+        "get_session_logs": ApprovalClass.READONLY_GLOBAL,
+        "get_tool_info": ApprovalClass.READONLY_GLOBAL,
+        # generate_image 是网络出站调用 + 写盘（image gen API），归 NETWORK_OUT；
+        # 实际写文件路径在 cwd，不算 mutating（不是用户文件）
+        "generate_image": ApprovalClass.NETWORK_OUT,
+        "set_task_timeout": ApprovalClass.CONTROL_PLANE,
+        "get_workspace_map": ApprovalClass.READONLY_GLOBAL,
+    }
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
@@ -81,14 +103,22 @@ class SystemHandler:
         count = params.get("count", 20)
         # level 参数改为 level_filter（修复参数名不匹配问题）
         level_filter = params.get("level_filter") or params.get("level")
+        include_debug = bool(params.get("include_debug", False))
 
         log_buffer = get_session_log_buffer()
         logs = log_buffer.get_logs(count=count, level_filter=level_filter)
+        if not include_debug:
+            logs = [
+                log
+                for log in logs
+                if log.get("level") != "DEBUG"
+                and "[LLM DEBUG]" not in str(log.get("message", ""))
+            ]
 
         if not logs:
             return "没有会话日志"
 
-        output = f"最近 {len(logs)} 条日志:\n\n"
+        output = f"最近 {len(logs)} 条会话日志（不包含完整 LLM 调试 trace）:\n\n"
         for log in logs:
             output += f"[{log['level']}] {log['module']}: {log['message']}\n"
 
@@ -105,8 +135,10 @@ class SystemHandler:
         ht = int(params.get("hard_timeout_seconds") or 0)
         reason = params.get("reason", "")
 
-        if pt <= 0:
-            return "❌ progress_timeout_seconds 必须为正整数（秒）"
+        if pt < 0:
+            return "❌ progress_timeout_seconds 不能为负数（0=禁用）"
+        if 0 < pt < 60:
+            return "❌ progress_timeout_seconds 非 0 时最小为 60 秒；设为 0 表示禁用"
         if ht < 0:
             return "❌ hard_timeout_seconds 不能为负数"
 
@@ -117,7 +149,9 @@ class SystemHandler:
         monitor.timeout_seconds = pt
         monitor.hard_timeout_seconds = ht
         logger.info(f"[TaskTimeout] Updated by LLM: progress={pt}s hard={ht}s reason={reason}")
-        return f"✅ 已更新当前任务超时策略：无进展超时={pt}s，硬超时={ht if ht else 0}s（0=禁用）。原因：{reason}"
+        progress_desc = "禁用" if pt == 0 else f"{pt}s"
+        hard_desc = "禁用" if ht == 0 else f"{ht}s"
+        return f"✅ 已更新当前任务超时策略：无进展超时={progress_desc}，硬超时={hard_desc}。原因：{reason}"
 
     def _get_workspace_map(self) -> str:
         """返回工作区目录结构和关键路径说明"""
@@ -317,8 +351,8 @@ class SystemHandler:
                 out_path.write_bytes(img_bytes)
             except Exception as e:
                 detail = extract_connection_error(e)
-                from urllib.parse import urlparse
-                host = urlparse(image_url).hostname or image_url[:60]
+                from synapse.utils.url_safety import safe_urlparse
+                host = safe_urlparse(image_url).hostname or image_url[:60]
                 return f"❌ 图片下载失败（网络错误，目标: {host}）: {detail}{_hint}"
 
         except httpx.HTTPError as e:

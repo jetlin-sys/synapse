@@ -12,6 +12,9 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from synapse.memory.json_utils import coerce_text
+from synapse.utils.errors import format_user_friendly_error
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -45,26 +48,40 @@ def _notify_im_event(event: str, data: dict | None = None) -> None:
         pass
 
 
+def _content_preview(value: Any, limit: int) -> str:
+    """Convert structured IM message content to safe preview text before slicing."""
+
+    return coerce_text(value)[:limit]
+
+
 @router.get("/api/im/channels")
 async def list_channels(request: Request):
     """Return all configured IM channels with online status."""
     channels: list[dict[str, Any]] = []
 
     gateway = _get_gateway(request)
-    if gateway is None:
-        return JSONResponse(content={"channels": channels})
 
-    # Build bot_id -> bot_name lookup from settings
+    # Build lookup tables from persisted bot/profile config so the viewer
+    # shows the same agent binding that MessageGateway applies at runtime.
+    from synapse.agents.profile import get_profile_store
+    from synapse.channels.status import collect_effective_im_status
     from synapse.config import settings
 
+    effective_status = collect_effective_im_status(settings, gateway)
     bot_name_map: dict[str, str] = {}
+    profile_name_map: dict[str, str] = {"default": "Default Agent"}
     for b in getattr(settings, "im_bots", []):
         if isinstance(b, dict) and b.get("id") and b.get("name"):
             bot_name_map[b["id"]] = b["name"]
+    try:
+        profile_store = get_profile_store()
+        profile_name_map.update({p.id: p.name for p in profile_store.list_all()})
+    except Exception as e:
+        logger.debug("[IM API] Failed to load agent profile names: %s", e)
 
     # _adapters is a dict {name: adapter} in MessageGateway
-    adapters_dict = getattr(gateway, "_adapters", None) or {}
-    adapters_list = getattr(gateway, "adapters", [])
+    adapters_dict = (getattr(gateway, "_adapters", None) or {}) if gateway is not None else {}
+    adapters_list = getattr(gateway, "adapters", []) if gateway is not None else []
     if isinstance(adapters_dict, dict):
         adapter_items = list(adapters_dict.items())
     else:
@@ -107,6 +124,8 @@ async def list_channels(request: Request):
             or bot_name_map.get(name)
             or name
         )
+        agent_profile_id = getattr(adapter, "agent_profile_id", None) or "default"
+        agent_profile_name = profile_name_map.get(agent_profile_id, agent_profile_id)
         entry: dict[str, Any] = {
             "channel": name,
             "channel_type": getattr(adapter, "channel_type", name.split(":")[0]),
@@ -114,14 +133,48 @@ async def list_channels(request: Request):
             "status": status,
             "sessionCount": session_count,
             "lastActive": last_active,
+            "agentProfileId": agent_profile_id,
+            "agentProfileName": agent_profile_name,
         }
         if status == "offline":
-            reasons = getattr(gateway, "_failed_adapter_reasons", {})
+            reasons = getattr(gateway, "_failed_adapter_reasons", {}) if gateway is not None else {}
             if name in reasons:
-                entry["error"] = reasons[name]
+                entry["error"] = format_user_friendly_error(str(reasons[name]))
         channels.append(entry)
 
-    return JSONResponse(content={"channels": channels})
+    seen_channels = {str(c.get("channel") or "") for c in channels}
+    for detail in effective_status["details"]:
+        if detail.get("source") != "im_bots":
+            continue
+        channel = str(detail.get("channel") or detail.get("type") or "")
+        if not channel or channel in seen_channels:
+            continue
+        if not detail.get("enabled") and not detail.get("configured"):
+            continue
+        channels.append(
+            {
+                "channel": channel,
+                "channel_type": detail.get("type"),
+                "name": detail.get("name") or channel,
+                "status": "configured" if detail.get("configured") else "offline",
+                "sessionCount": 0,
+                "lastActive": None,
+                "agentProfileId": "default",
+                "agentProfileName": profile_name_map.get("default", "Default Agent"),
+                "source": "im_bots",
+                "configured": detail.get("configured", False),
+                "missing": detail.get("missing", []),
+            }
+        )
+        seen_channels.add(channel)
+
+    return JSONResponse(
+        content={
+            "channels": channels,
+            "effective_channels": effective_status["channels"],
+            "effective_details": effective_status["details"],
+        }
+    )
 
 
 @router.get("/api/im/sessions")
@@ -148,9 +201,9 @@ async def list_sessions(request: Request, channel: str = Query("")):
             msg_count = len(history)
             last_item = history[-1]
             if isinstance(last_item, dict):
-                last_msg = (last_item.get("content") or "")[:100]
+                last_msg = _content_preview(last_item.get("content"), 100)
             else:
-                last_msg = str(getattr(last_item, "content", ""))[:100]
+                last_msg = _content_preview(getattr(last_item, "content", ""), 100)
 
         # SessionState 是 Enum，需要取 .value 才能 JSON 序列化
         state = getattr(sess, "state", "active")
@@ -224,7 +277,7 @@ def _to_safe_session_id(session_key: str) -> str:
     return re.sub(r'[/\\+=%?*<>|"\x00-\x1f]', "_", safe)
 
 
-@router.get("/api/im/sessions/{session_id}/messages")
+@router.get("/api/im/sessions/{session_id:path}/messages")
 async def get_session_messages(
     request: Request,
     session_id: str,
@@ -309,21 +362,9 @@ async def get_session_messages(
     page = history[offset : offset + limit]
 
     def _to_str(content: Any) -> str:
-        """Ensure content is a plain string for the API response.
+        """Ensure content is a plain string for the API response."""
 
-        Anthropic MessageParam may store content as a list of content blocks.
-        """
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            return "".join(parts)
-        return str(content) if content is not None else ""
+        return coerce_text(content)
 
     messages: list[dict[str, Any]] = []
     for item in page:
@@ -358,11 +399,11 @@ async def get_session_messages(
             content_id_map: dict[tuple[str, str], int] = {}
             for t in turns:
                 if t.get("id") is not None:
-                    key = (t.get("role", ""), _to_str(t.get("content", ""))[:200])
+                    key = (t.get("role", ""), _content_preview(t.get("content"), 200))
                     content_id_map.setdefault(key, t["id"])
             matched = 0
             for msg in messages:
-                key = (msg.get("role", ""), (msg.get("content") or "")[:200])
+                key = (msg.get("role", ""), _content_preview(msg.get("content"), 200))
                 msg["id"] = content_id_map.get(key)
                 if msg["id"] is not None:
                     matched += 1
@@ -391,7 +432,7 @@ class DeleteMessagesRequest(BaseModel):
     turn_ids: list[int]
 
 
-@router.post("/api/im/sessions/{session_id}/messages/delete")
+@router.post("/api/im/sessions/{session_id:path}/messages/delete")
 async def delete_session_messages(request: Request, session_id: str, body: DeleteMessagesRequest):
     """Delete specific messages (conversation_turns) by their SQLite IDs."""
     storage = _get_storage()
@@ -406,7 +447,7 @@ async def delete_session_messages(request: Request, session_id: str, body: Delet
         turn_id_set = set(body.turn_ids)
         for t in all_turns:
             if t.get("id") in turn_id_set:
-                deleted_keys.add((t.get("role", ""), (t.get("content") or "")[:200]))
+                deleted_keys.add((t.get("role", ""), _content_preview(t.get("content"), 200)))
     except Exception as exc:
         logger.warning("[IM] Failed to build deleted_keys for session %s: %s", session_id, exc)
 
@@ -427,15 +468,18 @@ async def delete_session_messages(request: Request, session_id: str, body: Delet
 
                     def _msg_key(m: Any) -> tuple[str, str]:
                         if isinstance(m, dict):
-                            return (m.get("role", ""), (m.get("content") or "")[:200])
-                        return (getattr(m, "role", ""), str(getattr(m, "content", ""))[:200])
+                            return (m.get("role", ""), _content_preview(m.get("content"), 200))
+                        return (
+                            getattr(m, "role", ""),
+                            _content_preview(getattr(m, "content", ""), 200),
+                        )
 
                     ctx.messages = [m for m in msgs if _msg_key(m) not in deleted_keys]
 
     return JSONResponse(content={"ok": True, "deleted": deleted})
 
 
-@router.delete("/api/im/sessions/{session_id}")
+@router.delete("/api/im/sessions/{session_id:path}")
 async def delete_im_session(request: Request, session_id: str):
     """Close and remove an IM session, including its SQLite conversation_turns."""
     session_mgr = _get_session_manager(request)
@@ -579,6 +623,7 @@ async def delete_chat_alias(
 # ─── Group Policy Management ─────────────────────────────────────────────
 
 _GROUP_POLICY_PATH = Path("data/sessions/group_policy.json")
+_OWNER_ALLOWLIST_PATH = Path("data/sessions/im_owner_allowlist.json")
 
 
 def _load_group_policy() -> dict:
@@ -597,6 +642,24 @@ def _save_group_policy(data: dict) -> None:
 
     _GROUP_POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
     atomic_json_write(_GROUP_POLICY_PATH, data)
+
+
+def _load_owner_allowlist() -> dict:
+    if _OWNER_ALLOWLIST_PATH.exists():
+        try:
+            import json
+
+            return json.loads(_OWNER_ALLOWLIST_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_owner_allowlist(data: dict) -> None:
+    from synapse.utils.atomic_io import atomic_json_write
+
+    _OWNER_ALLOWLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(_OWNER_ALLOWLIST_PATH, data)
 
 
 @router.get("/api/im/group-policy")
@@ -664,6 +727,73 @@ async def set_group_policy(request: Request, body: GroupPolicyRequest):
     _save_group_policy(policy_data)
 
     _notify_im_event("im:group_policy_changed", {"channel": body.channel, "mode": body.mode})
+    return JSONResponse(content={"ok": True})
+
+
+# ─── IM Owner Allowlist (C8 §9.2) ─────────────────────────────────────
+
+
+@router.get("/api/im/owner-allowlist")
+async def get_owner_allowlist(request: Request, channel: str = Query("")):
+    """Return the IM owner user_id allowlist for a channel.
+
+    语义见 ``MessageGateway._get_owner_user_ids``：``configured=False`` 表示
+    该渠道未配 allowlist（PolicyContext 默认 ``is_owner=True``，向后兼容
+    单用户私聊）；``configured=True`` 时只有 ``owners`` 内的 user_id 在
+    PolicyContext 里得到 ``is_owner=True``，其余一律 False。
+    """
+    gateway = _get_gateway(request)
+    if gateway is None or not channel:
+        return JSONResponse(content={"channel": channel, "configured": False, "owners": []})
+    owners_set = gateway._get_owner_user_ids(channel)
+    if owners_set is None:
+        return JSONResponse(content={"channel": channel, "configured": False, "owners": []})
+    return JSONResponse(
+        content={"channel": channel, "configured": True, "owners": sorted(owners_set)}
+    )
+
+
+class OwnerAllowlistRequest(BaseModel):
+    channel: str
+    owners: list[str] | None = None
+    """``None`` → 显式取消 allowlist 配置（恢复"未配 allowlist"语义）；
+    ``[]`` → 显式锁定 owner 为空集（CONTROL_PLANE 工具全员被拒）；
+    非空 list → 设置 owner allowlist。"""
+
+
+@router.post("/api/im/owner-allowlist")
+async def set_owner_allowlist(request: Request, body: OwnerAllowlistRequest):
+    """Update IM owner user_id allowlist (runtime + persisted)."""
+    gateway = _get_gateway(request)
+    if gateway is None:
+        return JSONResponse(status_code=500, content={"error": "gateway not available"})
+
+    adapter = gateway._adapters.get(body.channel)
+    if adapter is not None:
+        if body.owners is None:
+            if hasattr(adapter, "_owner_user_ids"):
+                try:
+                    delattr(adapter, "_owner_user_ids")
+                except AttributeError:
+                    adapter._owner_user_ids = None
+        else:
+            adapter._owner_user_ids = {str(uid) for uid in body.owners}
+
+    policy_data = _load_owner_allowlist()
+    if body.owners is None:
+        policy_data.pop(body.channel, None)
+    else:
+        policy_data[body.channel] = {"owners": [str(uid) for uid in body.owners]}
+    _save_owner_allowlist(policy_data)
+
+    _notify_im_event(
+        "im:owner_allowlist_changed",
+        {
+            "channel": body.channel,
+            "configured": body.owners is not None,
+            "count": len(body.owners or []),
+        },
+    )
     return JSONResponse(content={"ok": True})
 
 

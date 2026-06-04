@@ -13,9 +13,12 @@
 import asyncio
 import json
 import logging
+import re
+from dataclasses import dataclass
 from typing import Any
 
 from ..tracing.tracer import get_tracer
+from ..utils.url_safety import safe_urlparse
 from .context_utils import DEFAULT_MAX_CONTEXT_TOKENS
 from .context_utils import estimate_tokens as _shared_estimate_tokens
 from .context_utils import get_max_context_tokens as _shared_get_max_context_tokens
@@ -26,6 +29,23 @@ logger = logging.getLogger(__name__)
 CHARS_PER_TOKEN = 2  # JSON 序列化后约 2 字符 = 1 token
 CHUNK_MAX_TOKENS = 30000  # 每次发给 LLM 压缩的单块上限
 CONTEXT_BOUNDARY_MARKER = "[上下文边界]"  # 话题切换边界标记
+
+
+@dataclass(frozen=True)
+class ContextPressure:
+    """Unified context pressure snapshot used by compression and tracing."""
+
+    max_tokens: int
+    system_tokens: int
+    tools_tokens: int
+    messages_tokens: int
+    estimated_total_tokens: int
+    calibrated_total_tokens: int
+    hard_limit: int
+    soft_limit: int
+    available_message_budget: int
+    trigger_tokens: int
+    last_real_input_tokens: int | None = None
 
 
 class _CancelledError(Exception):
@@ -52,7 +72,7 @@ class ContextManager:
         self._cancel_event = cancel_event
         self._token_cache: dict[int, int] = {}
         self._tools_tokens_cache: int | None = None
-        self._previous_summary: str = ""
+        self._previous_summaries: dict[str, str] = {}
 
     def set_cancel_event(self, event: asyncio.Event | None) -> None:
         """更新 cancel_event（每次任务开始时由 Agent 设置）"""
@@ -252,6 +272,84 @@ class ContextManager:
 
         return microcompact(messages)
 
+    def estimate_tools_tokens(self, tools: list | None) -> int:
+        """Estimate tool schema/catalog token footprint."""
+        if not tools:
+            return 0
+        try:
+            tools_text = json.dumps(tools, ensure_ascii=False, default=str)
+            return self.estimate_tokens(tools_text)
+        except Exception:
+            return len(tools) * 200
+
+    def calculate_context_pressure(
+        self,
+        messages: list[dict],
+        *,
+        system_prompt: str = "",
+        tools: list | None = None,
+        max_tokens: int | None = None,
+        conversation_id: str | None = None,
+        last_real_input_tokens: int | None = None,
+    ) -> ContextPressure:
+        """Calculate total prompt pressure from messages, system prompt, tools, and real usage."""
+        from ..config import settings as _settings
+
+        resolved_max = max_tokens or self.get_max_context_tokens(conversation_id=conversation_id)
+        system_tokens = self.estimate_tokens(system_prompt)
+        # Brain.convert_tools_to_llm omits ``_deferred`` tools' input_schema from
+        # the API request body, so they should not inflate context pressure here.
+        # Otherwise long-running tasks with many side tools see a large fixed
+        # tools_tokens overhead and trip token-anomaly compaction prematurely.
+        if tools:
+            effective_tools = [
+                t for t in tools
+                if not (isinstance(t, dict) and t.get("_deferred"))
+            ]
+        else:
+            effective_tools = tools
+        tools_tokens = self.estimate_tools_tokens(effective_tools)
+        messages_tokens = self.estimate_messages_tokens(messages)
+        hard_limit = resolved_max - system_tokens - tools_tokens - 500
+        min_hard_limit = max(min(1024, int(resolved_max * 0.3)), 256)
+        if hard_limit < min_hard_limit:
+            logger.warning(
+                f"[Compress] hard_limit too small ({hard_limit}), "
+                f"max={resolved_max}, system={system_tokens}, tools={tools_tokens}. "
+                f"Falling back to {min_hard_limit}."
+            )
+            hard_limit = min_hard_limit
+        threshold = float(_settings.context_compression_threshold)
+        soft_limit = int(hard_limit * threshold)
+        estimated_total = system_tokens + tools_tokens + messages_tokens
+        calibrated_total = estimated_total
+        if last_real_input_tokens:
+            decay = float(getattr(_settings, "context_real_usage_decay", 0.9) or 0.9)
+            calibrated_total = max(estimated_total, int(last_real_input_tokens * decay))
+        # Compare against the message soft limit while still letting large
+        # system/tools overhead contribute to pressure. With local estimates this
+        # reduces to the old messages-driven behavior, but real usage calibration
+        # can now push the trigger above the soft limit even when messages look
+        # deceptively small.
+        trigger_tokens = max(
+            messages_tokens,
+            int(calibrated_total - (system_tokens + tools_tokens) * threshold),
+        )
+        available_message_budget = max(0, soft_limit - messages_tokens)
+        return ContextPressure(
+            max_tokens=resolved_max,
+            system_tokens=system_tokens,
+            tools_tokens=tools_tokens,
+            messages_tokens=messages_tokens,
+            estimated_total_tokens=estimated_total,
+            calibrated_total_tokens=calibrated_total,
+            hard_limit=hard_limit,
+            soft_limit=soft_limit,
+            available_message_budget=available_message_budget,
+            trigger_tokens=trigger_tokens,
+            last_real_input_tokens=last_real_input_tokens,
+        )
+
     def snip_old_segments(self, messages: list[dict]) -> tuple[list[dict], int]:
         """直接丢弃最早的对话段 (History Snip)。
 
@@ -267,7 +365,9 @@ class ContextManager:
         *,
         system_prompt: str = "",
         tools: list | None = None,
+        memory_manager: object | None = None,
         conversation_id: str | None = None,
+        last_real_input_tokens: int | None = None,
     ) -> list[dict]:
         """API 返回 413/prompt-too-long 后的紧急压缩。
 
@@ -291,7 +391,10 @@ class ContextManager:
             system_prompt=system_prompt,
             tools=tools,
             max_tokens=tighter_budget,
+            memory_manager=memory_manager,
             conversation_id=conversation_id,
+            last_real_input_tokens=last_real_input_tokens,
+            force=True,
         )
 
     async def compress_if_needed(
@@ -303,6 +406,8 @@ class ContextManager:
         max_tokens: int | None = None,
         memory_manager: object | None = None,
         conversation_id: str | None = None,
+        last_real_input_tokens: int | None = None,
+        force: bool = False,
     ) -> list[dict]:
         """
         如果上下文接近限制，执行压缩 (autocompact)。
@@ -330,31 +435,21 @@ class ContextManager:
         Returns:
             压缩后的消息列表
         """
-        max_tokens = max_tokens or self.get_max_context_tokens(conversation_id=conversation_id)
-
-        system_tokens = self.estimate_tokens(system_prompt)
-
-        tools_tokens = 0
-        if tools:
-            try:
-                tools_text = json.dumps(tools, ensure_ascii=False, default=str)
-                tools_tokens = self.estimate_tokens(tools_text)
-            except Exception:
-                tools_tokens = len(tools) * 200
-
-        hard_limit = max_tokens - system_tokens - tools_tokens - 500
-        min_hard_limit = max(min(1024, int(max_tokens * 0.3)), 256)
-        if hard_limit < min_hard_limit:
-            logger.warning(
-                f"[Compress] hard_limit too small ({hard_limit}), "
-                f"max={max_tokens}, system={system_tokens}, tools={tools_tokens}. "
-                f"Falling back to {min_hard_limit}."
-            )
-            hard_limit = min_hard_limit
         from ..config import settings as _settings
 
-        _threshold = _settings.context_compression_threshold
-        soft_limit = int(hard_limit * _threshold)
+        pressure = self.calculate_context_pressure(
+            messages,
+            system_prompt=system_prompt,
+            tools=tools,
+            max_tokens=max_tokens,
+            conversation_id=conversation_id,
+            last_real_input_tokens=last_real_input_tokens,
+        )
+        max_tokens = pressure.max_tokens
+        system_tokens = pressure.system_tokens
+        tools_tokens = pressure.tools_tokens
+        hard_limit = pressure.hard_limit
+        soft_limit = pressure.soft_limit
 
         _overhead_bytes = len(system_prompt.encode("utf-8")) if system_prompt else 0
         if tools:
@@ -365,20 +460,27 @@ class ContextManager:
             except Exception:
                 _overhead_bytes += len(tools) * 800
 
-        current_tokens = self.estimate_messages_tokens(messages)
+        current_tokens = pressure.messages_tokens
 
         logger.info(
             f"[Compress] Budget: max_ctx={max_tokens}, system={system_tokens}, "
             f"tools={tools_tokens}({len(tools) if tools else 0}个), "
-            f"hard={hard_limit}, soft={soft_limit}, msgs={current_tokens}({len(messages)}条)"
+            f"hard={hard_limit}, soft={soft_limit}, msgs={current_tokens}({len(messages)}条), "
+            f"estimated_total={pressure.estimated_total_tokens}, "
+            f"calibrated_total={pressure.calibrated_total_tokens}, "
+            f"last_real={pressure.last_real_input_tokens}"
         )
 
-        if current_tokens <= soft_limit:
+        if not force and pressure.trigger_tokens <= soft_limit:
             return messages
 
         # v2: 压缩前记忆提取 — 确保即将被压缩的消息先保存到记忆
         if memory_manager is not None:
             try:
+                snapshot = self._build_precompact_snapshot(messages, memory_manager)
+                save_snapshot = getattr(memory_manager, "save_precompact_snapshot", None)
+                if snapshot and callable(save_snapshot):
+                    save_snapshot(snapshot)
                 on_compressing = getattr(memory_manager, "on_context_compressing", None)
                 if on_compressing:
                     await on_compressing(messages)
@@ -390,12 +492,16 @@ class ContextManager:
 
         ctx_span = tracer.start_span("context_compression", SpanType.CONTEXT)
         ctx_span.set_attribute("tokens_before", current_tokens)
+        ctx_span.set_attribute("estimated_total_tokens", pressure.estimated_total_tokens)
+        ctx_span.set_attribute("calibrated_total_tokens", pressure.calibrated_total_tokens)
+        ctx_span.set_attribute("system_tokens", system_tokens)
+        ctx_span.set_attribute("tools_tokens", tools_tokens)
         ctx_span.set_attribute("soft_limit", soft_limit)
         ctx_span.set_attribute("hard_limit", hard_limit)
 
         logger.info(
-            f"Context approaching limit ({current_tokens} tokens, soft={soft_limit}, "
-            f"hard={hard_limit}), compressing with LLM..."
+            f"Context approaching limit (msgs={current_tokens}, trigger={pressure.trigger_tokens}, "
+            f"soft={soft_limit}, hard={hard_limit}), compressing with LLM..."
         )
 
         def _end_ctx_span(result_msgs: list[dict]) -> list[dict]:
@@ -467,11 +573,15 @@ class ContextManager:
         # Step 3: LLM 分块摘要早期对话（支持迭代式更新）
         early_tokens = self.estimate_messages_tokens(early_messages)
         target_summary_tokens = max(int(early_tokens * _settings.context_compression_ratio), 200)
+        _summary_key = conversation_id or "__default__"
         summary = await self._summarize_messages_chunked(
-            early_messages, target_summary_tokens, previous_summary=self._previous_summary,
+            early_messages,
+            target_summary_tokens,
+            previous_summary=self._previous_summaries.get(_summary_key, ""),
+            url_facts=self._extract_urls_from_messages(early_messages),
         )
         if summary:
-            self._previous_summary = summary
+            self._previous_summaries[_summary_key] = summary
 
         if summary and memory_manager is not None:
             try:
@@ -850,12 +960,14 @@ class ContextManager:
         messages: list[dict],
         target_tokens: int,
         previous_summary: str = "",
+        url_facts: list[dict[str, str]] | None = None,
     ) -> str:
         """分块 LLM 摘要消息列表。支持迭代式更新：当存在 previous_summary 时
         走「更新摘要」路径而非从零开始，避免多次压缩后早期信息逐渐稀释。"""
         if not messages:
             return ""
 
+        url_guard = self._format_url_facts_for_prompt(url_facts or [])
         chunks: list[str] = []
         current_chunk = ""
         current_chunk_tokens = 0
@@ -905,6 +1017,7 @@ class ContextManager:
                     )
                     _content = (
                         f"上次摘要:\n{previous_summary}\n\n"
+                        f"{url_guard}"
                         f"新增对话（第 {i + 1}/{len(chunks)} 块，"
                         f"约 {chunk_tokens} tokens）:\n\n{chunk}\n\n"
                         f"请更新摘要，压缩到 {chunk_target * CHARS_PER_TOKEN} 字以内。"
@@ -912,6 +1025,7 @@ class ContextManager:
                 else:
                     _system = get_compact_prompt()
                     _content = (
+                        f"{url_guard}"
                         f"请将以下对话片段（第 {i + 1}/{len(chunks)} 块，"
                         f"约 {chunk_tokens} tokens）压缩到 "
                         f"{chunk_target * CHARS_PER_TOKEN} 字以内:\n\n{chunk}"
@@ -994,7 +1108,85 @@ class ContextManager:
                 combined, target_tokens, context_type="conversation"
             )
 
+        if url_guard and "原始链接清单" not in combined:
+            combined = f"{url_guard.strip()}\n\n{combined}"
         return combined
+
+    @staticmethod
+    def _flatten_message_text(msg: dict) -> str:
+        """Best-effort plain-text view of a message for URL scanning.
+
+        Static and dependency-free so it can be used outside the instance
+        (tests, future helpers) without touching ``_extract_message_text``.
+        """
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    parts.append(str(block))
+                    continue
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                elif block.get("type") == "tool_result":
+                    inner = block.get("content")
+                    if isinstance(inner, str):
+                        parts.append(inner)
+                    elif isinstance(inner, list):
+                        for sub in inner:
+                            if isinstance(sub, dict) and sub.get("type") == "text":
+                                parts.append(str(sub.get("text", "")))
+                else:
+                    text_field = block.get("text")
+                    if isinstance(text_field, str):
+                        parts.append(text_field)
+            return "\n".join(parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    @staticmethod
+    def _extract_urls_from_messages(messages: list[dict]) -> list[dict[str, str]]:
+        """Extract exact URLs before LLM compression so summaries cannot rewrite them."""
+        facts: list[dict[str, str]] = []
+        seen: set[str] = set()
+        url_re = re.compile(r"https?://[^\s<>'\"，。；、)）\]}]+", re.IGNORECASE)
+        for index, msg in enumerate(messages):
+            text = ContextManager._flatten_message_text(msg)
+            for match in url_re.finditer(text):
+                url = match.group(0).rstrip(".,;:")
+                if url in seen:
+                    continue
+                seen.add(url)
+                parsed = safe_urlparse(url)
+                if not parsed.scheme:
+                    continue
+                facts.append(
+                    {
+                        "message_index": str(index),
+                        "role": str(msg.get("role", "")),
+                        "url": url,
+                        "hostname": parsed.hostname or "",
+                    }
+                )
+        return facts
+
+    @staticmethod
+    def _format_url_facts_for_prompt(url_facts: list[dict[str, str]]) -> str:
+        if not url_facts:
+            return ""
+        lines = [
+            "[原始链接清单 - 必须逐字保留]",
+            "下面 URL 来自被压缩的原始对话。摘要中不得改写、猜测、合并或省略这些 URL；如果后续用户说“刚才那个链接”，优先参考本清单。",
+        ]
+        for fact in url_facts:
+            lines.append(
+                f"- msg#{fact.get('message_index', '')} role={fact.get('role', '')} "
+                f"host={fact.get('hostname', '')}: {fact.get('url', '')}"
+            )
+        return "\n".join(lines) + "\n\n"
 
     async def _compress_further(self, messages: list[dict], max_tokens: int) -> list[dict]:
         """递归压缩：减少保留的最近组数量"""
@@ -1019,7 +1211,11 @@ class ContextManager:
         from ..config import settings as _settings
 
         target = max(int(early_tokens * _settings.context_compression_ratio), 100)
-        summary = await self._summarize_messages_chunked(early_messages, target)
+        summary = await self._summarize_messages_chunked(
+            early_messages,
+            target,
+            url_facts=self._extract_urls_from_messages(early_messages),
+        )
 
         compressed = self._inject_summary_into_recent(summary, recent_messages)
 
@@ -1259,6 +1455,8 @@ class ContextManager:
             f"Applying hard truncation."
         )
 
+        protected_media_idx = self._current_turn_media_message_index(messages)
+
         # Build per-message token array and suffix sum
         n = len(messages)
         msg_tokens = [self._estimate_single_message_tokens(msg) for msg in messages]
@@ -1281,8 +1479,23 @@ class ContextManager:
                 lo = mid + 1
         drop_until = lo
 
+        if 0 <= protected_media_idx < drop_until:
+            drop_until = protected_media_idx
+
         truncated = list(messages[drop_until:])
         dropped_messages = list(messages[:drop_until])
+        if dropped_messages:
+            snapshot = self._build_precompact_snapshot(dropped_messages, memory_manager)
+            if snapshot:
+                save_snapshot = getattr(memory_manager, "save_precompact_snapshot", None)
+                if callable(save_snapshot):
+                    try:
+                        save_snapshot(snapshot)
+                    except Exception:
+                        logger.debug("[HardTruncate] save_precompact_snapshot failed", exc_info=True)
+        protected_truncated_idx = (
+            protected_media_idx - drop_until if protected_media_idx >= drop_until else -1
+        )
         if dropped_messages:
             logger.warning(f"[HardTruncate] Dropped {len(dropped_messages)} earliest messages")
 
@@ -1305,7 +1518,11 @@ class ContextManager:
                         ),
                     }
                 elif isinstance(content, list):
-                    new_content = self._hard_truncate_content_blocks(content, max_chars_per_msg)
+                    new_content = self._hard_truncate_content_blocks(
+                        content,
+                        max_chars_per_msg,
+                        preserve_media=i == protected_truncated_idx,
+                    )
                     truncated[i] = {**msg, "content": new_content}
 
         truncated.insert(
@@ -1324,6 +1541,57 @@ class ContextManager:
             f"(hard_limit={hard_limit}, messages={len(truncated)})"
         )
         return self._strip_oversized_payload(truncated, overhead_bytes=overhead_bytes)
+
+    @staticmethod
+    def _build_precompact_snapshot(
+        dropped_messages: list[dict],
+        memory_manager: object | None = None,
+        *,
+        max_facts: int = 12,
+    ) -> dict:
+        """Extract high-confidence facts before hard truncation drops messages."""
+        import re
+        import time
+
+        signal_words = (
+            "必须",
+            "不要",
+            "记住",
+            "偏好",
+            "决定",
+            "方案",
+            "todo",
+            "待办",
+            "文件",
+            "路径",
+            "实现",
+            "always",
+            "never",
+            "must",
+        )
+        facts: list[str] = []
+        path_re = re.compile(r"(?:[A-Za-z]:[\\/][^\s\"'<>|]+|[\w./\\-]+\.(?:py|ts|tsx|js|md|json|yaml|toml))")
+        for msg in dropped_messages:
+            if msg.get("role") not in ("user", "assistant"):
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            text = re.sub(r"\s+", " ", content).strip()
+            if not text:
+                continue
+            paths = path_re.findall(text)
+            if any(word in text for word in signal_words) or paths:
+                fact = text[:220]
+                if fact not in facts:
+                    facts.append(fact)
+            if len(facts) >= max_facts:
+                break
+        return {
+            "session_id": getattr(memory_manager, "_current_session_id", "") if memory_manager else "",
+            "created_at": time.time(),
+            "facts": facts,
+        }
 
     def _strip_oversized_payload(
         self,
@@ -1353,6 +1621,7 @@ class ContextManager:
             f"> {effective_limit} limit (overhead={overhead_bytes}). "
             f"Stripping media from history."
         )
+        protected_media_idx = self._current_turn_media_message_index(messages)
         result = list(messages)
         budget_per_msg = effective_limit // max(len(result), 1)
         for i, msg in enumerate(result):
@@ -1360,8 +1629,32 @@ class ContextManager:
             if isinstance(content, list):
                 result[i] = {
                     **msg,
-                    "content": self._hard_truncate_content_blocks(content, budget_per_msg),
+                    "content": self._hard_truncate_content_blocks(
+                        content,
+                        budget_per_msg,
+                        preserve_media=i == protected_media_idx,
+                    ),
                 }
+        if self._payload_size_bytes(result) <= effective_limit:
+            return result
+
+        if protected_media_idx >= 0:
+            msg = result[protected_media_idx]
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                result[protected_media_idx] = {
+                    **msg,
+                    "content": self._hard_truncate_content_blocks(
+                        content,
+                        budget_per_msg,
+                        preserve_media=False,
+                        current_turn_notice=True,
+                    ),
+                }
+                logger.warning(
+                    "[PayloadGuard] Current-turn media exceeds payload budget; "
+                    "replaced with explicit size notice"
+                )
         return result
 
     _MEDIA_BLOCK_TYPES = frozenset(
@@ -1376,10 +1669,57 @@ class ContextManager:
     )
 
     @classmethod
+    def _has_media_blocks(cls, content: object) -> bool:
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(item, dict) and item.get("type", "") in cls._MEDIA_BLOCK_TYPES
+            for item in content
+        )
+
+    @classmethod
+    def _current_turn_media_message_index(cls, messages: list[dict]) -> int:
+        """Return the current user turn when it directly carries media."""
+        if not messages:
+            return -1
+        i = len(messages) - 1
+        msg = messages[i]
+        if msg.get("role") == "user" and cls._has_media_blocks(msg.get("content")):
+            return i
+        return -1
+
+    @staticmethod
+    def _payload_size_bytes(messages: list[dict]) -> int:
+        return sum(
+            len(json.dumps(msg, ensure_ascii=False, default=str).encode("utf-8"))
+            for msg in messages
+        )
+
+    @staticmethod
+    def _media_removed_notice(item_type: str, *, current_turn_notice: bool = False) -> str:
+        label = {
+            "image": "图片",
+            "image_url": "图片",
+            "video": "视频",
+            "video_url": "视频",
+            "audio": "音频",
+            "input_audio": "音频",
+        }.get(item_type, "媒体")
+        if current_turn_notice:
+            return (
+                f"[本轮{label}内容过大，已无法随当前请求发送。"
+                f"请压缩{label}后重新上传，或改用更小尺寸文件。]"
+            )
+        return f"[{label}内容已移除以节省上下文空间]"
+
+    @classmethod
     def _hard_truncate_content_blocks(
         cls,
         content: list,
         max_chars: int,
+        *,
+        preserve_media: bool = False,
+        current_turn_notice: bool = False,
     ) -> list:
         """截断 content block 列表中的大型内容（图片/视频/大文本等）。"""
         new_content: list = []
@@ -1391,18 +1731,16 @@ class ContextManager:
             item_type = item.get("type", "")
 
             if item_type in cls._MEDIA_BLOCK_TYPES:
-                label = {
-                    "image": "图片",
-                    "image_url": "图片",
-                    "video": "视频",
-                    "video_url": "视频",
-                    "audio": "音频",
-                    "input_audio": "音频",
-                }.get(item_type, "媒体")
+                if preserve_media:
+                    new_content.append(item)
+                    continue
                 new_content.append(
                     {
                         "type": "text",
-                        "text": f"[{label}内容已移除以节省上下文空间]",
+                        "text": cls._media_removed_notice(
+                            item_type,
+                            current_turn_notice=current_turn_notice,
+                        ),
                     }
                 )
                 logger.warning(f"[HardTruncate] Stripped {item_type} block to free context")

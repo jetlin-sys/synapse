@@ -297,7 +297,7 @@ class Judge:
     "score": 0-1 的置信度
 }}"""
 
-        response = await self.brain.think(prompt, usage_scene="llm_judge")
+        response = await self.brain.think(prompt)
 
         import json
 
@@ -320,3 +320,4 @@ class Judge:
                 reason="Failed to parse LLM response",
                 score=0.0,
             )
+
