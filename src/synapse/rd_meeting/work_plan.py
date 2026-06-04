@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from synapse.rd_meeting.binding import resolve_node_binding
+from synapse.rd_meeting.collaboration import collaboration_worker_ids
 from synapse.rd_meeting.dev_status import load_dev_status
 from synapse.rd_meeting.live import parse_rd_meeting_session, scope_id_for_room_id
 from synapse.rd_meeting.participants import resolve_profile_display_name
@@ -173,9 +174,14 @@ def submit_work_plan(
         raise ValueError("已开始委派协作智能体，不可再修改工作安排计划")
 
     binding = resolve_node_binding(node_id, scope_id=scope_id)
-    workers = [str(w).strip() for w in (binding.get("worker_profile_ids") or []) if str(w).strip()]
     host_id = str(binding.get("host_profile_id") or "default")
+    workers = collaboration_worker_ids(host_id, binding.get("worker_profile_ids"))
     normalized = _normalize_items(items)
+    if not workers:
+        raise ValueError(
+            "本场无协作智能体，无需 submit_meeting_work_plan；"
+            "请直接按 SKILL / 工具完成本节点，勿调用 delegate_to_agent / delegate_parallel"
+        )
     validate_work_plan_items(normalized, allowed_worker_ids=workers, host_profile_id=host_id)
 
     plan = build_plan_document(goal_summary=goal_summary, items=normalized, node_id=node_id)
@@ -230,6 +236,10 @@ def check_delegation_allowed(
         return "❌ 无法解析研发会议室上下文，委派已阻止"
 
     scope_id = ctx["scope_id"]
+    binding = resolve_node_binding(ctx["node_id"], scope_id=scope_id)
+    host_id = str(binding.get("host_profile_id") or "default")
+    if not collaboration_worker_ids(host_id, binding.get("worker_profile_ids")):
+        return None
     plan = get_work_plan(scope_id)
     if plan is None:
         return (

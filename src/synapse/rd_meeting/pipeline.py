@@ -987,6 +987,8 @@ def clear_room_state_for_node_reprocess(scope_id: str, node_id: str) -> dict[str
         "pending_host_llm_begin_kind",
         "stopped_at",
         "stopped_reason",
+        "solution_review_blocked",
+        "escalate_reason",
     ):
         rs.pop(key, None)
 

@@ -306,10 +306,162 @@ export interface MeetingRoomLivePayload {
   skipped_node_ids?: string[];
   participants?: MeetingRoomParticipantWire[];
   intervention_kind?: string;
+  /** 中栏面板：solution_review | node_review | hitl */
+  intervention_panel?: string | null;
   hitl_form_schema?: HitlFormSchema;
   hitl_locked?: boolean;
   hitl_submission?: { values?: Record<string, unknown>; submitted_at?: string; locked?: boolean };
-  pending_delivery?: { report_body?: string; await_confirm?: boolean };
+  pending_delivery?: {
+    report_body?: string;
+    await_confirm?: boolean;
+    solution_review_payload?: SolutionReviewPayload;
+  };
+  solution_review_blocked?: boolean;
+}
+
+// ─── 方案评审面板 ──────────────────────────────────────
+
+export interface SolutionReviewSuggestion {
+  severity?: string;
+  dimension?: string;
+  title?: string;
+  detail?: string;
+  evidence_refs?: string[];
+}
+
+export interface SolutionReviewWhaleReview {
+  score?: number;
+  score_breakdown?: Record<string, number>;
+  verdict?: string;
+  summary_markdown?: string;
+  suggestions?: SolutionReviewSuggestion[];
+}
+
+export interface SolutionReviewRepoRow {
+  branch_version_id?: string;
+  repo_url?: string;
+  change_summary?: string;
+  product_module_name?: string;
+  branch_version_name?: string;
+}
+
+export interface SolutionReviewImpactAssessment {
+  performance?: Record<string, string>[];
+  functional?: Record<string, string>[];
+  config?: Record<string, string>[];
+  upgrade_risk?: Record<string, string>[];
+  security?: Record<string, string>[];
+  compatibility?: Record<string, string>[];
+  ui_ue?: Record<string, string>[];
+}
+
+export interface SolutionReviewArtifactInput {
+  node_id: string;
+  node_name?: string;
+  artifact: string;
+  relative_path?: string;
+  file_exists?: boolean;
+  included?: boolean;
+}
+
+export interface SplitTaskDraft {
+  taskNo?: string;
+  taskTitle?: string;
+  comments?: string;
+  productModuleName?: string;
+  branchVersionName?: string;
+  patchName?: string;
+  taskImpactDesc?: string;
+  performanceImpact?: string;
+  functionalImpact?: string;
+  cfgChangeDescription?: string;
+  upgradeRisk?: string;
+  securityImpact?: string;
+  compatibilityImpact?: string;
+  branch_version_id?: string;
+}
+
+export interface SolutionReviewHumanReview {
+  status?: 'pending' | 'approved' | 'rejected';
+  comment?: string;
+  decided_at?: string | null;
+}
+
+export interface SolutionReviewPayload {
+  schema_version?: number;
+  demand_no?: string;
+  requirement_name?: string;
+  reviewed_at?: string;
+  inputs?: { stage2_artifacts?: SolutionReviewArtifactInput[] };
+  whale_review?: SolutionReviewWhaleReview;
+  func_solution_parsed?: {
+    repos?: SolutionReviewRepoRow[];
+    impact_assessment?: SolutionReviewImpactAssessment;
+  };
+  split_tasks_draft?: SplitTaskDraft[];
+  human_review?: SolutionReviewHumanReview;
+}
+
+export interface SolutionReviewGetResponse {
+  room_id: string;
+  scope_id: string;
+  payload: SolutionReviewPayload;
+  intervention_kind?: string;
+  blocked?: boolean;
+}
+
+export interface PatchVersionItem {
+  patchName?: string;
+  state?: string;
+  closingDate?: string;
+}
+
+export async function fetchSolutionReview(
+  synapseApiBase: string,
+  roomId: string,
+): Promise<SolutionReviewGetResponse> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  return apiGet<SolutionReviewGetResponse>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/solution-review`,
+  );
+}
+
+export async function fetchPatchVersions(
+  synapseApiBase: string,
+  roomId: string,
+  branchVersionIdList: string[],
+): Promise<{ patches?: PatchVersionItem[] }> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  return apiPost<{ patches?: PatchVersionItem[] }>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/patch-versions`,
+    { branch_version_id_list: branchVersionIdList },
+  );
+}
+
+export interface SolutionReviewDecisionResult {
+  status: string;
+  node_id?: string;
+  solution_review_payload?: SolutionReviewPayload;
+  next_node_id?: string | null;
+}
+
+export async function submitSolutionReviewDecision(
+  synapseApiBase: string,
+  roomId: string,
+  body: {
+    decision: 'approve' | 'reject';
+    comment: string;
+    patches?: { branch_version_id: string; patch_name: string }[];
+  },
+): Promise<SolutionReviewDecisionResult> {
+  const base = synapseApiBase.replace(/\/$/, '');
+  return apiPost<SolutionReviewDecisionResult>(
+    base,
+    `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/solution-review/decision`,
+    body,
+  );
 }
 
 export async function fetchMeetingRoomLive(

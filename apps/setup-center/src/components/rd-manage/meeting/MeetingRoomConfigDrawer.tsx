@@ -23,6 +23,10 @@ import type { MeetingRoomNodeBinding } from '../../../api/meetingRoomService';
 import { toast } from 'sonner';
 import { NODE_TYPE_LABEL, SOP_STAGES, type NodeType, type SOPNode } from '../../../rd-sop/constants';
 import {
+  effectiveHumanConfirmByType,
+  humanConfirmSwitchVisible,
+} from './meetingInterventionPanel';
+import {
   fetchLlmEndpointsCatalog,
   type LlmEndpointCatalogItem,
 } from '@/api/rdUnifiedService';
@@ -244,9 +248,12 @@ function effectiveHumanConfirm(
   ov: MeetingRoomNodeOverride,
   binding?: MeetingRoomNodeBinding,
 ): boolean {
-  if (binding?.type === 'system') return false;
-  if (ov.human_confirm !== undefined && ov.human_confirm !== null) return Boolean(ov.human_confirm);
-  return Boolean(binding?.human_confirm ?? binding?.default_human_confirm);
+  const nodeType = (binding?.type ?? 'ai') as NodeType;
+  return effectiveHumanConfirmByType(
+    nodeType,
+    ov.human_confirm,
+    binding?.human_confirm ?? binding?.default_human_confirm,
+  );
 }
 
 function normalizeOverridesForSave(
@@ -266,7 +273,13 @@ function normalizeOverridesForSave(
     if (Array.isArray(workers)) {
       entry.worker_profile_ids = workers.filter((id) => id !== HOST_PROFILE_ID);
     }
-    if (ov.human_confirm !== undefined && b?.type !== 'system') entry.human_confirm = ov.human_confirm;
+    if (
+      ov.human_confirm !== undefined &&
+      b?.type !== 'system' &&
+      humanConfirmSwitchVisible(b?.type as NodeType)
+    ) {
+      entry.human_confirm = ov.human_confirm;
+    }
     if (ov.hitl_form_schema && b?.type !== 'system') entry.hitl_form_schema = ov.hitl_form_schema;
     out[nodeId] = entry;
   }
@@ -386,7 +399,9 @@ export const MeetingRoomConfigDrawer: React.FC<{
 
   const defaultNodeIntent = binding?.default_node_intent ?? binding?.intent ?? '';
   const meetingGoal = effectiveNodeIntent(override, binding);
+  const nodeType = (binding?.type ?? 'ai') as NodeType;
   const humanConfirm = effectiveHumanConfirm(override, binding);
+  const showHumanConfirmSwitch = humanConfirmSwitchVisible(nodeType);
   const isSystemNode = binding?.type === 'system';
   const nodeOutputs = binding?.node_outputs ?? [];
 
@@ -534,11 +549,11 @@ export const MeetingRoomConfigDrawer: React.FC<{
     const typeMeta = nodeTypeNavMeta(node.type);
     const TypeIcon = typeMeta.Icon;
     const b = bindingByNodeId.get(node.id);
-    const humanConfirm =
-      config?.node_overrides?.[node.id]?.human_confirm ??
-      b?.human_confirm ??
-      b?.default_human_confirm ??
-      false;
+    const humanConfirm = effectiveHumanConfirmByType(
+      node.type,
+      config?.node_overrides?.[node.id]?.human_confirm,
+      b?.human_confirm ?? b?.default_human_confirm,
+    );
 
     return (
       <button
@@ -857,21 +872,31 @@ export const MeetingRoomConfigDrawer: React.FC<{
                         <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
                         人工确认
                       </label>
-                      <MeetingConfigSwitch
-                        checked={humanConfirm}
-                        disabled={isSystemNode}
-                        onChange={(checked) => patchOverride({ human_confirm: checked })}
-                        tone="emerald"
-                        ariaLabel="人工确认"
-                      />
+                      {showHumanConfirmSwitch ? (
+                        <MeetingConfigSwitch
+                          checked={humanConfirm}
+                          disabled={isSystemNode}
+                          onChange={(checked) => patchOverride({ human_confirm: checked })}
+                          tone="emerald"
+                          ariaLabel="人工确认"
+                        />
+                      ) : (
+                        <Tag className="m-0 text-[10px] border-border/50">
+                          {nodeType === 'ai_human' ? '协同·默认开启' : nodeType === 'ai' ? 'AI·默认关闭' : '固定'}
+                        </Tag>
+                      )}
                     </div>
                     <ConfigFieldBox className={humanConfirm ? 'border-emerald-500/20' : ''}>
                       <p className="text-[11px] text-muted-foreground leading-relaxed mb-0">
                         {isSystemNode
                           ? '系统节点固定为自动推进，不支持人工确认。'
-                          : humanConfirm
-                            ? '节点完成后需填写确认表单，小鲸收到结构化结果后再推进下一节点。'
-                            : '节点完成后自动推进下一 SOP 节点。'}
+                          : nodeType === 'ai_human'
+                            ? '协同节点固定开启人工确认，完成后使用节点专用面板（如方案评审），不可在此开关。'
+                            : nodeType === 'ai'
+                              ? 'AI 节点固定自动推进，不展示人工确认开关。'
+                              : humanConfirm
+                                ? '节点完成后需填写 HITL 确认表单，小鲸收到结构化结果后再推进下一节点。'
+                                : '节点完成后自动推进下一 SOP 节点。'}
                       </p>
                     </ConfigFieldBox>
                   </div>

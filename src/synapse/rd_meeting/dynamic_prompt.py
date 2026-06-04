@@ -235,8 +235,16 @@ def build_dynamic_meeting_context(
     return "\n".join(parts).strip()
 
 
-def build_meeting_user_turn_prompt() -> str:
+def build_meeting_user_turn_prompt(*, has_collaborators: bool = True) -> str:
     """主控首轮 user 消息：仅触发执行，上下文已在 SKILL 动态段。"""
+    if has_collaborators:
+        return (
+            "请严格参考系统提示词中的各项内容，按照会议室流程与规则开始本 SOP 节点工作，"
+            "委派的所有任务不应该随机生成，必须围绕上下文(工单内容、用户反馈内容、协作智能体反馈内容)处理。"
+            "需要注意，先 `submit_meeting_work_plan`，再按能力边界委派协作智能体。"
+        )
     return (
-        "请严格参考系统提示词中的各项内容，按照会议室流程与规则开始本 SOP 节点工作，委派的所有任务不应该随机生成，必须围绕上下文(工单内容、用户反馈内容、协作智能体反馈内容)处理。需要注意，先 `submit_meeting_work_plan`，再按能力边界委派协作智能体。"
+        "请严格参考系统提示词中的各项内容，按照会议室流程与规则开始本 SOP 节点工作。"
+        "本场无协作智能体，由你独立完成：无需 `submit_meeting_work_plan`，勿 `delegate_*`，"
+        "直接按 SKILL 与会议产出清单执行。"
     )

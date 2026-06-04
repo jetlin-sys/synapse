@@ -27,8 +27,9 @@ import {
 import { consumeMeetingRoomFocus } from '../../../rd-meeting/focus';
 import { MeetingRoomConfigDrawer } from './MeetingRoomConfigDrawer';
 import { MeetingHitlForm, type HitlFormSchema } from './MeetingHitlForm';
+import { SolutionReviewPanel } from './SolutionReviewPanel';
 import { NodeReviewPanel } from './NodeReviewPanel';
-import type { NodeReviewPayload } from '../../../api/meetingRoomService';
+import type { NodeReviewPayload, SolutionReviewPayload } from '../../../api/meetingRoomService';
 import {
   MeetingAgentContextDrawer,
   type AgentContextTarget,
@@ -45,6 +46,11 @@ import {
   type SOPStage,
 } from '../../../rd-sop/constants';
 import { MeetingNodeDetailPanel, type MeetingNodeVisualState } from './panels/MeetingNodeDetailPanel';
+import {
+  effectiveHumanConfirmByType,
+  resolveMeetingInterventionPanel,
+  type InterventionPanelKind,
+} from './meetingInterventionPanel';
 import { MeetingChatEmpty, MeetingChatMessage } from './MeetingChatMessage';
 import {
   HOST_PROFILE_ID,
@@ -137,6 +143,10 @@ interface MeetingRoom {
   hitlFormSchema?: HitlFormSchema | null;
   hitlPendingSummary?: string | null;
   reviewPayload?: NodeReviewPayload | null;
+  interventionKind?: string | null;
+  interventionPanel?: InterventionPanelKind | string | null;
+  solutionReviewPayload?: SolutionReviewPayload | null;
+  solutionReviewBlocked?: boolean;
   hitlLocked?: boolean;
   hitlSubmission?: { values?: Record<string, unknown>; submitted_at?: string } | null;
   participants?: MeetingRoomParticipantWire[];
@@ -366,6 +376,19 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
     reviewPayload:
       ((live.pending_delivery as { review_payload?: NodeReviewPayload } | undefined)
         ?.review_payload as NodeReviewPayload | undefined) ?? room.reviewPayload ?? null,
+    interventionKind: live.intervention_kind ?? room.interventionKind ?? null,
+    interventionPanel:
+      (live.intervention_panel as InterventionPanelKind | undefined) ??
+      room.interventionPanel ??
+      null,
+    solutionReviewPayload:
+      ((live.pending_delivery as { solution_review_payload?: SolutionReviewPayload } | undefined)
+        ?.solution_review_payload as SolutionReviewPayload | undefined) ??
+      room.solutionReviewPayload ??
+      null,
+    solutionReviewBlocked: Boolean(
+      live.solution_review_blocked ?? room.solutionReviewBlocked,
+    ),
     brief: live.phase ? `${nextBrief.split(' · ')[0] || nextBrief} · ${live.phase}` : nextBrief,
     chatSopKey: nextSopKey,
     participants: live.participants?.length ? live.participants : room.participants,
@@ -446,6 +469,12 @@ function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
     reviewPayload:
       ((item.room_state?.pending_delivery as { review_payload?: NodeReviewPayload } | undefined)
         ?.review_payload as NodeReviewPayload | undefined) ?? null,
+    interventionKind: (item.room_state?.intervention_kind as string | undefined) ?? null,
+    interventionPanel: null,
+    solutionReviewPayload:
+      ((item.room_state?.pending_delivery as { solution_review_payload?: SolutionReviewPayload })
+        ?.solution_review_payload as SolutionReviewPayload | undefined) ?? null,
+    solutionReviewBlocked: Boolean(item.room_state?.solution_review_blocked),
     participants: item.participants,
     scopeType: item.scope_type,
     scopeId: item.scope_id,
@@ -1255,33 +1284,42 @@ const InterventionDialog = ({
   const isViewingHitlNode = Boolean(hitlTargetNodeId && chatNodeId === hitlTargetNodeId);
 
   const hitlLocked = Boolean(room?.hitlLocked);
-  const hasReviewPayload = !!(room?.reviewPayload && room.status === 'human_intervention' && !hitlLocked);
-  const hitlAvailable = !!(
-    (room?.hitlFormSchema || hasReviewPayload) &&
-    room?.status === 'human_intervention' &&
-    !hitlLocked &&
-    isViewingHitlNode
+  const hitlNodeType = useMemo((): NodeType => {
+    const nid = hitlTargetNodeId || room?.currentNode || '';
+    return (ALL_NODES.find((n) => n.id === nid)?.type ?? 'ai') as NodeType;
+  }, [hitlTargetNodeId, room?.currentNode]);
+  const interventionPanel = useMemo(
+    () =>
+      room
+        ? resolveMeetingInterventionPanel(room, hitlNodeType, hitlTargetNodeId)
+        : null,
+    [room, hitlNodeType, hitlTargetNodeId],
   );
-  const hitlKind = (room?.hitlFormSchema as { summary_kind?: string; intervention_kind?: string } | undefined)
-    ?? (hasReviewPayload ? { intervention_kind: 'result_confirm' as const } : undefined);
+  const hitlAvailable = Boolean(
+    interventionPanel &&
+      room?.status === 'human_intervention' &&
+      !hitlLocked &&
+      isViewingHitlNode,
+  );
   const hitlBadgeText = useMemo(() => {
-    const k = (hitlKind?.summary_kind || hitlKind?.intervention_kind || '').toLowerCase();
+    if (interventionPanel === 'solution_review') return '方案评审';
+    if (interventionPanel === 'node_review') return '结果待确认';
+    const k = (room?.interventionKind || '').toLowerCase();
     if (k === 'exception') return '异常待裁决';
-    if (k === 'result_confirm') return '结果待确认';
     if (k === 'interactive') return '澄清待回复';
     return '待人工确认';
-  }, [hitlKind]);
+  }, [interventionPanel, room?.interventionKind]);
 
   const hitlFocusKey = useMemo(() => {
     if (!hitlAvailable || !room) return null;
     const schema = room.hitlFormSchema as { title?: string; questions?: unknown[] } | null | undefined;
     const schemaSig = schema
       ? `${schema.title ?? ''}:${schema.questions?.length ?? 0}`
-      : hasReviewPayload
-        ? `review:${room.reviewPayload?.node_id ?? room.currentNode}`
+      : interventionPanel
+        ? `${interventionPanel}:${room.reviewPayload?.node_id ?? room.currentNode}`
         : 'hitl';
     return `${room.id}:${room.currentNode}:${schemaSig}`;
-  }, [hitlAvailable, room, hasReviewPayload]);
+  }, [hitlAvailable, room, interventionPanel]);
 
   const displayChatLogs = useMemo(
     () => (room ? filterLogsForNodeExact(room.allChatLogs ?? room.logs, chatNodeId) : []),
@@ -1722,7 +1760,18 @@ const InterventionDialog = ({
 
           {/* Tab Body */}
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-            {centerTab === 'hitl' && hitlAvailable && (hitlKind?.intervention_kind === 'result_confirm' || (hasReviewPayload && !room.hitlFormSchema)) ? (
+            {centerTab === 'hitl' && hitlAvailable && interventionPanel === 'solution_review' ? (
+              <div className="min-h-0 flex-1 overflow-hidden">
+                <SolutionReviewPanel
+                  synapseApiBase={synapseApiBase || ''}
+                  roomId={room.id}
+                  scopeId={room.scopeId}
+                  initialPayload={room.solutionReviewPayload ?? null}
+                  blocked={room.solutionReviewBlocked}
+                  onDecided={() => setCenterTab('detail')}
+                />
+              </div>
+            ) : centerTab === 'hitl' && hitlAvailable && interventionPanel === 'node_review' ? (
               <div className="min-h-0 flex-1 overflow-hidden">
                 <NodeReviewPanel
                   synapseApiBase={synapseApiBase || ''}
@@ -1732,7 +1781,7 @@ const InterventionDialog = ({
                   onDecided={() => setCenterTab('detail')}
                 />
               </div>
-            ) : centerTab === 'hitl' && hitlAvailable && room.hitlFormSchema ? (
+            ) : centerTab === 'hitl' && hitlAvailable && interventionPanel === 'hitl' && room.hitlFormSchema ? (
               <div className="h-full min-h-0 overflow-y-auto custom-scrollbar bg-[color:var(--panel)] p-6">
                 <div className="max-w-[920px] mx-auto">
                   <MeetingHitlForm
@@ -1743,12 +1792,7 @@ const InterventionDialog = ({
                       room.hitlFormSchema.summary_markdown ??
                       undefined
                     }
-                    submitLabel={
-                      hitlKind?.summary_kind === 'result_confirm' ||
-                      hitlKind?.intervention_kind === 'result_confirm'
-                        ? '确认并归档推进'
-                        : '提交并继续处理'
-                    }
+                    submitLabel="提交并继续处理"
                     onSubmit={(values) => {
                       setCenterTab('detail');
                       const summary = Object.entries(values)

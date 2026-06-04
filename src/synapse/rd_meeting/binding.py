@@ -17,6 +17,7 @@ from synapse.rd_sop.manifest import (
     is_system_node,
     node_output_artifacts,
 )
+from synapse.rd_sop.manifest import NODE_TYPES as SOP_NODE_TYPES
 from synapse.rd_sop.nodes import node_display_name
 
 
@@ -33,9 +34,22 @@ def _coerce_enabled(value: Any) -> bool:
     return bool(value)
 
 
-def _coerce_human_confirm(value: Any, *, node_id: str) -> bool:
+def _human_confirm_for_node_type(node_type: str, *, node_id: str) -> bool | None:
+    """按 SOP 节点类型固定人工确认；返回 None 表示可走配置覆盖。"""
     if is_system_node(node_id):
         return False
+    t = (node_type or "").strip()
+    if t == "ai":
+        return False
+    if t == "ai_human":
+        return True
+    return None
+
+
+def _coerce_human_confirm(value: Any, *, node_id: str, node_type: str = "") -> bool:
+    fixed = _human_confirm_for_node_type(node_type, node_id=node_id)
+    if fixed is not None:
+        return fixed
     if value is None:
         return default_human_confirm(node_id)
     if isinstance(value, bool):
@@ -96,9 +110,11 @@ def resolve_node_binding(
     entry = get_node_manifest_entry(node_id)
     if entry is None:
         node_intent, default_node_intent = resolve_node_intent(node_id, node_override=override)
+        node_type = "ai"
         human_confirm = _coerce_human_confirm(
             override.get("human_confirm") if "human_confirm" in override else None,
             node_id=node_id,
+            node_type=node_type,
         )
         hitl_schema = resolve_hitl_form_schema(node_id, node_override=override) if human_confirm else None
         return {
@@ -106,7 +122,7 @@ def resolve_node_binding(
             "node_name": node_display_name(node_id),
             "stage_id": 0,
             "stage_name": "",
-            "type": "ai",
+            "type": node_type,
             "enabled": enabled,
             "human_confirm": human_confirm,
             "default_human_confirm": default_human_confirm(node_id),
@@ -134,10 +150,11 @@ def resolve_node_binding(
     ).strip() or worker_llm_endpoint
     merged["llm_endpoint_key"] = node_worker_endpoint
 
-    node_type = str(entry.get("type") or "ai")
+    node_type = str(entry.get("type") or SOP_NODE_TYPES.get(node_id, "ai"))
     human_confirm = _coerce_human_confirm(
         merged.get("human_confirm") if "human_confirm" in merged else None,
         node_id=node_id,
+        node_type=node_type,
     )
     if is_system_node(node_id):
         human_confirm = False

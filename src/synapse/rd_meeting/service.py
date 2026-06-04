@@ -127,6 +127,24 @@ class MeetingRoomService:
     def resolve_binding(self, node_id: str) -> dict[str, Any]:
         return resolve_node_binding(node_id)
 
+    @staticmethod
+    def _resolve_intervention_panel(room_state: dict[str, Any]) -> str | None:
+        from synapse.rd_meeting.intervention_panel import resolve_intervention_panel
+
+        if not isinstance(room_state, dict):
+            return None
+        pending = room_state.get("pending_delivery")
+        node_id = str(room_state.get("current_node_id") or "").strip()
+        if not node_id and isinstance(pending, dict):
+            node_id = str(pending.get("node_id") or "").strip()
+        schema = room_state.get("hitl_form_schema")
+        return resolve_intervention_panel(
+            node_id=node_id,
+            intervention_kind=str(room_state.get("intervention_kind") or "") or None,
+            hitl_form_schema=schema if isinstance(schema, dict) else None,
+            pending_delivery=pending if isinstance(pending, dict) else None,
+        )
+
     async def run_current_node_sync(
         self,
         room_id: str,
@@ -280,10 +298,12 @@ class MeetingRoomService:
             "recent_history": history,
             "recent_chat": history_to_chat_logs(history),
             "intervention_kind": room_state.get("intervention_kind"),
+            "intervention_panel": self._resolve_intervention_panel(room_state),
             "hitl_form_schema": room_state.get("hitl_form_schema"),
             "hitl_locked": bool(room_state.get("hitl_locked")),
             "hitl_submission": room_state.get("hitl_submission"),
             "pending_delivery": room_state.get("pending_delivery"),
+            "solution_review_blocked": bool(room_state.get("solution_review_blocked")),
             "skipped_node_ids": extract_skipped_node_ids(all_history),
         }
 
@@ -771,9 +791,14 @@ class MeetingRoomService:
             },
         )
 
+        if rs.get("solution_review_blocked") and resume_run:
+            raise ValueError("solution_review_blocked")
+
         effective_resume = resume_run
         if message_type == "instruction":
-            if str(rs.get("status") or "") == "human_intervention":
+            if str(rs.get("status") or "") == "human_intervention" and not rs.get(
+                "solution_review_blocked"
+            ):
                 effective_resume = True
                 rs["status"] = "processing"
                 save_room_state(scope_id, rs)

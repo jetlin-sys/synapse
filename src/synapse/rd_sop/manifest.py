@@ -131,10 +131,14 @@ def default_human_confirm(node_id: str) -> bool:
     if is_system_node(node_id):
         return False
     t = NODE_TYPES.get(node_id, "")
-    if t in ("human", "human_start", "ai_human", "human_multi"):
+    if t == "ai_human":
+        return True
+    if t in ("human", "human_start", "human_multi"):
         return True
     if t == "ai_exception":
         return True
+    if t == "ai":
+        return False
     return False
 
 
@@ -156,7 +160,7 @@ NODE_OUTPUTS: dict[str, list[str]] = {
     "module_confirm": ["模块范围确认.md"],
     "func_solution": ["函数级方案.md"],
     "entropy_gen": ["agent.md", "rule.md", "控熵文件包"],
-    "solution_review": ["方案评审结论.md"],
+    "solution_review": ["方案评审结论.md", "solution_review.json"],
     "auto_split": ["研发子单拆分清单.md"],
     "sandbox_build": ["沙箱构建说明.md"],
     "env_pregen": ["环境预生成报告.md"],
@@ -230,10 +234,34 @@ NODE_PRIOR_OUTPUT_RULES: dict[str, list[dict[str, Any]]] = {
     ],
     "solution_review": [
         {
+            "source_node_id": "func_assign",
+            "artifacts": ["功能点分派清单.md"],
+            "use_mode": "llm_judge",
+            "note": "评审须覆盖已开启节点的功能点分派",
+        },
+        {
+            "source_node_id": "history_solution",
+            "artifacts": ["历史方案映射.md"],
+            "use_mode": "flow_required",
+            "note": "方案评审须对照历史方案映射",
+        },
+        {
+            "source_node_id": "module_confirm",
+            "artifacts": ["模块范围确认.md"],
+            "use_mode": "flow_required",
+            "note": "方案评审须对照模块范围确认",
+        },
+        {
             "source_node_id": "func_solution",
             "artifacts": ["函数级方案.md"],
             "use_mode": "flow_required",
             "note": "方案评审须对照函数级方案全文",
+        },
+        {
+            "source_node_id": "entropy_gen",
+            "artifacts": ["agent.md", "rule.md"],
+            "use_mode": "flow_required",
+            "note": "方案评审须对照控熵文件",
         },
     ],
     "unit_test": [

@@ -375,6 +375,15 @@ async def get_node_review(
     if not target_node:
         return error_response(400, "node_id_required")
 
+    from synapse.rd_meeting.solution_review import uses_solution_review_gate
+
+    if uses_solution_review_gate(target_node):
+        return error_response(
+            400,
+            "solution_review_uses_dedicated_panel",
+            "方案评审节点请使用 GET /solution-review，不走 node-review",
+        )
+
     pending_node = str(pending.get("node_id") or "").strip()
     pending_matches = pending_node == target_node or (not pending_node and target_node == current_node)
     is_historical = bool(current_node) and target_node != current_node
@@ -585,4 +594,122 @@ async def submit_review_decision(
         logger.exception("submit_review_decision failed: %s", exc)
         return error_response(500, "review_decision_failed", str(exc))
     return success_response(result)
+
+
+class SolutionReviewPatchRow(BaseModel):
+    branch_version_id: str = Field(..., description="产品分支ID")
+    patch_name: str = Field(..., description="补丁计划名称")
+
+
+class SolutionReviewDecisionBody(BaseModel):
+    decision: Literal["approve", "reject"] = Field(..., description="人工评审：通过 / 不通过")
+    comment: str = Field("", description="人工评审意见")
+    patches: list[SolutionReviewPatchRow] = Field(
+        default_factory=list,
+        description="按产品分支选择的补丁（通过时必填）",
+    )
+
+
+@router.get("/api/dev/meeting-rooms/{room_id}/solution-review")
+async def get_solution_review(room_id: str) -> dict:
+    """读取方案评审结构化 payload（solution_review.json + 需求设计产出列表）。"""
+    resolved = _resolve_scope_for_room(room_id)
+    if resolved is None:
+        return error_response(404, "meeting_room_not_found")
+    sid, _ = resolved
+    from synapse.rd_meeting.room_runtime import extract_skipped_node_ids, read_history
+    from synapse.rd_meeting.solution_review import load_solution_review_payload
+
+    history = read_history(sid, limit=500) or []
+    skipped = extract_skipped_node_ids(history)
+    payload = load_solution_review_payload(sid, skipped_node_ids=skipped)
+    if payload is None:
+        return error_response(404, "solution_review_not_found")
+    room_state = load_room_state(sid) or {}
+    pending = room_state.get("pending_delivery") if isinstance(room_state.get("pending_delivery"), dict) else {}
+    return success_response(
+        {
+            "room_id": room_id,
+            "scope_id": sid,
+            "payload": payload,
+            "intervention_kind": room_state.get("intervention_kind"),
+            "blocked": bool(room_state.get("solution_review_blocked")),
+            "pending_node_id": pending.get("node_id"),
+        }
+    )
+
+
+@router.post("/api/dev/meeting-rooms/{room_id}/solution-review/decision")
+async def submit_solution_review_decision(
+    room_id: str,
+    body: SolutionReviewDecisionBody,
+    request: Request,
+) -> dict:
+    """方案评审裁决：通过与拆单预览一步完成；不通过则落盘并阻断推进（异常门控）。"""
+    resolved = _resolve_scope_for_room(room_id)
+    if resolved is None:
+        return error_response(404, "meeting_room_not_found")
+    sid, scope_type = resolved
+
+    pool = getattr(request.app.state, "agent_pool", None)
+    detail = _service.get_room_detail(room_id) or {}
+    ticket_title = str(detail.get("ticket_title") or "")
+
+    patches = [
+        {"branch_version_id": p.branch_version_id, "patch_name": p.patch_name}
+        for p in (body.patches or [])
+    ]
+    orch = MeetingRoomOrchestrator()
+    try:
+        result = orch.confirm_solution_review_decision(
+            scope_type=scope_type,
+            scope_id=sid,
+            room_id=room_id,
+            decision=body.decision,
+            comment=body.comment or "",
+            patches=patches,
+            ticket_title=ticket_title,
+            agent_pool=pool,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        code = 400
+        if msg.startswith("patch_required"):
+            code = 422
+        return error_response(code, msg)
+    except Exception as exc:
+        logger.exception("submit_solution_review_decision failed: %s", exc)
+        return error_response(500, "solution_review_decision_failed", str(exc))
+    return success_response(result)
+
+
+@router.post("/api/dev/meeting-rooms/{room_id}/patch-versions")
+async def list_patch_versions_for_room(
+    room_id: str,
+    body: dict[str, Any],
+) -> dict:
+    """按产品分支 ID 列表查询补丁计划（userId 由服务端会话填充）。"""
+    resolved = _resolve_scope_for_room(room_id)
+    if resolved is None:
+        return error_response(404, "meeting_room_not_found")
+    branch_ids = body.get("branch_version_id_list") or body.get("branchVersionIdList") or []
+    if not isinstance(branch_ids, list) or not branch_ids:
+        return error_response(400, "branch_version_id_list_required")
+    from synapse.api.routes.dev_iwhalecloud import (
+        GetPatchVersionRequest,
+        _get_patch_version,
+        _load_userinfo_plain,
+    )
+
+    userinfo = _load_userinfo_plain()
+    if not userinfo:
+        return error_response(400, "iwhalecloud_not_logged_in")
+    user_id = userinfo.get("userId")
+    if not user_id:
+        return error_response(400, "userId_missing")
+    req = GetPatchVersionRequest(
+        userId=int(user_id),
+        branchVersionIdList=[str(x) for x in branch_ids],
+    )
+    return await _get_patch_version(req)
 

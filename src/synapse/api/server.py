@@ -317,7 +317,7 @@ def create_app(
         path = request.url.path
         if not path.startswith("/api"):
             return await call_next(request)
-        # 健康检查 / 聊天占用 / 会议室 live 轮询频繁，不打访问日志
+        # 健康检查 / 聊天占用 / 会议室 live·节点详情轮询频繁，不打访问日志
         if (
             path == "/api/health"
             or path.startswith("/api/health/")
@@ -325,7 +325,15 @@ def create_app(
             or path == "/api/logs/service"
             or (
                 path.startswith("/api/dev/meeting-rooms/")
-                and path.endswith("/live")
+                and (
+                    path.endswith("/live")
+                    or path.endswith("/node-review")
+                    or path.endswith("/agent-contexts")
+                )
+            )
+            or (
+                path.startswith("/api/dev/work-orders/")
+                and path.endswith("/meeting-summary")
             )
         ):
             return await call_next(request)

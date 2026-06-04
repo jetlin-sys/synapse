@@ -1337,6 +1337,7 @@ async def _get_patch_version(body: GetPatchVersionRequest) -> dict:
     params = {"page": 1, "limit": 1000}
     headers = _build_get_patch_version_headers(csrf, cookies)
     payload = _build_get_patch_version_payload(body)
+    logger.info("payload:%s", payload)
 
     logger.debug("get_patch_version url:%s, params:%s, payload:%s", url, params, payload)
     try:
@@ -1380,6 +1381,7 @@ async def _get_patch_version(body: GetPatchVersionRequest) -> dict:
                 "closingDate": ap.get("closingDate"),
             }
         )
+
     return success_response({"patches": patches})
 
 

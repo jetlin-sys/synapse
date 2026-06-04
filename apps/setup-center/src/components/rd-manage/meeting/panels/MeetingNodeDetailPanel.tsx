@@ -319,8 +319,11 @@ export function MeetingNodeDetailPanel({
       setError(null);
       try {
         const sid = (scopeId || '').trim();
+        const skipNodeReview = nodeId === 'solution_review';
         const [reviewRes, ctxRes, summaryRes] = await Promise.allSettled([
-          fetchNodeReview(synapseApiBase, roomId, { nodeId, refresh }),
+          skipNodeReview
+            ? Promise.reject(new Error('solution_review_uses_dedicated_panel'))
+            : fetchNodeReview(synapseApiBase, roomId, { nodeId, refresh }),
           fetchMeetingAgentContexts(synapseApiBase, roomId, { messageCharLimit: 0, nodeId }),
           sid
             ? fetchMeetingSummary(synapseApiBase, scopeType, sid)
@@ -329,7 +332,7 @@ export function MeetingNodeDetailPanel({
 
         if (reviewRes.status === 'fulfilled') {
           setReview(reviewRes.value);
-        } else if (nodeState !== 'pending') {
+        } else if (nodeState !== 'pending' && !skipNodeReview) {
           setReview(null);
         }
 

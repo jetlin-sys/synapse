@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from synapse.rd_meeting.binding import resolve_node_binding
+from synapse.rd_meeting.collaboration import has_collaboration_workers
 from synapse.rd_meeting.dev_status import load_dev_status
 from synapse.rd_meeting.dynamic_prompt import build_dynamic_meeting_context, build_meeting_user_turn_prompt
 from synapse.rd_meeting.init_context import build_node_init_log_data
@@ -64,7 +65,7 @@ def assemble_host_prompt_bundle(
         binding=bind,
         sop_node_display=sop_display,
     )
-    user_prompt = build_meeting_user_turn_prompt()
+    user_prompt = build_meeting_user_turn_prompt(has_collaborators=has_collaboration_workers(bind))
 
     host_id = str(bind.get("host_profile_id") or "default")
     worker_ids = [

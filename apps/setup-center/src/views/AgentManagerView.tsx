@@ -13,6 +13,8 @@ import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import type { SkillInfo } from "../types";
+import { isWhalecloudDevToolSkill, rdToolDisplayLabel } from "../utils/whalecloudDevToolSkill";
 
 type AgentProfile = {
   id: string;
@@ -38,7 +40,20 @@ type SkillItem = {
   name: string;
   enabled: boolean;
   name_i18n?: Record<string, string> | null;
+  label?: string | null;
+  toolName?: string | null;
+  category?: string | null;
 };
+
+function skillItemDisplayName(skill: SkillItem, lang: string, rdPrefix = ""): string {
+  const asInfo = skill as SkillInfo;
+  if (isWhalecloudDevToolSkill(asInfo)) {
+    const label = rdToolDisplayLabel(asInfo, lang);
+    return rdPrefix ? `${rdPrefix}${label}` : label;
+  }
+  const key = lang.startsWith("zh") ? "zh" : lang;
+  return skill.name_i18n?.[key] || skill.name;
+}
 
 type ModelInfo = {
   name: string;
@@ -298,6 +313,9 @@ export function AgentManagerView({
           name: s.name,
           enabled: s.enabled !== false,
           name_i18n: s.name_i18n || null,
+          label: s.label ?? null,
+          toolName: s.tool_name ?? null,
+          category: s.category ?? null,
         })),
       );
     } catch {
@@ -538,6 +556,23 @@ export function AgentManagerView({
     const ids = new Set(availableSkills.map((s) => s.skillId));
     return editingProfile.skills.filter((id) => !ids.has(id));
   }, [editingProfile.skills_mode, editingProfile.skills, availableSkills]);
+
+  const rdSkillDisplayPrefix = t("agentManager.rdSkillDisplayPrefix", "研发技能-");
+
+  /** 研发技能置顶，同组内按展示名排序 */
+  const sortedAvailableSkills = useMemo(() => {
+    const lang = i18n.language || "zh";
+    const locale = lang.startsWith("zh") ? "zh-CN" : lang;
+    return [...availableSkills].sort((a, b) => {
+      const da = isWhalecloudDevToolSkill(a as SkillInfo) ? 0 : 1;
+      const db = isWhalecloudDevToolSkill(b as SkillInfo) ? 0 : 1;
+      if (da !== db) return da - db;
+      return skillItemDisplayName(a, lang, rdSkillDisplayPrefix).localeCompare(
+        skillItemDisplayName(b, lang, rdSkillDisplayPrefix),
+        locale,
+      );
+    });
+  }, [availableSkills, i18n.language, rdSkillDisplayPrefix]);
 
   const handleVisibility = async (profileId: string, hidden: boolean) => {
     try {
@@ -1214,9 +1249,9 @@ export function AgentManagerView({
             </div>
 
             {/* Skills multi-select */}
-            {editingProfile.skills_mode !== "all" && availableSkills.length > 0 && (
+            {editingProfile.skills_mode !== "all" && sortedAvailableSkills.length > 0 && (
               <div className="max-h-[220px] overflow-y-auto rounded-lg border p-1">
-                {availableSkills.map((skill) => {
+                {sortedAvailableSkills.map((skill) => {
                   const checked = editingProfile.skills.includes(skill.skillId);
                   const showGlobalOff = checked && !skill.enabled;
                   return (
@@ -1230,8 +1265,16 @@ export function AgentManagerView({
                         checked={checked}
                         onCheckedChange={() => toggleSkill(skill.skillId)}
                       />
-                      <span className="flex-1 min-w-0 truncate">
-                        {skill.name_i18n?.[i18n.language?.startsWith("zh") ? "zh" : i18n.language || "zh"] || skill.name}
+                      <span
+                        className="flex-1 min-w-0 truncate"
+                        title={
+                          skill.skillId !==
+                          skillItemDisplayName(skill, i18n.language || "zh", rdSkillDisplayPrefix)
+                            ? skill.skillId
+                            : undefined
+                        }
+                      >
+                        {skillItemDisplayName(skill, i18n.language || "zh", rdSkillDisplayPrefix)}
                       </span>
                       {showGlobalOff && (
                         <Badge

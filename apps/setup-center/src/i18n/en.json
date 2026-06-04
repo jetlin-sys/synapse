@@ -2046,7 +2046,8 @@
     "profileSkillsNotLoadedHint": "These skill IDs are still saved on this agent profile, but they are not in the current global skills list (they may have been disabled and unloaded in Skills). They will not work at runtime. Remove them here or re-enable the skills under Capabilities → Skills.",
     "profileSkillUnavailableTag": "Globally off / unavailable",
     "removeProfileSkill": "Remove from profile",
-    "skillGloballyDisabledTag": "Globally disabled"
+    "skillGloballyDisabledTag": "Globally disabled",
+    "rdSkillDisplayPrefix": "R&D skill - "
   },
   "dashboard": {
     "title": "Agent Dashboard",

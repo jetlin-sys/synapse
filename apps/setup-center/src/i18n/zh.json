@@ -2048,7 +2048,8 @@
     "profileSkillsNotLoadedHint": "以下技能 ID 仍写在本 Agent 人设中，但当前全局技能列表未包含（可能已在技能管理中关闭并卸载），运行时无法使用。可从人设中移除或于「能力 → 技能」重新启用。",
     "profileSkillUnavailableTag": "全局关闭不可用",
     "removeProfileSkill": "从人设移除",
-    "skillGloballyDisabledTag": "全局已关闭"
+    "skillGloballyDisabledTag": "全局已关闭",
+    "rdSkillDisplayPrefix": "研发技能-"
   },
   "dashboard": {
     "title": "Agent 仪表盘",

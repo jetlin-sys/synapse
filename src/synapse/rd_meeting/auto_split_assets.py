@@ -84,6 +84,18 @@ def _fetch_portal_task_nos(demand_no: str) -> tuple[list[str], str]:
     return nos, ""
 
 
+def _load_split_plan_tasks(scope_id: str) -> list[dict[str, Any]]:
+    from synapse.rd_meeting.solution_review import load_split_plan
+
+    plan = load_split_plan(scope_id)
+    if not isinstance(plan, dict):
+        return []
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list):
+        return []
+    return [dict(t) for t in tasks if isinstance(t, dict)]
+
+
 def bootstrap_auto_split(
     scope_type: ScopeType,
     scope_id: str,
@@ -91,10 +103,12 @@ def bootstrap_auto_split(
     """汇总本地 userwork 子单与门户任务列表，生成拆单摘要。"""
     sid = (scope_id or "").strip()
     demand_no = _resolve_demand_no(scope_type, sid)
+    split_plan_tasks = _load_split_plan_tasks(sid)
     result: dict[str, Any] = {
         "scope_type": scope_type,
         "scope_id": sid,
         "demand_no": demand_no,
+        "split_plan_tasks": split_plan_tasks,
         "local_tasks": [],
         "portal_task_nos": [],
         "portal_error": "",
@@ -188,6 +202,21 @@ def format_auto_split_report(assets: dict[str, Any], *, node_name: str) -> str:
             lines.append(f"- 仅门户：{', '.join(only_p)}")
         if only_l:
             lines.append(f"- 仅本地：{', '.join(only_l)}")
+
+    plan_tasks = assets.get("split_plan_tasks") if isinstance(assets.get("split_plan_tasks"), list) else []
+    lines.extend(["", "## 方案评审拆单计划（split_plan.json）", ""])
+    if not plan_tasks:
+        lines.append("（无 — 须先通过方案评审并落盘 split_plan.json）")
+    else:
+        for row in plan_tasks:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"- **{row.get('taskTitle') or '—'}** "
+                f"模块={row.get('productModuleName') or '—'} "
+                f"分支={row.get('branchVersionName') or '—'} "
+                f"补丁={row.get('patchName') or '—'}"
+            )
 
     lines.extend(
         [
