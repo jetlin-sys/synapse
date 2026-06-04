@@ -625,6 +625,9 @@ async def get_solution_review(room_id: str) -> dict:
     payload = load_solution_review_payload(sid, skipped_node_ids=skipped)
     if payload is None:
         return error_response(404, "solution_review_not_found")
+    from synapse.rd_meeting.product_context import project_fields_for_scope
+
+    project_ctx = project_fields_for_scope(sid)
     room_state = load_room_state(sid) or {}
     pending = room_state.get("pending_delivery") if isinstance(room_state.get("pending_delivery"), dict) else {}
     return success_response(
@@ -632,6 +635,8 @@ async def get_solution_review(room_id: str) -> dict:
             "room_id": room_id,
             "scope_id": sid,
             "payload": payload,
+            "project_id": project_ctx.get("project_id") or "",
+            "project_name": project_ctx.get("project_name") or "",
             "intervention_kind": room_state.get("intervention_kind"),
             "blocked": bool(room_state.get("solution_review_blocked")),
             "pending_node_id": pending.get("node_id"),
@@ -707,8 +712,21 @@ async def list_patch_versions_for_room(
     user_id = userinfo.get("userId")
     if not user_id:
         return error_response(400, "userId_missing")
+    from synapse.rd_meeting.product_context import project_id_int_for_scope
+
+    raw_pid = body.get("projectId")
+    if raw_pid is None:
+        raw_pid = body.get("project_id")
+    if raw_pid is not None and str(raw_pid).strip() not in ("", "-1"):
+        try:
+            project_id = int(raw_pid)
+        except (TypeError, ValueError):
+            project_id = project_id_int_for_scope(sid)
+    else:
+        project_id = project_id_int_for_scope(sid)
     req = GetPatchVersionRequest(
         userId=int(user_id),
+        projectId=project_id,
         branchVersionIdList=[str(x) for x in branch_ids],
     )
     return await _get_patch_version(req)

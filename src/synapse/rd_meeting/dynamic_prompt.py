@@ -92,6 +92,12 @@ def _format_section_product(product: dict[str, Any]) -> str:
         lines.append(f"- PROD：`{product['prod']}`")
     if product.get("prod_feature"):
         lines.append(f"- PROD_FEATURE：{product['prod_feature']}")
+    project_id = str(product.get("project_id") or _pipe_id_part(product.get("space")) or "").strip()
+    project_name = str(product.get("project_name") or _pipe_name_part(product.get("space")) or "").strip()
+    if project_name:
+        lines.append(f"- 项目空间名称：{project_name}")
+    if project_id:
+        lines.append(f"- 项目空间 ID：`{project_id}`")
     if product.get("version"):
         lines.append(f"- version：`{product['version']}`")
     repos = product.get("repos")

@@ -406,6 +406,9 @@ export interface SolutionReviewGetResponse {
   room_id: string;
   scope_id: string;
   payload: SolutionReviewPayload;
+  /** 项目空间 ID（来自会议室产品定位，补丁查询必传） */
+  project_id?: string;
+  project_name?: string;
   intervention_kind?: string;
   blocked?: boolean;
 }
@@ -431,12 +434,17 @@ export async function fetchPatchVersions(
   synapseApiBase: string,
   roomId: string,
   branchVersionIdList: string[],
+  projectId?: number | string,
 ): Promise<{ patches?: PatchVersionItem[] }> {
   const base = synapseApiBase.replace(/\/$/, '');
+  const body: Record<string, unknown> = { branch_version_id_list: branchVersionIdList };
+  if (projectId !== undefined && projectId !== null && String(projectId).trim() !== '') {
+    body.projectId = Number(projectId);
+  }
   return apiPost<{ patches?: PatchVersionItem[] }>(
     base,
     `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/patch-versions`,
-    { branch_version_id_list: branchVersionIdList },
+    body,
   );
 }
 

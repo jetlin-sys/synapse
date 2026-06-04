@@ -23,7 +23,7 @@ label: 文档生成工具
 |----------|-------------|------|
 | `templates/需求澄清.md` | `需求澄清.md` | 需求澄清交付文档 |
 | `templates/模块功能.md` | `模块功能.md` | 模块功能清单 |
-| `templates/函数级方案.md` | `函数级方案.md` | 函数级改造方案（由 `whalecloud-dev-tool-function-solution` 汇总正文后调用本技能落盘） |
+| `templates/函数级方案.md` | `函数级方案.md` | 函数级改造方案 |
 
 新增模板：在 `templates/` 下放置 `{文件名}.md`，调用时设 `OUTPUT` 与文件名一致即可。
 
@@ -36,7 +36,7 @@ label: 文档生成工具
 | `OUTPUT_DIR` | 是 | 输出目录，如 `./requirements/` |
 | `OUTPUT` | 是 | 输出文件名，须与 `templates/` 下某模板文件名一致，如 `需求澄清.md` |
 | `TEMPLATE` | 否 | 显式指定模板文件名（相对 `templates/`），默认等于 `OUTPUT` |
-| `CONTEXT_JSON` | 否 | 模板变量 JSON（字符串或 `.json` 文件路径） |
+| `CONTEXT_JSON` | 是 | 模板变量 JSON（字符串） |
 | `CONTEXT_FILES` | 否 | 逗号分隔的上下文文件路径（Markdown / JSON），用于抽取或补充变量 |
 | `STRICT` | 否 | 默认 `false`。为 `true` 时，模板必填占位符未提供则中止 |
 | `OUTPUT_MODE` | 否 | `file`（默认，仅写盘）、`content`（仅输出 Markdown 正文）、`both`（写盘并输出正文） |
@@ -152,7 +152,7 @@ Step 4 — 落盘与输出
 ```
 OUTPUT_DIR: ./requirements/
 OUTPUT: 模块功能.md
-CONTEXT_JSON: ./requirements/.tmp/module_context.json
+CONTEXT_JSON: {}
 PROD: XXX系统
 STATUS: confirmed
 OUTPUT_MODE: file
@@ -163,32 +163,18 @@ OUTPUT_MODE: file
 ```
 OUTPUT_DIR: ./requirements/
 OUTPUT: 需求澄清.md
-CONTEXT_JSON: { "REQUIREMENT_NAME": "索引优先级在线变更", "scenarios": [...], ... }
+CONTEXT_JSON: {}
 OUTPUT_MODE: content
 ```
 
-### 示例 3：OUTPUT 与模板文件名不同
+### 示例 3：函数级方案（上游 function-solution 技能调用）
 
 ```
-OUTPUT_DIR: ./requirements/
-OUTPUT: clarify-final.md
-TEMPLATE: 需求澄清.md
-CONTEXT_JSON: ./requirements/.tmp/clarify_context.json
-```
-
-### 示例 4：函数级方案（上游 function-solution 技能调用）
-
-```
-OUTPUT_DIR: work/21881451/archive/需求分析/function_solution/
+OUTPUT_DIR: ./solution/
 OUTPUT: 函数级方案.md
-CONTEXT_JSON: work/21881451/archive/需求分析/function_solution/.tmp/function_solution_context.json
-PROD: XXX系统
-STATUS: draft
-SCHEME_COUNT: 2
+CONTEXT_JSON: {}
 OUTPUT_MODE: file
 ```
-
-`function_solution_context.json` 中 `DOCUMENT_BODY` 为 §0–§5 完整正文；页眉元数据由模板与标量参数填充。
 
 ---
 

@@ -165,6 +165,69 @@ def _normalize_doc_entry(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _space_id_and_name(space_raw: Any) -> tuple[str, str]:
+    """研发统一服务 ``space`` 字段：`projectId|projectName`。"""
+    v = str(space_raw or "").strip()
+    if not v:
+        return "", ""
+    if "|" in v:
+        pid, pname = v.split("|", 1)
+        pid = pid.strip()
+        pname = (pname.strip() or pid)
+        return pid, pname
+    return v, v
+
+
+def project_id_int_for_scope(scope_id: str) -> int:
+    """从会议室产品缓存解析项目空间 ID；无则返回 -1（与门户默认一致）。"""
+    sid = (scope_id or "").strip()
+    if not sid:
+        return -1
+    product = load_product_session_cache(sid)
+    if not isinstance(product, dict):
+        from synapse.rd_meeting.dev_status import load_dev_status
+        from synapse.rd_meeting.init_context import build_node_init_log_data
+
+        dev = load_dev_status(sid) or {}
+        scope = dev.get("scope") if isinstance(dev.get("scope"), dict) else {}
+        st = str(scope.get("type") or "demand").strip() or "demand"
+        init = build_node_init_log_data(st, sid)  # type: ignore[arg-type]
+        product = init.get("product") if isinstance(init.get("product"), dict) else {}
+    pid = str(product.get("project_id") or "").strip()
+    if not pid:
+        pid, _ = _space_id_and_name(product.get("space"))
+    if not pid:
+        return -1
+    try:
+        return int(pid)
+    except (TypeError, ValueError):
+        return -1
+
+
+def project_fields_for_scope(scope_id: str) -> dict[str, str]:
+    """项目空间 ID / 名称（供 API 与前端补丁查询）。"""
+    sid = (scope_id or "").strip()
+    product = load_product_session_cache(sid) if sid else None
+    if not isinstance(product, dict) and sid:
+        from synapse.rd_meeting.dev_status import load_dev_status
+        from synapse.rd_meeting.init_context import build_node_init_log_data
+
+        dev = load_dev_status(sid) or {}
+        scope = dev.get("scope") if isinstance(dev.get("scope"), dict) else {}
+        st = str(scope.get("type") or "demand").strip() or "demand"
+        init = build_node_init_log_data(st, sid)  # type: ignore[arg-type]
+        product = init.get("product") if isinstance(init.get("product"), dict) else {}
+    if not isinstance(product, dict):
+        return {"project_id": "", "project_name": ""}
+    pid = str(product.get("project_id") or "").strip()
+    pname = str(product.get("project_name") or "").strip()
+    if not pid or not pname:
+        spid, spname = _space_id_and_name(product.get("space"))
+        pid = pid or spid
+        pname = pname or spname
+    return {"project_id": pid, "project_name": pname}
+
+
 def _normalize_product_wire(row: dict[str, Any]) -> dict[str, Any]:
     repos_raw = row.get("repo_info")
     repos: list[dict[str, Any]] = []
@@ -179,11 +242,15 @@ def _normalize_product_wire(row: dict[str, Any]) -> dict[str, Any]:
             if isinstance(item, dict):
                 docs.append(_normalize_doc_entry(item))
     prod_feature = str(row.get("prod_feature") or row.get("function") or "").strip()
+    space_raw = str(row.get("space") or "").strip()
+    project_id, project_name = _space_id_and_name(space_raw)
     return {
         "prod": str(row.get("prod") or "").strip(),
         "version": str(row.get("version") or "").strip(),
         "module": str(row.get("module") or "").strip(),
-        "space": str(row.get("space") or "").strip(),
+        "space": space_raw,
+        "project_id": project_id,
+        "project_name": project_name,
         "function": prod_feature,
         "prod_feature": prod_feature,
         "prod_desc": str(row.get("prod_desc") or "").strip(),
