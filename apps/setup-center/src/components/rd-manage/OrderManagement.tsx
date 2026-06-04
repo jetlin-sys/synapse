@@ -1267,24 +1267,30 @@ export const OrderManagement: React.FC<{
     if (!container) return;
     
     const handleWheel = (e: WheelEvent) => {
+      const target = e.target as HTMLElement;
+      const onSopStrip = Boolean(
+        target.closest('.node-card') ||
+          target.closest('.rd-order-sop-canvas') ||
+          target.closest('.stage-collapse-btn'),
+      );
       e.preventDefault();
       if (e.ctrlKey || e.metaKey) {
         const zoomSensitivity = 0.002;
         const delta = -e.deltaY * zoomSensitivity;
-        setTransform(prev => {
+        setTransform((prev) => {
           const newScale = Math.min(Math.max(0.2, prev.scale * (1 + delta)), 3);
           const rect = container.getBoundingClientRect();
           const mouseX = e.clientX - rect.left;
-          const mouseY = e.clientY - rect.top;
           const canvasX = (mouseX - prev.x) / prev.scale;
-          const canvasY = (mouseY - prev.y) / prev.scale;
           return { x: mouseX - canvasX * newScale, y: 0, scale: newScale };
         });
       } else {
-        setTransform(prev => ({
+        const horizontal = e.deltaX !== 0 ? e.deltaX : e.deltaY;
+        const gain = onSopStrip ? 1.2 : 1;
+        setTransform((prev) => ({
           ...prev,
-          x: prev.x - e.deltaX - e.deltaY,
-          y: 0
+          x: prev.x - horizontal * gain,
+          y: 0,
         }));
       }
     };
@@ -2059,9 +2065,10 @@ export const OrderManagement: React.FC<{
             </motion.div>
           </div>
 
-          <div 
+          <div
             ref={containerRef}
-            className="relative min-h-0 flex-1 overflow-hidden bg-muted/10 cursor-grab active:cursor-grabbing"
+            className="rd-order-sop-viewport relative min-h-0 flex-1 overflow-hidden bg-muted/10 cursor-grab active:cursor-grabbing"
+            title="滚轮左右滑动浏览 SOP 节点；Ctrl + 滚轮缩放"
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
@@ -2087,9 +2094,9 @@ export const OrderManagement: React.FC<{
                 </div>
               </div>
             ) : (
-            <div 
+            <div
               ref={canvasRef}
-              className="absolute flex h-full min-h-0 min-w-max items-center px-16 origin-left"
+              className="rd-order-sop-canvas absolute flex h-full min-h-0 min-w-max items-center px-16 origin-left"
               style={{ transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})` }}
             >
               {/* Background Central Data Bus Line */}
@@ -2373,70 +2380,123 @@ export const OrderManagement: React.FC<{
 
       {/* Node Details Drawer */}
       <Drawer
+        className="rd-order-node-drawer"
         title={
           selectedNode ? (
-            <div className="flex items-center gap-3 text-foreground">
+            <div className="rd-order-node-drawer__title-row relative z-[1] flex min-w-0 items-center gap-2.5 text-foreground">
               {getNodeStateGlobal(displayTicket, selectedNode.id) === 'skipped' ? (
-                <div className="rounded-lg bg-slate-500/15 p-1.5">
-                  <SkipForward className="h-5 w-5 text-slate-400" />
+                <div className="shrink-0 rounded-lg border border-slate-500/30 bg-slate-500/10 p-1.5">
+                  <SkipForward className="h-4 w-4 text-slate-400" />
                 </div>
               ) : (
                 <div
-                  className={`rounded-lg border p-1.5 ${getSopNodeTypeInfo(selectedNode.type).bg}`}
+                  className={`shrink-0 rounded-lg border p-1.5 ${getSopNodeTypeInfo(selectedNode.type).bg}`}
                 >
-                  <Zap className={`h-5 w-5 ${getSopNodeTypeInfo(selectedNode.type).color}`} />
+                  <Zap className={`h-4 w-4 ${getSopNodeTypeInfo(selectedNode.type).color}`} />
                 </div>
               )}
-              <div className="min-w-0">
-                <span className="text-base font-semibold">{selectedNode.name}</span>
-                <div
-                  className={`mt-0.5 inline-flex items-center gap-1 text-[11px] ${getSopNodeTypeInfo(selectedNode.type).color}`}
-                >
-                  {getSopNodeTypeInfo(selectedNode.type).label}
-                  {getNodeStateGlobal(displayTicket, selectedNode.id) === 'skipped' ? (
-                    <span className="rd-meeting-node-card__skip-badge ml-1">已跳过</span>
-                  ) : null}
-                </div>
-              </div>
+              <span className="min-w-0 truncate text-sm font-semibold tracking-tight md:text-base">
+                {selectedNode.name}
+              </span>
+              <span className="shrink-0 text-border/80" aria-hidden>
+                ·
+              </span>
+              <span
+                className={`shrink-0 rounded border border-current/20 bg-current/5 px-1.5 py-0.5 text-[11px] font-medium leading-none ${getSopNodeTypeInfo(selectedNode.type).color}`}
+              >
+                {getSopNodeTypeInfo(selectedNode.type).label}
+              </span>
+              <span className="shrink-0 font-mono text-[11px] text-muted-foreground/85">
+                {selectedNode.id}
+              </span>
+              {(() => {
+                const st = getNodeStateGlobal(displayTicket, selectedNode.id);
+                if (st === 'processing') {
+                  return (
+                    <span className="rd-order-node-drawer__status-pill rd-order-node-drawer__status-pill--processing ml-auto shrink-0">
+                      <Loader2 className="h-3 w-3 animate-spin" /> 进行中
+                    </span>
+                  );
+                }
+                if (st === 'completed') {
+                  return (
+                    <span className="rd-order-node-drawer__status-pill rd-order-node-drawer__status-pill--completed ml-auto shrink-0">
+                      <CheckCircle2 className="h-3 w-3" /> 已完成
+                    </span>
+                  );
+                }
+                if (st === 'skipped') {
+                  return (
+                    <span className="rd-order-node-drawer__status-pill rd-order-node-drawer__status-pill--skipped ml-auto shrink-0">
+                      <SkipForward className="h-3 w-3" /> 已跳过
+                    </span>
+                  );
+                }
+                return null;
+              })()}
             </div>
           ) : null
         }
         placement="right"
+        closable={false}
         onClose={() => setDrawerOpen(false)}
         open={drawerOpen}
-        width={500}
+        width={Math.min(620, typeof window !== 'undefined' ? window.innerWidth * 0.92 : 620)}
         styles={{
-          header: { background: 'var(--panel2)', borderBottom: '1px solid var(--line)', padding: '16px 24px' },
-          body: { background: 'var(--bg-app)', padding: '24px' },
-          mask: { backdropFilter: 'blur(3px)', background: 'rgba(0,0,0,0.45)' }
+          header: {
+            background: 'var(--panel2)',
+            borderBottom: 'none',
+            padding: '14px 20px',
+          },
+          body: {
+            background: 'var(--bg-app)',
+            padding: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+          },
+          mask: { backdropFilter: 'blur(6px)', background: 'rgba(0,0,0,0.52)' },
         }}
-        closeIcon={<span className="text-muted-foreground transition-colors hover:text-foreground">✕</span>}
       >
         {selectedNode && (
-          <div className="flex h-full flex-col">
-            <div className="mb-6 rounded-xl border border-border bg-muted/30 p-4 shadow-inner">
-              <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">节点说明</h4>
-              <p className="text-sm leading-relaxed text-foreground/90">
-                {selectedNode.desc}
-              </p>
+          <div className="rd-order-node-drawer__shell flex h-full min-h-0 flex-col">
+            <div className="rd-order-node-drawer__glow" aria-hidden />
+            <div className="rd-order-node-drawer__desc">
+              <h4 className="mb-2 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                <Info className="h-3 w-3 text-primary/80" />
+                节点说明
+              </h4>
+              <p className="text-sm leading-relaxed text-foreground/92">{selectedNode.desc}</p>
             </div>
-
-            <div className="min-h-0 flex-1">
-              <h4 className="mb-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">执行产物 / 交互区</h4>
-              {meetingSummary?.room_id && selectedNode ? (
-                <MeetingNodeDetailPanel
-                  synapseApiBase={synapseApiBase}
-                  roomId={meetingSummary.room_id}
-                  scopeType={sopMeetingScope?.scopeType}
-                  scopeId={sopMeetingScope?.scopeId}
-                  nodeId={selectedNode.id}
-                  nodeName={selectedNode.name}
-                  nodeState={mapNodeStateForPanel(getNodeStateGlobal(displayTicket, selectedNode.id))}
-                  pollMs={displayTicket.status === 'processing' ? 5000 : 0}
-                />
-              ) : (
-                renderNodeOutput(selectedNode, displayTicket)
-              )}
+            <div className="rd-order-node-drawer__content">
+              <h4 className="mb-3 flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                <span className="flex items-center gap-1.5">
+                  <Activity className="h-3 w-3 text-violet-400" />
+                  执行产物 / 实况
+                </span>
+                <span className="normal-case tracking-normal text-[10px] font-normal text-muted-foreground/70">
+                  Tab 栏可滚轮左右切换
+                </span>
+              </h4>
+              <div className="min-h-0 flex-1 rounded-xl border border-border/50 bg-[color-mix(in_srgb,var(--panel2)_55%,transparent)] p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+                {meetingSummary?.room_id && selectedNode ? (
+                  <MeetingNodeDetailPanel
+                    variant="orderDrawer"
+                    synapseApiBase={synapseApiBase}
+                    roomId={meetingSummary.room_id}
+                    scopeType={sopMeetingScope?.scopeType}
+                    scopeId={sopMeetingScope?.scopeId}
+                    nodeId={selectedNode.id}
+                    nodeName={selectedNode.name}
+                    nodeState={mapNodeStateForPanel(getNodeStateGlobal(displayTicket, selectedNode.id))}
+                    pollMs={displayTicket.status === 'processing' ? 5000 : 0}
+                  />
+                ) : (
+                  <div className="custom-scrollbar max-h-[min(58vh,560px)] overflow-y-auto p-4">
+                    {renderNodeOutput(selectedNode, displayTicket)}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}

@@ -34,6 +34,193 @@
   flex-shrink: 0;
 }
 
+/* ── 工单 SOP 画布：滚轮横向浏览提示 ── */
+.rdOrdersRoot .rd-order-sop-viewport {
+  position: relative;
+}
+.rdOrdersRoot .rd-order-sop-viewport::before,
+.rdOrdersRoot .rd-order-sop-viewport::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2.5rem;
+  z-index: 15;
+  pointer-events: none;
+  opacity: 0.85;
+}
+.rdOrdersRoot .rd-order-sop-viewport::before {
+  left: 0;
+  background: linear-gradient(to right, var(--bg-app) 0%, transparent 100%);
+}
+.rdOrdersRoot .rd-order-sop-viewport::after {
+  right: 0;
+  background: linear-gradient(to left, var(--bg-app) 0%, transparent 100%);
+}
+.rdOrdersRoot .rd-order-sop-canvas {
+  touch-action: pan-x;
+}
+
+/* ── 节点详情抽屉 ── */
+.rd-order-node-drawer.ant-drawer .ant-drawer-content {
+  background: var(--bg-app);
+  box-shadow:
+    -24px 0 80px rgba(0, 0, 0, 0.45),
+    -4px 0 0 color-mix(in srgb, var(--primary) 35%, transparent);
+}
+.rd-order-node-drawer.ant-drawer .ant-drawer-header {
+  position: relative;
+  overflow: hidden;
+}
+.rd-order-node-drawer.ant-drawer .ant-drawer-header::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    120deg,
+    color-mix(in srgb, var(--primary) 14%, transparent) 0%,
+    transparent 45%,
+    color-mix(in srgb, #8b5cf6 10%, transparent) 100%
+  );
+  pointer-events: none;
+}
+.rd-order-node-drawer .rd-order-node-drawer__title-row {
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+.rd-order-node-drawer.ant-drawer .ant-drawer-header-title {
+  flex: 1;
+  min-width: 0;
+}
+.rd-order-node-drawer.ant-drawer .ant-drawer-header::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--primary) 55%, var(--line)),
+    transparent
+  );
+}
+.rd-order-node-drawer__shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+.rd-order-node-drawer__glow {
+  pointer-events: none;
+  position: absolute;
+  top: -4rem;
+  right: -3rem;
+  width: 14rem;
+  height: 14rem;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--primary) 22%, transparent) 0%,
+    transparent 70%
+  );
+  filter: blur(28px);
+  opacity: 0.9;
+}
+.rd-order-node-drawer__desc {
+  position: relative;
+  margin: 1.25rem 1.5rem 0;
+  padding: 1rem 1.15rem;
+  border-radius: 0.875rem;
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--line));
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--panel2) 92%, transparent),
+    color-mix(in srgb, var(--primary) 6%, var(--panel2))
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 12px 32px rgba(0, 0, 0, 0.18);
+}
+.rd-order-node-drawer__content {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 1.5rem 1.5rem;
+}
+.rd-order-node-drawer__status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.rd-order-node-drawer__status-pill--processing {
+  border: 1px solid color-mix(in srgb, var(--primary) 45%, transparent);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+}
+.rd-order-node-drawer__status-pill--completed {
+  border: 1px solid color-mix(in srgb, #22c55e 40%, transparent);
+  background: color-mix(in srgb, #22c55e 12%, transparent);
+  color: #4ade80;
+}
+.rd-order-node-drawer__status-pill--skipped {
+  border: 1px solid color-mix(in srgb, #94a3b8 35%, transparent);
+  background: color-mix(in srgb, #94a3b8 10%, transparent);
+  color: #94a3b8;
+}
+
+/* 抽屉内 Tabs：隐藏「…」溢出菜单，横向滚轮滚动 */
+.rd-order-node-drawer .meeting-node-detail-tabs .ant-tabs-nav-operations {
+  display: none !important;
+}
+.rd-order-node-drawer .meeting-node-detail-tabs .ant-tabs-nav-wrap {
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  scroll-behavior: smooth;
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.rd-order-node-drawer .meeting-node-detail-tabs .ant-tabs-nav-wrap::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+.rd-order-node-drawer .meeting-node-detail-tabs .ant-tabs-nav-list {
+  flex-wrap: nowrap !important;
+}
+.rd-order-node-drawer .meeting-node-detail-tabs .ant-tabs-tab {
+  flex-shrink: 0;
+  padding: 8px 12px !important;
+}
+.rd-order-node-drawer .meeting-node-detail-tabs .ant-tabs-nav::before {
+  border-bottom-color: color-mix(in srgb, var(--primary) 18%, var(--line)) !important;
+}
+.rd-order-node-drawer .meeting-node-detail-tabs .ant-tabs-ink-bar {
+  height: 2px !important;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--primary) 70%, transparent),
+    #a78bfa
+  ) !important;
+  box-shadow: 0 0 12px color-mix(in srgb, var(--primary) 45%, transparent);
+}
+.rd-order-node-drawer .meeting-node-detail-tabs--drawer .ant-tabs-content-holder {
+  flex: 1;
+  min-height: 0;
+}
+.rd-order-node-drawer .meeting-node-detail-tabs--drawer .ant-tabs-tabpane {
+  max-height: min(58vh, 560px);
+}
+
 /* 研发会议室：与工单管理同样全幅铺满，并跟随 data-theme */
 .content:has(.rdMeetingRoot) {
   padding: 0 !important;

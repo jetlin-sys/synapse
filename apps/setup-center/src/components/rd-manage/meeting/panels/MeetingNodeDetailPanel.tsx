@@ -2,7 +2,7 @@
  * MeetingNodeDetailPanel — 会议室节点详情（产出 / 消耗 / 流程）
  * 从 node-review、agent-contexts、meeting-summary 拉取真实数据，替代 mock。
  */
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Spin, Tabs, Tooltip } from 'antd';
 import { motion, AnimatePresence } from 'motion/react';
 import {
@@ -64,6 +64,8 @@ interface Props {
   nodeState: MeetingNodeVisualState;
   /** 轮询间隔（处理中节点），0 表示不轮询 */
   pollMs?: number;
+  /** 工单管理抽屉：可横向滚轮切换 Tab，隐藏 Ant Design「…」溢出菜单 */
+  variant?: 'default' | 'orderDrawer';
 }
 
 function formatDuration(seconds: number): string {
@@ -265,8 +267,12 @@ function ArtifactCard({
           <div className="mt-2 flex items-center gap-2 text-[10px] text-muted-foreground">
             <span>{formatBytes(file.size)}</span>
             {isMd ? (
-              <Button type="link" size="small" className="!h-auto !p-0 !text-[10px]" onClick={() => void loadPreview()}>
-                {loading ? '加载中…' : preview != null ? '已加载预览' : '预览 Markdown'}
+              <Button
+                size="small"
+                className="!h-auto !min-h-0 !border-2 !border-primary/40 !px-2.5 !py-0.5 !text-[10px] !leading-tight !shadow-none hover:!border-primary/60"
+                onClick={() => void loadPreview()}
+              >
+                {loading ? '加载中…' : preview != null ? '已加载预览' : '预览'}
               </Button>
             ) : null}
           </div>
@@ -299,7 +305,9 @@ export function MeetingNodeDetailPanel({
   nodeName,
   nodeState,
   pollMs = 0,
+  variant = 'default',
 }: Props) {
+  const tabsRootRef = useRef<HTMLDivElement>(null);
   const [activeTab, setActiveTab] = useState('output');
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -386,6 +394,23 @@ export function MeetingNodeDetailPanel({
     const t = window.setInterval(() => void load(true), pollMs);
     return () => window.clearInterval(t);
   }, [load, nodeState, pollMs]);
+
+  useEffect(() => {
+    if (variant !== 'orderDrawer') return;
+    const root = tabsRootRef.current;
+    if (!root) return;
+    const wrap = root.querySelector<HTMLElement>('.ant-tabs-nav-wrap');
+    if (!wrap) return;
+    const onWheel = (e: WheelEvent) => {
+      if (wrap.scrollWidth <= wrap.clientWidth + 2) return;
+      const dominantVertical = Math.abs(e.deltaY) > Math.abs(e.deltaX);
+      if (!dominantVertical && e.deltaX === 0) return;
+      e.preventDefault();
+      wrap.scrollLeft += dominantVertical ? e.deltaY : e.deltaX;
+    };
+    wrap.addEventListener('wheel', onWheel, { passive: false });
+    return () => wrap.removeEventListener('wheel', onWheel);
+  }, [variant, activeTab]);
 
   const metrics = review?.metrics;
   const artifacts = review?.artifacts?.length ? review.artifacts : fallbackArtifacts;
@@ -544,7 +569,10 @@ export function MeetingNodeDetailPanel({
     </div>
   );
 
-  const tabPaneClass = 'custom-scrollbar overflow-y-auto max-h-[min(52vh,520px)]';
+  const tabPaneClass =
+    variant === 'orderDrawer'
+      ? 'custom-scrollbar overflow-y-auto max-h-[min(58vh,560px)]'
+      : 'custom-scrollbar overflow-y-auto max-h-[min(52vh,520px)]';
 
   const liveTabItems = [
     {
@@ -625,8 +653,13 @@ export function MeetingNodeDetailPanel({
     },
   ];
 
+  const tabsClass =
+    variant === 'orderDrawer'
+      ? 'meeting-node-detail-tabs meeting-node-detail-tabs--drawer req-analysis-tabs flex-1 min-h-0'
+      : 'meeting-node-detail-tabs req-analysis-tabs flex-1 min-h-0';
+
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div ref={tabsRootRef} className="flex h-full min-h-0 flex-col">
       {!isPending ? header : null}
       {!isPending && loading && !review ? (
         <div className="flex flex-1 items-center justify-center gap-2 py-16 text-muted-foreground">
@@ -642,7 +675,7 @@ export function MeetingNodeDetailPanel({
           activeKey={activeTab}
           onChange={setActiveTab}
           size="small"
-          className="meeting-node-detail-tabs req-analysis-tabs flex-1 min-h-0"
+          className={tabsClass}
           items={liveTabItems}
         />
       )}
