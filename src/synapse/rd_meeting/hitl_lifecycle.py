@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from synapse.rd_meeting.binding import resolve_node_binding
 from synapse.rd_meeting.hitl_feedback import (
     HitlFeedbackMode,
     user_has_free_text_input,
@@ -45,6 +46,25 @@ def should_enter_node_review_after_hitl_locked(
     """
     if not isinstance(room_state, dict):
         return False
+    sid = (scope_id or "").strip()
+    nid = (node_id or "").strip()
+    if not sid or not nid or nid == "pending":
+        return False
+
+    try:
+        from synapse.rd_meeting.work_plan import get_work_plan, plan_awaiting_hitl, plan_requires_hitl
+
+        if plan_awaiting_hitl(sid):
+            return False
+        plan = get_work_plan(sid)
+        if isinstance(plan, dict) and str(plan.get("node_id") or "") == nid:
+            binding = resolve_node_binding(nid, scope_id=sid)
+            if plan_requires_hitl(plan, human_confirm=bool(binding.get("human_confirm"))):
+                if not plan.get("hitl_submitted"):
+                    return False
+    except Exception:
+        pass
+
     if not room_state.get("hitl_locked"):
         return False
     # 仍有待填问卷 schema 时不应跳过会中门控（防御性；主路径在 orchestrator 优先消费 tool_questionnaire）
@@ -57,10 +77,6 @@ def should_enter_node_review_after_hitl_locked(
     if not kind:
         kind = str(room_state.get("intervention_kind") or "").strip().lower()
     if kind and kind not in ("interactive", ""):
-        return False
-    sid = (scope_id or "").strip()
-    nid = (node_id or "").strip()
-    if not sid or not nid or nid == "pending":
         return False
     return node_archive_ready_for_review(sid, nid)
 
