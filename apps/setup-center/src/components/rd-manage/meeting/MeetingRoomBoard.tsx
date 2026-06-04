@@ -1279,6 +1279,8 @@ const InterventionDialog = ({
   const interventionRoomIdRef = useRef<string | null>(null);
   const lastFollowedNodeRef = useRef<string | null>(null);
   const hitlAutoFocusRef = useRef<string | null>(null);
+  /** 用户手动点选 SOP 节点后，禁止 live/HITL 副作用把选中态拉回流水线当前节点 */
+  const userPinnedNodeRef = useRef(false);
 
   const chatNodeId = selectedNodeId || room?.currentNode || 'pending';
   /** 人工确认表单/结果确认仅归属当前流水线节点（或 review_payload 指定节点） */
@@ -1336,8 +1338,11 @@ const InterventionDialog = ({
     : undefined;
   const pipelineStageId = room ? stageIdForNodeId(room.currentNode) || room.stageIndex : 0;
   const stageNodes = currentStage?.nodes || [];
+  const resolvedSelectedNodeId = selectedNodeId || room?.currentNode || stageNodes[0]?.id || null;
   const selectedNode =
-    stageNodes.find((n) => n.id === selectedNodeId) ||
+    (resolvedSelectedNodeId
+      ? ALL_NODES.find((n) => n.id === resolvedSelectedNodeId)
+      : undefined) ||
     stageNodes.find((n) => n.id === room?.currentNode) ||
     stageNodes[0];
 
@@ -1459,9 +1464,19 @@ const InterventionDialog = ({
     }, 100);
   }, []);
 
+  const selectSopNode = useCallback((nodeId: string) => {
+    const nid = (nodeId || '').trim();
+    if (!nid) return;
+    userPinnedNodeRef.current = true;
+    setSelectedNodeId(nid);
+    const sid = stageIdForNodeId(nid);
+    if (sid) setViewStageId(sid);
+  }, []);
+
   const handleStageSelect = useCallback(
     (stageId: number) => {
       if (!room) return;
+      userPinnedNodeRef.current = true;
       setViewStageId(stageId);
       const stage = MEETING_PIPELINE_STAGES.find((s) => s.id === stageId);
       if (!stage) return;
@@ -1479,14 +1494,17 @@ const InterventionDialog = ({
       interventionRoomIdRef.current = null;
       lastFollowedNodeRef.current = null;
       hitlAutoFocusRef.current = null;
+      userPinnedNodeRef.current = false;
       return;
     }
     if (!room?.currentNode) return;
     if (interventionRoomIdRef.current !== room.id) {
       interventionRoomIdRef.current = room.id;
+      userPinnedNodeRef.current = false;
     }
     if (lastFollowedNodeRef.current !== room.currentNode) {
       lastFollowedNodeRef.current = room.currentNode;
+      userPinnedNodeRef.current = false;
       setSelectedNodeId(room.currentNode);
       setViewStageId(stageIdForNodeId(room.currentNode) || room.stageIndex);
     }
@@ -1503,7 +1521,7 @@ const InterventionDialog = ({
     if (hitlAutoFocusRef.current === hitlFocusKey) return;
     hitlAutoFocusRef.current = hitlFocusKey;
     setCenterTab('hitl');
-    if (room?.currentNode) {
+    if (room?.currentNode && !userPinnedNodeRef.current) {
       setSelectedNodeId(room.currentNode);
       setViewStageId(stageIdForNodeId(room.currentNode) || room.stageIndex);
     }
@@ -1625,7 +1643,7 @@ const InterventionDialog = ({
             {stageNodes.map((node, idx) => {
               const state = getNodeStateGlobal(room, node.id, disabledSopNodeIds);
               const typeInfo = getNodeTypeInfo(node.type);
-              const isSelected = selectedNode?.id === node.id;
+              const isSelected = resolvedSelectedNodeId === node.id;
               const isCurrentNode = node.id === room.currentNode;
 
               return (
@@ -1633,7 +1651,7 @@ const InterventionDialog = ({
                   key={node.id}
                   whileHover={{ x: 2 }}
                   onClick={() => {
-                    setSelectedNodeId(node.id);
+                    selectSopNode(node.id);
                     if (node.id !== hitlTargetNodeId) setCenterTab('detail');
                   }}
                   className={`relative cursor-pointer rounded-xl p-3 border transition-all duration-200 ${
