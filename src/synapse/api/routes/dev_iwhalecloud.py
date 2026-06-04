@@ -76,7 +76,7 @@ def _load_dev_iwhalecloud_authorization() -> str:
 
 
 def _userinfo_encryption_path() -> Path:
-    """浩鲸研发云本地用户信息（姓名、工号、密码、token），CryptHelper 加密存储。"""
+    """浩鲸研发云本地用户信息（姓名、工号、密码、token、access_token），CryptHelper 加密存储。"""
     return settings.project_root / "data" / "userinfo.encryption"
 
 def _dev_iwhalecloud_session_path() -> Path:
@@ -389,7 +389,13 @@ def _load_userinfo_plain() -> dict | None:
 
 
 def _save_userinfo_encrypted(
-    *, name: str, employee_id: str, password: str, token: str, user_id: int = None
+    *,
+    name: str,
+    employee_id: str,
+    password: str,
+    token: str,
+    access_token: str = "",
+    user_id: int = None,
 ) -> tuple[bool, str]:
     crypt_helper = _crypt_helper()
     payload = {
@@ -397,6 +403,7 @@ def _save_userinfo_encrypted(
         "employee_id": employee_id,
         "password": password,
         "token": token,
+        "access_token": access_token,
         "userId": user_id,
     }
     raw = json.dumps(payload, ensure_ascii=False)
@@ -4317,6 +4324,10 @@ class LoginRequest(BaseModel):
     username: str | None = Field(None, description="工号，与 password 对应；引导或改密时必填")
     password: str | None = Field(None, description="密码；引导或改密时必填")
     token: str | None = Field(None, description="x-csrf-token 等；可选，未传则尝试从页面请求中捕获")
+    access_token: str | None = Field(
+        None,
+        description="Git 仓库 Access Token；可选，未传则保留 userinfo 中已有值",
+    )
 
     @model_validator(mode="after")
     def _require_creds_when_guide(self) -> LoginRequest:
@@ -4363,6 +4374,61 @@ def local_userinfo_exists():
             "exists": exists,
             "path": str(path.resolve()),
             "project_root": str(settings.project_root.resolve()),
+        }
+    )
+
+
+@router.get("/api/dev/iwhalecloud/userinfo-summary")
+def userinfo_summary():
+    """
+    返回本地 userinfo 中非敏感摘要，供引导重复验证与产品管理预填仓库 Token。
+
+    不返回 password、研发云 API token（Authorization）。
+    """
+    path = _userinfo_encryption_path()
+    if not path.is_file():
+        return success_response(
+            {
+                "exists": False,
+                "name": "",
+                "employee_id": "",
+                "access_token": "",
+                "has_access_token": False,
+            }
+        )
+    try:
+        if path.stat().st_size <= 0:
+            return success_response(
+                {
+                    "exists": False,
+                    "name": "",
+                    "employee_id": "",
+                    "access_token": "",
+                    "has_access_token": False,
+                }
+            )
+    except OSError:
+        return success_response(
+            {
+                "exists": False,
+                "name": "",
+                "employee_id": "",
+                "access_token": "",
+                "has_access_token": False,
+            }
+        )
+    try:
+        data = _load_userinfo_plain() or {}
+    except ValueError as e:
+        return error_response(400, str(e))
+    access = (data.get("access_token") or "").strip()
+    return success_response(
+        {
+            "exists": True,
+            "name": (data.get("name") or "").strip(),
+            "employee_id": (data.get("employee_id") or data.get("username") or "").strip(),
+            "access_token": access,
+            "has_access_token": bool(access),
         }
     )
 
@@ -4564,7 +4630,7 @@ def login(body: LoginRequest):
     """
     登录研发云（浩鲸研发云验证流程）。
 
-    验证通过后，将姓名、工号、密码、token 写入 data/userinfo.encryption（foundation.CryptHelper 加密）。
+    验证通过后，将姓名、工号、密码、token、access_token 写入 data/userinfo.encryption（foundation.CryptHelper 加密）。
     """
     try:
         username, password, file_user = _resolve_iwhalecloud_login_creds(body)
@@ -4632,6 +4698,9 @@ def login(body: LoginRequest):
 
             captured = csrf_token["value"]
             token_out = body.token or captured or (file_user or {}).get("token") or ""
+            access_out = (body.access_token or "").strip() or str(
+                (file_user or {}).get("access_token") or ""
+            ).strip()
             if body.purpose == "guide":
                 name_out = body.name if body.name is not None else ""
             elif body.purpose == "password_change":
@@ -4644,12 +4713,16 @@ def login(body: LoginRequest):
                 employee_id=username,
                 password=password,
                 token=token_out,
-                user_id=logged_user_id["value"]
+                access_token=access_out,
+                user_id=logged_user_id["value"],
             )
             if not ok:
                 return error_response(500, err or "保存用户信息失败")
 
-            return success_response({"token": token_out}, "验证通过")
+            return success_response(
+                {"token": token_out, "access_token": access_out},
+                "验证通过",
+            )
         except FileNotFoundError as e:
             return error_response(500, str(e))
         except ValueError as e:

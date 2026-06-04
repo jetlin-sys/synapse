@@ -120,6 +120,16 @@ class TestLoginAndTokenHelpers:
         )
         assert resp.status_code == 422
 
+    async def test_userinfo_summary_when_missing_file(self, client):
+        with patch.object(dev_iwhalecloud, "_userinfo_encryption_path") as mock_path:
+            mock_path.return_value.is_file.return_value = False
+            resp = await client.get("/api/dev/iwhalecloud/userinfo-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("errorcode") == 0
+        assert data.get("data", {}).get("exists") is False
+        assert data.get("data", {}).get("access_token") == ""
+
 
 class TestCreateTaskValidation:
     async def test_empty_body_422(self, client):

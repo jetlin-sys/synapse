@@ -6,7 +6,7 @@
 
 | 类别 | 存储 | 用途 |
 |------|------|------|
-| 用户引导登录结果 | `data/userinfo.encryption`（加密） | 研发统一服务 `:10001` 的 `owner_info` 等；内含工号、密码、API token、`userId` |
+| 用户引导登录结果 | `data/userinfo.encryption`（加密） | 研发统一服务 `:10001` 的 `owner_info` 等；内含工号、密码、研发云 API token（Authorization）、Git `access_token`、`userId` |
 | 门户浏览器会话 | `data/iwhalecloud_session.json`（明文 JSON） | 转发浩鲸门户 **REST** 时使用的 `x-csrf-token` 与 `Cookie` 请求头 |
 
 ## 2. 会话获取与串行

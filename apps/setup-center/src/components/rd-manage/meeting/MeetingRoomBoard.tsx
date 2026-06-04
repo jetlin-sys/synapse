@@ -74,7 +74,7 @@ import {
   Globe, Clock, Coins, MoreHorizontal, CircleDashed, 
   Terminal, Code2, GitBranch, FileCode2, Play, User, Info, Network, Code, 
   TestTube, CheckSquare, Flame, TrendingUp, Loader2, AlertCircle, MessageSquareText, ClipboardCheck,
-  SkipForward, RotateCw, ArrowLeft, Layers, Square,
+  SkipForward, RotateCw, RefreshCw, ArrowLeft, Layers, Square,
   Search, PenLine, ShieldCheck, Check, Container,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -1659,19 +1659,6 @@ const InterventionDialog = ({
                         <Square className="h-3.5 w-3.5 fill-current" />
                       </button>
                     </Tooltip>
-                  ) : canReprocessHistoricalNode(node.id, node.type) ? (
-                    <Tooltip title="重新处理该节点（将清理本节点至当前节点之间的过程数据）">
-                      <button
-                        type="button"
-                        className="absolute bottom-2 right-2 z-10 flex h-7 w-7 items-center justify-center rounded-md border border-amber-500/40 bg-amber-950/50 text-amber-200 hover:bg-amber-900/70"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onReprocess?.(node.id);
-                        }}
-                      >
-                        <RotateCw className="h-3.5 w-3.5" />
-                      </button>
-                    </Tooltip>
                   ) : null}
                   {/* Node Header Row */}
                   <div className="flex items-center justify-between mb-2">
@@ -1702,9 +1689,32 @@ const InterventionDialog = ({
                         </span>
                       </div>
                     </div>
-                    {isCurrentNode && (
-                      <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-blue-900/40 border border-blue-700/50 text-blue-400 whitespace-nowrap shrink-0">当前</span>
-                    )}
+                    <div className="flex items-center gap-1 shrink-0">
+                      {canReprocessHistoricalNode(node.id, node.type) ? (
+                        <Tooltip title="重新处理（将清理本节点至当前节点之间的过程数据）">
+                          <Button
+                            type="text"
+                            size="small"
+                            className="!h-6 !min-w-6 !px-1 text-muted-foreground hover:!text-foreground"
+                            icon={
+                              <RefreshCw
+                                className={`h-3.5 w-3.5 ${room.reprocessing ? 'animate-spin' : ''}`}
+                              />
+                            }
+                            loading={room.reprocessing}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onReprocess?.(node.id);
+                            }}
+                          />
+                        </Tooltip>
+                      ) : null}
+                      {isCurrentNode ? (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-blue-900/40 border border-blue-700/50 text-blue-400 whitespace-nowrap">
+                          当前
+                        </span>
+                      ) : null}
+                    </div>
                   </div>
 
                   {/* 主要动作 */}

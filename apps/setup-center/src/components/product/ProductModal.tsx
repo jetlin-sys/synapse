@@ -32,6 +32,7 @@ import {
   fetchModuleNameList,
   fetchProductBranchList,
   fetchRepoDetailByProdBranch,
+  fetchIwhalecloudUserinfoSummary,
   fetchZcmProductList,
   repoDetailFetchCacheKey,
   validateRepoTokens,
@@ -206,6 +207,8 @@ export function ProductModal({
   const [repoDetailLoadingVid, setRepoDetailLoadingVid] = useState<Record<string, boolean>>({});
   const repoDetailFetchStartedRef = useRef<Set<string>>(new Set());
   const [expandedRepos, setExpandedRepos] = useState<string[]>([]);
+  /** 研发云 userinfo.access_token，新建仓库时预填 repo.token（用户可改） */
+  const [defaultRepoAccessToken, setDefaultRepoAccessToken] = useState("");
 
   const isProductInfoFilled = !!(
     formState.name &&
@@ -249,8 +252,27 @@ export function ProductModal({
       setIsEdit(false);
       setAppModuleOptions([]);
       setAppModuleRows([]);
+      setDefaultRepoAccessToken("");
     }
   }, [open, initialValues]);
+
+  useEffect(() => {
+    if (!open || initialValues) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const summary = await fetchIwhalecloudUserinfoSummary(synapseApiBase);
+        if (!cancelled) {
+          setDefaultRepoAccessToken((summary.access_token || "").trim());
+        }
+      } catch {
+        if (!cancelled) setDefaultRepoAccessToken("");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, initialValues, synapseApiBase]);
 
   /** 选择项目空间后再拉取产品版本全量列表，避免与弹窗初始化竞态导致列表被清空 */
   useEffect(() => {
@@ -486,7 +508,7 @@ export function ProductModal({
         isMain: formState.repositories.length === 0,
         url: "",
         purpose: "",
-        token: "",
+        token: defaultRepoAccessToken || "",
         codePath: "",
         wireAnalysisState: "new" as const,
       },

@@ -413,6 +413,24 @@ export async function fetchUserinfoForUnifiedService(synapseApiBase: string): Pr
   return fetchSynapseJson(synapseApiBase, "/api/dev/userinfo-for-unified-service");
 }
 
+export type IwhalecloudUserinfoSummary = {
+  exists: boolean;
+  name: string;
+  employee_id: string;
+  access_token: string;
+  has_access_token: boolean;
+};
+
+/** 本地 userinfo 摘要（含 Git Access Token，供引导与新建产品预填） */
+export async function fetchIwhalecloudUserinfoSummary(
+  synapseApiBase: string,
+): Promise<IwhalecloudUserinfoSummary> {
+  return fetchSynapseJson<IwhalecloudUserinfoSummary>(
+    synapseApiBase,
+    "/api/dev/iwhalecloud/userinfo-summary",
+  );
+}
+
 /** POST 研发统一服务（Tauri `http_proxy_request`） */
 export async function postRdUnifiedJson<T>(
   host: string,

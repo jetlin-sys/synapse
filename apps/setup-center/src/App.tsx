@@ -467,9 +467,14 @@ export function App() {
   const [obIwcEmployeeId, setObIwcEmployeeId] = useState("");
   const [obIwcPassword, setObIwcPassword] = useState("");
   const [obIwcToken, setObIwcToken] = useState("");
+  const [obIwcAccessToken, setObIwcAccessToken] = useState("");
   const [obIwcShowPassword, setObIwcShowPassword] = useState(false);
   const [obIwcShowToken, setObIwcShowToken] = useState(false);
+  const [obIwcShowAccessToken, setObIwcShowAccessToken] = useState(false);
   const [obIwcShowVideo, setObIwcShowVideo] = useState(false);
+  const [obIwcShowAccessVideo, setObIwcShowAccessVideo] = useState(false);
+  /** 已有本地凭据时默认仅补充 Access Token；开启后解锁姓名/工号/密码/Token 完整重填 */
+  const [obIwcReverifyAll, setObIwcReverifyAll] = useState(false);
   const [obIwcValidating, setObIwcValidating] = useState(false);
   const [obIwcValidated, setObIwcValidated] = useState(false);
   const [obIwcError, setObIwcError] = useState<string | null>(null);
@@ -664,6 +669,26 @@ export function App() {
           setObIwcLocalDetectPassed(true);
           setObIwcLocalDetectHint(null);
           setObIwcValidated(false);
+          setObIwcReverifyAll(false);
+          try {
+            const sumRes = await fetch(
+              `${String(base).replace(/\/$/, "")}/api/dev/iwhalecloud/userinfo-summary`,
+              { signal: AbortSignal.timeout(8000) },
+            );
+            if (!cancelled && sumRes.ok) {
+              const sumJ = (await sumRes.json()) as {
+                errorcode?: number;
+                data?: { access_token?: string; name?: string; employee_id?: string };
+              };
+              if (sumJ?.errorcode === 0 && sumJ.data) {
+                if (sumJ.data.access_token) setObIwcAccessToken(String(sumJ.data.access_token));
+                if (sumJ.data.name) setObIwcFullName(String(sumJ.data.name));
+                if (sumJ.data.employee_id) setObIwcEmployeeId(String(sumJ.data.employee_id));
+              }
+            }
+          } catch {
+            /* 摘要可选 */
+          }
         } else {
           setObIwcLocalDetectPassed(false);
           setObIwcLocalDetectHint(
@@ -4763,7 +4788,8 @@ export function App() {
           </div>
         );
 
-      case "ob-iwhalecloud":
+      case "ob-iwhalecloud": {
+        const iwcCoreFieldsLocked = obIwcLocalDetecting || (obIwcLocalDetectPassed && !obIwcReverifyAll);
         return (
           <TooltipProvider>
             <div className="obPage">
@@ -4775,10 +4801,30 @@ export function App() {
                 <p className="obStepDesc">{t("onboarding.iwhalecloud.subtitle")}</p>
                 <Card className="text-left mt-2">
                   <CardContent className="py-5 px-5 space-y-4">
+                    {obIwcLocalDetectPassed && (
+                      <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                        <span>{t("onboarding.iwhalecloud.localDetectUpgradeHint")}</span>
+                        <Button
+                          type="button"
+                          variant="link"
+                          className="h-auto p-0 text-xs"
+                          disabled={obIwcLocalDetecting}
+                          onClick={() => {
+                            setObIwcReverifyAll((v) => !v);
+                            setObIwcValidated(false);
+                            setObIwcError(null);
+                          }}
+                        >
+                          {obIwcReverifyAll
+                            ? t("onboarding.iwhalecloud.reverifyAccessOnly")
+                            : t("onboarding.iwhalecloud.reverifyAll")}
+                        </Button>
+                      </div>
+                    )}
                     <div className="space-y-2">
                       <Label>{t("onboarding.iwhalecloud.fullName")} <span className="text-destructive">*</span></Label>
                       <Input
-                        disabled={obIwcLocalDetecting || obIwcLocalDetectPassed}
+                        disabled={iwcCoreFieldsLocked}
                         value={obIwcFullName}
                         onChange={(e) => { setObIwcFullName(e.target.value); setObIwcValidated(false); setObIwcError(null); }}
                         placeholder={t("onboarding.iwhalecloud.fullNamePlaceholder")}
@@ -4787,7 +4833,7 @@ export function App() {
                     <div className="space-y-2">
                       <Label>{t("onboarding.iwhalecloud.employeeId")} <span className="text-destructive">*</span></Label>
                       <Input
-                        disabled={obIwcLocalDetecting || obIwcLocalDetectPassed}
+                        disabled={iwcCoreFieldsLocked}
                         value={obIwcEmployeeId}
                         onChange={(e) => { setObIwcEmployeeId(e.target.value); setObIwcValidated(false); setObIwcError(null); }}
                         placeholder={t("onboarding.iwhalecloud.employeeIdPlaceholder")}
@@ -4797,14 +4843,14 @@ export function App() {
                       <Label>{t("onboarding.iwhalecloud.password")} <span className="text-destructive">*</span></Label>
                       <div className="relative">
                         <Input
-                          disabled={obIwcLocalDetecting || obIwcLocalDetectPassed}
+                          disabled={iwcCoreFieldsLocked}
                           type={obIwcShowPassword ? "text" : "password"}
                           className="pr-10"
                           value={obIwcPassword}
                           onChange={(e) => { setObIwcPassword(e.target.value); setObIwcValidated(false); setObIwcError(null); }}
                           placeholder={t("onboarding.iwhalecloud.passwordPlaceholder")}
                         />
-                        <Button type="button" variant="ghost" size="icon" className="absolute right-0 top-0 h-full px-3" disabled={obIwcLocalDetecting || obIwcLocalDetectPassed} onClick={() => setObIwcShowPassword((v) => !v)}>
+                        <Button type="button" variant="ghost" size="icon" className="absolute right-0 top-0 h-full px-3" disabled={iwcCoreFieldsLocked} onClick={() => setObIwcShowPassword((v) => !v)}>
                           {obIwcShowPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
                         </Button>
                       </div>
@@ -4814,7 +4860,7 @@ export function App() {
                         <Label className="mb-0">{t("onboarding.iwhalecloud.token")} <span className="text-destructive">*</span></Label>
                         <Tooltip>
                           <TooltipTrigger asChild>
-                            <button type="button" className="text-muted-foreground hover:text-foreground inline-flex disabled:opacity-50" aria-label={t("onboarding.iwhalecloud.tokenHint")} disabled={obIwcLocalDetecting || obIwcLocalDetectPassed}>
+                            <button type="button" className="text-muted-foreground hover:text-foreground inline-flex disabled:opacity-50" aria-label={t("onboarding.iwhalecloud.tokenHint")} disabled={iwcCoreFieldsLocked}>
                               <AlertCircle className="size-4" />
                             </button>
                           </TooltipTrigger>
@@ -4823,20 +4869,20 @@ export function App() {
                       </div>
                       <div className="relative">
                         <Input
-                          disabled={obIwcLocalDetecting || obIwcLocalDetectPassed}
+                          disabled={iwcCoreFieldsLocked}
                           type={obIwcShowToken ? "text" : "password"}
                           className="pr-10"
                           value={obIwcToken}
                           onChange={(e) => { setObIwcToken(e.target.value); setObIwcValidated(false); setObIwcError(null); }}
                           placeholder={t("onboarding.iwhalecloud.tokenPlaceholder")}
                         />
-                        <Button type="button" variant="ghost" size="icon" className="absolute right-0 top-0 h-full px-3" disabled={obIwcLocalDetecting || obIwcLocalDetectPassed} onClick={() => setObIwcShowToken((v) => !v)}>
+                        <Button type="button" variant="ghost" size="icon" className="absolute right-0 top-0 h-full px-3" disabled={iwcCoreFieldsLocked} onClick={() => setObIwcShowToken((v) => !v)}>
                           {obIwcShowToken ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
                         </Button>
                       </div>
                     </div>
                     <div>
-                      <Button type="button" variant="link" className="h-auto p-0 text-xs" disabled={obIwcLocalDetecting || obIwcLocalDetectPassed} onClick={() => setObIwcShowVideo((v) => !v)}>
+                      <Button type="button" variant="link" className="h-auto p-0 text-xs" disabled={iwcCoreFieldsLocked} onClick={() => setObIwcShowVideo((v) => !v)}>
                         {obIwcShowVideo ? `▾ ${t("onboarding.iwhalecloud.tokenVideoHide")}` : `▸ ${t("onboarding.iwhalecloud.tokenVideoLabel")}`}
                       </Button>
                       {obIwcShowVideo && (
@@ -4845,14 +4891,53 @@ export function App() {
                         </div>
                       )}
                     </div>
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Label className="mb-0">{t("onboarding.iwhalecloud.accessToken")}</Label>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button type="button" className="text-muted-foreground hover:text-foreground inline-flex disabled:opacity-50" aria-label={t("onboarding.iwhalecloud.accessTokenHint")} disabled={obIwcLocalDetecting}>
+                              <AlertCircle className="size-4" />
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent className="max-w-xs"><p>{t("onboarding.iwhalecloud.accessTokenHint")}</p></TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <div className="relative">
+                        <Input
+                          disabled={obIwcLocalDetecting}
+                          type={obIwcShowAccessToken ? "text" : "password"}
+                          className="pr-10"
+                          value={obIwcAccessToken}
+                          onChange={(e) => { setObIwcAccessToken(e.target.value); setObIwcValidated(false); setObIwcError(null); }}
+                          placeholder={t("onboarding.iwhalecloud.accessTokenPlaceholder")}
+                        />
+                        <Button type="button" variant="ghost" size="icon" className="absolute right-0 top-0 h-full px-3" disabled={obIwcLocalDetecting} onClick={() => setObIwcShowAccessToken((v) => !v)}>
+                          {obIwcShowAccessToken ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                        </Button>
+                      </div>
+                    </div>
+                    <div>
+                      <Button type="button" variant="link" className="h-auto p-0 text-xs" disabled={obIwcLocalDetecting} onClick={() => setObIwcShowAccessVideo((v) => !v)}>
+                        {obIwcShowAccessVideo ? `▾ ${t("onboarding.iwhalecloud.accessTokenVideoHide")}` : `▸ ${t("onboarding.iwhalecloud.accessTokenVideoLabel")}`}
+                      </Button>
+                      {obIwcShowAccessVideo && (
+                        <div className="mt-2 rounded-lg overflow-hidden border">
+                          <video src="/devaccesstoken.mp4" controls className="w-full max-h-[260px] bg-black block" />
+                        </div>
+                      )}
+                    </div>
                     <div className="flex flex-wrap items-center gap-3">
                       <Button
-                        disabled={obIwcLocalDetecting || obIwcLocalDetectPassed || obIwcValidating}
+                        disabled={obIwcLocalDetecting || obIwcValidating}
                         onClick={async () => {
-                          if (obIwcLocalDetecting || obIwcLocalDetectPassed) return;
-                          if (!obIwcFullName.trim() || !obIwcEmployeeId.trim() || !obIwcPassword.trim() || !obIwcToken.trim()) {
-                            setObIwcError(t("onboarding.iwhalecloud.fieldRequired"));
-                            return;
+                          if (obIwcLocalDetecting) return;
+                          const partialReverify = obIwcLocalDetectPassed && !obIwcReverifyAll;
+                          if (!partialReverify) {
+                            if (!obIwcFullName.trim() || !obIwcEmployeeId.trim() || !obIwcPassword.trim() || !obIwcToken.trim()) {
+                              setObIwcError(t("onboarding.iwhalecloud.fieldRequired"));
+                              return;
+                            }
                           }
                           setObIwcValidating(true);
                           setObIwcError(null);
@@ -4864,16 +4949,24 @@ export function App() {
                               setObIwcError(null);
                             } else {
                               const base = httpApiBase();
+                              const loginBody = partialReverify
+                                ? {
+                                    purpose: "normal",
+                                    ...(obIwcAccessToken.trim() ? { access_token: obIwcAccessToken.trim() } : {}),
+                                    ...(obIwcToken.trim() ? { token: obIwcToken.trim() } : {}),
+                                  }
+                                : {
+                                    purpose: "guide",
+                                    name: obIwcFullName.trim(),
+                                    username: obIwcEmployeeId.trim(),
+                                    password: obIwcPassword.trim(),
+                                    token: obIwcToken.trim(),
+                                    ...(obIwcAccessToken.trim() ? { access_token: obIwcAccessToken.trim() } : {}),
+                                  };
                               const res = await fetch(`${base}/api/dev/iwhalecloud/login`, {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({
-                                  purpose: "guide",
-                                  name: obIwcFullName.trim(),
-                                  username: obIwcEmployeeId.trim(),
-                                  password: obIwcPassword.trim(),
-                                  token: obIwcToken.trim(),
-                                }),
+                                body: JSON.stringify(loginBody),
                               });
                               const data = await res.json().catch(() => ({}));
                               const errText = (() => {
@@ -4903,8 +4996,6 @@ export function App() {
                       >
                         {obIwcLocalDetecting ? (
                           <><Loader2 className="size-4 animate-spin inline mr-2" />{t("onboarding.iwhalecloud.localDetecting", "正在检测本地凭据…")}</>
-                        ) : obIwcLocalDetectPassed ? (
-                          t("onboarding.iwhalecloud.localDetectDone", "检测已完成")
                         ) : obIwcValidating ? (
                           <><Loader2 className="size-4 animate-spin inline mr-2" />{t("onboarding.iwhalecloud.validating")}</>
                         ) : (
@@ -4947,6 +5038,7 @@ export function App() {
             </div>
           </TooltipProvider>
         );
+      }
 
       case "ob-core-agent":
         return (
