@@ -654,12 +654,14 @@ function pickDefaultNodeForStage(
 }
 
 const SkippedNodeDetailPanel = ({ nodeName }: { nodeName: string }) => (
-  <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-8 py-16 text-center">
-    <SkipForward className="mb-4 h-14 w-14 text-slate-400" />
-    <h3 className="text-base font-medium text-foreground">{nodeName}</h3>
-    <p className="mt-2 max-w-md text-sm leading-relaxed text-muted-foreground">
-      该节点未开启，流程已自动跳过，无节点处理详情。
-    </p>
+  <div className="rd-meeting-skipped-detail">
+    <div className="rd-meeting-skipped-detail__panel">
+      <SkipForward className="rd-meeting-skipped-detail__icon h-14 w-14 text-slate-400" />
+      <h3 className="rd-meeting-skipped-detail__title">{nodeName}</h3>
+      <p className="rd-meeting-skipped-detail__desc">
+        该节点未开启，流程已自动跳过，无节点处理详情。
+      </p>
+    </div>
   </div>
 );
 
@@ -1722,25 +1724,32 @@ const InterventionDialog = ({
               const typeInfo = getNodeTypeInfo(node.type);
               const isSelected = resolvedSelectedNodeId === node.id;
               const isCurrentNode = node.id === room.currentNode;
+              const isSkipped = state === 'skipped';
 
               return (
                 <motion.div
                   key={node.id}
-                  whileHover={{ x: 2 }}
+                  whileHover={isSkipped ? undefined : { x: 2 }}
                   onClick={() => {
                     selectSopNode(node.id);
                     if (node.id !== hitlTargetNodeId) setCenterTab('detail');
                   }}
                   className={`relative cursor-pointer rounded-xl p-3 border transition-all duration-200 ${
-                    isSelected
-                      ? 'bg-blue-950/30 border-blue-700/60 shadow-[0_0_12px_rgba(59,130,246,0.1)]'
-                      : state === 'error' ? 'bg-red-950/20 border-red-900/40 hover:border-red-700/50'
-                      : state === 'human_intervention' ? 'bg-amber-950/20 border-amber-900/40 hover:border-amber-700/50'
-                      : state === 'completed' ? 'bg-emerald-950/10 border-emerald-900/30 hover:border-emerald-700/40'
-                      : state === 'skipped' ? 'bg-slate-900/20 border-slate-700/40 hover:border-slate-600/50'
-                      : state === 'processing' ? 'bg-blue-950/15 border-blue-900/30 hover:border-blue-700/50'
-                      : state === 'stopped' ? 'bg-slate-900/25 border-slate-600/45 hover:border-slate-500/55'
-                      : 'bg-muted/40 border-border/50 hover:border-border'
+                    isSkipped
+                      ? `rd-meeting-node-card--skipped${isSelected ? ' rd-meeting-node-card--skipped-selected' : ''}`
+                      : isSelected
+                        ? 'bg-blue-950/30 border-blue-700/60 shadow-[0_0_12px_rgba(59,130,246,0.1)]'
+                        : state === 'error'
+                          ? 'bg-red-950/20 border-red-900/40 hover:border-red-700/50'
+                          : state === 'human_intervention'
+                            ? 'bg-amber-950/20 border-amber-900/40 hover:border-amber-700/50'
+                            : state === 'completed'
+                              ? 'bg-emerald-950/10 border-emerald-900/30 hover:border-emerald-700/40'
+                              : state === 'processing'
+                                ? 'bg-blue-950/15 border-blue-900/30 hover:border-blue-700/50'
+                                : state === 'stopped'
+                                  ? 'bg-slate-900/25 border-slate-600/45 hover:border-slate-500/55'
+                                  : 'bg-muted/40 border-border/50 hover:border-border'
                   }`}
                 >
                   {canStopNodeRun && isCurrentNode ? (
@@ -1802,6 +1811,9 @@ const InterventionDialog = ({
                       </div>
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
+                      {isSkipped && !isCurrentNode ? (
+                        <span className="rd-meeting-node-card__skip-badge">已跳过</span>
+                      ) : null}
                       {isCurrentNode ? (
                         <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-blue-900/40 border border-blue-700/50 text-blue-400 whitespace-nowrap">
                           当前
@@ -1945,12 +1957,22 @@ const InterventionDialog = ({
                 return (
                   <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
                     {/* Node sub-header（节点名 / 状态） */}
-                    <div className="shrink-0 border-b border-border/40 bg-[color:var(--panel)]/40 px-6 pb-3 pt-4">
+                    <div
+                      className={`shrink-0 border-b px-6 pb-3 pt-4 ${
+                        selectedNodeState === 'skipped'
+                          ? 'border-slate-700/25 bg-slate-900/15 opacity-75 saturate-50'
+                          : 'border-border/40 bg-[color:var(--panel)]/40'
+                      }`}
+                    >
                       <div className="flex items-center gap-3">
                         <div className={`rounded-lg p-2 ${
-                          selectedNode.type.includes('ai') ? 'bg-blue-500/20 text-blue-400' :
-                          selectedNode.type === 'system' ? 'bg-muted/20 text-muted-foreground' :
-                          'bg-amber-500/20 text-amber-500'
+                          selectedNodeState === 'skipped'
+                            ? 'bg-slate-500/15 text-slate-400'
+                            : selectedNode.type.includes('ai')
+                              ? 'bg-blue-500/20 text-blue-400'
+                              : selectedNode.type === 'system'
+                                ? 'bg-muted/20 text-muted-foreground'
+                                : 'bg-amber-500/20 text-amber-500'
                         }`}>
                           {selectedNode.type.includes('ai') ? <Bot className="h-5 w-5" /> :
                            selectedNode.type === 'system' ? <TerminalSquare className="h-5 w-5" /> :
