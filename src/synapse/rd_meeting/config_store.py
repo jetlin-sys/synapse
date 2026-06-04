@@ -121,7 +121,6 @@ _SAVABLE_OVERRIDE_KEYS = (
     "host_profile_id",
     "worker_profile_ids",
     "llm_endpoint_key",
-    "node_intent",
     "hitl_form_schema",
 )
 
@@ -153,7 +152,7 @@ def _strip_legacy_override_fields(overrides: dict[str, Any]) -> dict[str, Any]:
     for node_id, ov in overrides.items():
         if not isinstance(ov, dict):
             continue
-        entry = {k: v for k, v in ov.items() if k != "skill_ids"}
+        entry = {k: v for k, v in ov.items() if k not in ("skill_ids", "node_intent")}
         if is_system_node(str(node_id)):
             entry.pop("human_confirm", None)
         if entry:

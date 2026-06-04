@@ -112,7 +112,6 @@ class MeetingRoomService:
                     "host_profile_id",
                     "worker_profile_ids",
                     "llm_endpoint_key",
-                    "node_intent",
                     "hitl_form_schema",
                 ):
                     if key in ov:

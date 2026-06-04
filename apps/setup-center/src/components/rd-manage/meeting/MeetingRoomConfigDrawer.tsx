@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Drawer, Input, Select, Button, Tag, Spin } from 'antd';
+import { Drawer, Select, Button, Tag, Spin } from 'antd';
 import {
   Settings2,
   Users,
@@ -17,11 +17,24 @@ import {
   User,
   Cog,
   AlertCircle,
+  Plus,
+  X,
   type LucideIcon,
 } from 'lucide-react';
 import type { MeetingRoomNodeBinding } from '../../../api/meetingRoomService';
 import { toast } from 'sonner';
 import { NODE_TYPE_LABEL, SOP_STAGES, type NodeType, type SOPNode } from '../../../rd-sop/constants';
+import { nodeIntentFor } from '../../../rd-sop/nodeIntents';
+import { safeFetch } from '../../../providers';
+import { MeetingAgentSkillCards } from './MeetingAgentSkillCards';
+import {
+  HOST_REQUIRED_SKILLS,
+  resolveProfileSkillCards,
+  validateRequiredSkills,
+  workerRulesForProfile,
+  type MeetingAgentProfile,
+  type MeetingSkillCatalogItem,
+} from './meetingRoomSkillConfig';
 import {
   effectiveHumanConfirmByType,
   humanConfirmSwitchVisible,
@@ -37,16 +50,17 @@ import {
   type MeetingRoomNodeOverride,
 } from '../../../api/meetingRoomService';
 
-const { TextArea } = Input;
-
 /** 主控固定为小鲸（profile id: default） */
 const HOST_PROFILE_ID = 'default';
 
 interface AgentProfile {
   id: string;
   name: string;
+  description?: string;
   icon: string;
   color: string;
+  skills?: string[];
+  skills_mode?: string;
 }
 
 const FALLBACK_HOST_AGENT: AgentProfile = {
@@ -235,15 +249,6 @@ function bindingFor(
   return bindings?.find((b) => b.node_id === nodeId);
 }
 
-function effectiveNodeIntent(
-  ov: MeetingRoomNodeOverride,
-  binding?: MeetingRoomNodeBinding,
-): string {
-  const custom = (ov.node_intent ?? '').trim();
-  if (custom) return custom;
-  return (binding?.default_node_intent ?? binding?.intent ?? '').trim();
-}
-
 function effectiveHumanConfirm(
   ov: MeetingRoomNodeOverride,
   binding?: MeetingRoomNodeBinding,
@@ -268,8 +273,8 @@ function normalizeOverridesForSave(
     const entry: MeetingRoomNodeOverride = {
       ...ov,
       host_profile_id: HOST_PROFILE_ID,
-      node_intent: effectiveNodeIntent(ov, b),
     };
+    delete entry.node_intent;
     if (Array.isArray(workers)) {
       entry.worker_profile_ids = workers.filter((id) => id !== HOST_PROFILE_ID);
     }
@@ -298,6 +303,9 @@ export const MeetingRoomConfigDrawer: React.FC<{
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [llmEndpoints, setLlmEndpoints] = useState<LlmEndpointCatalogItem[]>([]);
   const [llmEndpointsErr, setLlmEndpointsErr] = useState<string | null>(null);
+  const [skillCatalog, setSkillCatalog] = useState<MeetingSkillCatalogItem[]>([]);
+  /** 单选添加协作智能体后重置，避免选择器内堆叠已选 tag */
+  const [workerPickerKey, setWorkerPickerKey] = useState(0);
   const [expandedStages, setExpandedStages] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(PIPELINE_STAGES.map((s) => [String(s.id), true])),
   );
@@ -319,23 +327,59 @@ export const MeetingRoomConfigDrawer: React.FC<{
     return map;
   }, [agents, hostAgent]);
 
+  const toMeetingProfile = useCallback((a: AgentProfile): MeetingAgentProfile => ({
+    id: a.id,
+    name: a.name,
+    description: a.description,
+    icon: a.icon,
+    color: a.color,
+    skills: a.skills ?? [],
+    skills_mode: a.skills_mode ?? 'inclusive',
+  }), []);
+
+  const hostMeetingProfile = useMemo(() => toMeetingProfile(hostAgent), [hostAgent, toMeetingProfile]);
+
+  const hostSkillCards = useMemo(
+    () => resolveProfileSkillCards(hostMeetingProfile, skillCatalog),
+    [hostMeetingProfile, skillCatalog],
+  );
+
+  const hostSkillValidation = useMemo(
+    () => validateRequiredSkills(hostMeetingProfile, skillCatalog, HOST_REQUIRED_SKILLS),
+    [hostMeetingProfile, skillCatalog],
+  );
+
   const load = useCallback(async () => {
     const base = synapseApiBase.trim();
     if (!base) return;
     setLoading(true);
     setLlmEndpointsErr(null);
     try {
-      const [data, profilesRes, endpoints] = await Promise.all([
+      const [data, profilesRes, endpoints, skillsRes] = await Promise.all([
         fetchMeetingRoomConfig(base),
         fetch(`${base}/api/agents/profiles?include_hidden=true`).then((r) => r.json()),
         fetchLlmEndpointsCatalog(base).catch((e: unknown) => {
           setLlmEndpointsErr(e instanceof Error ? e.message : String(e));
           return [] as LlmEndpointCatalogItem[];
         }),
+        safeFetch(`${base}/api/skills`, { signal: AbortSignal.timeout(15_000) })
+          .then((r) => r.json())
+          .catch(() => ({ skills: [] })),
       ]);
       setConfig(hydrateConfigWithDefaults(data));
       setAgents(profilesRes.profiles || []);
       setLlmEndpoints(endpoints);
+      const rawSkills = Array.isArray(skillsRes?.skills) ? skillsRes.skills : [];
+      setSkillCatalog(
+        rawSkills.map((s: Record<string, unknown>) => ({
+          skillId: String(s.skillId ?? s.skill_id ?? ''),
+          name: String(s.name ?? ''),
+          description: String(s.description ?? ''),
+          enabled: s.enabled !== false,
+          label: (s.label as string | null) ?? null,
+          name_i18n: (s.name_i18n as Record<string, string>) ?? null,
+        })).filter((s: MeetingSkillCatalogItem) => s.skillId),
+      );
       if (endpoints.length > 0) setLlmEndpointsErr(null);
 
       const first = SOP_STAGES.find((s) => s.id > 0)?.nodes[0]?.id;
@@ -397,8 +441,9 @@ export const MeetingRoomConfigDrawer: React.FC<{
 
   const nodeEnabled = isNodeEnabled(config?.node_overrides ?? {}, selectedNodeId);
 
-  const defaultNodeIntent = binding?.default_node_intent ?? binding?.intent ?? '';
-  const meetingGoal = effectiveNodeIntent(override, binding);
+  const meetingGoal =
+    nodeIntentFor(selectedNodeId) ||
+    (binding?.default_node_intent ?? binding?.intent ?? '').trim();
   const nodeType = (binding?.type ?? 'ai') as NodeType;
   const humanConfirm = effectiveHumanConfirm(override, binding);
   const showHumanConfirmSwitch = humanConfirmSwitchVisible(nodeType);
@@ -414,18 +459,43 @@ export const MeetingRoomConfigDrawer: React.FC<{
     setConfig({ ...config, ...patch });
   };
 
+  const collectSkillValidationErrors = useCallback((): string[] => {
+    const errs: string[] = [];
+    if (!hostSkillValidation.ok) {
+      const missing = hostSkillValidation.issues.map((i) => i.displayName).join('、');
+      errs.push(`主控小鲸缺少必备技能：${missing}`);
+    }
+    for (const pid of workerProfileIds) {
+      const rules = workerRulesForProfile(pid);
+      if (!rules) continue;
+      const agent = agentById.get(pid);
+      if (!agent) continue;
+      const profile = toMeetingProfile(agent);
+      const result = validateRequiredSkills(profile, skillCatalog, rules);
+      if (!result.ok) {
+        const missing = result.issues.map((i) => i.displayName).join('、');
+        errs.push(`协作智能体「${agent.name}」缺少必备技能：${missing}`);
+      }
+    }
+    return errs;
+  }, [
+    hostSkillValidation,
+    workerProfileIds,
+    agentById,
+    skillCatalog,
+    toMeetingProfile,
+  ]);
+
   const handleSave = async () => {
     const base = synapseApiBase.trim();
     if (!config || !base) return;
-    for (const nodeId of allSopNodeIds()) {
-      if (!isNodeEnabled(config.node_overrides ?? {}, nodeId)) continue;
-      const ov = config.node_overrides?.[nodeId] ?? {};
-      const goal = effectiveNodeIntent(ov, bindingFor(config.bindings, nodeId));
-      if (!goal) {
-        const name = bindingFor(config.bindings, nodeId)?.node_name ?? nodeId;
-        toast.error(`节点「${name}」的会议目标不能为空`);
-        return;
+    const skillErrs = collectSkillValidationErrors();
+    if (skillErrs.length > 0) {
+      toast.error(skillErrs[0]);
+      if (skillErrs.length > 1) {
+        toast.error(skillErrs.slice(1).join('\n'));
       }
+      return;
     }
     setSaving(true);
     try {
@@ -489,6 +559,19 @@ export const MeetingRoomConfigDrawer: React.FC<{
     name: a.name,
     label: a.name,
   }));
+
+  const toggleWorkerProfile = (profileId: string) => {
+    const id = profileId.trim();
+    if (!id || id === HOST_PROFILE_ID) return;
+    if (workerProfileIds.includes(id)) {
+      patchOverride({
+        worker_profile_ids: workerProfileIds.filter((w) => w !== id),
+      });
+    } else {
+      patchOverride({ worker_profile_ids: [...workerProfileIds, id] });
+    }
+    setWorkerPickerKey((k) => k + 1);
+  };
 
   const llmEndpointValue = override.llm_endpoint_key ?? binding?.llm_endpoint_key ?? 'default';
 
@@ -852,17 +935,13 @@ export const MeetingRoomConfigDrawer: React.FC<{
                       <Target className="w-3.5 h-3.5 text-sky-400" />
                       会议目标
                     </label>
-                    <ConfigFieldBox>
-                      <TextArea
-                        rows={3}
-                        value={meetingGoal}
-                        onChange={(e) => patchOverride({ node_intent: e.target.value })}
-                        placeholder={defaultNodeIntent || '请填写本节点会议目标'}
-                        className="!bg-transparent !border-none !shadow-none text-foreground text-sm leading-relaxed resize-none p-0 focus:!ring-0"
-                      />
+                    <ConfigFieldBox className="border-sky-500/20 bg-sky-500/[0.04]">
+                      <p className="text-sm text-foreground leading-relaxed m-0 whitespace-pre-wrap">
+                        {meetingGoal || '（该节点暂无预设会议目标）'}
+                      </p>
                     </ConfigFieldBox>
                     <p className="text-[10px] text-muted-foreground mt-2">
-                      可修改预设目标，保存时不可留空
+                      会议目标由 SOP 流水线固定，不可在此修改
                     </p>
                   </div>
 
@@ -930,13 +1009,17 @@ export const MeetingRoomConfigDrawer: React.FC<{
                       <Bot className="w-3.5 h-3.5 text-indigo-400" />
                       主控智能体
                     </label>
-                    <ConfigFieldBox>
-                      <div className="rd-meeting-host-readonly flex items-center gap-2">
-                        {renderAgentChip(hostAgent)}
-                        <Tag className="ml-auto m-0 border-indigo-500/25 bg-indigo-500/10 text-[10px] text-indigo-300">
-                          固定小鲸
-                        </Tag>
-                      </div>
+                    <ConfigFieldBox className="!p-0 !bg-transparent !border-none !shadow-none">
+                      <MeetingAgentSkillCards
+                        agent={hostMeetingProfile}
+                        skills={hostSkillCards}
+                        validation={hostSkillValidation}
+                        variant="host"
+                        skillsModeAll={(hostAgent.skills_mode || '').toLowerCase() === 'all'}
+                      />
+                      <p className="text-[10px] text-muted-foreground mt-2 mb-0 px-0.5">
+                        固定小鲸 · 必备：方案评审、人机问卷、文档生成、研发工具共享脚本
+                      </p>
                     </ConfigFieldBox>
                   </div>
 
@@ -947,41 +1030,77 @@ export const MeetingRoomConfigDrawer: React.FC<{
                     </label>
                     <ConfigFieldBox>
                       <Select
-                        mode="multiple"
-                        className="w-full rd-meeting-agent-select"
+                        key={workerPickerKey}
+                        className="w-full rd-meeting-agent-select rd-meeting-agent-select--add"
                         styles={meetingSelectStyles}
                         popupClassName="rd-meeting-agent-select-dropdown"
-                        placeholder="选择本节点参与的协作智能体"
-                        value={workerProfileIds}
-                        onChange={(v) => patchOverride({ worker_profile_ids: v })}
+                        placeholder={
+                          workerProfileIds.length > 0
+                            ? `管理协作智能体（已选 ${workerProfileIds.length} 位，点击已选项可取消）`
+                            : '选择协作智能体'
+                        }
+                        onChange={(id) => toggleWorkerProfile(String(id ?? ''))}
                         showSearch
                         optionFilterProp="name"
                         optionLabelProp="label"
                         options={workerSelectOptions}
                         optionRender={(opt) => {
-                          const agent = agentById.get(String(opt.value));
-                          return agent ? renderAgentChip(agent) : opt.label;
-                        }}
-                        tagRender={({ value, closable, onClose }) => {
-                          const agent = agentById.get(String(value));
-                          if (!agent) return <span className="text-foreground">{String(value)}</span>;
+                          const id = String(opt.value ?? '');
+                          const agent = agentById.get(id);
+                          const selected = workerProfileIds.includes(id);
                           return (
-                            <span className="rd-meeting-agent-tag inline-flex items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/12 pl-1.5 pr-1 py-0.5 mr-1 mb-1">
-                              {renderAgentChip(agent, true)}
-                              {closable ? (
-                                <button
-                                  type="button"
-                                  className="ml-0.5 rounded px-1 text-foreground/70 hover:bg-foreground/10"
-                                  onClick={onClose}
-                                  aria-label="移除"
-                                >
-                                  ×
-                                </button>
-                              ) : null}
-                            </span>
+                            <div
+                              className={`rd-meeting-agent-option flex items-center justify-between gap-2 w-full min-w-0 ${
+                                selected ? 'rd-meeting-agent-option--selected' : ''
+                              }`}
+                            >
+                              <span className="min-w-0 flex-1">
+                                {agent ? renderAgentChip(agent) : opt.label}
+                              </span>
+                              {selected ? (
+                                <span className="rd-meeting-agent-option__cancel shrink-0">
+                                  <X className="h-3 w-3" />
+                                  取消
+                                </span>
+                              ) : (
+                                <span className="rd-meeting-agent-option__add shrink-0 text-muted-foreground">
+                                  <Plus className="h-3 w-3 inline-block mr-0.5 -mt-px" />
+                                  添加
+                                </span>
+                              )}
+                            </div>
                           );
                         }}
                       />
+
+                      {workerProfileIds.length > 0 ? (
+                        <div className="mt-4 space-y-3">
+                          {workerProfileIds.map((pid) => {
+                            const agent = agentById.get(pid);
+                            if (!agent) return null;
+                            const profile = toMeetingProfile(agent);
+                            const rules = workerRulesForProfile(pid);
+                            const validation = rules
+                              ? validateRequiredSkills(profile, skillCatalog, rules)
+                              : null;
+                            const cards = resolveProfileSkillCards(profile, skillCatalog);
+                            return (
+                              <MeetingAgentSkillCards
+                                key={pid}
+                                agent={profile}
+                                skills={cards}
+                                validation={validation}
+                                variant="worker"
+                                skillsModeAll={(agent.skills_mode || '').toLowerCase() === 'all'}
+                              />
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-muted-foreground mt-3 mb-0">
+                          打开上方选择器添加协作智能体；已选项再次点击可取消。浩鲸三专家将自动校验必备技能。
+                        </p>
+                      )}
 
                       <div className="mt-4 pl-3 border-l-2 border-purple-500/35 space-y-2">
                         <label

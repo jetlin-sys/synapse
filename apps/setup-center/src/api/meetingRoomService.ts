@@ -154,7 +154,7 @@ export interface HitlFormSchema {
 export interface MeetingRoomNodeOverride {
   /** 会议室 SOP 节点是否参与流水线，默认 true */
   enabled?: boolean;
-  /** 会议目标（不可留空；未配置时用 Manifest 默认） */
+  /** @deprecated 会议目标已写死为 SOP Manifest，不再持久化 */
   node_intent?: string;
   /** 完成后是否需人工确认再推进下一节点 */
   human_confirm?: boolean;

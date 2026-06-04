@@ -77,8 +77,6 @@ def _merge_binding(base: dict[str, Any], override: dict[str, Any], *, node_id: s
         out["llm_endpoint_key"] = str(override["llm_endpoint_key"]).strip()
     if override.get("prompt_supplement") is not None:
         out["prompt_supplement"] = str(override.get("prompt_supplement") or "")
-    if override.get("node_intent") is not None:
-        out["node_intent"] = str(override.get("node_intent") or "")
     if override.get("hitl_form_schema") is not None:
         out["hitl_form_schema"] = override.get("hitl_form_schema")
     return out

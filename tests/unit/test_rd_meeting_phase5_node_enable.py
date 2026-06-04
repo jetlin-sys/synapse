@@ -43,17 +43,22 @@ def test_resolve_binding_enabled_false_from_override(isolated_config_dir: Path):
     assert binding["enabled"] is False
 
 
-def test_resolve_node_intent_uses_override(isolated_config_dir: Path):
+def test_resolve_node_intent_ignores_override(isolated_config_dir: Path):
     save_meeting_room_config(
         {"node_overrides": {"boundary": {"node_intent": "自定义会议目标"}}}
     )
     from synapse.rd_meeting.config_store import load_meeting_room_config
 
     loaded = load_meeting_room_config()
-    ov = loaded["node_overrides"]["boundary"]
-    intent, def_intent = resolve_node_intent("boundary", node_override=ov)
-    assert intent == "自定义会议目标"
+    assert "node_intent" not in loaded.get("node_overrides", {}).get("boundary", {})
+    intent, def_intent = resolve_node_intent(
+        "boundary",
+        node_override={"node_intent": "自定义会议目标"},
+    )
+    assert intent == default_node_intent("boundary")
     assert def_intent == default_node_intent("boundary")
+    binding = resolve_node_binding("boundary")
+    assert binding["node_intent"] == default_node_intent("boundary")
 
 
 def test_human_confirm_override(isolated_config_dir: Path):
@@ -78,7 +83,7 @@ def test_node_outputs_list(isolated_config_dir: Path):
     assert binding["node_outputs"] == node_output_artifacts("boundary")
 
 
-def test_service_put_persists_human_confirm_and_intent(isolated_config_dir: Path):
+def test_service_put_persists_human_confirm_not_intent(isolated_config_dir: Path):
     svc = MeetingRoomService()
     saved = svc.put_meeting_room_config(
         {
@@ -93,7 +98,7 @@ def test_service_put_persists_human_confirm_and_intent(isolated_config_dir: Path
     )
     ov = saved["node_overrides"]["boundary"]
     assert ov["enabled"] is False
-    assert ov["node_intent"] == "边界会议目标"
+    assert "node_intent" not in ov
     assert ov["human_confirm"] is True
 
 

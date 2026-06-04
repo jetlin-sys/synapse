@@ -18,14 +18,15 @@ def default_node_intent(node_id: str) -> str:
 def resolve_node_intent(
     node_id: str,
     *,
-    node_override: dict[str, Any],
+    node_override: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
-    """解析节点会议目标（不可为空；配置留空则用默认）。
+    """解析节点会议目标（写死为 SOP Manifest，不再读取会议室配置覆盖）。
+
+    ``node_override`` 保留参数以兼容旧调用方，已忽略其中的 ``node_intent``。
 
     Returns:
-        (node_intent, default_node_intent)
+        (node_intent, default_node_intent) — 二者相同
     """
+    del node_override  # 会议目标不可配置
     def_node = default_node_intent(node_id)
-    custom = str(node_override.get("node_intent") or "").strip()
-    intent = custom or def_node
-    return intent, def_node
+    return def_node, def_node
