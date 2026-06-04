@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "scope": {
+    "type": "demand",
+    "id": "init-ctx-demand"
+  },
+  "local_process_state": "处理中",
+  "stage_id": 1,
+  "current_node_id": "req_clarify",
+  "sop_node_display": "需求澄清",
+  "pipeline_enabled": true,
+  "meeting_room": {
+    "active": true,
+    "room_id": "mr_d_init-ctx-demand_s1"
+  },
+  "updated_at": "2026-05-21T16:34:31"
+}

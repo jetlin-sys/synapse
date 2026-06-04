@@ -67,6 +67,22 @@ SYSTEM_PERMISSIONS = frozenset(
 ALL_PERMISSIONS = BASIC_PERMISSIONS | ADVANCED_PERMISSIONS | SYSTEM_PERMISSIONS
 
 
+class PluginUIConfig(BaseModel):
+    """UI configuration for plugins that provide a frontend page (Plugin 2.0)."""
+
+    model_config = {"extra": "allow"}
+
+    entry: str = "ui/dist/index.html"
+    icon: str = ""
+    title: str = ""
+    title_i18n: dict[str, str] = Field(default_factory=dict)
+    sidebar_group: str = "apps"
+    width: int = 0
+    height: int = 0
+    permissions: list[str] = Field(default_factory=list)
+    sandbox: str = "allow-scripts allow-forms allow-same-origin allow-popups"
+
+
 class PluginManifest(BaseModel):
     """Parsed plugin.json manifest with strict validation."""
 
@@ -97,7 +113,12 @@ class PluginManifest(BaseModel):
     load_timeout: float = 10.0
     hook_timeout: float = 5.0
     retrieve_timeout: float = 3.0
+    ui: PluginUIConfig | None = None
     raw: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+    @property
+    def has_ui(self) -> bool:
+        return self.ui is not None
 
     @field_validator("id")
     @classmethod

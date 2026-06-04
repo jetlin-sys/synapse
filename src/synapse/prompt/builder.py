@@ -6,7 +6,7 @@ Prompt Builder - 消息组装模块
 组装顺序:
 1. Base Prompt: per-model 基础指令
 2. Core Rules: 行为规则 + 提问准则 + 安全约束
-3. Identity: SOUL.md + agent.core
+3. Identity: identity.core + agent.behavior（编译产物，含 {{agent_name}}）
 4. Mode Rules: Ask/Plan/Agent 模式专属规则
 5. Persona 层: 当前人格描述
 6. Runtime 层: runtime_facts (OS/CWD/时间)
@@ -432,6 +432,7 @@ def build_system_prompt(
     context_window: int = 0,
     prompt_profile: "PromptProfile | None" = None,
     prompt_tier: "PromptTier | None" = None,
+    agent_voice: str = "",
 ) -> str:
     """
     组装系统提示词
@@ -456,6 +457,7 @@ def build_system_prompt(
         model_id: 模型标识（用于 per-model 基础 prompt）
         prompt_profile: 产品场景 profile（None 回退到 LOCAL_AGENT）
         prompt_tier: 上下文窗口分档（None 回退到 LARGE）
+        agent_voice: 当前 Agent 显示名（替换 identity 块中的 ``{{agent_name}}``）
 
     Returns:
         完整的系统提示词
@@ -506,15 +508,17 @@ def build_system_prompt(
         compiled = get_compiled_content(identity_dir)
         _static_prompt_cache[f"compiled:{_id_dir_key}"] = (_now_ts, compiled)
 
-    # 4. Identity 层（SOUL.md + agent.core）
+    # 4. Identity 层（编译后的 identity.core + agent.behavior）
     if prompt_mode == PromptMode.FULL:
+        _voice_key = (agent_voice or "").strip() or "_default"
         identity_section = _cached_section(
-            "identity",
+            f"identity:{_voice_key}",
             lambda: _build_identity_section(
                 compiled=compiled,
                 identity_dir=identity_dir,
                 tools_enabled=tools_enabled,
                 budget_tokens=budget_config.identity_budget,
+                agent_voice=agent_voice,
             ),
         )
 
@@ -531,7 +535,7 @@ def build_system_prompt(
                 system_parts.append(persona_section)
 
     elif prompt_mode == PromptMode.NONE:
-        system_parts.append("你是 Synapse，一个 AI 助手。")
+        system_parts.append(f"你是 {_resolve_agent_voice(agent_voice)}，一个 AI 助手。")
 
     # 5. Mode Rules（Ask/Plan/Agent 模式专属规则）
     mode_rules = build_mode_rules(mode)
@@ -897,42 +901,49 @@ def _read_with_fallback(path: Path, fallback_key: str) -> str:
     return fallback
 
 
+_AGENT_VOICE_PLACEHOLDER = "{{agent_name}}"
+_DEFAULT_AGENT_VOICE = "Synapse"
+
+
+def _resolve_agent_voice(agent_voice: str | None) -> str:
+    if isinstance(agent_voice, str):
+        stripped = agent_voice.strip()
+        if stripped:
+            return stripped
+    return _DEFAULT_AGENT_VOICE
+
+
 def _build_identity_section(
     compiled: dict[str, str],
     identity_dir: Path,
     tools_enabled: bool,
     budget_tokens: int,
+    agent_voice: str = "",
 ) -> str:
-    """构建 Identity 层 — 双链路设计
+    """构建 Identity 层 — 注入编译后的短身份核心与行为规范。
 
-    SOUL.md / AGENT.md 直接注入源文件（不编译不转换），用户修改立即生效。
-    源文件缺失时使用 _BUILT_IN_DEFAULTS 兜底。
-    用户自定义策略（policies.md）如存在则追加。
+    ``agent_voice`` 将 ``{{agent_name}}`` 替换为当前 Agent 显示名，避免所有
+    Agent 在 SOUL/行为块中固定自称「Synapse」产品名。
     """
-    import re
-
     parts = []
 
     parts.append("# Synapse System")
     parts.append("")
 
-    # SOUL — 直接注入（~60% 预算）
-    soul_content = _read_with_fallback(identity_dir / "SOUL.md", "soul")
-    if soul_content:
-        soul_clean = re.sub(r"<!--.*?-->", "", soul_content, flags=re.DOTALL).strip()
-        soul_result = apply_budget(soul_clean, budget_tokens * 60 // 100, "soul")
-        parts.append(soul_result.content)
+    identity_core = compiled.get("identity_core") or _BUILT_IN_DEFAULTS.get("soul", "")
+    if identity_core:
+        result = apply_budget(identity_core.strip(), budget_tokens * 30 // 100, "identity_core")
+        parts.append(result.content)
         parts.append("")
 
-    # AGENT — 直接注入（~25% 预算）
-    agent_content = _read_with_fallback(identity_dir / "AGENT.md", "agent_core")
-    if agent_content:
-        agent_clean = re.sub(r"<!--.*?-->", "", agent_content, flags=re.DOTALL).strip()
-        core_result = apply_budget(agent_clean, budget_tokens * 25 // 100, "agent_core")
-        parts.append(core_result.content)
+    agent_behavior = (
+        compiled.get("agent_behavior") or compiled.get("agent_core") or _BUILT_IN_DEFAULTS.get("agent_core", "")
+    )
+    if agent_behavior:
+        result = apply_budget(agent_behavior.strip(), budget_tokens * 40 // 100, "agent_behavior")
+        parts.append(result.content)
         parts.append("")
 
-    # User policies (~15%) — 用户自定义策略文件
     policies_path = identity_dir / "prompts" / "policies.md"
     if policies_path.exists():
         try:
@@ -945,7 +956,10 @@ def _build_identity_section(
         except Exception:
             pass
 
-    return "\n".join(parts)
+    text = "\n".join(parts)
+    if _AGENT_VOICE_PLACEHOLDER in text:
+        text = text.replace(_AGENT_VOICE_PLACEHOLDER, _resolve_agent_voice(agent_voice))
+    return text
 
 
 def _get_current_time(timezone_name: str = "Asia/Shanghai") -> str:

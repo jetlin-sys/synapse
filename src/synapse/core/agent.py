@@ -2050,6 +2050,24 @@ class Agent:
         except Exception as e:
             logger.warning(f"Failed to register sync_owner_work_orders task: {e}")
 
+    def _resolve_agent_voice(self) -> str:
+        """SOUL/identity 块中 ``{{agent_name}}`` 应展开为的显示名。"""
+        profile = getattr(self, "_agent_profile", None)
+        if profile is not None:
+            try:
+                display = profile.get_display_name("zh")
+            except Exception:
+                display = ""
+            if isinstance(display, str) and display.strip():
+                return display.strip()
+            primary = getattr(profile, "name", "")
+            if isinstance(primary, str) and primary.strip():
+                return primary.strip()
+        agent_name = getattr(self, "name", "")
+        if isinstance(agent_name, str) and agent_name.strip():
+            return agent_name.strip()
+        return getattr(settings, "agent_name", "") or ""
+
     def _build_system_prompt(
         self,
         task_description: str = "",
@@ -2073,6 +2091,7 @@ class Agent:
             session_type=session_type,
             context_window=ctx_window,
             is_sub_agent=self._is_sub_agent_call,
+            agent_voice=self._resolve_agent_voice(),
         )
         if self._custom_prompt_suffix:
             prompt += f"\n\n{self._custom_prompt_suffix}"
@@ -2172,6 +2191,7 @@ class Agent:
             user_input_tokens=_user_input_tokens,
             prompt_profile=_prompt_profile,
             prompt_tier=_prompt_tier,
+            agent_voice=self._resolve_agent_voice(),
         )
         if self._custom_prompt_suffix:
             prompt += f"\n\n{self._custom_prompt_suffix}"

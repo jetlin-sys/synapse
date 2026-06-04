@@ -208,7 +208,7 @@ async def handle_message(update: Update, context):
         session.add_message("user", text)
         
         # 调用 Agent 处理
-        response = await agent.chat(text, usage_scene="telegram_bot")
+        response = await agent.chat(text)
         
         # 记录助手回复到会话
         session.add_message("assistant", response)
@@ -289,3 +289,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

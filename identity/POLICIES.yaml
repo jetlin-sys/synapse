@@ -78,3 +78,10 @@ security:
   user_allowlist:
     commands: []
     tools: []
+  profile:
+    current: trust
+    base: null
+  shell_risk:
+    enabled: true
+  death_switch:
+    enabled: true

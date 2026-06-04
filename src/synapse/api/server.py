@@ -380,6 +380,15 @@ def create_app(
                         "Failed to mount pending routes for plugin '%s': %s", plugin_id, e
                     )
 
+            pending_ui = pm._host_refs.pop("_pending_plugin_ui_mounts", [])
+            for plugin_id, ui_dist_dir in pending_ui:
+                try:
+                    pm._do_mount_plugin_ui(app, plugin_id, ui_dist_dir)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to mount pending UI for plugin '%s': %s", plugin_id, e
+                    )
+
     # Initialize OrgManager & OrgRuntime
     from synapse.orgs.manager import OrgManager
     from synapse.orgs.runtime import OrgRuntime

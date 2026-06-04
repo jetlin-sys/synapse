@@ -297,6 +297,73 @@ class PluginManager:
             sys_path_entry=sys_path_entry,
         )
 
+        plugin_pending = api._host.pop("_pending_plugin_routers", [])
+        if plugin_pending:
+            shared_pending = self._host_refs.setdefault("_pending_plugin_routers", [])
+            if plugin_pending is not shared_pending:
+                for entry in plugin_pending:
+                    if entry not in shared_pending:
+                        shared_pending.append(entry)
+
+        if manifest.has_ui:
+            self._mount_plugin_ui(manifest, plugin_dir)
+
+    def _mount_plugin_ui(self, manifest: PluginManifest, plugin_dir: Path) -> None:
+        assert manifest.ui is not None
+        ui_entry = manifest.ui.entry
+        ui_dist_dir = (plugin_dir / ui_entry).parent
+        if not ui_dist_dir.is_dir():
+            logger.warning(
+                "Plugin '%s' declares UI but dist dir '%s' not found, skipping UI mount",
+                manifest.id,
+                ui_dist_dir,
+            )
+            return
+        index_file = plugin_dir / ui_entry
+        if not index_file.is_file():
+            logger.warning(
+                "Plugin '%s' UI entry '%s' not found, skipping UI mount",
+                manifest.id,
+                ui_entry,
+            )
+            return
+
+        app = self._host_refs.get("api_app")
+        if app is None:
+            logger.debug(
+                "Plugin '%s' has UI but api_app not yet available; will mount later",
+                manifest.id,
+            )
+            pending = self._host_refs.setdefault("_pending_plugin_ui_mounts", [])
+            pending.append((manifest.id, str(ui_dist_dir)))
+            return
+
+        self._do_mount_plugin_ui(app, manifest.id, str(ui_dist_dir))
+
+    @staticmethod
+    def _do_mount_plugin_ui(app: Any, plugin_id: str, ui_dist_dir: str) -> None:
+        from fastapi.staticfiles import StaticFiles
+        from starlette.responses import Response
+
+        mount_path = f"/api/plugins/{plugin_id}/ui"
+
+        class NoCacheStaticFiles(StaticFiles):
+            async def get_response(self, path: str, scope) -> Response:  # type: ignore[override]
+                resp = await super().get_response(path, scope)
+                resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                resp.headers["Pragma"] = "no-cache"
+                return resp
+
+        try:
+            app.mount(
+                mount_path,
+                NoCacheStaticFiles(directory=ui_dist_dir, html=True),
+                name=f"plugin-ui-{plugin_id}",
+            )
+            logger.info("Mounted plugin UI for '%s' at %s", plugin_id, mount_path)
+        except Exception as e:
+            logger.warning("Failed to mount UI for plugin '%s': %s", plugin_id, e)
+
     def _load_python_plugin(
         self, manifest: PluginManifest, plugin_dir: Path
     ) -> tuple[PluginBase, str, str]:
@@ -756,6 +823,37 @@ class PluginManager:
         all_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
         tail = all_lines[-lines:]
         return "\n".join(tail)
+
+    def list_ui_plugins(self) -> list[dict]:
+        """Return metadata for all loaded plugins that have a UI."""
+        result = []
+        for lp in self._loaded.values():
+            if not lp.manifest.has_ui:
+                continue
+            ui = lp.manifest.ui
+            assert ui is not None
+            icon_url = ""
+            if ui.icon:
+                version = ""
+                ui_icon_path = (lp.plugin_dir / ui.entry).parent / ui.icon
+                try:
+                    version = f"?v={ui_icon_path.stat().st_mtime_ns}"
+                except OSError:
+                    version = ""
+                icon_url = f"/api/plugins/{lp.manifest.id}/ui/{ui.icon}{version}"
+            result.append(
+                {
+                    "id": lp.manifest.id,
+                    "title": ui.title or lp.manifest.name,
+                    "title_i18n": dict(ui.title_i18n) if ui.title_i18n else {},
+                    "icon_url": icon_url,
+                    "sidebar_group": ui.sidebar_group,
+                    "sandbox": ui.sandbox,
+                    "enabled": True,
+                    "status": "loaded",
+                }
+            )
+        return result
 
 
 class _LoadedPlugin:

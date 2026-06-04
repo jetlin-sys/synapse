@@ -9,9 +9,8 @@ Prompt Compiler (v2) — LLM 辅助编译 + 缓存 + 规则降级
 5. 写入 compiled/ 目录
 
 编译目标:
-- SOUL.md -> soul.summary.md (<=150 tokens)
-- AGENT.md -> agent.core.md (<=300 tokens)
-- USER.md -> user.summary.md (<=120 tokens)
+- SOUL.md -> identity.core.md + identity.longform.index.md
+- AGENT.md -> agent.behavior.md
 - personas/user_custom.md -> persona.custom.md (<=150 tokens)
 """
 
@@ -30,9 +29,24 @@ logger = logging.getLogger(__name__)
 # =========================================================================
 
 _COMPILE_PROMPTS: dict[str, dict] = {
-    # SOUL.md — 不编译，全文直接注入 system prompt
-    # AGENT.md — 不编译，builder.py 直接注入 (v3)
-    # USER.md — 不编译，builder.py 运行时清洗 (v3)
+    "identity_core": {
+        "target": "identity_core",
+        "system": "你是身份文件编译器，只保留不可省略的核心身份和安全原则。",
+        "user": "将以下 SOUL.md 编译为 300-600 tokens 的核心身份摘要，保留安全、诚实、人类监督、语言/价值观边界；第一人称使用 {{agent_name}} 占位符，项目/platform 称 Synapse。\n\n原文:\n{content}",
+        "max_tokens": 600,
+    },
+    "agent_behavior": {
+        "target": "agent_behavior",
+        "system": "你是 Agent 行为规范编译器，只保留可执行行为规则。",
+        "user": "将以下 AGENT.md 编译为 600-1000 tokens 的行为规范，保留任务执行、验证、失败处理、用户沟通边界；自称使用 {{agent_name}} 占位符。\n\n原文:\n{content}",
+        "max_tokens": 1000,
+    },
+    "identity_longform_index": {
+        "target": "identity_longform_index",
+        "system": "你是长身份文档索引器。",
+        "user": "为以下身份文档生成按需加载索引，只列主题，不输出全文，不超过 200 tokens；第一人称用 {{agent_name}}，项目称 Synapse。\n\n原文:\n{content}",
+        "max_tokens": 200,
+    },
     "persona_custom": {
         "target": "persona_custom",
         "system": "你是一个文本精简专家。",
@@ -51,20 +65,20 @@ _COMPILE_PROMPTS: dict[str, dict] = {
 }
 
 _SOURCE_MAP: dict[str, str] = {
-    # SOUL.md — 不编译，全文注入
-    # AGENT.md — 不编译，全文注入 (v3: 改为直接注入)
-    # USER.md — 不编译，builder 运行时清洗 (v3: 改为运行时清洗)
+    "identity_core": "SOUL.md",
+    "agent_behavior": "AGENT.md",
+    "identity_longform_index": "SOUL.md",
     "persona_custom": "personas/user_custom.md",
 }
 
 _OUTPUT_MAP: dict[str, str] = {
-    # soul.summary.md — 不再生成
-    # agent.core.md — 不再生成 (v3: AGENT.md 直接注入)
-    # user.summary.md — 不再生成 (v3: USER.md 运行时清洗)
+    "identity_core": "identity.core.md",
+    "agent_behavior": "agent.behavior.md",
+    "identity_longform_index": "identity.longform.index.md",
     "persona_custom": "persona.custom.md",
 }
 
-_ORPHAN_FILES = ["soul.summary.md", "agent.tooling.md", "agent.core.md", "user.summary.md"]
+_ORPHAN_FILES = ["soul.summary.md", "agent.core.md", "user.summary.md"]
 
 
 # =========================================================================
@@ -370,9 +384,25 @@ def _is_relevant_section(section: str, target: str) -> bool:
 # =========================================================================
 
 _STATIC_FALLBACKS: dict[str, str] = {
-    # NOTE: agent_core 和 agent_tooling 的 fallback 已不再使用
-    # (v3: AGENT.md 改为 builder.py 直接注入，兜底在 builder._BUILT_IN_DEFAULTS 中)
-    # 保留此处仅为向后兼容，不会被新代码路径调用。
+    "identity_core": """\
+## 身份核心
+- 你是 {{agent_name}}，由 Synapse 项目驱动的全能自进化 AI 助手。
+- 优先保持安全、诚实、支持人类监督；遵守 workspace 与 `POLICIES.yaml` 安全区。
+- 真正帮助用户完成任务，但不越权、不欺骗、不操纵用户。
+- 对不确定信息保持校准，必要时说明限制。""",
+    "agent_behavior": """\
+## 行为核心
+- 理解用户目标，先做能做的调查和验证。
+- 任务执行遵循：理解 → 检查 → 执行 → 验证 → 报告。
+- 出错时分析原因并尝试修复，不能假装成功。
+- 不超出用户请求范围，不做未经授权的破坏性操作。""",
+    "identity_longform_index": """\
+## 身份长文索引
+- Soul Overview / 核心价值观
+- 帮助用户
+- 诚实与校准
+- 避免伤害
+- 人类监督""",
     "agent_core": """\
 ## 核心执行原则
 
@@ -497,7 +527,8 @@ def compile_soul(content: str) -> str:
 
 
 def compile_agent_core(content: str) -> str:
-    return _compile_with_rules(content, _COMPILE_PROMPTS["agent_core"])
+    """向后兼容：历史上 agent_core 对应现在的 agent_behavior。"""
+    return _compile_with_rules(content, _COMPILE_PROMPTS["agent_behavior"])
 
 
 def compile_agent_tooling(content: str) -> str:
