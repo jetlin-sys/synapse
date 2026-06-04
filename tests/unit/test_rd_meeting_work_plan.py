@@ -9,8 +9,12 @@ import pytest
 from synapse.rd_meeting.room_runtime import history_to_chat_logs
 from synapse.rd_meeting.work_plan import (
     check_delegation_allowed,
+    check_host_hitl_gate,
     clear_work_plan,
+    mark_delegation_completed,
     mark_delegation_started,
+    mark_plan_hitl_submitted,
+    plan_awaiting_hitl,
     submit_work_plan,
 )
 
@@ -161,3 +165,86 @@ def test_clear_work_plan(meeting_scope: str, monkeypatch: pytest.MonkeyPatch) ->
     )
     clear_work_plan(meeting_scope)
     assert check_delegation_allowed(session, agent_id="worker-a") is not None
+
+
+def test_human_confirm_requires_closing_step_in_plan(meeting_scope: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    binding = {
+        "host_profile_id": "default",
+        "worker_profile_ids": ["worker-a"],
+        "node_id": "req_clarify",
+        "human_confirm": True,
+    }
+    monkeypatch.setattr(
+        "synapse.rd_meeting.work_plan.resolve_node_binding",
+        lambda *a, **k: binding,
+    )
+    session = "rd_meeting:room-plan:host"
+    plan = submit_work_plan(
+        session_id=session,
+        goal_summary="澄清",
+        items=[{"id": "t1", "agent_id": "worker-a", "task": "调研", "reason": "专家"}],
+    )
+    assert isinstance(plan.get("closing_step"), dict)
+    assert plan["closing_step"]["action"] == "submit_hitl"
+    assert plan["hitl_submitted"] is False
+
+
+def test_batch_complete_awaiting_hitl_gate(meeting_scope: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    binding = {
+        "host_profile_id": "default",
+        "worker_profile_ids": ["worker-a", "worker-b"],
+        "node_id": "req_clarify",
+        "human_confirm": True,
+    }
+    monkeypatch.setattr(
+        "synapse.rd_meeting.work_plan.resolve_node_binding",
+        lambda *a, **k: binding,
+    )
+    session = "rd_meeting:room-plan:host"
+    submit_work_plan(
+        session_id=session,
+        goal_summary="澄清",
+        items=[
+            {"id": "t1", "agent_id": "worker-a", "task": "a", "reason": "r"},
+            {"id": "t2", "agent_id": "worker-b", "task": "b", "reason": "r"},
+        ],
+    )
+    assert plan_awaiting_hitl(meeting_scope) is False
+    mark_delegation_completed(session, agent_id="worker-a", plan_item_id="t1")
+    assert plan_awaiting_hitl(meeting_scope) is False
+    hint = mark_delegation_completed(session, agent_id="worker-b", plan_item_id="t2")
+    assert plan_awaiting_hitl(meeting_scope) is True
+    assert "submit_hitl_questionnaire" in hint
+    err = check_host_hitl_gate(session, "deliver_artifacts")
+    assert err is not None
+    mark_plan_hitl_submitted(meeting_scope, kind="interactive")
+    assert plan_awaiting_hitl(meeting_scope) is False
+    assert check_host_hitl_gate(session, "deliver_artifacts") is None
+
+
+def test_redelegate_resets_hitl_until_batch_complete_again(
+    meeting_scope: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binding = {
+        "host_profile_id": "default",
+        "worker_profile_ids": ["worker-a"],
+        "node_id": "req_clarify",
+        "human_confirm": True,
+    }
+    monkeypatch.setattr(
+        "synapse.rd_meeting.work_plan.resolve_node_binding",
+        lambda *a, **k: binding,
+    )
+    session = "rd_meeting:room-plan:host"
+    submit_work_plan(
+        session_id=session,
+        goal_summary="g",
+        items=[{"id": "t1", "agent_id": "worker-a", "task": "t", "reason": "r"}],
+    )
+    mark_delegation_completed(session, agent_id="worker-a", plan_item_id="t1")
+    mark_plan_hitl_submitted(meeting_scope, kind="interactive")
+    assert plan_awaiting_hitl(meeting_scope) is False
+    mark_delegation_started(session, agent_id="worker-a", plan_item_id="t1")
+    assert plan_awaiting_hitl(meeting_scope) is False
+    mark_delegation_completed(session, agent_id="worker-a", plan_item_id="t1")
+    assert plan_awaiting_hitl(meeting_scope) is True

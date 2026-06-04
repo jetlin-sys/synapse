@@ -19,6 +19,18 @@ logger = logging.getLogger(__name__)
 PLAN_TYPE = "meeting_work_plan"
 PLAN_VERSION = "1"
 ROOM_STATE_KEY = "current_work_plan"
+HOST_HITL_ACTION = "submit_hitl"
+DEFAULT_CLOSING_STEP: dict[str, str] = {
+    "action": HOST_HITL_ACTION,
+    "kind": "interactive",
+    "task": "综合本计划全部协作智能体产出，调用 submit_hitl_questionnaire 生成本批次人机确认表单",
+    "reason": "本节点开启人工确认，须结构化问卷，禁止在聊天中用「待用户确认」代替",
+}
+PLAN_HITL_GATED_TOOLS = frozenset({
+    "deliver_artifacts",
+    "execute_skill",
+    "run_skill_script",
+})
 
 
 def _now_iso() -> str:
@@ -100,13 +112,83 @@ def validate_work_plan_items(
             )
 
 
+def _normalize_closing_step(raw: Any) -> dict[str, str]:
+    if raw is None:
+        return dict(DEFAULT_CLOSING_STEP)
+    if not isinstance(raw, dict):
+        raise ValueError("closing_step 必须为对象")
+    action = str(raw.get("action") or HOST_HITL_ACTION).strip().lower()
+    if action != HOST_HITL_ACTION:
+        raise ValueError(f"closing_step.action 必须为 `{HOST_HITL_ACTION}`")
+    kind = str(raw.get("kind") or "interactive").strip().lower()
+    if kind != "interactive":
+        raise ValueError("closing_step.kind 当前仅支持 `interactive`（会中批次澄清）")
+    task = str(raw.get("task") or "").strip()
+    reason = str(raw.get("reason") or "").strip()
+    if not task:
+        raise ValueError("closing_step.task 不能为空")
+    if not reason:
+        raise ValueError("closing_step.reason 不能为空")
+    return {"action": action, "kind": kind, "task": task, "reason": reason}
+
+
+def _delegate_item_ids(plan: dict[str, Any]) -> set[str]:
+    items = plan.get("items") if isinstance(plan.get("items"), list) else []
+    return {
+        str(it.get("id") or "").strip()
+        for it in items
+        if isinstance(it, dict) and str(it.get("id") or "").strip()
+    }
+
+
+def is_plan_batch_complete(plan: dict[str, Any]) -> bool:
+    delegate_ids = _delegate_item_ids(plan)
+    if not delegate_ids:
+        return False
+    completed = plan.get("completed_item_ids")
+    if not isinstance(completed, list):
+        return False
+    done = {str(x).strip() for x in completed if str(x).strip()}
+    return delegate_ids.issubset(done)
+
+
+def plan_requires_hitl(plan: dict[str, Any], *, human_confirm: bool) -> bool:
+    return bool(human_confirm and isinstance(plan.get("closing_step"), dict))
+
+
+def plan_awaiting_hitl(scope_id: str, *, human_confirm: bool | None = None) -> bool:
+    plan = get_work_plan(scope_id)
+    if not plan:
+        return False
+    if human_confirm is None:
+        node_id = str(plan.get("node_id") or "").strip()
+        binding = resolve_node_binding(node_id, scope_id=scope_id) if node_id else {}
+        human_confirm = bool(binding.get("human_confirm"))
+    if not plan_requires_hitl(plan, human_confirm=bool(human_confirm)):
+        return False
+    if plan.get("hitl_submitted"):
+        return False
+    return is_plan_batch_complete(plan)
+
+
+def batch_complete_hint(scope_id: str) -> str:
+    if not plan_awaiting_hitl(scope_id):
+        return ""
+    return (
+        "\n\n---\n**系统提示**：本工作安排计划中的协作任务已全部返回。"
+        "请综合各 Worker 产出调用 `submit_hitl_questionnaire`（kind=\"interactive\"），"
+        "勿在正文中写「待用户确认」代替表单。"
+    )
+
+
 def build_plan_document(
     *,
     goal_summary: str,
     items: list[dict[str, Any]],
     node_id: str,
+    closing_step: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    doc: dict[str, Any] = {
         "type": PLAN_TYPE,
         "version": PLAN_VERSION,
         "node_id": node_id,
@@ -115,6 +197,9 @@ def build_plan_document(
         "plan_id": uuid.uuid4().hex[:12],
         "submitted_at": _now_iso(),
     }
+    if closing_step is not None:
+        doc["closing_step"] = dict(closing_step)
+    return doc
 
 
 def format_plan_summary_text(plan: dict[str, Any]) -> str:
@@ -135,6 +220,13 @@ def format_plan_summary_text(plan: dict[str, Any]) -> str:
         lines.append(f"- **{name}** (`{aid}`){pg_txt}：{task}")
         if reason:
             lines.append(f"  - 原因：{reason}")
+    closing = plan.get("closing_step")
+    if isinstance(closing, dict):
+        lines.append("\n**收尾（主控）**：")
+        lines.append(f"- {str(closing.get('task') or '').strip()}")
+        creason = str(closing.get("reason") or "").strip()
+        if creason:
+            lines.append(f"  - 原因：{creason}")
     return "\n".join(lines)
 
 
@@ -159,6 +251,7 @@ def submit_work_plan(
     session_id: str,
     goal_summary: str,
     items: list[dict[str, Any]],
+    closing_step: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ctx = meeting_context_from_session(session_id)
     if ctx is None:
@@ -184,9 +277,23 @@ def submit_work_plan(
         )
     validate_work_plan_items(normalized, allowed_worker_ids=workers, host_profile_id=host_id)
 
-    plan = build_plan_document(goal_summary=goal_summary, items=normalized, node_id=node_id)
+    human_confirm = bool(binding.get("human_confirm"))
+    normalized_closing: dict[str, str] | None = None
+    if human_confirm:
+        normalized_closing = _normalize_closing_step(
+            closing_step if closing_step is not None else DEFAULT_CLOSING_STEP
+        )
+
+    plan = build_plan_document(
+        goal_summary=goal_summary,
+        items=normalized,
+        node_id=node_id,
+        closing_step=normalized_closing,
+    )
     plan["delegation_started"] = False
     plan["delegated_item_ids"] = []
+    plan["completed_item_ids"] = []
+    plan["hitl_submitted"] = False
 
     rs[ROOM_STATE_KEY] = plan
     save_room_state(scope_id, rs)
@@ -312,5 +419,102 @@ def mark_delegation_started(
                     delegated.append(iid)
                 break
     plan["delegated_item_ids"] = delegated
+    if plan.get("hitl_submitted"):
+        plan["hitl_submitted"] = False
+        completed = plan.get("completed_item_ids")
+        if isinstance(completed, list) and pid:
+            plan["completed_item_ids"] = [x for x in completed if str(x).strip() != pid]
     rs[ROOM_STATE_KEY] = plan
     save_room_state(scope_id, rs)
+
+
+def mark_delegation_completed(
+    session_id: str,
+    *,
+    agent_id: str,
+    plan_item_id: str = "",
+    ok: bool = True,
+) -> str:
+    """委派返回后标记计划条目完成；若本批全部完成则返回提示 Host 交 HITL 的文案。"""
+    if not ok or not is_rd_meeting_host_session(session_id):
+        return ""
+    ctx = meeting_context_from_session(session_id)
+    if ctx is None:
+        return ""
+    scope_id = ctx["scope_id"]
+    rs = dict(load_room_state(scope_id) or {})
+    plan = rs.get(ROOM_STATE_KEY)
+    if not isinstance(plan, dict):
+        return ""
+
+    plan = dict(plan)
+    completed = plan.get("completed_item_ids")
+    if not isinstance(completed, list):
+        completed = []
+    pid = (plan_item_id or "").strip()
+    if not pid:
+        items = plan.get("items") if isinstance(plan.get("items"), list) else []
+        for it in items:
+            if isinstance(it, dict) and str(it.get("agent_id") or "").strip() == (agent_id or "").strip():
+                pid = str(it.get("id") or "").strip()
+                break
+    if pid and pid not in completed:
+        completed.append(pid)
+    plan["completed_item_ids"] = completed
+    rs[ROOM_STATE_KEY] = plan
+    save_room_state(scope_id, rs)
+    return batch_complete_hint(scope_id)
+
+
+def mark_plan_hitl_submitted(scope_id: str, *, kind: str = "interactive") -> None:
+    """Host 成功 submit_hitl 后标记当前计划批次已交问卷。"""
+    if kind.strip().lower() != "interactive":
+        return
+    sid = (scope_id or "").strip()
+    if not sid:
+        return
+    rs = dict(load_room_state(sid) or {})
+    plan = rs.get(ROOM_STATE_KEY)
+    if not isinstance(plan, dict) or not isinstance(plan.get("closing_step"), dict):
+        return
+    plan = dict(plan)
+    plan["hitl_submitted"] = True
+    rs[ROOM_STATE_KEY] = plan
+    save_room_state(sid, rs)
+
+
+def session_id_from_agent(agent: Any) -> str:
+    session = getattr(agent, "_current_session", None)
+    return str(
+        getattr(session, "id", None)
+        or getattr(session, "session_id", None)
+        or getattr(agent, "_current_session_id", None)
+        or ""
+    )
+
+
+def check_host_hitl_gate(
+    session_id: str,
+    tool_name: str,
+    *,
+    skill_name: str = "",
+) -> str | None:
+    """本批协作任务已收齐且尚未 submit_hitl 时，阻止 Host 归档/交付类工具。"""
+    if not is_rd_meeting_host_session(session_id):
+        return None
+    ctx = meeting_context_from_session(session_id)
+    if ctx is None:
+        return None
+    if tool_name not in PLAN_HITL_GATED_TOOLS:
+        return None
+    if tool_name in ("execute_skill", "run_skill_script"):
+        skill = (skill_name or "").strip().lower()
+        if "doc-generate" not in skill and "doc_generate" not in skill:
+            return None
+    if not plan_awaiting_hitl(ctx["scope_id"]):
+        return None
+    return (
+        "❌ 本工作安排计划的协作任务已全部返回，但尚未调用 `submit_hitl_questionnaire`。"
+        "请先综合 Worker 产出提交 interactive 人机问卷，再归档或调用 doc-generate。"
+        "禁止在聊天中用「待用户确认」代替表单。"
+    )

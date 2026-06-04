@@ -39,8 +39,9 @@ MEETING_ROOM_TOOLS = [
             "- 每题人工输入框与末尾补充题由桌面端表单组件**自动追加**，无需在 ``questions`` 里设置 "
             "``inputEnabled`` 或手写补充题。\n\n"
             "**人工确认开关（``human_confirm: true``）下的硬约束**：\n"
-            "- **每次**收到 Worker 响应、**每次**做下一步决策前（重派 / 换人 / 收敛 / 归档），"
-            "都必须先调用本工具（``kind=\"interactive\"``）与用户交互，再继续推进；\n"
+            "- 本批 ``submit_meeting_work_plan`` 协作任务**全部返回后**，须综合产出调用本工具（``kind=\"interactive\"``）；"
+            "批次内可继续 delegate / 重派，**不必**每条 Worker 响应都弹表单；\n"
+            "- 在需要用户拍板的决策分叉（重派 / 换人 / 收敛 / 归档）前，必须先 submit_hitl；\n"
             "- 严禁自行替用户「拍板」「自动通过」「自动重派」。"
         ),
         "input_schema": {
@@ -109,7 +110,10 @@ MEETING_ROOM_TOOLS = [
             "**强制流程**：\n"
             "1. 阅读能力卡片与会议目标，拆分可委派的子任务\n"
             "2. 调用本工具提交计划（items 非空，每项含 agent_id / task / reason）\n"
-            "3. 再按 plan 使用 delegate_to_agent 或 delegate_parallel\n\n"
+            "3. 再按 plan 使用 delegate_to_agent 或 delegate_parallel\n"
+            "4. **若本节点 `human_confirm: true`**：计划须含 `closing_step`（主控收尾："
+            "综合全部 Worker 产出后调用 `submit_hitl_questionnaire`）；系统会在协作任务全部返回后"
+            "要求先交表单，再归档\n\n"
             "**注意**：\n"
             "- agent_id 必须属于当前节点 binding 的 worker_profile_ids\n"
             "- 已开始委派后不可再修改计划\n"
@@ -124,7 +128,7 @@ MEETING_ROOM_TOOLS = [
                 },
                 "items": {
                     "type": "array",
-                    "description": "工作安排条目（至少 1 条）",
+                    "description": "协作智能体工作安排条目（至少 1 条）",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -151,6 +155,34 @@ MEETING_ROOM_TOOLS = [
                         },
                         "required": ["agent_id", "task", "reason"],
                     },
+                },
+                "closing_step": {
+                    "type": "object",
+                    "description": (
+                        "human_confirm 为 true 时必填（可省略以使用系统默认）："
+                        "主控在本批协作任务全部返回后的收尾步骤"
+                    ),
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["submit_hitl"],
+                            "description": "固定为 submit_hitl",
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["interactive"],
+                            "description": "会中批次澄清问卷",
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "主控收尾任务描述（综合 Worker 产出后 submit_hitl）",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "为何需要此收尾步骤",
+                        },
+                    },
+                    "required": ["task", "reason"],
                 },
             },
             "required": ["goal_summary", "items"],

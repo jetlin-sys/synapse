@@ -196,6 +196,11 @@ class IMChannelHandler:
 
         # deliver_artifacts 支持跨通道发送（target_channel 参数）
         if tool_name == "deliver_artifacts":
+            from synapse.rd_meeting.work_plan import check_host_hitl_gate, session_id_from_agent
+
+            gate_err = check_host_hitl_gate(session_id_from_agent(self.agent), tool_name)
+            if gate_err:
+                return gate_err
             params = self._normalize_delivery_params(params)
             target_channel = (params.get("target_channel") or "").strip()
             if target_channel:

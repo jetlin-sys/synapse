@@ -62,9 +62,21 @@ def finish_rd_meeting_delegation(
     ok: bool,
     summary: str = "",
     elapsed_s: float | None = None,
-) -> None:
-    if not session_id:
-        return
+    plan_item_id: str = "",
+) -> str:
+    hint = ""
+    if session_id:
+        try:
+            from synapse.rd_meeting.work_plan import mark_delegation_completed
+
+            hint = mark_delegation_completed(
+                session_id,
+                agent_id=to_agent,
+                plan_item_id=plan_item_id,
+                ok=ok,
+            )
+        except Exception as exc:
+            logger.debug("mark_delegation_completed failed: %s", exc)
     try:
         from synapse.rd_meeting.live import record_delegation_finished
 
@@ -78,6 +90,7 @@ def finish_rd_meeting_delegation(
         )
     except Exception as exc:
         logger.debug("record_delegation_finished failed: %s", exc)
+    return hint
 
 
 def handle_rd_meeting_delegation_error(

@@ -1398,14 +1398,17 @@ class AgentOrchestrator:
                 pre_state_key=state_key,
             )
             ok = not str(result).strip().startswith("❌")
-            finish_rd_meeting_delegation(
+            hint = finish_rd_meeting_delegation(
                 session_id,
                 from_agent=from_agent,
                 to_agent=to_agent,
                 ok=ok,
                 summary=str(result)[:500],
                 elapsed_s=time.monotonic() - started,
+                plan_item_id=(plan_item_id or "").strip(),
             )
+            if hint:
+                result = str(result) + hint
             return result
         except Exception as exc:
             handle_rd_meeting_delegation_error(
