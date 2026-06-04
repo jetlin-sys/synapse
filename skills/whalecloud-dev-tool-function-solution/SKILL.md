@@ -314,7 +314,7 @@ Step 9 — 影响评估
 Step 10 — 文档落地（调用 whalecloud-dev-tool-doc-generate）
   10a. 汇总所有章节内容，按照「输出内容格式」生成完整正文
       - 各模块改造内容在 §1.7 中按模块分小节合并输出
-      - 正文从 §1 方案内容 起至 §2 附录止，记为 DOCUMENT_BODY（不含模板页眉中的元数据行）
+      - 正文从 §1.1 需求背景 起至 §1.11 验收映射 止，记为 DOCUMENT_BODY（不含模板中的 `## 1. 方案内容` 标题和页眉元数据行）
   10b. 组装 CONTEXT_JSON（UTF-8），建议字段：
       - DOCUMENT_BODY：Step 10a 的完整 Markdown 正文（必填）
       - REQUIREMENT_NAME：来自 CLARIFY_DATA 的需求名称或标题
@@ -341,7 +341,7 @@ Step 10 — 文档落地（调用 whalecloud-dev-tool-doc-generate）
 | 模板 | `templates/函数级方案.md`（与 `OUTPUT` 同名） |
 | OUTPUT_DIR | `{ARCHIVE_DIR}`（默认 `{WORK_ORDER_DIR}/archive/需求分析/function_solution/`） |
 | OUTPUT | `函数级方案.md` |
-| 正文字段 | `CONTEXT_JSON.DOCUMENT_BODY` — 含 §1–§2 全部章节 |
+| 正文字段 | `CONTEXT_JSON.DOCUMENT_BODY` — 含 §1.1–§1.11 全部章节 |
 
 ### 调用示例
 
@@ -359,7 +359,7 @@ OUTPUT_MODE: file
 ```json
 {
   "REQUIREMENT_NAME": "索引优先级在线变更",
-  "DOCUMENT_BODY": "## 1. 方案内容\n\n...\n\n## 2. 附录\n\n..."
+  "DOCUMENT_BODY": "### 1.1 需求背景\n...\n\n### 1.11 验收映射\n...\n\n## 2. 附录\n..."
 }
 ```
 
