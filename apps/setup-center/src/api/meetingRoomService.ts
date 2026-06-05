@@ -916,13 +916,20 @@ export interface ArtifactFileContent {
   size: number;
 }
 
+/** meeting-summary archive_index 曾用 archive 内相对路径；artifact-file 需要 scope 根下路径。 */
+export function normalizeArtifactRelativePath(path: string): string {
+  const p = (path || '').trim().replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!p || p.startsWith('archive/') || p.includes('..')) return p;
+  return `archive/${p}`;
+}
+
 export async function fetchArtifactFile(
   synapseApiBase: string,
   roomId: string,
   path: string,
 ): Promise<ArtifactFileContent> {
   const base = synapseApiBase.replace(/\/$/, '');
-  const params = new URLSearchParams({ path });
+  const params = new URLSearchParams({ path: normalizeArtifactRelativePath(path) });
   return apiGet<ArtifactFileContent>(
     base,
     `/api/dev/meeting-rooms/${encodeURIComponent(roomId)}/artifact-file?${params.toString()}`,

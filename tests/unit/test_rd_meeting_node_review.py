@@ -26,6 +26,7 @@ from synapse.rd_meeting.paths import (
     meeting_pipeline_path,
     scope_dir,
 )
+from synapse.rd_meeting.room_runtime import list_archive_index
 
 
 @pytest.fixture(autouse=True)
@@ -287,6 +288,22 @@ def test_read_artifact_file_reads_md(tmp_path):
     content, ext = res
     assert content == "# X"
     assert ext == ".md"
+
+
+def test_list_archive_index_uses_scope_relative_paths(tmp_path):
+    scope = "scope-archive-index"
+    stage_name = "需求设计"
+    node_id = "req_clarify"
+    base = archive_root(scope) / stage_name / node_id
+    base.mkdir(parents=True)
+    (base / "需求澄清.md").write_text("# Hello", encoding="utf-8")
+
+    index = list_archive_index(scope)
+    assert len(index) == 1
+    rel = index[0]["files"][0]["relative_path"]
+    assert rel.startswith("archive/")
+    assert rel.endswith(f"{stage_name}/{node_id}/需求澄清.md")
+    assert read_artifact_file(scope, rel) is not None
 
 
 @pytest.mark.asyncio

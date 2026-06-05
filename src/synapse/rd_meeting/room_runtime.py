@@ -16,6 +16,7 @@ from synapse.rd_meeting.paths import (
     room_history_path,
     room_state_lock_path,
     room_state_path,
+    scope_dir,
 )
 from synapse.rd_sop.nodes import ALL_NODES, node_display_name, stage_id_for_name
 
@@ -285,6 +286,7 @@ def list_archive_index(scope_id: str) -> list[dict[str, Any]]:
     root = archive_root(scope_id)
     if not root.is_dir():
         return []
+    scope_root = scope_dir(scope_id).resolve()
     index: list[dict[str, Any]] = []
     for stage_dir in sorted(root.iterdir(), key=lambda p: p.name):
         if not stage_dir.is_dir():
@@ -297,7 +299,10 @@ def list_archive_index(scope_id: str) -> list[dict[str, Any]]:
             files: list[dict[str, Any]] = []
             for f in sorted(node_dir.iterdir(), key=lambda p: p.name):
                 if f.is_file():
-                    rel = f.relative_to(root).as_posix()
+                    try:
+                        rel = f.resolve().relative_to(scope_root).as_posix()
+                    except ValueError:
+                        rel = f"archive/{f.relative_to(root).as_posix()}"
                     files.append(
                         {
                             "name": f.name,

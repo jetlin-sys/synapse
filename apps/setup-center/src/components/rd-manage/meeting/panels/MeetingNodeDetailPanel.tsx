@@ -226,6 +226,8 @@ function ProcessTimelineItem({ entry, index }: { entry: ProcessingHistoryEntry; 
   );
 }
 
+type PreviewState = 'idle' | 'loading' | 'ready' | 'error';
+
 function ArtifactCard({
   synapseApiBase,
   roomId,
@@ -236,21 +238,32 @@ function ArtifactCard({
   file: { name: string; relative_path: string; size: number; ext?: string };
 }) {
   const [preview, setPreview] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [previewState, setPreviewState] = useState<PreviewState>('idle');
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const isMd = /\.(md|markdown)$/i.test(file.name);
 
+  useEffect(() => {
+    setPreview(null);
+    setPreviewState('idle');
+    setPreviewError(null);
+  }, [file.relative_path, file.name]);
+
   const loadPreview = useCallback(async () => {
-    if (!isMd || preview != null) return;
-    setLoading(true);
+    if (!isMd || previewState === 'loading' || previewState === 'ready') return;
+    setPreviewState('loading');
+    setPreviewError(null);
     try {
       const data = await fetchArtifactFile(synapseApiBase, roomId, file.relative_path);
-      setPreview(data.content.slice(0, 4000));
-    } catch {
-      setPreview('');
-    } finally {
-      setLoading(false);
+      const text = (data.content ?? '').slice(0, 12000);
+      setPreview(text);
+      setPreviewState('ready');
+      if (!text.trim()) setPreviewError('文件为空或无法解析为文本');
+    } catch (e) {
+      setPreview(null);
+      setPreviewState('error');
+      setPreviewError(e instanceof Error ? e.message : '加载预览失败');
     }
-  }, [file.relative_path, isMd, preview, roomId, synapseApiBase]);
+  }, [file.relative_path, isMd, previewState, roomId, synapseApiBase]);
 
   return (
     <motion.div
@@ -271,15 +284,31 @@ function ArtifactCard({
                 size="small"
                 className="!h-auto !min-h-0 !border-2 !border-primary/40 !px-2.5 !py-0.5 !text-[10px] !leading-tight !shadow-none hover:!border-primary/60"
                 onClick={() => void loadPreview()}
+                loading={previewState === 'loading'}
               >
-                {loading ? '加载中…' : preview != null ? '已加载预览' : '预览'}
+                {previewState === 'ready'
+                  ? '已加载'
+                  : previewState === 'error'
+                    ? '重试预览'
+                    : '预览'}
               </Button>
             ) : null}
           </div>
         </div>
       </div>
-      {preview ? (
-        <div className="mt-3 max-h-48 overflow-y-auto rounded-lg border border-border/40 bg-black/20 p-3 text-xs custom-scrollbar">
+      {previewState === 'loading' ? (
+        <div className="mt-3 flex items-center justify-center gap-2 rounded-lg border border-border/40 bg-black/20 py-6 text-xs text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin text-primary" />
+          正在加载文档…
+        </div>
+      ) : null}
+      {previewError ? (
+        <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          {previewError}
+        </div>
+      ) : null}
+      {preview && previewState === 'ready' ? (
+        <div className="mt-3 max-h-[min(52vh,480px)] overflow-y-auto rounded-lg border border-border/40 bg-black/20 p-3 text-xs custom-scrollbar">
           <ReviewMarkdown content={preview} />
         </div>
       ) : null}

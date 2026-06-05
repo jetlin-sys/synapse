@@ -80,6 +80,9 @@ def test_meeting_summary_nodes_and_archive(synapse_work_home):
     assert "diff_analysis" in node_ids
     assert summary["archive_index"]
     assert summary["archive_index"][0]["files"][0]["name"] == "report.md"
+    rel = summary["archive_index"][0]["files"][0]["relative_path"]
+    assert rel.startswith("archive/")
+    assert rel.endswith("diff_analysis/report.md")
 
 
 def test_get_room_detail(synapse_work_home):
