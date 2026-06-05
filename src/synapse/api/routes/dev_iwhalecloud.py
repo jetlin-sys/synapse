@@ -1921,7 +1921,7 @@ class CreateTaskRequest(BaseModel):
     branchVersionName: str | None = Field(None, description="产品分支名称:可以是主产品分支,也可以是Trunk产品分支")
     mainBranchVersionTaskNo: str | None = Field(None, description="Trunk分支关联的主分支单号")
     patchName: str = Field(..., description="补丁计划名称")
-    selfTestDesc: str = Field(..., description="自测描述")
+    taskImpactDesc: str = Field(..., description="自测描述")
     performanceImpact: str = Field(..., description="性能影响")
     functionalImpact: str = Field(..., description="功能影响")
     cfgChangeDescription: str = Field(..., description="配置变更说明")
@@ -1985,8 +1985,8 @@ async def create_task(body: CreateTaskRequest) -> dict:
         return error_response(400, "projectId 与 productModuleName 必须二选一传值")
     if not body.patchName or not body.productModuleName or not body.branchVersionName:
         return error_response(400, "未传版本名称（补丁计划名称）、应用模块名称、产品分支名称，不允许创建任务单")
-    if not body.selfTestDesc:
-        return error_response(400, "selfTestDesc 不能为空")
+    if not body.taskImpactDesc:
+        return error_response(400, "taskImpactDesc 不能为空")
     if not body.performanceImpact or not body.functionalImpact or not body.cfgChangeDescription or not body.upgradeRisk or not body.securityImpact or not body.compatibilityImpact:
         return error_response(400, "performanceImpact、functionalImpact、cfgChangeDescription、upgradeRisk、securityImpact、compatibilityImpact 不能为空")
     try:
@@ -2042,7 +2042,7 @@ async def create_task(body: CreateTaskRequest) -> dict:
     #     return error_response(502, "任务已创建，但新增任务影响点失败", error=str(add_impact_result))
 
     # 步骤7：自动确认影响点
-    confirm_body = TaskImpactConfirmRequest(taskId=created_task_id, selfTestDesc=body.selfTestDesc)
+    confirm_body = TaskImpactConfirmRequest(taskId=created_task_id, selfTestDesc=body.taskImpactDesc)
     confirm_result = await _task_impact_confirm(confirm_body)
     if isinstance(confirm_result, dict) and confirm_result.get("errorcode") not in (None, 0):
         return error_response(502, "任务已创建，但影响点确认失败", error=str(confirm_result))
