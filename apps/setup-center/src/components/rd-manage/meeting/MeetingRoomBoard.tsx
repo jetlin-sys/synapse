@@ -1943,6 +1943,16 @@ const InterventionDialog = ({
 
                     {detailViewMode === 'skipped' ? (
                       <SkippedNodeDetailPanel nodeName={selectedNode.name} />
+                    ) : detailViewMode === 'review' && selectedNode.id === 'solution_review' ? (
+                      <div className="min-h-0 flex-1 overflow-hidden">
+                        <SolutionReviewPanel
+                          key={`detail-sr-${room.id}`}
+                          synapseApiBase={synapseApiBase || ''}
+                          roomId={room.id}
+                          scopeId={room.scopeId}
+                          blocked={room.solutionReviewBlocked}
+                        />
+                      </div>
                     ) : detailViewMode === 'review' ? (
                       <div className="min-h-0 flex-1 overflow-hidden">
                         <NodeReviewPanel

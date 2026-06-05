@@ -524,6 +524,11 @@ export const NodeReviewPanel: React.FC<Props> = ({
 
   const load = useCallback(
     async (refresh = false) => {
+      if (nodeId === 'solution_review') {
+        setError('方案评审节点请使用方案评审面板查看');
+        setPayload(null);
+        return;
+      }
       if (refresh) setRefreshing(true);
       else setLoading(true);
       setError(null);

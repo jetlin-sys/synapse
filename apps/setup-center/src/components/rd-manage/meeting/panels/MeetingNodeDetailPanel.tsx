@@ -330,7 +330,7 @@ export function MeetingNodeDetailPanel({
         const skipNodeReview = nodeId === 'solution_review';
         const [reviewRes, ctxRes, summaryRes] = await Promise.allSettled([
           skipNodeReview
-            ? Promise.reject(new Error('solution_review_uses_dedicated_panel'))
+            ? Promise.resolve(null)
             : fetchNodeReview(synapseApiBase, roomId, { nodeId, refresh }),
           fetchMeetingAgentContexts(synapseApiBase, roomId, { messageCharLimit: 0, nodeId }),
           sid
@@ -338,7 +338,7 @@ export function MeetingNodeDetailPanel({
             : Promise.reject(new Error('missing_scope')),
         ]);
 
-        if (reviewRes.status === 'fulfilled') {
+        if (reviewRes.status === 'fulfilled' && reviewRes.value) {
           setReview(reviewRes.value);
         } else if (nodeState !== 'pending' && !skipNodeReview) {
           setReview(null);
