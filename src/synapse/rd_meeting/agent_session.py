@@ -57,11 +57,34 @@ def bind_meeting_agent_session(agent: Any, session: Session) -> None:
         pass
 
 
+def prepare_host_for_meeting_run(agent: Any) -> None:
+    """每次主控 LLM 轮次开始前：恢复工具白名单与会议室短路标记。
+
+    同一节点内可能多次调用 ``_run_host``（重试、HITL 补跑）；不得在轮次间
+    ``restore_meeting_slim_tools``，否则后续轮次会把全量工具发给模型。
+    """
+    try:
+        from synapse.rd_meeting.agent_runtime import apply_meeting_slim_tools
+
+        apply_meeting_slim_tools(agent, "host")
+    except Exception:
+        pass
+    try:
+        agent._org_context = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def clear_meeting_agent_session(agent: Any) -> None:
-    """任务结束后清理，避免池化 Agent 残留会话指针 / 会议室提示词短路标记。"""
+    """单轮 host 任务结束后仅清理会话指针，不恢复全量工具。"""
     agent._current_session = None
     if getattr(agent, "agent_state", None) is not None:
         agent.agent_state.current_session = None
+
+
+def release_meeting_pool_agent(agent: Any) -> None:
+    """节点收尾：池化 Agent 离开会议室时恢复全量工具并关闭短路。"""
+    clear_meeting_agent_session(agent)
     try:
         from synapse.rd_meeting.agent_runtime import restore_meeting_slim_tools
 
@@ -69,6 +92,6 @@ def clear_meeting_agent_session(agent: Any) -> None:
     except Exception:
         pass
     try:
-        agent._org_context = False  # 复位会议室短路开关，允许复用时回到通用编译管线
+        agent._org_context = False  # type: ignore[attr-defined]
     except Exception:
         pass

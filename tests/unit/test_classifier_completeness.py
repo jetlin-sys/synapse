@@ -268,6 +268,7 @@ def test_registry_get_tool_class_returns_nonnull_for_every_registered_tool():
         ("org_setup", "create_handler"),
         ("browser", "create_handler"),
         ("mcp", "create_handler"),
+        ("meeting_room", "create_meeting_room_handler"),
     ]
 
     registered_tools: list[tuple[str, str]] = []  # (handler, tool)

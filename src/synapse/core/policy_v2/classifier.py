@@ -85,6 +85,10 @@ _HEURISTIC_EXACT_MATCH: dict[str, ApprovalClass] = {
     "pet_say": ApprovalClass.INTERACTIVE,
     "pet_status_update": ApprovalClass.INTERACTIVE,
     "send_agent_message": ApprovalClass.INTERACTIVE,
+    # 研发会议室 HITL / 派单编排（须全模式 ALLOW，避免 UNKNOWN→CONFIRM）
+    "submit_hitl_questionnaire": ApprovalClass.INTERACTIVE,
+    "submit_meeting_work_plan": ApprovalClass.INTERACTIVE,
+    "deliver_artifacts": ApprovalClass.INTERACTIVE,
     # C6 新增 —— 内部 todo / memory 状态
     "complete_todo": ApprovalClass.EXEC_LOW_RISK,
     "add_memory": ApprovalClass.EXEC_LOW_RISK,

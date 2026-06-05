@@ -21,6 +21,7 @@ from synapse.rd_meeting.agent_runtime import apply_meeting_agent_runtime
 from synapse.rd_meeting.agent_session import (
     bind_meeting_agent_session,
     clear_meeting_agent_session,
+    prepare_host_for_meeting_run,
     ensure_host_session,
     host_session_id,
 )
@@ -1801,6 +1802,7 @@ class MeetingRoomOrchestrator:
                 )
 
                 async def _run_host(message: str) -> Any:
+                    prepare_host_for_meeting_run(host_agent)
                     bind_meeting_agent_session(host_agent, meeting_session)
                     try:
                         host_agent._hitl_locked = False

@@ -867,7 +867,9 @@ def _cleanup_agents_for_finished_node(
             logger.warning("reset host context failed scope=%s: %s", scope_id, exc)
         try:
             from synapse.rd_meeting.agent_prompt import clear_meeting_prompt_binding
+            from synapse.rd_meeting.agent_session import release_meeting_pool_agent
 
+            release_meeting_pool_agent(host_agent)
             clear_meeting_prompt_binding(host_agent)
         except Exception as exc:  # pragma: no cover
             logger.warning("clear host meeting prompt binding failed scope=%s: %s", scope_id, exc)
@@ -907,7 +909,9 @@ def _cleanup_agents_for_finished_node(
             logger.warning("reset worker %s context failed: %s", wid, exc)
         try:
             from synapse.rd_meeting.agent_prompt import clear_meeting_prompt_binding
+            from synapse.rd_meeting.agent_session import release_meeting_pool_agent
 
+            release_meeting_pool_agent(worker_agent)
             clear_meeting_prompt_binding(worker_agent)
         except Exception as exc:  # pragma: no cover
             logger.warning("clear worker %s meeting prompt binding failed: %s", wid, exc)

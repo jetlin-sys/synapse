@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from ...core.policy_v2 import ApprovalClass
+
 if TYPE_CHECKING:
     from ...core.agent import Agent
 
@@ -13,6 +15,13 @@ logger = logging.getLogger(__name__)
 
 class MeetingRoomToolHandler:
     TOOLS = ["submit_meeting_work_plan", "submit_hitl_questionnaire"]
+
+    # 会中问卷 / 工作计划是 HITL 与派单编排入口，语义同 ask_user，须全模式 ALLOW，
+    # 避免 policy_v2 UNKNOWN→CONFIRM 弹出 SecurityConfirm 阻断会议室流程。
+    TOOL_CLASSES = {
+        "submit_hitl_questionnaire": ApprovalClass.INTERACTIVE,
+        "submit_meeting_work_plan": ApprovalClass.INTERACTIVE,
+    }
 
     def __init__(self, agent: Agent):
         self.agent = agent
