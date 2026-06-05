@@ -93,6 +93,15 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 5173,
     strictPort: true,
+    // Windows: Tauri rebuild locks synapse_desktop.exe under target/; watching it causes EBUSY.
+    watch: isRemoteBuild
+    ? undefined
+    : {
+        ignored: [
+          "**/src-tauri/target/**",
+          path.resolve(__dirname, "src-tauri/target"),
+        ],
+      },
     ...(isWebBuild
       ? {
           proxy: {

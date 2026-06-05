@@ -25,11 +25,83 @@ logger = logging.getLogger(__name__)
 ScopeType = Literal["demand", "task"]
 RoomStatus = Literal["processing", "human_intervention", "completed", "failed", "stopped"]
 ROOM_STATE_SCHEMA_VERSION = 1
-DEFAULT_TOKEN_BUDGET = 150_000
+DEFAULT_TOKEN_BUDGET = 2_000_000
 
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_node_metrics_seconds(started_at: str, completed_at: str) -> int:
+    """节点墙钟耗时：completed_at − started_at（秒）。"""
+    start = _parse_iso_datetime(started_at)
+    end = _parse_iso_datetime(completed_at)
+    if start is None or end is None:
+        return 0
+    return max(1, int((end - start).total_seconds()))
+
+
+def finalize_node_metrics(
+    room_state: dict[str, Any],
+    *,
+    scope_id: str,
+    node_id: str,
+    completed_at: str | None = None,
+) -> dict[str, Any]:
+    """归档 ``room_state.node_metrics[node_id]``：completed_at、seconds、tokens（activity 汇总）。"""
+    from synapse.rd_meeting.agent_activity import aggregate_node_activity_tokens
+
+    sid = (scope_id or "").strip()
+    nid = (node_id or "").strip()
+    now = completed_at or _now_iso()
+
+    node_metrics = room_state.get("node_metrics")
+    if not isinstance(node_metrics, dict):
+        node_metrics = {}
+    prev = node_metrics.get(nid) if isinstance(node_metrics.get(nid), dict) else {}
+    started = str(prev.get("started_at") or now)
+    tokens = aggregate_node_activity_tokens(sid, nid)
+    seconds = compute_node_metrics_seconds(started, now)
+
+    entry = {
+        "started_at": started,
+        "completed_at": now,
+        "seconds": seconds,
+        "tokens": tokens,
+    }
+    node_metrics[nid] = entry
+    room_state["node_metrics"] = node_metrics
+    return entry
+
+
+def refresh_room_metrics(scope_id: str) -> dict[str, Any] | None:
+    """live 轮询时从各节点 activity.jsonl 汇总 token 并写回 room_state.metrics。"""
+    from synapse.rd_meeting.agent_activity import aggregate_room_activity_tokens
+
+    sid = (scope_id or "").strip()
+    if not sid:
+        return None
+    rs = load_room_state(sid)
+    if not isinstance(rs, dict):
+        return None
+    payload = dict(rs)
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+    metrics["tokens"] = aggregate_room_activity_tokens(sid)
+    metrics["token_budget"] = DEFAULT_TOKEN_BUDGET
+    payload["metrics"] = metrics
+    return save_room_state(sid, payload)
 
 
 def default_room_state(

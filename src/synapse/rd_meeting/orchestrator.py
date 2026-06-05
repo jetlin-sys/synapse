@@ -12,6 +12,7 @@ from typing import Any
 
 from synapse.rd_meeting.agent_activity import (
     record_input,
+    resolve_agent_billable_tokens,
     resolve_binding_for_profile,
     set_agent_activity_binding,
 )
@@ -67,6 +68,7 @@ from synapse.rd_meeting.prewarm_coordinator import (
 )
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
+    finalize_node_metrics,
     load_room_state,
     save_room_state,
 )
@@ -420,24 +422,30 @@ class MeetingRoomOrchestrator:
 
         room_state = load_room_state(sid) or {}
         room_state = dict(room_state)
-        node_metrics = room_state.get("node_metrics")
-        if not isinstance(node_metrics, dict):
-            node_metrics = {}
-        prev = node_metrics.get(node_id) if isinstance(node_metrics.get(node_id), dict) else {}
-        started = str(prev.get("started_at") or now)
-        node_metrics[node_id] = {
-            "started_at": started,
-            "completed_at": now,
-            "seconds": max(int(duration_seconds), int(prev.get("seconds") or 0)),
-            "tokens": max(int(tokens_used), int(prev.get("tokens") or 0)),
-        }
-        room_state["node_metrics"] = node_metrics
+        prev_nm = room_state.get("node_metrics")
+        if isinstance(prev_nm, dict):
+            prev_entry = prev_nm.get(node_id) if isinstance(prev_nm.get(node_id), dict) else {}
+        else:
+            prev_entry = {}
+        prev_tokens = int(prev_entry.get("tokens") or 0)
+        prev_seconds = int(prev_entry.get("seconds") or 0)
+
+        archived = finalize_node_metrics(
+            room_state,
+            scope_id=sid,
+            node_id=node_id,
+            completed_at=now,
+        )
+        archived_tokens = int(archived.get("tokens") or 0)
+        archived_seconds = int(archived.get("seconds") or 0)
 
         metrics = room_state.get("metrics")
         if not isinstance(metrics, dict):
             metrics = {}
-        metrics["tokens"] = int(metrics.get("tokens") or 0) + int(tokens_used)
-        metrics["stage_seconds"] = int(metrics.get("stage_seconds") or 0) + int(duration_seconds)
+        metrics["tokens"] = int(metrics.get("tokens") or 0) + max(0, archived_tokens - prev_tokens)
+        metrics["stage_seconds"] = int(metrics.get("stage_seconds") or 0) + max(
+            0, archived_seconds - prev_seconds
+        )
         room_state["metrics"] = metrics
         room_state["agents_active"] = []
         room_state["status"] = "processing"
@@ -482,8 +490,8 @@ class MeetingRoomOrchestrator:
                 "room_id": room_id,
                 "node_id": node_id,
                 "artifacts": artifacts or [],
-                "tokens_used": tokens_used,
-                "duration_seconds": duration_seconds,
+                "tokens_used": archived_tokens,
+                "duration_seconds": archived_seconds,
                 "next_node_id": next_id,
             },
         )
@@ -816,6 +824,8 @@ class MeetingRoomOrchestrator:
             room_state.pop("hitl_form_schema", None)
         if pending_delivery:
             room_state["pending_delivery"] = pending_delivery
+        if (intervention_kind or "").strip().lower() == "exception":
+            finalize_node_metrics(room_state, scope_id=sid, node_id=node_id)
         save_room_state(sid, room_state)
 
         msg = reason or f"节点 {node_display_name(node_id)} 需人工处理"
@@ -1000,6 +1010,7 @@ class MeetingRoomOrchestrator:
             pending["solution_review_payload"] = payload
             pending["await_confirm"] = False
             room_state["pending_delivery"] = pending
+            finalize_node_metrics(room_state, scope_id=sid, node_id=node_id)
             save_room_state(sid, room_state)
             set_phase(sid, "exception_gate")
             append_history_event(
@@ -1388,6 +1399,7 @@ class MeetingRoomOrchestrator:
             room_state["intervention_kind"] = "exception"
             if comment.strip():
                 room_state["escalate_reason"] = comment.strip()
+            finalize_node_metrics(room_state, scope_id=sid, node_id=node_id)
             save_room_state(sid, room_state)
             set_phase(sid, "exception_gate")
             append_history_event(
@@ -1656,7 +1668,7 @@ class MeetingRoomOrchestrator:
                 f"scope: {scope_type}/{sid}\n\n"
                 f"本节点模拟执行完成，交付完成。完成时间：{_now_iso()}。\n"
             )
-            tokens_used = 128
+            tokens_used = 0
             _dry_stage = stage_name_for_id(
                 int(dev.get("stage_id") or stage_id_for_node_id(node_id))
             )
@@ -1669,7 +1681,7 @@ class MeetingRoomOrchestrator:
                     f"# {node_display_name(node_id)} 交付结论（stub）\n\n"
                     "Agent 池不可用或未找到主控画像（host）；已写入占位产物，待后续重试。\n"
                 )
-                tokens_used = 64
+                tokens_used = 0
                 use_dry = True
             else:
                 scope_dir(sid).mkdir(parents=True, exist_ok=True)
@@ -1838,8 +1850,7 @@ class MeetingRoomOrchestrator:
                         **gate,
                     }
 
-                usage = getattr(host_agent, "last_usage", None) or {}
-                tokens_used = int(usage.get("total_tokens") or usage.get("tokens") or 256)
+                tokens_used = resolve_agent_billable_tokens(host_agent)
                 append_history_event(
                     sid,
                     {

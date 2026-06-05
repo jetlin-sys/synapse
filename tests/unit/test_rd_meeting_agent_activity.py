@@ -8,6 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from types import SimpleNamespace
+
 from synapse.rd_meeting.agent_activity import (
     aggregate_tools_and_skills,
     enrich_display,
@@ -19,6 +21,7 @@ from synapse.rd_meeting.agent_activity import (
     record_skill,
     record_skill_load_blocked,
     record_tool,
+    resolve_agent_billable_tokens,
     resolve_binding_for_profile,
     set_agent_activity_binding,
     try_record_tool_from_agent,
@@ -449,3 +452,21 @@ def test_mark_llm_call_start_records_duration(activity_work):
         }
     )
     assert tool_row["presentation_tier"] == "primary"
+
+
+def test_resolve_agent_billable_tokens_prefers_last_usage_summary():
+    agent = SimpleNamespace(
+        _last_usage_summary={"total_tokens": 420, "input_tokens": 100, "output_tokens": 320},
+        last_usage={"total_tokens": 999},
+    )
+    assert resolve_agent_billable_tokens(agent) == 420
+
+
+def test_resolve_agent_billable_tokens_falls_back_to_last_usage_for_tests():
+    agent = SimpleNamespace(last_usage={"total_tokens": 88})
+    assert resolve_agent_billable_tokens(agent) == 88
+
+
+def test_resolve_agent_billable_tokens_returns_zero_when_missing():
+    assert resolve_agent_billable_tokens(SimpleNamespace()) == 0
+    assert resolve_agent_billable_tokens(SimpleNamespace(_last_usage_summary={})) == 0

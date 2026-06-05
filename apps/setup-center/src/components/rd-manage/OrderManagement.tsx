@@ -53,12 +53,10 @@ import {
   fetchMeetingSummary,
   fetchMeetingRoomConfig,
   fetchMeetingRoomLive,
-  fetchNodeReview,
   openMeetingRoom,
   type MeetingRoomArchiveEntry,
   type MeetingRoomConfigPayload,
   type MeetingSummaryPayload,
-  type NodeReviewMetrics,
 } from '../../api/meetingRoomService';
 import { setMeetingRoomFocus } from '../../rd-meeting/focus';
 import {
@@ -615,16 +613,6 @@ export const OrderManagement: React.FC<{
   const [llmEndpointCatalog, setLlmEndpointCatalog] = useState<LlmEndpointCatalogItem[]>(
     [],
   );
-  const [nodeReviewMetricsById, setNodeReviewMetricsById] = useState<
-    Map<string, NodeReviewMetrics>
-  >(() => new Map());
-  const [nodeReviewLoading, setNodeReviewLoading] = useState(false);
-
-  const pipelineNodeIds = useMemo(
-    () => ALL_NODES.filter((n) => n.id !== 'pending').map((n) => n.id),
-    [],
-  );
-
   const [collapsedStages, setCollapsedStages] = useState<Record<number, boolean>>({});
   const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
   const isDragging = useRef(false);
@@ -808,32 +796,6 @@ export const OrderManagement: React.FC<{
     }
     return m;
   }, [meetingSummary]);
-
-  const refreshNodeReviewMetrics = useCallback(
-    async (roomId: string, nodeIds: string[]) => {
-      const base = (synapseApiBase || '').trim();
-      if (!base || !roomId || !nodeIds.length) return;
-      const results = await Promise.all(
-        nodeIds.map(async (nodeId) => {
-          if (nodeId === 'solution_review') return null;
-          try {
-            const payload = await fetchNodeReview(base, roomId, { nodeId });
-            return { nodeId, metrics: payload.metrics };
-          } catch {
-            return null;
-          }
-        }),
-      );
-      setNodeReviewMetricsById((prev) => {
-        const next = new Map(prev);
-        for (const row of results) {
-          if (row) next.set(row.nodeId, row.metrics);
-        }
-        return next;
-      });
-    },
-    [synapseApiBase],
-  );
 
   const meetingArchiveByNodeId = useMemo(() => {
     const m = new Map<string, MeetingRoomArchiveEntry['files']>();
@@ -1089,22 +1051,6 @@ export const OrderManagement: React.FC<{
   }, [synapseApiBase, activeMeetingRoomId, displayTicket?.currentNode]);
 
   useEffect(() => {
-    const roomId = activeMeetingRoomId;
-    if (!roomId) {
-      setNodeReviewMetricsById(new Map());
-      return;
-    }
-    let cancelled = false;
-    setNodeReviewLoading(true);
-    void refreshNodeReviewMetrics(roomId, pipelineNodeIds).finally(() => {
-      if (!cancelled) setNodeReviewLoading(false);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeMeetingRoomId, pipelineNodeIds, refreshNodeReviewMetrics]);
-
-  useEffect(() => {
     if (!sopMeetingScope?.scopeId) return;
     if (displayTicket?.status !== 'processing') return;
     const base = (synapseApiBase || '').trim();
@@ -1116,11 +1062,6 @@ export const OrderManagement: React.FC<{
           if (!cancelled) setMeetingSummary(data);
         })
         .catch(() => {});
-      const roomId = activeMeetingRoomId;
-      const focusId = displayTicket?.currentNode;
-      if (roomId && focusId) {
-        void refreshNodeReviewMetrics(roomId, [focusId]);
-      }
     };
     const timer = window.setInterval(poll, 5000);
     return () => {
@@ -1131,10 +1072,7 @@ export const OrderManagement: React.FC<{
     sopMeetingScope?.scopeId,
     sopMeetingScope?.scopeType,
     displayTicket?.status,
-    displayTicket?.currentNode,
     synapseApiBase,
-    activeMeetingRoomId,
-    refreshNodeReviewMetrics,
   ]);
 
   // Simulate real-time token consumption for processing tickets
@@ -2180,12 +2118,10 @@ export const OrderManagement: React.FC<{
                         
                         const hasMeetingSummary = Boolean(meetingSummary);
                         const runtimeMetrics = pickSopNodePipelineMetrics(
-                          nodeReviewMetricsById.get(node.id),
                           meetingNodeMetricsById.get(node.id),
                           hasMeetingSummary,
                         );
-                        const metricsLoading =
-                          nodeReviewLoading && !nodeReviewMetricsById.has(node.id);
+                        const metricsLoading = meetingSummaryLoading;
                         const modelStr = resolveSopNodeModelDisplay(
                           node.type,
                           node.id,

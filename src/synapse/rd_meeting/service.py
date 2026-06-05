@@ -42,12 +42,14 @@ from synapse.rd_meeting.pipeline import MeetingPipeline
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
     build_meeting_summary_nodes,
+    DEFAULT_TOKEN_BUDGET,
     extract_skipped_node_ids,
     history_to_chat_logs,
     list_archive_index,
     load_room_state,
     mark_room_stopped,
     read_history,
+    refresh_room_metrics,
     save_room_state,
     sync_room_state_from_dev,
 )
@@ -239,6 +241,13 @@ class MeetingRoomService:
         if detail is None:
             return None
         scope_id = str(detail.get("scope_id") or "")
+        if scope_id:
+            refreshed = refresh_room_metrics(scope_id)
+            if refreshed and isinstance(refreshed.get("metrics"), dict):
+                m = refreshed["metrics"]
+                detail["tokenConsumed"] = int(m.get("tokens") or 0)
+                detail["tokenBudget"] = int(m.get("token_budget") or DEFAULT_TOKEN_BUDGET)
+                detail["room_state"] = refreshed
         room_state = detail.get("room_state") if isinstance(detail.get("room_state"), dict) else {}
         node_id = str(detail.get("current_node_id") or "pending")
         history = read_history(scope_id, node_id=node_id, limit=history_limit) if scope_id else []
@@ -1220,7 +1229,7 @@ class MeetingRoomService:
             "summary_metrics": {
                 "stage_seconds": int(metrics.get("stage_seconds") or 0),
                 "tokens": int(metrics.get("tokens") or 0),
-                "token_budget": int(metrics.get("token_budget") or 150_000),
+                "token_budget": int(metrics.get("token_budget") or DEFAULT_TOKEN_BUDGET),
                 "human_interventions": sum(
                     1 for h in history if str(h.get("event") or "") == "human_intervene"
                 ),
@@ -1261,7 +1270,7 @@ class MeetingRoomService:
             m = room_state["metrics"]
             item["stageDuration"] = self._format_duration(int(m.get("stage_seconds") or 0))
             item["tokenConsumed"] = int(m.get("tokens") or 0)
-            item["tokenBudget"] = int(m.get("token_budget") or 150_000)
+            item["tokenBudget"] = int(m.get("token_budget") or DEFAULT_TOKEN_BUDGET)
             item["meetingStartedAt"] = str(m.get("stage_started_at") or "").strip()
             rs = str(room_state.get("status") or "")
             if rs in ("processing", "human_intervention", "completed", "failed", "stopped"):
@@ -1361,13 +1370,13 @@ class MeetingRoomService:
             ui_status = "completed" if local == "已完成" else "human_intervention"
 
         token_consumed = 0
-        token_budget = 150_000
+        token_budget = DEFAULT_TOKEN_BUDGET
         stage_duration = "—"
         meeting_started_at = ""
         if room_state and isinstance(room_state.get("metrics"), dict):
             m = room_state["metrics"]
             token_consumed = int(m.get("tokens") or 0)
-            token_budget = int(m.get("token_budget") or 150_000)
+            token_budget = int(m.get("token_budget") or DEFAULT_TOKEN_BUDGET)
             stage_duration = self._format_duration(int(m.get("stage_seconds") or 0))
             meeting_started_at = str(m.get("stage_started_at") or "").strip()
 

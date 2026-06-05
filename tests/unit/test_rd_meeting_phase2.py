@@ -71,7 +71,8 @@ async def test_run_node_dry_run_advances_and_archives(synapse_work_home):
     assert rs["current_node_id"] == next_node_id("boundary")
 
     nm = rs.get("node_metrics", {}).get("boundary", {})
-    assert int(nm.get("tokens") or 0) > 0
+    assert nm.get("completed_at")
+    assert int(nm.get("seconds") or 0) >= 1
 
 
 @pytest.mark.asyncio

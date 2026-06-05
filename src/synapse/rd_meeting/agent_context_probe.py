@@ -597,7 +597,9 @@ def probe_pooled_agent(
             scope_id, profile_id, sub_rows, node_id=current_node_id
         ),
 
-        "last_usage": getattr(agent, "last_usage", None),
+        "last_usage": (
+            getattr(agent, "_last_usage_summary", None) or getattr(agent, "last_usage", None)
+        ),
 
     }
 

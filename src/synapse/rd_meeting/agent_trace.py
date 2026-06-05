@@ -451,7 +451,14 @@ def dump_agent_node_trace(
                 {"skills_executed": skills, "updated_at": _now_iso()},
             )
 
-    usage = getattr(agent, "last_usage", None) or {}
+    from synapse.rd_meeting.agent_activity import resolve_agent_billable_tokens
+
+    billable = resolve_agent_billable_tokens(agent)
+    usage = getattr(agent, "_last_usage_summary", None) or getattr(agent, "last_usage", None) or {}
+    if not isinstance(usage, dict):
+        usage = {}
+    if billable > 0 and not usage.get("total_tokens"):
+        usage = {**usage, "total_tokens": billable}
     if isinstance(usage, dict) and usage:
         _write_json(
             base / "usage.json",

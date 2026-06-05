@@ -88,6 +88,9 @@ import type { LucideIcon } from 'lucide-react';
 
 const { darkAlgorithm } = theme;
 
+/** 会议室 Token 预算固定 2M */
+const MEETING_TOKEN_BUDGET = 2_000_000;
+
 function useAntThemeDark() {
   const [dark, setDark] = useState(() => {
     if (typeof document === 'undefined') return false;
@@ -415,7 +418,7 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
     logs: displayLogs,
     agents,
     tokenConsumed: live.tokenConsumed ?? room.tokenConsumed,
-    tokenBudget: live.tokenBudget ?? room.tokenBudget,
+    tokenBudget: MEETING_TOKEN_BUDGET,
     stageDuration: live.stageDuration || room.stageDuration,
     meetingStartedAt: live.meetingStartedAt || room.meetingStartedAt,
     hitlFormSchema:
@@ -511,7 +514,7 @@ function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
     stageDuration: item.stageDuration || '—',
     meetingStartedAt: item.meetingStartedAt,
     tokenConsumed: item.tokenConsumed ?? 0,
-    tokenBudget: item.tokenBudget ?? 150000,
+    tokenBudget: MEETING_TOKEN_BUDGET,
     agents: buildAgentsFromDetail(item),
     allChatLogs: allChatLogs.length ? allChatLogs : logs,
     logs,
@@ -901,10 +904,17 @@ function formatMeetingStartedAt(raw?: string): string {
   });
 }
 
+function formatTokenAmount(n: number): string {
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return m >= 10 ? `${Math.round(m)}M` : `${m.toFixed(1)}M`;
+  }
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
 function formatTokenConsumed(consumed: number, budget: number): string {
-  const k = consumed >= 1000 ? `${(consumed / 1000).toFixed(1)}k` : String(consumed);
-  const bk = budget >= 1000 ? `${(budget / 1000).toFixed(0)}k` : String(budget);
-  return `${k} / ${bk}`;
+  return `${formatTokenAmount(consumed)} / ${formatTokenAmount(budget)}`;
 }
 
 /** 与中栏 Tab（人工确认等）同高 */
@@ -935,15 +945,17 @@ const MeetingRoomTitleBar = ({
   onBack: () => void;
 }) => {
   const currentNodeName = resolveSopNodeName(room.currentNode);
-  const tokenPct = room.tokenBudget > 0
-    ? Math.min(100, (room.tokenConsumed / room.tokenBudget) * 100)
+  const tokenBudget = MEETING_TOKEN_BUDGET;
+  const tokenConsumed = room.tokenConsumed;
+  const tokenPct = tokenBudget > 0
+    ? Math.min(100, (tokenConsumed / tokenBudget) * 100)
     : 0;
-  const tokenHot = room.tokenBudget > 0 && room.tokenConsumed > room.tokenBudget * 0.9;
+  const tokenHot = tokenBudget > 0 && tokenConsumed > tokenBudget * 0.9;
 
   return (
     <header className="shrink-0 border-b border-border/60 bg-gradient-to-r from-[color:var(--panel)] via-[color:var(--panel2)] to-[color:var(--panel)] px-4 py-3">
       <div className="flex items-center gap-4 min-w-0">
-        <div className="flex items-center gap-3 min-w-0 shrink-0">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
           <Button
             size="small"
             icon={<ArrowLeft className="w-3.5 h-3.5" />}
@@ -962,6 +974,12 @@ const MeetingRoomTitleBar = ({
               >
                 {room.ticketTitle}
               </h2>
+              <Tag
+                color={meetingStatusTagColor(room.status)}
+                className={`m-0 shrink-0 border-0 ${MEETING_TAB_BAR_HEIGHT}`}
+              >
+                {roomCardStatusLabel(room.status)}
+              </Tag>
             </div>
             <div
               className="flex items-center gap-1.5 text-[11px] text-muted-foreground font-mono pl-6 min-w-0"
@@ -979,7 +997,7 @@ const MeetingRoomTitleBar = ({
           </div>
         </div>
 
-        <div className="flex-1 flex items-center justify-center gap-2 min-w-0 flex-wrap">
+        <div className="flex items-center justify-end gap-2 min-w-0 shrink-0 flex-wrap">
           <Tooltip title={`会议开始于 ${formatMeetingStartedAt(room.meetingStartedAt)} · 累计处理 ${room.stageDuration}`}>
             <div className="inline-flex items-center gap-2 rounded-lg border border-border/50 bg-muted/25 px-3 py-1.5 text-[11px] text-muted-foreground">
               <Clock className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
@@ -996,12 +1014,12 @@ const MeetingRoomTitleBar = ({
               <span className="font-medium text-blue-300 truncate">{currentNodeName}</span>
             </div>
           </Tooltip>
-          <Tooltip title={`Token 总消耗 ${room.tokenConsumed.toLocaleString()} / 预算 ${room.tokenBudget.toLocaleString()}`}>
+          <Tooltip title={`Token 总消耗 ${tokenConsumed.toLocaleString()} / 预算 ${tokenBudget.toLocaleString()}`}>
             <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/25 bg-amber-500/8 px-3 py-1.5 text-[11px] min-w-[140px]">
               <Coins className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span className="text-muted-foreground whitespace-nowrap">Token</span>
               <span className={`font-mono whitespace-nowrap ${tokenHot ? 'text-red-400' : 'text-amber-200/90'}`}>
-                {formatTokenConsumed(room.tokenConsumed, room.tokenBudget)}
+                {formatTokenConsumed(tokenConsumed, tokenBudget)}
               </span>
               <Progress
                 percent={tokenPct}
@@ -1014,13 +1032,6 @@ const MeetingRoomTitleBar = ({
             </div>
           </Tooltip>
         </div>
-
-        <Tag
-          color={meetingStatusTagColor(room.status)}
-          className={`m-0 shrink-0 border-0 ${MEETING_TAB_BAR_HEIGHT}`}
-        >
-          {roomCardStatusLabel(room.status)}
-        </Tag>
       </div>
     </header>
   );

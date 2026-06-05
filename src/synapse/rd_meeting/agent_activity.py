@@ -21,7 +21,7 @@ from typing import Any, Literal
 
 from synapse.rd_meeting.dev_status import load_dev_status
 from synapse.rd_meeting.live import parse_rd_meeting_session, scope_id_for_room_id
-from synapse.rd_meeting.paths import agent_sop_node_dir, agent_sop_profile_dir
+from synapse.rd_meeting.paths import agent_sop_node_dir, agent_sop_profile_dir, agents_root
 
 logger = logging.getLogger(__name__)
 
@@ -702,6 +702,26 @@ def _pop_llm_duration_ms(agent: Any) -> int | None:
         return None
 
 
+def resolve_agent_billable_tokens(agent: Any) -> int:
+    """从 Agent 读取本次任务可计费 token；无数据时返回 0（禁止编造占位值）。"""
+    usage = getattr(agent, "_last_usage_summary", None) or getattr(agent, "last_usage", None)
+    if not isinstance(usage, dict) or not usage:
+        return 0
+    for key in ("total_tokens", "billable_total_tokens", "tokens"):
+        raw = usage.get(key)
+        if raw is not None:
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                pass
+    try:
+        inp = int(usage.get("input_tokens") or usage.get("billable_input_tokens") or 0)
+        out = int(usage.get("output_tokens") or usage.get("billable_output_tokens") or 0)
+        return max(0, inp + out)
+    except (TypeError, ValueError):
+        return 0
+
+
 def record_llm_usage(
     binding: dict[str, str],
     *,
@@ -771,6 +791,34 @@ def try_record_llm_usage_from_agent(
         )
     except Exception as exc:
         logger.debug("try_record_llm_usage_from_agent failed: %s", exc)
+
+
+def aggregate_node_activity_tokens(scope_id: str, node_id: str) -> int:
+    """汇总当前节点各智能体 activity.jsonl 的 LLM token 总消耗。"""
+    sid = (scope_id or "").strip()
+    nid = (node_id or "").strip()
+    if not sid or not nid:
+        return 0
+    total = 0
+    for pid in list_node_agent_profiles(sid, nid):
+        rows = read_activity_log(sid, nid, pid, limit=5000)
+        total += aggregate_llm_tokens(rows)
+    return total
+
+
+def aggregate_room_activity_tokens(scope_id: str) -> int:
+    """汇总会议室各 SOP 节点下全部智能体 activity.jsonl 的 LLM token 总消耗。"""
+    sid = (scope_id or "").strip()
+    if not sid:
+        return 0
+    root = agents_root(sid)
+    if not root.is_dir():
+        return 0
+    total = 0
+    for child in sorted(root.iterdir(), key=lambda p: p.name):
+        if child.is_dir():
+            total += aggregate_node_activity_tokens(sid, child.name)
+    return total
 
 
 def aggregate_llm_tokens(entries: list[dict[str, Any]], *, exclude_scenes: frozenset[str] | None = None) -> int:

@@ -148,25 +148,11 @@ export type SopNodeRuntimeMetrics = {
   tokens: number;
 };
 
-export type SopNodeReviewMetricsSlice = {
-  node_token_total: number;
-  node_duration_seconds: number;
-};
-
-/**
- * 与 MeetingNodeDetailPanel 一致：优先 node-review（activity 汇总），其次 meeting-summary。
- */
+/** 工单 SOP 卡片：仅使用 meeting-summary（room_state.node_metrics）中的指标。 */
 export function pickSopNodePipelineMetrics(
-  review: SopNodeReviewMetricsSlice | undefined,
   summary: SopNodeRuntimeMetrics | undefined,
   hasMeetingSummary: boolean,
 ): SopNodeRuntimeMetrics | null {
-  if (review) {
-    return {
-      tokens: review.node_token_total,
-      deal_seconds: review.node_duration_seconds,
-    };
-  }
   if (!hasMeetingSummary) return null;
   if (!summary) return { deal_seconds: 0, tokens: 0 };
   return summary;

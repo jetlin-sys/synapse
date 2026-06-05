@@ -1,6 +1,6 @@
 /**
  * MeetingNodeDetailPanel — 会议室节点详情（产出 / 消耗 / 流程）
- * 从 node-review、agent-contexts、meeting-summary 拉取真实数据，替代 mock。
+ * 节点 token/耗时取自 meeting-summary（room_state.node_metrics）；流程/产出等仍拉 agent-contexts 等。
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Spin, Tabs, Tooltip } from 'antd';
@@ -444,12 +444,8 @@ export function MeetingNodeDetailPanel({
   const metrics = review?.metrics;
   const artifacts = review?.artifacts?.length ? review.artifacts : fallbackArtifacts;
 
-  const tokenTotal =
-    metrics?.node_token_total ??
-    summaryNode?.metrics?.tokens ??
-    processEntries.reduce((acc, e) => acc + (e.total_tokens || 0), 0);
-  const durationSec =
-    metrics?.node_duration_seconds ?? summaryNode?.metrics?.deal_seconds ?? 0;
+  const tokenTotal = summaryNode?.metrics?.tokens ?? 0;
+  const durationSec = summaryNode?.metrics?.deal_seconds ?? 0;
   const toolTotal = metrics?.tool_call_total ?? 0;
   const skillTotal = metrics?.skill_call_total ?? 0;
   const delegationTotal = metrics?.delegation_total ?? 0;
