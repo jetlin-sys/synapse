@@ -2,6 +2,13 @@ import type { NodeType } from '../../../rd-sop/constants';
 
 export type InterventionPanelKind = 'solution_review' | 'node_review' | 'hitl';
 
+/** 协同型节点（ai_human）禁止配置协作智能体阵容。 */
+export function collaborationWorkersConfigurable(
+  nodeType: NodeType | string | undefined,
+): boolean {
+  return nodeType !== 'ai_human' && nodeType !== 'system';
+}
+
 /** 仅人工主导节点可在配置里开关「人工确认」。 */
 export function humanConfirmSwitchVisible(nodeType: NodeType | string | undefined): boolean {
   return nodeType === 'human' || nodeType === 'human_start' || nodeType === 'human_multi' || nodeType === 'ai_exception';

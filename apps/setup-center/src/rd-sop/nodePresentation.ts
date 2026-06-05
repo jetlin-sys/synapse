@@ -146,16 +146,20 @@ export function resolveSopNodeModelDisplay(
 export type SopNodeRuntimeMetrics = {
   deal_seconds: number;
   tokens: number;
+  tokens_live?: number;
 };
 
-/** 工单 SOP 卡片：仅使用 meeting-summary（room_state.node_metrics）中的指标。 */
+/** 工单 SOP 卡片：进行中用 tokens_live（activity 动态），已完成用 tokens（node_metrics 归档）。 */
 export function pickSopNodePipelineMetrics(
   summary: SopNodeRuntimeMetrics | undefined,
   hasMeetingSummary: boolean,
+  nodeState?: string,
 ): SopNodeRuntimeMetrics | null {
   if (!hasMeetingSummary) return null;
   if (!summary) return { deal_seconds: 0, tokens: 0 };
-  return summary;
+  const displayTokens =
+    nodeState === 'processing' ? (summary.tokens_live ?? summary.tokens) : summary.tokens;
+  return { deal_seconds: summary.deal_seconds, tokens: displayTokens };
 }
 
 export function resolveSopPipelineNodeState(

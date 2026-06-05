@@ -35,6 +35,7 @@ import {
 } from './meetingRoomSkillConfig';
 import { MeetingWorkerAgentPicker } from './MeetingWorkerAgentPicker';
 import {
+  collaborationWorkersConfigurable,
   effectiveHumanConfirmByType,
   humanConfirmSwitchVisible,
 } from './meetingInterventionPanel';
@@ -228,10 +229,13 @@ function hydrateConfigWithDefaults(config: MeetingRoomConfigPayload): MeetingRoo
   for (const nodeId of allSopNodeIds()) {
     const ov = { ...(overrides[nodeId] ?? {}) };
     const binding = bindingFor(config.bindings, nodeId);
+    const collabNode = binding?.type === 'ai_human';
     const workersSource = ov.worker_profile_ids ?? binding?.worker_profile_ids;
-    const worker_profile_ids = Array.isArray(workersSource)
-      ? workersSource.filter((id) => id !== HOST_PROFILE_ID)
-      : undefined;
+    const worker_profile_ids = collabNode
+      ? []
+      : Array.isArray(workersSource)
+        ? workersSource.filter((id) => id !== HOST_PROFILE_ID)
+        : undefined;
     overrides[nodeId] = {
       ...ov,
       host_profile_id: HOST_PROFILE_ID,
@@ -274,7 +278,9 @@ function normalizeOverridesForSave(
       host_profile_id: HOST_PROFILE_ID,
     };
     delete entry.node_intent;
-    if (Array.isArray(workers)) {
+    if (b?.type === 'ai_human') {
+      entry.worker_profile_ids = [];
+    } else if (Array.isArray(workers)) {
       entry.worker_profile_ids = workers.filter((id) => id !== HOST_PROFILE_ID);
     }
     if (
@@ -410,17 +416,21 @@ export const MeetingRoomConfigDrawer: React.FC<{
   );
 
   const override: MeetingRoomNodeOverride = config?.node_overrides?.[selectedNodeId] ?? {};
+  const nodeType = (binding?.type ?? 'ai') as NodeType;
 
   const workerProfileIds = useMemo(() => {
+    if (!collaborationWorkersConfigurable(nodeType)) return [];
     const raw = override.worker_profile_ids ?? binding?.worker_profile_ids;
     if (!Array.isArray(raw)) return [];
     return raw.filter((id) => id !== HOST_PROFILE_ID);
-  }, [override.worker_profile_ids, binding?.worker_profile_ids]);
+  }, [nodeType, override.worker_profile_ids, binding?.worker_profile_ids]);
 
   const patchOverride = (patch: MeetingRoomNodeOverride) => {
     if (!config) return;
     const next = { ...override, ...patch };
-    if (next.worker_profile_ids) {
+    if (!collaborationWorkersConfigurable(nodeType)) {
+      next.worker_profile_ids = [];
+    } else if (next.worker_profile_ids) {
       next.worker_profile_ids = next.worker_profile_ids.filter((id) => id !== HOST_PROFILE_ID);
     }
     next.host_profile_id = HOST_PROFILE_ID;
@@ -441,7 +451,6 @@ export const MeetingRoomConfigDrawer: React.FC<{
   const meetingGoal =
     nodeIntentFor(selectedNodeId) ||
     (binding?.default_node_intent ?? binding?.intent ?? '').trim();
-  const nodeType = (binding?.type ?? 'ai') as NodeType;
   const humanConfirm = effectiveHumanConfirm(override, binding);
   const showHumanConfirmSwitch = humanConfirmSwitchVisible(nodeType);
   const isSystemNode = binding?.type === 'system';
@@ -552,6 +561,7 @@ export const MeetingRoomConfigDrawer: React.FC<{
   );
 
   const toggleWorkerProfile = (profileId: string) => {
+    if (!collaborationWorkersConfigurable(nodeType)) return;
     const id = profileId.trim();
     if (!id || id === HOST_PROFILE_ID) return;
     if (workerProfileIds.includes(id)) {
@@ -1008,6 +1018,7 @@ export const MeetingRoomConfigDrawer: React.FC<{
                     </ConfigFieldBox>
                   </div>
 
+                  {collaborationWorkersConfigurable(nodeType) ? (
                   <div>
                     <label className="mb-2.5 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-foreground/80">
                       <Users className="w-3.5 h-3.5 text-emerald-400" />
@@ -1085,6 +1096,19 @@ export const MeetingRoomConfigDrawer: React.FC<{
                       </div>
                     </ConfigFieldBox>
                   </div>
+                  ) : nodeType === 'ai_human' ? (
+                  <div>
+                    <label className="mb-2.5 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-foreground/80">
+                      <Users className="w-3.5 h-3.5 text-purple-400" />
+                      协作智能体
+                    </label>
+                    <ConfigFieldBox className="border-purple-500/20 bg-purple-500/[0.04]">
+                      <p className="text-[11px] text-muted-foreground leading-relaxed mb-0">
+                        协同节点由小鲸独立主持并完成产出，禁止配置协作智能体或委派子智能体；完成后走专用协同面板（如方案评审、组长审批）。
+                      </p>
+                    </ConfigFieldBox>
+                  </div>
+                  ) : null}
                   </>
                   ) : null}
                 </div>

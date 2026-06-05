@@ -14,6 +14,7 @@ from synapse.rd_sop.manifest import (
     DEFAULT_HOST_PROFILE_ID,
     default_human_confirm,
     get_node_manifest_entry,
+    is_collaborative_node,
     is_system_node,
     node_output_artifacts,
 )
@@ -69,7 +70,7 @@ def _merge_binding(base: dict[str, Any], override: dict[str, Any], *, node_id: s
         out["human_confirm"] = override.get("human_confirm")
     if override.get("host_profile_id"):
         out["host_profile_id"] = str(override["host_profile_id"]).strip()
-    if override.get("worker_profile_ids"):
+    if override.get("worker_profile_ids") and not is_collaborative_node(node_id):
         w = override["worker_profile_ids"]
         if isinstance(w, list):
             out["worker_profile_ids"] = [str(x).strip() for x in w if str(x).strip()]
@@ -149,6 +150,8 @@ def resolve_node_binding(
     merged["llm_endpoint_key"] = node_worker_endpoint
 
     node_type = str(entry.get("type") or SOP_NODE_TYPES.get(node_id, "ai"))
+    if node_type == "ai_human":
+        merged["worker_profile_ids"] = []
     human_confirm = _coerce_human_confirm(
         merged.get("human_confirm") if "human_confirm" in merged else None,
         node_id=node_id,

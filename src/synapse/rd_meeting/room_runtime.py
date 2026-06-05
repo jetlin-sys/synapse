@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 ScopeType = Literal["demand", "task"]
 RoomStatus = Literal["processing", "human_intervention", "completed", "failed", "stopped"]
 ROOM_STATE_SCHEMA_VERSION = 1
-DEFAULT_TOKEN_BUDGET = 2_000_000
+DEFAULT_TOKEN_BUDGET = 20_000_000
 
 
 def _now_iso() -> str:
@@ -49,6 +49,11 @@ def compute_node_metrics_seconds(started_at: str, completed_at: str) -> int:
     if start is None or end is None:
         return 0
     return max(1, int((end - start).total_seconds()))
+
+
+def compute_stage_elapsed_seconds(stage_started_at: str, *, end_at: str | None = None) -> int:
+    """会议墙钟耗时：当前时刻（或 end_at）− stage_started_at（秒）。"""
+    return compute_node_metrics_seconds(stage_started_at, end_at or _now_iso())
 
 
 def finalize_node_metrics(
@@ -84,24 +89,136 @@ def finalize_node_metrics(
     return entry
 
 
-def refresh_room_metrics(scope_id: str) -> dict[str, Any] | None:
-    """live 轮询时从各节点 activity.jsonl 汇总 token 并写回 room_state.metrics。"""
-    from synapse.rd_meeting.agent_activity import aggregate_room_activity_tokens
+_LEGACY_NODE_TOKEN_PLACEHOLDERS = frozenset({64, 128, 256})
+
+
+def archived_node_tokens(nm: dict[str, Any]) -> int:
+    """节点归档 token（``node_metrics[node_id].tokens``，剔除历史占位值）。"""
+    raw = int(nm.get("tokens") or 0)
+    return 0 if raw in _LEGACY_NODE_TOKEN_PLACEHOLDERS else raw
+
+
+def resolve_node_seconds(nm: dict[str, Any], *, node_status: str = "") -> int:
+    """节点耗时：``completed_at − started_at``；无 ``completed_at`` 时用当前时刻 − ``started_at``。"""
+    _ = node_status
+    started = str(nm.get("started_at") or "").strip()
+    if not started:
+        return 0
+    completed = str(nm.get("completed_at") or "").strip()
+    if completed:
+        return compute_node_metrics_seconds(started, completed)
+    return compute_stage_elapsed_seconds(started)
+
+
+def resolve_node_tokens_live(
+    scope_id: str,
+    node_id: str,
+    nm: dict[str, Any],
+    *,
+    node_status: str,
+) -> int:
+    """节点 token 动态值：进行中从 activity.jsonl 汇总，否则用归档 tokens。"""
+    static = archived_node_tokens(nm)
+    if node_status != "processing":
+        return static
+    sid = (scope_id or "").strip()
+    nid = (node_id or "").strip()
+    if not sid or not nid:
+        return static
+    from synapse.rd_meeting.agent_activity import aggregate_node_activity_tokens
+
+    live = aggregate_node_activity_tokens(sid, nid)
+    return live if live > 0 else static
+
+
+def resolve_node_summary_metrics(
+    scope_id: str,
+    node_id: str,
+    nm: dict[str, Any],
+    *,
+    node_status: str,
+) -> dict[str, Any]:
+    """工单 / 会议室节点指标：``tokens`` 静态归档，``tokens_live`` 含进行中动态刷新。"""
+    raw = int(nm.get("tokens") or 0)
+    static_tokens = archived_node_tokens(nm)
+    sid = (scope_id or "").strip()
+    nid = (node_id or "").strip()
+    if raw in _LEGACY_NODE_TOKEN_PLACEHOLDERS and sid and nid:
+        from synapse.rd_meeting.agent_activity import aggregate_node_activity_tokens
+
+        activity_tokens = aggregate_node_activity_tokens(sid, nid)
+        if activity_tokens > 0:
+            static_tokens = activity_tokens
+    live_tokens = resolve_node_tokens_live(sid, nid, nm, node_status=node_status)
+    return {
+        "deal_seconds": resolve_node_seconds(nm, node_status=node_status),
+        "tokens": static_tokens,
+        "tokens_live": live_tokens,
+        "started_at": nm.get("started_at"),
+        "completed_at": nm.get("completed_at"),
+    }
+
+
+def refresh_node_metrics(
+    scope_id: str,
+    node_id: str,
+    *,
+    current_node_id: str = "",
+) -> int:
+    """进行中节点 live 轮询：从 activity.jsonl 汇总 token 并写回 node_metrics。"""
+    from synapse.rd_meeting.agent_activity import aggregate_node_activity_tokens
 
     sid = (scope_id or "").strip()
-    if not sid:
-        return None
+    nid = (node_id or "").strip()
+    if not sid or not nid:
+        return 0
+
     rs = load_room_state(sid)
     if not isinstance(rs, dict):
-        return None
+        return aggregate_node_activity_tokens(sid, nid)
+
+    nm = rs.get("node_metrics")
+    if not isinstance(nm, dict):
+        nm = {}
+    entry = dict(nm.get(nid) if isinstance(nm.get(nid), dict) else {})
+    cur = (current_node_id or str(rs.get("current_node_id") or "")).strip()
+    is_processing = not entry.get("completed_at") and (not cur or nid == cur)
+
+    if not is_processing:
+        return archived_node_tokens(entry)
+
+    live_tokens = aggregate_node_activity_tokens(sid, nid)
+    tokens = live_tokens if live_tokens > 0 else archived_node_tokens(entry)
+
     payload = dict(rs)
-    metrics = payload.get("metrics")
+    nm = dict(nm)
+    entry["tokens"] = tokens
+    if not entry.get("started_at") and tokens > 0:
+        entry["started_at"] = _now_iso()
+    nm[nid] = entry
+    payload["node_metrics"] = nm
+    save_room_state(sid, payload)
+    return tokens
+
+
+def ensure_metrics_token_budget(scope_id: str) -> None:
+    """将 ``room_state.metrics.token_budget`` 对齐为当前默认预算（幂等）。"""
+    sid = (scope_id or "").strip()
+    if not sid:
+        return
+    rs = load_room_state(sid)
+    if not isinstance(rs, dict):
+        return
+    metrics = rs.get("metrics")
     if not isinstance(metrics, dict):
-        metrics = {}
-    metrics["tokens"] = aggregate_room_activity_tokens(sid)
-    metrics["token_budget"] = DEFAULT_TOKEN_BUDGET
-    payload["metrics"] = metrics
-    return save_room_state(sid, payload)
+        return
+    if int(metrics.get("token_budget") or 0) == DEFAULT_TOKEN_BUDGET:
+        return
+    payload = dict(rs)
+    m = dict(metrics)
+    m["token_budget"] = DEFAULT_TOKEN_BUDGET
+    payload["metrics"] = m
+    save_room_state(sid, payload)
 
 
 def default_room_state(
@@ -223,8 +340,7 @@ def sync_room_state_from_dev(
                     stage_id=stage_id,
                     current_node_id=current_node_id,
                 )["metrics"]
-            if "token_budget" not in payload["metrics"]:
-                payload["metrics"]["token_budget"] = DEFAULT_TOKEN_BUDGET
+            payload["metrics"]["token_budget"] = DEFAULT_TOKEN_BUDGET
             if not isinstance(payload.get("node_metrics"), dict):
                 payload["node_metrics"] = {}
             if not isinstance(payload.get("agents_active"), list):
@@ -419,6 +535,8 @@ def derive_node_states(current_node_id: str) -> dict[str, str]:
 def build_meeting_summary_nodes(
     dev_status: dict[str, Any] | None,
     room_state: dict[str, Any] | None,
+    *,
+    scope_id: str = "",
 ) -> list[dict[str, Any]]:
     current_node_id = "pending"
     if dev_status:
@@ -431,23 +549,25 @@ def build_meeting_summary_nodes(
     if room_state and isinstance(room_state.get("node_metrics"), dict):
         node_metrics = room_state["node_metrics"]
 
+    sid = (scope_id or "").strip()
+    if not sid and isinstance(room_state, dict):
+        scope = room_state.get("scope")
+        if isinstance(scope, dict):
+            sid = str(scope.get("id") or "").strip()
+
     nodes: list[dict[str, Any]] = []
     for node in ALL_NODES:
         nid = str(node["id"])
         nm = node_metrics.get(nid) if isinstance(node_metrics.get(nid), dict) else {}
+        node_status = node_states.get(nid, "pending")
         nodes.append(
             {
                 "node_id": nid,
                 "node_name": node_display_name(nid),
                 "stage_id": int(node.get("stage_id") or 0),
                 "stage_name": str(node.get("stage_name") or ""),
-                "status": node_states.get(nid, "pending"),
-                "metrics": {
-                    "deal_seconds": int(nm.get("seconds") or 0),
-                    "tokens": int(nm.get("tokens") or 0),
-                    "started_at": nm.get("started_at"),
-                    "completed_at": nm.get("completed_at"),
-                },
+                "status": node_status,
+                "metrics": resolve_node_summary_metrics(sid, nid, nm, node_status=node_status),
             }
         )
     return nodes

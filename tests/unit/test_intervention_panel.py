@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from synapse.rd_meeting.intervention_panel import resolve_intervention_panel
 from synapse.rd_sop.manifest import default_human_confirm
 from synapse.rd_meeting.binding import resolve_node_binding
@@ -34,6 +36,34 @@ def test_binding_ai_human_forces_human_confirm_on() -> None:
     b = resolve_node_binding("solution_review")
     assert b.get("type") == "ai_human"
     assert b.get("human_confirm") is True
+    assert b.get("worker_profile_ids") == []
+
+
+def test_binding_ai_human_strips_worker_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    from synapse.rd_meeting.config_store import save_meeting_room_config
+
+    cfg_dir = tmp_path / "rd_meeting"
+    cfg_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        "synapse.rd_meeting.config_store.rd_meeting_config_dir",
+        lambda: cfg_dir,
+    )
+    save_meeting_room_config(
+        {
+            "node_overrides": {
+                "solution_review": {
+                    "worker_profile_ids": ["whalecloud-rd-expert", "doc-gen"],
+                },
+                "leader_review": {
+                    "worker_profile_ids": ["code-explorer"],
+                },
+            }
+        }
+    )
+    assert resolve_node_binding("solution_review")["worker_profile_ids"] == []
+    assert resolve_node_binding("leader_review")["worker_profile_ids"] == []
 
 
 def test_binding_ai_forces_human_confirm_off() -> None:

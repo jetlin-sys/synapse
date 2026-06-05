@@ -607,6 +607,9 @@ export const OrderManagement: React.FC<{
   const [meetingSummaryLoading, setMeetingSummaryLoading] = useState(false);
   const [meetingSummaryErr, setMeetingSummaryErr] = useState<string | null>(null);
   const [roomScopeIndex, setRoomScopeIndex] = useState<Map<string, string>>(new Map());
+  const [roomMetricsByScope, setRoomMetricsByScope] = useState<
+    Map<string, { tokens: number; stageDuration: string; meetingStartedAt?: string }>
+  >(new Map());
   const [disabledSopNodeIds, setDisabledSopNodeIds] = useState<Set<string>>(() => new Set());
   const [meetingRoomConfig, setMeetingRoomConfig] = useState<MeetingRoomConfigPayload | null>(null);
   const [runtimeSkippedNodeIds, setRuntimeSkippedNodeIds] = useState<string[]>([]);
@@ -732,25 +735,56 @@ export const OrderManagement: React.FC<{
     };
   }, [sopMeetingScope, synapseApiBase]);
 
-  useEffect(() => {
-    let cancelled = false;
-    void fetchMeetingRooms(synapseApiBase)
+  const refreshRoomMetricsIndex = useCallback(() => {
+    const base = (synapseApiBase || '').trim();
+    if (!base) return Promise.resolve();
+    return fetchMeetingRooms(base)
       .then((list) => {
-        if (cancelled) return;
         const m = new Map<string, string>();
+        const metrics = new Map<string, { tokens: number; stageDuration: string; meetingStartedAt?: string }>();
         for (const r of list) {
           const key = `${r.scope_type}:${r.scope_id}`;
           if (r.room_id) m.set(key, r.room_id);
+          metrics.set(key, {
+            tokens: r.tokenConsumed ?? 0,
+            stageDuration: r.stageDuration || '—',
+            meetingStartedAt: r.meetingStartedAt,
+          });
         }
         setRoomScopeIndex(m);
+        setRoomMetricsByScope(metrics);
       })
       .catch(() => {
-        if (!cancelled) setRoomScopeIndex(new Map());
+        setRoomScopeIndex(new Map());
+        setRoomMetricsByScope(new Map());
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [synapseApiBase, boardDataInitialized]);
+  }, [synapseApiBase]);
+
+  useEffect(() => {
+    if (!boardDataInitialized) return;
+    void refreshRoomMetricsIndex();
+  }, [boardDataInitialized, refreshRoomMetricsIndex]);
+
+  /** 左侧任务卡片总 token / 耗时：进行中等状态轮询 room_state.metrics */
+  const hasActiveMeetingTickets = useMemo(
+    () =>
+      tickets.some(
+        (t) =>
+          t.status === 'processing' ||
+          t.status === 'error' ||
+          t.sopAwaitingHuman ||
+          (t.workItems?.some((w) => w.humanIntervention) ?? false),
+      ),
+    [tickets],
+  );
+
+  useEffect(() => {
+    if (!hasActiveMeetingTickets) return;
+    const timer = window.setInterval(() => {
+      void refreshRoomMetricsIndex();
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveMeetingTickets, refreshRoomMetricsIndex]);
 
   const activeMeetingRoomId = useMemo(() => {
     if (!sopMeetingScope?.scopeId) return '';
@@ -1050,19 +1084,28 @@ export const OrderManagement: React.FC<{
     };
   }, [synapseApiBase, activeMeetingRoomId, displayTicket?.currentNode]);
 
+  const shouldPollMeetingSummary = useMemo(() => {
+    if (!displayTicket) return false;
+    return (
+      displayTicket.status === 'processing' ||
+      displayTicket.status === 'error' ||
+      displayTicket.sopAwaitingHuman
+    );
+  }, [displayTicket]);
+
   useEffect(() => {
-    if (!sopMeetingScope?.scopeId) return;
-    if (displayTicket?.status !== 'processing') return;
+    if (!sopMeetingScope?.scopeId || !shouldPollMeetingSummary) return;
     const base = (synapseApiBase || '').trim();
     if (!base) return;
     let cancelled = false;
     const poll = () => {
-      void fetchMeetingSummary(synapseApiBase, sopMeetingScope.scopeType, sopMeetingScope.scopeId)
+      void fetchMeetingSummary(base, sopMeetingScope.scopeType, sopMeetingScope.scopeId)
         .then((data) => {
           if (!cancelled) setMeetingSummary(data);
         })
         .catch(() => {});
     };
+    poll();
     const timer = window.setInterval(poll, 5000);
     return () => {
       cancelled = true;
@@ -1071,29 +1114,29 @@ export const OrderManagement: React.FC<{
   }, [
     sopMeetingScope?.scopeId,
     sopMeetingScope?.scopeType,
-    displayTicket?.status,
+    shouldPollMeetingSummary,
     synapseApiBase,
   ]);
 
-  // Simulate real-time token consumption for processing tickets
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setTickets(prev => prev.map(t => {
-        if (t.status === 'processing') {
-          return {
-            ...t,
-            tokens: t.tokens + Math.floor(Math.random() * 80) + 20,
-            workItems: t.workItems?.map(w => ({
-              ...w,
-              tokens: w.tokens + Math.floor(Math.random() * 40) + 10
-            }))
-          };
-        }
-        return t;
-      }));
-    }, 1500);
-    return () => clearInterval(interval);
+  // Simulate real-time token consumption for processing tickets — removed; 总 token 取自 room_state.metrics.tokens
+
+  /** SOP 顶栏 / 左侧卡片：总耗时（stage_started_at 墙钟）超过 4 小时标红 */
+  const MEETING_DURATION_WARN_MS = 4 * 60 * 60 * 1000;
+  const isStageDurationHot = useCallback((startedAt?: string, nowMs = Date.now()) => {
+    const raw = startedAt?.trim();
+    if (!raw) return false;
+    const start = new Date(raw);
+    if (Number.isNaN(start.getTime())) return false;
+    return nowMs - start.getTime() > MEETING_DURATION_WARN_MS;
   }, []);
+
+  const sopTopStageSeconds = meetingSummary?.summary_metrics?.stage_seconds;
+  const sopTopStageStartedAt = meetingSummary?.summary_metrics?.stage_started_at;
+  const sopTopRunTimeLabel =
+    sopTopStageSeconds != null
+      ? formatDurationSeconds(sopTopStageSeconds, t)
+      : displayTicket?.runTime ?? '—';
+  const sopTopDurationHot = isStageDurationHot(sopTopStageStartedAt);
 
   // Handle auto-scroll to current / 已完成时最后一个 SOP 节点
   useEffect(() => {
@@ -1743,6 +1786,15 @@ export const OrderManagement: React.FC<{
                 const rowPendingOpen = !isWorkItem && ticket.status === 'pending';
                 const rowActionOverlay = rowPendingOpen || rowHitl;
                 const openMeetingBusyKey = `${isWorkItem ? 'task' : 'demand'}:${item.id}`;
+                const cardScopeType = isWorkItem ? ('task' as const) : ('demand' as const);
+                const cardScopeMetrics = roomMetricsByScope.get(`${cardScopeType}:${item.id}`);
+                const cardTotalTokens = cardScopeMetrics?.tokens ?? 0;
+                const cardTokenLabel =
+                  cardTotalTokens >= 1_000_000
+                    ? `${(cardTotalTokens / 1_000_000).toFixed(1)}M`
+                    : cardTotalTokens >= 1000
+                      ? `${(cardTotalTokens / 1000).toFixed(1)}k`
+                      : String(cardTotalTokens);
                 const rowFullManual = !isWorkItem && ticket.status === 'full_manual';
                 /** 预备中 / 全人工不参与本流水线，卡片上不应展示「等待调度」等节点名 */
                 const hidePipelineNodeLabel =
@@ -1902,7 +1954,7 @@ export const OrderManagement: React.FC<{
                         <span className="relative flex items-center gap-1">
                           <Coins className={`h-3 w-3 ${ticket.status === 'processing' || rowHitl ? 'text-amber-500' : 'text-amber-500/70'}`} />
                           <span className={ticket.status === 'processing' || rowHitl ? 'text-amber-500' : 'text-amber-600/70 dark:text-amber-400/70'}>
-                            {item.tokens >= 1000 ? (item.tokens/1000).toFixed(1) + 'k' : item.tokens}
+                            {cardTokenLabel}
                           </span>
                           {(ticket.status === 'processing' || rowHitl) && (
                             <motion.div
@@ -1961,7 +2013,13 @@ export const OrderManagement: React.FC<{
                 </span>
               </div>
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span className="flex items-center gap-1.5"><Clock className="h-3.5 w-3.5 shrink-0" /> 持续运行: <span className="font-mono text-foreground/90">{displayTicket.runTime}</span></span>
+                <span className="flex items-center gap-1.5">
+                  <Clock className={`h-3.5 w-3.5 shrink-0 ${sopTopDurationHot ? 'text-red-400' : ''}`} />
+                  持续运行:{' '}
+                  <span className={`font-mono ${sopTopDurationHot ? 'text-red-400' : 'text-foreground/90'}`}>
+                    {meetingSummaryLoading ? '…' : sopTopRunTimeLabel}
+                  </span>
+                </span>
                 <span className="flex items-center gap-1.5">
                   <Coins className="h-3.5 w-3.5 shrink-0 text-amber-500/80" /> 消耗 Token:{' '}
                   <span className="font-mono text-foreground/90">
@@ -2120,6 +2178,7 @@ export const OrderManagement: React.FC<{
                         const runtimeMetrics = pickSopNodePipelineMetrics(
                           meetingNodeMetricsById.get(node.id),
                           hasMeetingSummary,
+                          state,
                         );
                         const metricsLoading = meetingSummaryLoading;
                         const modelStr = resolveSopNodeModelDisplay(

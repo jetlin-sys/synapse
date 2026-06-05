@@ -88,9 +88,6 @@ import type { LucideIcon } from 'lucide-react';
 
 const { darkAlgorithm } = theme;
 
-/** 会议室 Token 预算固定 2M */
-const MEETING_TOKEN_BUDGET = 2_000_000;
-
 function useAntThemeDark() {
   const [dark, setDark] = useState(() => {
     if (typeof document === 'undefined') return false;
@@ -417,8 +414,8 @@ function applyLivePatch(room: MeetingRoom, live: MeetingRoomLivePayload): Meetin
     allChatLogs,
     logs: displayLogs,
     agents,
-    tokenConsumed: live.tokenConsumed ?? room.tokenConsumed,
-    tokenBudget: MEETING_TOKEN_BUDGET,
+    tokenConsumed: live.view_node_id ? room.tokenConsumed : (live.tokenConsumed ?? room.tokenConsumed),
+    tokenBudget: live.view_node_id ? room.tokenBudget : (live.tokenBudget ?? room.tokenBudget),
     stageDuration: live.stageDuration || room.stageDuration,
     meetingStartedAt: live.meetingStartedAt || room.meetingStartedAt,
     hitlFormSchema:
@@ -514,7 +511,7 @@ function mapDetailToRoom(item: MeetingRoomDetail): MeetingRoom {
     stageDuration: item.stageDuration || '—',
     meetingStartedAt: item.meetingStartedAt,
     tokenConsumed: item.tokenConsumed ?? 0,
-    tokenBudget: MEETING_TOKEN_BUDGET,
+    tokenBudget: item.tokenBudget ?? 20_000_000,
     agents: buildAgentsFromDetail(item),
     allChatLogs: allChatLogs.length ? allChatLogs : logs,
     logs,
@@ -890,6 +887,17 @@ function resolveSopNodeName(nodeId: string): string {
   return n?.name || nodeId;
 }
 
+/** 会议卡片：累计时长超过 4 小时高亮警示 */
+const MEETING_CARD_DURATION_WARN_MS = 4 * 60 * 60 * 1000;
+
+function isMeetingDurationHot(meetingStartedAt?: string, nowMs: number = Date.now()): boolean {
+  const raw = meetingStartedAt?.trim();
+  if (!raw) return false;
+  const start = new Date(raw);
+  if (Number.isNaN(start.getTime())) return false;
+  return nowMs - start.getTime() > MEETING_CARD_DURATION_WARN_MS;
+}
+
 function formatMeetingStartedAt(raw?: string): string {
   if (!raw?.trim()) return '—';
   const d = new Date(raw);
@@ -939,14 +947,21 @@ function meetingStatusTagColor(status: MeetingRoom['status']): string {
 /** 会议室全宽顶栏：工单信息 + 运行指标（跨左/中/右三栏） */
 const MeetingRoomTitleBar = ({
   room,
+  viewNodeId,
+  viewNodeName,
+  viewNodeToken,
   onBack,
 }: {
   room: MeetingRoom;
+  /** 当前 SOP 卡片选中的节点（顶栏指标随其切换） */
+  viewNodeId: string;
+  viewNodeName: string;
+  viewNodeToken: number;
   onBack: () => void;
 }) => {
-  const currentNodeName = resolveSopNodeName(room.currentNode);
-  const tokenBudget = MEETING_TOKEN_BUDGET;
-  const tokenConsumed = room.tokenConsumed;
+  const isPipelineCurrent = viewNodeId === room.currentNode;
+  const tokenBudget = room.tokenBudget;
+  const tokenConsumed = viewNodeToken;
   const tokenPct = tokenBudget > 0
     ? Math.min(100, (tokenConsumed / tokenBudget) * 100)
     : 0;
@@ -1007,14 +1022,16 @@ const MeetingRoomTitleBar = ({
               </span>
             </div>
           </Tooltip>
-          <Tooltip title={`流水线当前节点 · ${room.stageName}`}>
+          <Tooltip title={`${isPipelineCurrent ? '流水线当前' : '查看'}节点 · ${viewNodeName}`}>
             <div className="inline-flex items-center gap-2 rounded-lg border border-blue-500/25 bg-blue-500/8 px-3 py-1.5 text-[11px] max-w-[280px]">
               <Activity className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-              <span className="text-muted-foreground whitespace-nowrap">当前节点</span>
-              <span className="font-medium text-blue-300 truncate">{currentNodeName}</span>
+              <span className="text-muted-foreground whitespace-nowrap">
+                {isPipelineCurrent ? '当前节点' : '节点'}
+              </span>
+              <span className="font-medium text-blue-300 truncate">{viewNodeName}</span>
             </div>
           </Tooltip>
-          <Tooltip title={`Token 总消耗 ${tokenConsumed.toLocaleString()} / 预算 ${tokenBudget.toLocaleString()}`}>
+          <Tooltip title={`节点 Token 消耗 ${tokenConsumed.toLocaleString()} / 预算 ${tokenBudget.toLocaleString()}`}>
             <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/25 bg-amber-500/8 px-3 py-1.5 text-[11px] min-w-[140px]">
               <Coins className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span className="text-muted-foreground whitespace-nowrap">Token</span>
@@ -1140,6 +1157,15 @@ const RoomCard = ({
   onClick: (r: MeetingRoom) => void;
 }) => {
   const [activeLogIndex, setActiveLogIndex] = useState(room.logs.length - 1);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!room.meetingStartedAt) return;
+    const timer = window.setInterval(() => setNowTick(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, [room.meetingStartedAt]);
+
+  const durationHot = isMeetingDurationHot(room.meetingStartedAt, nowTick);
 
   useEffect(() => {
     if (room.status !== 'processing') return;
@@ -1185,9 +1211,15 @@ const RoomCard = ({
         <RoomCardStageProgress room={room} />
 
         <div className="flex items-center gap-3 text-xs">
-          <div className="flex items-center gap-1.5 text-muted-foreground bg-muted/40 px-2 py-1 rounded-md border border-border/50">
-            <Clock className="w-3 h-3 text-indigo-400" />
-            <span className="font-mono">{room.stageDuration}</span>
+          <div
+            className={`flex items-center gap-1.5 px-2 py-1 rounded-md border ${
+              durationHot
+                ? 'text-red-400 bg-red-500/10 border-red-500/40'
+                : 'text-muted-foreground bg-muted/40 border-border/50'
+            }`}
+          >
+            <Clock className={`w-3 h-3 shrink-0 ${durationHot ? 'text-red-400' : 'text-indigo-400'}`} />
+            <span className={`font-mono ${durationHot ? 'text-red-300' : ''}`}>{room.stageDuration}</span>
           </div>
           <div className="flex items-center gap-1.5 text-muted-foreground bg-muted/40 px-2 py-1 rounded-md border border-border/50 flex-1">
             <Coins className="w-3 h-3 text-amber-400" />
@@ -1319,6 +1351,7 @@ const InterventionDialog = ({
   const [contextOpen, setContextOpen] = useState(false);
   const [contextAgent, setContextAgent] = useState<AgentContextTarget | null>(null);
 
+  const [viewNodeToken, setViewNodeToken] = useState(0);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const lastLogKeyRef = useRef('');
   const interventionRoomIdRef = useRef<string | null>(null);
@@ -1485,6 +1518,49 @@ const InterventionDialog = ({
     };
   }, [open, room?.id, chatNodeId, synapseApiBase]);
 
+  /** 顶栏节点 Token：已完成用 node_metrics 静态值；进行中从 activity.jsonl 动态轮询 */
+  const viewNodePipelineState = room
+    ? getNodeStateGlobal(room, chatNodeId, disabledSopNodeIds)
+    : 'pending';
+  useEffect(() => {
+    if (!open || !room?.id || !chatNodeId) {
+      setViewNodeToken(0);
+      return;
+    }
+    const base = (synapseApiBase || '').trim();
+    if (!base) return;
+    const roomId = room.id;
+    const nodeId = chatNodeId;
+    const isLiveNode = viewNodePipelineState === 'processing';
+    let cancelled = false;
+    const poll = () => {
+      void fetchMeetingRoomLive(base, roomId, nodeId)
+        .then((live) => {
+          if (cancelled) return;
+          if (live.view_node_id && live.view_node_id !== nodeId) return;
+          const tok =
+            typeof live.view_node_token === 'number'
+              ? live.view_node_token
+              : live.tokenConsumed;
+          setViewNodeToken(typeof tok === 'number' ? tok : 0);
+        })
+        .catch(() => {
+          /* 静默 */
+        });
+    };
+    poll();
+    if (!isLiveNode) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const timer = window.setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [open, room?.id, chatNodeId, synapseApiBase, viewNodePipelineState]);
+
   useEffect(() => {
     if (!open || !room?.id || !chatNodeId || !onMergeNodeChat) return;
     const base = (synapseApiBase || '').trim();
@@ -1635,7 +1711,13 @@ const InterventionDialog = ({
       }}
     >
       <div className="flex h-[min(92vh,960px)] flex-col overflow-hidden">
-        <MeetingRoomTitleBar room={room} onBack={onClose} />
+        <MeetingRoomTitleBar
+          room={room}
+          viewNodeId={chatNodeId}
+          viewNodeName={selectedNode?.name || resolveSopNodeName(chatNodeId)}
+          viewNodeToken={viewNodeToken}
+          onBack={onClose}
+        />
 
         <div className="flex min-h-0 flex-1">
         {/* 左栏：SOP 阶段 + 议题清单 */}

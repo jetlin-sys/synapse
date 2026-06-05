@@ -123,13 +123,7 @@
     },
     "solution_review": {
       "host_profile_id": "default",
-      "worker_profile_ids": [
-        "whalecloud-requirement-expert",
-        "whalecloud-design-expert",
-        "whalecloud-rd-expert",
-        "whalecloud-test-expert",
-        "whalecloud-qa-expert"
-      ],
+      "worker_profile_ids": [],
       "node_intent": "方案评审与可行性验证。"
     },
     "auto_split": {
@@ -277,13 +271,7 @@
     },
     "leader_review": {
       "host_profile_id": "default",
-      "worker_profile_ids": [
-        "whalecloud-requirement-expert",
-        "whalecloud-design-expert",
-        "whalecloud-rd-expert",
-        "whalecloud-test-expert",
-        "whalecloud-qa-expert"
-      ],
+      "worker_profile_ids": [],
       "node_intent": "研发组长综合审批。"
     }
   }

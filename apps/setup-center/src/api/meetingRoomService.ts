@@ -89,6 +89,8 @@ export interface MeetingSummaryNode {
   metrics: {
     deal_seconds: number;
     tokens: number;
+    /** 进行中节点：activity.jsonl 动态汇总；已完成与 ``tokens`` 相同 */
+    tokens_live?: number;
     started_at?: string;
     completed_at?: string;
   };
@@ -102,6 +104,7 @@ export interface MeetingSummaryPayload {
   room_id?: string;
   summary_metrics?: {
     stage_seconds: number;
+    stage_started_at?: string;
     tokens: number;
     token_budget: number;
     human_interventions: number;
@@ -303,6 +306,8 @@ export interface MeetingRoomLivePayload {
   recent_chat?: MeetingRoomChatLogWire[];
   /** 仅当请求带 node_id 时：本次 recent_chat 对应的浏览节点，不等于流水线 current_node_id */
   view_node_id?: string;
+  /** 带 node_id 轮询时返回的节点级 token（动态/静态） */
+  view_node_token?: number;
   skipped_node_ids?: string[];
   participants?: MeetingRoomParticipantWire[];
   intervention_kind?: string;

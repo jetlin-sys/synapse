@@ -22,7 +22,7 @@ from typing import Any
 from filelock import FileLock
 
 from synapse.config import settings
-from synapse.rd_sop.manifest import is_system_node
+from synapse.rd_sop.manifest import is_collaborative_node, is_system_node
 
 logger = logging.getLogger(__name__)
 
@@ -138,9 +138,12 @@ def _normalize_overrides(value: Any) -> dict[str, Any]:
                 entry[key] = ov[key]
         if entry:
             entry.pop("skill_ids", None)
-            if is_system_node(str(node_id)):
+            nid = str(node_id)
+            if is_system_node(nid):
                 entry.pop("human_confirm", None)
-            cleaned[str(node_id)] = entry
+            if is_collaborative_node(nid):
+                entry["worker_profile_ids"] = []
+            cleaned[nid] = entry
     return cleaned
 
 
@@ -153,10 +156,13 @@ def _strip_legacy_override_fields(overrides: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(ov, dict):
             continue
         entry = {k: v for k, v in ov.items() if k not in ("skill_ids", "node_intent")}
-        if is_system_node(str(node_id)):
+        nid = str(node_id)
+        if is_system_node(nid):
             entry.pop("human_confirm", None)
+        if is_collaborative_node(nid):
+            entry["worker_profile_ids"] = []
         if entry:
-            out[str(node_id)] = entry
+            out[nid] = entry
     return out
 
 

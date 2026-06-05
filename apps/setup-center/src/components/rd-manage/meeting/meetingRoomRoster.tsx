@@ -29,6 +29,8 @@ export function workerProfileIdsForNode(
   if (!config || !nodeId) return [];
   const ov = config.node_overrides?.[nodeId];
   const binding = bindingFor(config.bindings, nodeId);
+  const nodeType = binding?.type ?? '';
+  if (nodeType === 'ai_human') return [];
   const raw = ov?.worker_profile_ids ?? binding?.worker_profile_ids;
   if (!Array.isArray(raw)) return [];
   return raw.map((id) => String(id).trim()).filter((id) => id && id !== HOST_PROFILE_ID);

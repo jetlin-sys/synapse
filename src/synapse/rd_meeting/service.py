@@ -12,6 +12,7 @@ from synapse.rd_meeting.agent_context_probe import (
     dump_meeting_agent_contexts,
 )
 from synapse.rd_meeting.binding import list_resolved_bindings, resolve_node_binding
+from synapse.rd_sop.manifest import is_collaborative_node
 from synapse.rd_meeting.config_store import (
     load_meeting_room_config,
     save_meeting_room_config,
@@ -42,6 +43,7 @@ from synapse.rd_meeting.pipeline import MeetingPipeline
 from synapse.rd_meeting.room_runtime import (
     append_history_event,
     build_meeting_summary_nodes,
+    compute_stage_elapsed_seconds,
     DEFAULT_TOKEN_BUDGET,
     extract_skipped_node_ids,
     history_to_chat_logs,
@@ -49,7 +51,8 @@ from synapse.rd_meeting.room_runtime import (
     load_room_state,
     mark_room_stopped,
     read_history,
-    refresh_room_metrics,
+    ensure_metrics_token_budget,
+    refresh_node_metrics,
     save_room_state,
     sync_room_state_from_dev,
 )
@@ -122,7 +125,10 @@ class MeetingRoomService:
                     if key in ov:
                         entry[key] = ov[key]
                 if entry:
-                    cleaned[str(node_id)] = entry
+                    nid = str(node_id)
+                    if is_collaborative_node(nid):
+                        entry["worker_profile_ids"] = []
+                    cleaned[nid] = entry
             allowed["node_overrides"] = cleaned
         if allowed:
             save_meeting_room_config(allowed)
@@ -190,6 +196,7 @@ class MeetingRoomService:
             data = read_dev_status_file(order_dir / "dev.status")
             if data is None or not should_list_in_meeting_rooms(data):
                 continue
+            ensure_metrics_token_budget(scope_id)
             items.append(self._to_list_item(data, scope_id, titles))
         items.sort(key=lambda x: (x.get("updated_at") or ""), reverse=True)
         return items
@@ -235,21 +242,27 @@ class MeetingRoomService:
         *,
         agent_pool: Any | None = None,
         history_limit: int = 40,
+        view_node_id: str = "",
     ) -> dict[str, Any] | None:
         """轻量 live 快照：phase、委派进度、子 Agent 状态、近期 history（供 UI 轮询）。"""
         detail = self.get_room_detail(room_id)
         if detail is None:
             return None
         scope_id = str(detail.get("scope_id") or "")
-        if scope_id:
-            refreshed = refresh_room_metrics(scope_id)
-            if refreshed and isinstance(refreshed.get("metrics"), dict):
-                m = refreshed["metrics"]
-                detail["tokenConsumed"] = int(m.get("tokens") or 0)
-                detail["tokenBudget"] = int(m.get("token_budget") or DEFAULT_TOKEN_BUDGET)
-                detail["room_state"] = refreshed
+        view_nid = (view_node_id or "").strip()
+        current_node_id = str(detail.get("current_node_id") or "pending")
+        node_token: int | None = None
+        if scope_id and view_nid:
+            node_token = refresh_node_metrics(
+                scope_id,
+                view_nid,
+                current_node_id=current_node_id,
+            )
+            rs = load_room_state(scope_id)
+            if isinstance(rs, dict):
+                detail["room_state"] = rs
         room_state = detail.get("room_state") if isinstance(detail.get("room_state"), dict) else {}
-        node_id = str(detail.get("current_node_id") or "pending")
+        node_id = view_nid or current_node_id
         history = read_history(scope_id, node_id=node_id, limit=history_limit) if scope_id else []
         all_history = read_history(scope_id, limit=500) if scope_id else []
 
@@ -299,8 +312,19 @@ class MeetingRoomService:
             "current_node_name": detail.get("current_node_name"),
             "stage_id": detail.get("stage_id"),
             "stage_name": detail.get("stage_name"),
-            "tokenConsumed": detail.get("tokenConsumed"),
-            "tokenBudget": detail.get("tokenBudget"),
+            "view_node_id": view_nid or None,
+            "view_node_token": node_token if view_nid else None,
+            "tokenConsumed": (
+                node_token
+                if view_nid
+                else int(
+                    (room_state.get("metrics") or {}).get("tokens")
+                    if isinstance(room_state.get("metrics"), dict)
+                    else detail.get("tokenConsumed")
+                    or 0
+                )
+            ),
+            "tokenBudget": detail.get("tokenBudget") or DEFAULT_TOKEN_BUDGET,
             "stageDuration": detail.get("stageDuration"),
             "meetingStartedAt": detail.get("meetingStartedAt"),
             "agents_active": agents_active,
@@ -1214,7 +1238,7 @@ class MeetingRoomService:
         room_state = load_room_state(sid)
         history = read_history(sid, limit=100)
         archive_index = list_archive_index(sid)
-        nodes = build_meeting_summary_nodes(dev, room_state)
+        nodes = build_meeting_summary_nodes(dev, room_state, scope_id=sid)
 
         metrics = room_state.get("metrics") if isinstance(room_state, dict) else {}
         if not isinstance(metrics, dict):
@@ -1227,7 +1251,8 @@ class MeetingRoomService:
             "room_state": room_state,
             "room_id": self._extract_room_id(dev, room_state),
             "summary_metrics": {
-                "stage_seconds": int(metrics.get("stage_seconds") or 0),
+                "stage_seconds": self._stage_elapsed_seconds(metrics),
+                "stage_started_at": str(metrics.get("stage_started_at") or "").strip(),
                 "tokens": int(metrics.get("tokens") or 0),
                 "token_budget": int(metrics.get("token_budget") or DEFAULT_TOKEN_BUDGET),
                 "human_interventions": sum(
@@ -1268,7 +1293,7 @@ class MeetingRoomService:
 
         if room_state and isinstance(room_state.get("metrics"), dict):
             m = room_state["metrics"]
-            item["stageDuration"] = self._format_duration(int(m.get("stage_seconds") or 0))
+            item["stageDuration"] = self._format_duration(self._stage_elapsed_seconds(m))
             item["tokenConsumed"] = int(m.get("tokens") or 0)
             item["tokenBudget"] = int(m.get("token_budget") or DEFAULT_TOKEN_BUDGET)
             item["meetingStartedAt"] = str(m.get("stage_started_at") or "").strip()
@@ -1301,6 +1326,13 @@ class MeetingRoomService:
         if MeetingPipeline.exists(scope_id):
             item["pipeline"] = MeetingPipeline.load(scope_id).snapshot_for_api()
         return item
+
+    @staticmethod
+    def _stage_elapsed_seconds(metrics: dict[str, Any]) -> int:
+        started = str(metrics.get("stage_started_at") or "").strip()
+        if started:
+            return compute_stage_elapsed_seconds(started)
+        return int(metrics.get("stage_seconds") or 0)
 
     @staticmethod
     def _format_duration(seconds: int) -> str:
@@ -1377,7 +1409,7 @@ class MeetingRoomService:
             m = room_state["metrics"]
             token_consumed = int(m.get("tokens") or 0)
             token_budget = int(m.get("token_budget") or DEFAULT_TOKEN_BUDGET)
-            stage_duration = self._format_duration(int(m.get("stage_seconds") or 0))
+            stage_duration = self._format_duration(self._stage_elapsed_seconds(m))
             meeting_started_at = str(m.get("stage_started_at") or "").strip()
 
         return {

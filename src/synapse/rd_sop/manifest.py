@@ -126,6 +126,11 @@ def is_system_node(node_id: str) -> bool:
     return NODE_TYPES.get((node_id or "").strip(), "") == "system"
 
 
+def is_collaborative_node(node_id: str) -> bool:
+    """协同型 SOP 节点（ai_human）：仅小鲸主持，不可配置协作智能体。"""
+    return NODE_TYPES.get((node_id or "").strip(), "") == "ai_human"
+
+
 def default_human_confirm(node_id: str) -> bool:
     """节点是否默认开启「人工确认」配置（与 NODE_TYPES 对齐，运行时可覆盖）。"""
     if is_system_node(node_id):
