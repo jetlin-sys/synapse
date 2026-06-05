@@ -57,6 +57,7 @@ export const WORKER_REQUIRED_SKILLS_BY_PROFILE: Record<string, RequiredSkillRule
   ],
   'whalecloud-design-expert': [
     { displayName: '函数级方案技能', skillIds: ['whalecloud-dev-tool-function-solution'] },
+    { displayName: '文档生成', skillIds: ['whalecloud-dev-tool-doc-generate'] },
     { displayName: '研发工具共享脚本', skillIds: ['whalecloud-dev-tool-base-scripts'] },
     { displayName: 'C++代码阅读', skillIds: ['whalecloud-dev-tool-c-code-access'] },
   ],

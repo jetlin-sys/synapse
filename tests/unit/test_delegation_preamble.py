@@ -148,6 +148,7 @@ class TestPresetSkillFixes:
             "whalecloud-dev-tool-base-scripts",
             "whalecloud-dev-tool-c-code-access",
             "whalecloud-dev-tool-module-function",
+            "whalecloud-dev-tool-doc-generate",
         ]
 
 

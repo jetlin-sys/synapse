@@ -733,6 +733,7 @@ SYSTEM_PRESETS: list[AgentProfile] = [
             "whalecloud-dev-tool-base-scripts",
             "whalecloud-dev-tool-c-code-access",
             "whalecloud-dev-tool-function-solution",
+            "whalecloud-dev-tool-doc-generate",
         ],
         skills_mode=SkillsMode.INCLUSIVE,
         custom_prompt="你是浩鲸产品设计专家。擅长产品架构与UI/UX设计。",
