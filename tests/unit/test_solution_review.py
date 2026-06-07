@@ -10,6 +10,7 @@ import pytest
 from synapse.rd_meeting.solution_review import (
     MIN_HUMAN_REVIEW_COMMENT_LEN,
     apply_human_decision,
+    ensure_human_review_pending_for_gate,
     enrich_payload_from_archive,
     parse_func_solution_impact_assessment,
     parse_func_solution_md,
@@ -195,3 +196,58 @@ def test_validate_solution_review_json_missing(tmp_path, monkeypatch):
     ok, errs = validate_solution_review_json(scope_id)
     assert not ok
     assert errs
+
+
+def test_ensure_human_review_pending_for_gate_resets_stale_approved(tmp_path, monkeypatch):
+    scope_id = "sr-reset"
+    archive = tmp_path / scope_id / "archive" / "需求设计" / "solution_review"
+    archive.mkdir(parents=True)
+    monkeypatch.setattr(
+        "synapse.rd_meeting.solution_review.archive_dir",
+        lambda sid: archive,
+    )
+    monkeypatch.setattr(
+        "synapse.rd_meeting.solution_review.json_path",
+        lambda sid: archive / "solution_review.json",
+    )
+    monkeypatch.setattr(
+        "synapse.rd_meeting.solution_review.split_plan_path",
+        lambda sid: archive / "split_plan.json",
+    )
+    monkeypatch.setattr(
+        "synapse.rd_meeting.solution_review.conclusion_path",
+        lambda sid: archive / "方案评审结论.md",
+    )
+    payload = {
+        "human_review": {
+            "status": "approved",
+            "comment": "",
+            "decided_at": "2026-06-08T00:58:15",
+        },
+        "whale_review": {"score": 80, "verdict": "pass"},
+    }
+    out = ensure_human_review_pending_for_gate(scope_id, payload)
+    assert out["human_review"]["status"] == "pending"
+    assert out["human_review"]["decided_at"] is None
+    on_disk = json.loads((archive / "solution_review.json").read_text(encoding="utf-8"))
+    assert on_disk["human_review"]["status"] == "pending"
+
+
+def test_ensure_human_review_pending_skips_when_split_plan_exists(tmp_path, monkeypatch):
+    scope_id = "sr-decided"
+    archive = tmp_path / scope_id / "archive" / "需求设计" / "solution_review"
+    archive.mkdir(parents=True)
+    monkeypatch.setattr(
+        "synapse.rd_meeting.solution_review.split_plan_path",
+        lambda sid: archive / "split_plan.json",
+    )
+    (archive / "split_plan.json").write_text(
+        json.dumps(
+            {"approved_at": "2026-06-08T01:00:00", "tasks": [{"taskNo": "1"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    payload = {"human_review": {"status": "approved", "decided_at": "x"}}
+    out = ensure_human_review_pending_for_gate(scope_id, payload)
+    assert out["human_review"]["status"] == "approved"

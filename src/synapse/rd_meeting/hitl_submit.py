@@ -72,6 +72,13 @@ def submit_questionnaire(
 
     rs = dict(load_room_state(scope_id) or {})
     node_id = str(rs.get("current_node_id") or "").strip() or "pending"
+    from synapse.rd_meeting.solution_review import (
+        SOLUTION_REVIEW_HITL_QUESTIONNAIRE_FORBIDDEN_MSG,
+        uses_solution_review_gate,
+    )
+
+    if uses_solution_review_gate(node_id):
+        raise ValueError(SOLUTION_REVIEW_HITL_QUESTIONNAIRE_FORBIDDEN_MSG)
     existing = rs.get(PENDING_QUESTIONNAIRE_KEY)
     if isinstance(existing, dict) and not existing.get("consumed"):
         logger.info(

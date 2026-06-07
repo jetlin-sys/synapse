@@ -162,6 +162,23 @@ def test_submit_questionnaire_rejects_non_host_session(meeting_scope):
         )
 
 
+def test_submit_questionnaire_forbidden_on_solution_review_node(meeting_scope):
+    scope_id, work = meeting_scope
+    state = {"current_node_id": "solution_review"}
+    (work / "room_state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="solution_review 节点禁止"):
+        submit_questionnaire(
+            session_id="rd_meeting:room-hitl:host",
+            kind="interactive",
+            questions=_sample_questions(),
+            title="误提交",
+        )
+    pending = json.loads((work / "room_state.json").read_text(encoding="utf-8")).get(
+        PENDING_QUESTIONNAIRE_KEY
+    )
+    assert pending is None
+    assert scope_id  # fixture side effect
+
 def test_consume_marks_consumed(meeting_scope):
     scope_id, _ = meeting_scope
     submit_questionnaire(

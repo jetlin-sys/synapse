@@ -403,6 +403,50 @@ def load_solution_review_payload(
     return data
 
 
+SOLUTION_REVIEW_HITL_QUESTIONNAIRE_FORBIDDEN_MSG = (
+    "solution_review 节点禁止使用 submit_hitl_questionnaire（含 interactive / "
+    "result_confirm / exception）。请先产出 solution_review.json 与方案评审结论.md；"
+    "系统将自动进入专用方案评审面板（补丁选择 + 人工意见 ≥50 字 + 通过/不通过），"
+    "勿提交会中问卷。"
+)
+
+
+def is_solution_review_formally_decided(scope_id: str) -> bool:
+    """``confirm_solution_review_decision(approve)`` 已落盘 split_plan 时视为正式裁决完成。"""
+    plan = _read_json_file(split_plan_path(scope_id))
+    if not isinstance(plan, dict):
+        return False
+    tasks = plan.get("tasks")
+    return bool(plan.get("approved_at")) and isinstance(tasks, list) and len(tasks) > 0
+
+
+def ensure_human_review_pending_for_gate(
+    scope_id: str,
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """进入方案评审门控前：清除误写的 human_review（如 interactive 问卷提前标 approved）。"""
+    if not isinstance(payload, dict):
+        return {}
+    if is_solution_review_formally_decided(scope_id):
+        return payload
+    human = payload.get("human_review") if isinstance(payload.get("human_review"), dict) else {}
+    status = str(human.get("status") or "").strip().lower()
+    if status == "pending" and not human.get("decided_at"):
+        return payload
+    out = dict(payload)
+    out["human_review"] = {
+        "status": "pending",
+        "comment": "",
+        "decided_at": None,
+    }
+    _write_json_file(json_path(scope_id), out)
+    try:
+        conclusion_path(scope_id).write_text(render_conclusion_markdown(out), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("refresh conclusion after human_review reset failed: %s", exc)
+    return out
+
+
 def validate_solution_review_json(scope_id: str) -> tuple[bool, list[str]]:
     data = _read_json_file(json_path(scope_id))
     if data is None:

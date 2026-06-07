@@ -870,6 +870,7 @@ class MeetingRoomOrchestrator:
     ) -> dict[str, Any]:
         """方案评审节点：加载 solution_review.json，进入专用人工评审面板（非问卷）。"""
         from synapse.rd_meeting.solution_review import (
+            ensure_human_review_pending_for_gate,
             load_solution_review_payload,
             validate_solution_review_json,
         )
@@ -915,6 +916,8 @@ class MeetingRoomOrchestrator:
 
         skipped = set(skipped_nodes or [])
         sr_payload = load_solution_review_payload(sid, skipped_node_ids=skipped)
+        if isinstance(sr_payload, dict):
+            sr_payload = ensure_human_review_pending_for_gate(sid, sr_payload)
         pending: dict[str, Any] = {
             "node_id": node_id,
             "report_body": report_body,
@@ -1935,6 +1938,24 @@ class MeetingRoomOrchestrator:
 
         need_human_confirm = bool(binding.get("human_confirm"))
         room_rs = load_room_state(sid) or {}
+
+        from synapse.rd_meeting.solution_review import (
+            SOLUTION_REVIEW_HITL_QUESTIONNAIRE_FORBIDDEN_MSG,
+            uses_solution_review_gate,
+        )
+        if need_human_confirm and tool_questionnaire and uses_solution_review_gate(node_id):
+            append_history_event(
+                sid,
+                {
+                    "event": "solution_review_questionnaire_rejected",
+                    "room_id": room_id,
+                    "node_id": node_id,
+                    "detail": SOLUTION_REVIEW_HITL_QUESTIONNAIRE_FORBIDDEN_MSG,
+                    "log_type": "warning",
+                    "agent_id": str(binding.get("host_profile_id") or "default"),
+                },
+            )
+            tool_questionnaire = None
 
         # 本轮回主控 submit_hitl_questionnaire 优先于历史 hitl_locked / ready 标记，
         # 避免「用户已填过一轮 + 归档已就绪」时跳过新一轮 interactive 问卷直达 NodeReview。
